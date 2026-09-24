@@ -20,6 +20,7 @@ use serde_json::{json, Value};
 
 use lisa_engine::core::generate::is_eos;
 use lisa_engine::models::qwen4::tower::Tower;
+use lisa_engine::DecisionModel;
 use lisa_engine::core::sampler::Sampler;
 use lisa_engine::core::session::Session;
 use lisa_engine::core::tokenizer::{self, Tokenizer};
@@ -678,3 +679,59 @@ fn completion_id() -> String {
 }
 
 static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+// ─────────────────────────── decisions ───────────────────────────
+
+/// Serve a non-generative decision model (e.g. Laya) over HTTP.
+///
+/// Endpoints: `POST /v1/decisions` (`{"state":…,"questions":…}` → answers),
+/// `GET /v1/models`, `GET /health`. The model is a pure function, so requests
+/// are handled inline on the accept thread (single-threaded; fast, ~30 ms).
+pub fn run_decisions(model: Box<dyn DecisionModel>, cfg: ServerConfig) -> anyhow::Result<()> {
+    let listener = TcpListener::bind(&cfg.addr)?;
+    let addr = listener.local_addr()?;
+    println!("lisa decisions listening on http://{addr}");
+    println!("  POST /v1/decisions   GET /v1/models   GET /health");
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                if let Err(e) = handle_decision_conn(stream, model.as_ref()) {
+                    eprintln!("decisions: {e}");
+                }
+            }
+            Err(e) => eprintln!("accept: {e}"),
+        }
+    }
+    Ok(())
+}
+
+fn handle_decision_conn(mut stream: TcpStream, model: &dyn DecisionModel) -> anyhow::Result<()> {
+    let Some((method, path, body)) = read_request(&mut stream)? else {
+        return Ok(());
+    };
+    if method == "GET" && (path == "/health" || path == "/healthz") {
+        return write_response(&mut stream, "200 OK", "application/json", br#"{"status":"ok"}"#, "");
+    }
+    if method == "GET" && path.starts_with("/v1/models") {
+        let payload = json!({"object":"list","data":[{"id":model.name(),"object":"model"}]});
+        return write_response(&mut stream, "200 OK", "application/json", payload.to_string().as_bytes(), "");
+    }
+    if method == "POST" && path == "/v1/decisions" {
+        let req: Value = match serde_json::from_slice(&body) {
+            Ok(v) => v,
+            Err(e) => return bad_request(&mut stream, format!("invalid JSON: {e}")),
+        };
+        let state = req.get("state").cloned().unwrap_or(Value::Null);
+        let questions = req.get("questions").cloned().unwrap_or(Value::Null);
+        return match model.system_one(&state, &questions) {
+            Ok(ans) => write_response(&mut stream, "200 OK", "application/json", ans.to_string().as_bytes(), ""),
+            Err(e) => bad_request(&mut stream, e.to_string()),
+        };
+    }
+    write_response(&mut stream, "404 Not Found", "application/json", br#"{"error":{"message":"not found"}}"#, "")
+}
+
+fn bad_request(stream: &mut TcpStream, msg: String) -> anyhow::Result<()> {
+    let body = json!({ "error": { "message": msg } }).to_string();
+    write_response(stream, "400 Bad Request", "application/json", body.as_bytes(), "")
+}

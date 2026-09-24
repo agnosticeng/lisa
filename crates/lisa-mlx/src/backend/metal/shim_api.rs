@@ -605,6 +605,12 @@ impl Array {
         Ok(Self::new(promoted_binary(&self.t, &rhs.as_ref().t, |a, b| a.minimum(b))?))
     }
 
+    /// MLX unary op by name (`"erf"`, `"gelu"`, …). Dispatches to the built-in
+    /// unary kernel (`unary_ops.metal`) with `op` as the functor type.
+    pub fn unary(&self, op: &str) -> Result<Self> {
+        Ok(Self::new(self.t.unary(op)?))
+    }
+
     pub fn exp(&self) -> Result<Self> {
         // LISA_EXP_ROUTE: "f32" | "bf16" | "all" | "none" (default none) to
         // bisect which dtype/path the ported kernel breaks on.

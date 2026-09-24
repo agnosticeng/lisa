@@ -149,6 +149,11 @@ pub fn array_from_bytes(bytes: &[u8], dtype: Dtype, shape: &[i32]) -> lisa_mlx::
                 shape,
                 Dtype::Float32,
             )),
+            Dtype::Float16 => Ok(Array::from_raw_data(
+                bytes.as_ptr() as *const std::ffi::c_void,
+                shape,
+                Dtype::Float16,
+            )),
             Dtype::Int32 => Ok(Array::from_raw_data(
                 bytes.as_ptr() as *const std::ffi::c_void,
                 shape,

@@ -9,7 +9,13 @@ pub struct Tokenizer {
 
 impl Tokenizer {
     pub fn load(dir: &std::path::Path) -> anyhow::Result<Self> {
-        let inner = HfTokenizer::from_file(dir.join("tokenizer.json"))
+        Self::load_file(&dir.join("tokenizer.json"))
+    }
+
+    /// Load a `tokenizer.json` from an explicit path (some checkpoints keep it
+    /// in a `tokenizer/` subdirectory).
+    pub fn load_file(path: &std::path::Path) -> anyhow::Result<Self> {
+        let inner = HfTokenizer::from_file(path)
             .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
         // <|im_end|> and <|endoftext|>
         let mut im_end_ids = Vec::new();

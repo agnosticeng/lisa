@@ -13,4 +13,4 @@ pub mod models;
 
 // Convenience re-exports for the common entry points.
 pub use core::{batch, generate, loader, mem, norm, quant, sampler, sched, session, tokenizer};
-pub use models::{qwen4, LanguageModel};
+pub use models::{laya, qwen4, DecisionModel, LanguageModel, Loaded};
