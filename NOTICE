@@ -1,0 +1,36 @@
+lisa includes third-party Metal kernel source.
+
+- crates/lisa-mlx/src/kernels/qsa/ (prefill.metal, prefill_header.metal,
+  select.metal, select_header.metal) and the host wrappers in
+  crates/lisa-mlx/src/qsa.rs are adapted from MTPLX
+  (https://github.com/youssofal/MTPLX), Copyright the MTPLX authors, licensed
+  under the Apache License, Version 2.0 (see mtplx/kernels/qsa_prefill_flash.py
+  and mtplx/kernels/qsa_indexer_select.py). The Metal source and header are
+  reproduced verbatim; only the host dispatch was adapted to lisa's MetalKernel
+  API and tensor layout.
+
+- crates/lisa-mlx/src/kernels/common/ (the MLX op kernels and helpers),
+  crates/lisa-mlx/src/kernels/nax/ (the flattened NAX header closures), and the
+  MLX-derived portions of crates/lisa-mlx/src/kernels/models/qwen4/ are derived
+  from Apple's MLX (https://github.com/ml-explore/mlx), Copyright © 2023-2025
+  Apple Inc., licensed under the MIT License. The Metal sources are reproduced
+  verbatim (or flattened from the pinned MLX headers in dependency order);
+  only the host dispatch was adapted to lisa's MetalKernel API and tensor
+  layout. See https://github.com/ml-explore/mlx/blob/main/LICENSE for the
+  license text.
+
+The QSA sparse-attention approach and the model-contract block-selection
+tie-break (`score - block_id * 1e-12`) follow the same project.
+
+- crates/lisa-mlx/src/kernels/common/candle_{binary,cast,ternary,indexing}.metal
+  are candle's `src/metal_src/{binary,cast,ternary,indexing}.metal` from
+  candle-metal-kernels 0.11.0
+  (https://github.com/huggingface/candle), licensed under the MIT License
+- crates/lisa-mlx/src/kernels/common/candle_{mlx_gemm,gemv}.metal are
+  candle's `src/metal_src/{mlx_gemm,gemv}.metal` (Apple MLX steel GEMM/GEMV
+  kernels extracted by candle-metal-kernels 0.11.0), MIT License; the original
+  kernels are Apple MLX (https://github.com/ml-explore/mlx), MIT License
+  (Copyright © 2023-2025 Hugging Face). It is vendored verbatim so the native
+  runtime can dispatch the elementwise binary, cast, ternary (where) and
+  indexing (gather) families without the candle dependency; only the host
+  dispatch is ours.

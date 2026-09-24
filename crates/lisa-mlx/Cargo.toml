@@ -1,0 +1,30 @@
+[package]
+name = "lisa-mlx"
+version = "0.1.0"
+edition = "2024"
+description = "Drop-in replacement for the lisa-mlx surface on the native Metal runtime"
+
+[lib]
+name = "lisa_mlx"
+path = "src/lib.rs"
+
+[dependencies]
+# No MLX dependency: the library name is `lisa_mlx` so call sites resolve here.
+objc2 = "0.6"
+objc2-metal = { version = "0.3", features = [
+    "MTLFunctionConstantValues",
+    "MTLLibrary",
+    "MTLDevice",
+    "MTLBuffer",
+    "MTLResource",
+    "MTLCommandQueue",
+    "MTLCommandBuffer",
+    "MTLCommandEncoder",
+    "MTLComputeCommandEncoder",
+    "MTLComputePipeline",
+    "MTLFence",
+    "MTLTypes",
+] }
+block2 = "0.6"
+objc2-foundation = "0.3"
+half = "2.7.1"
