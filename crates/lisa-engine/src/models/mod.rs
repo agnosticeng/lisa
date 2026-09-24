@@ -80,9 +80,16 @@ pub trait LanguageModel {
     fn drafter_reset(&mut self) {}
     /// Trim the drafter's caches by `n` rows (rollback).
     fn drafter_trim(&mut self, _n: usize) {}
+    /// The drafter's cache length in rows (pairs consumed so far).
+    fn drafter_offset(&self) -> usize {
+        0
+    }
+    /// Rewind the drafter's cache to a previously captured offset (prefix
+    /// snapshot restore).
+    fn drafter_restore_offset(&mut self, _n: usize) {}
     /// One draft step over `tokens [1,S]` and `multi [1,S,hc*H]`: returns the
     /// drafted token id and the last multi-stream row for the next step.
-    fn draft_step(&mut self, _tokens: &Array, _multi: &Array) -> anyhow::Result<(u32, Array)> {
+    fn draft_step(&mut self, _tokens: &Array, _multi: &Array) -> anyhow::Result<(Array, Array)> {
         anyhow::bail!("this model has no drafter")
     }
 }

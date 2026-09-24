@@ -233,6 +233,15 @@ impl FullAttentionCache {
         self.offset = self.offset.saturating_sub(n);
         self.indexer_tape.trim(self.offset);
     }
+
+    /// Set the live length back to `boundary` (prefix-snapshot restore); the
+    /// KV bytes past it stay and are overwritten by the next append.
+    pub fn restore_offset(&mut self, boundary: usize) {
+        if boundary <= self.offset {
+            self.indexer_tape.trim(boundary);
+            self.offset = boundary;
+        }
+    }
 }
 
 /// Per-layer recurrent state for the gated deltanet: a short-convolution
@@ -296,6 +305,17 @@ impl GdnCache {
             self.ple_conv = Some(full.index((.., n..(n + k), ..)).contiguous()?);
         }
         Ok(())
+    }
+/// Clone the recurrent state for a prefix snapshot.
+    pub fn snapshot_state(&self) -> (Option<Array>, Option<Array>, Option<Array>) {
+        (self.conv.clone(), self.ssm.clone(), self.ple_conv.clone())
+    }
+
+    /// Restore the recurrent state from a prefix snapshot.
+    pub fn restore_state(&mut self, s: &(Option<Array>, Option<Array>, Option<Array>)) {
+        self.conv = s.0.clone();
+        self.ssm = s.1.clone();
+        self.ple_conv = s.2.clone();
     }
 }
 
