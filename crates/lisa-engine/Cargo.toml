@@ -1,0 +1,16 @@
+[package]
+name = "lisa-engine"
+version = "0.1.0"
+edition = "2024"
+description = "Qwen 3.8 Flash-Next engine library"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.6", features = ["derive"] }
+half = "2.7.1"
+memmap2 = "0.9.11"
+lisa-mlx = { path = "../lisa-mlx" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+tokenizers = "0.23.2"
