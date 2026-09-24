@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 use lisa_engine::{batch, generate, sampler, sched, session, tokenizer};
 use lisa_engine::models::qwen4::{config, layerdiff, smoke};
 use lisa_engine::models::qwen4::tower as model;
+use lisa_engine::models::laya::{Laya, LayaDevice};
 use lisa_engine::core::mem::mlx_mem_line;
 use lisa_serve as serve;
 use lisa_mlx::ops::indexing::IndexOp;
@@ -37,6 +38,54 @@ impl std::str::FromStr for ModelDir {
     }
 }
 
+/// A `--state` value: a JSON object/array is parsed; anything else is a string.
+fn parse_state(s: &str) -> serde_json::Value {
+    match serde_json::from_str::<serde_json::Value>(s) {
+        Ok(v @ serde_json::Value::Object(_)) | Ok(v @ serde_json::Value::Array(_)) => v,
+        _ => serde_json::Value::String(s.to_string()),
+    }
+}
+
+/// Parse `--temperature-by-options TYPE:SIZE=TEMP` into `(bucket, temp)` pairs.
+fn parse_temp_by_options(items: &[String]) -> anyhow::Result<Vec<(String, f32)>> {
+    items
+        .iter()
+        .map(|s| {
+            let (k, v) = s
+                .rsplit_once('=')
+                .ok_or_else(|| anyhow::anyhow!("--temperature-by-options wants TYPE:SIZE=TEMP, got {s:?}"))?;
+            let val: f32 = v
+                .trim()
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid temperature {v:?} in {s:?}"))?;
+            Ok((k.trim().to_string(), val))
+        })
+        .collect()
+}
+
+/// Keep only the `k` highest probabilities in each answer's `probabilities` map.
+fn trim_topk(v: &mut serde_json::Value, k: usize) {
+    let Some(answers) = v.get_mut("answers").and_then(|a| a.as_object_mut()) else {
+        return;
+    };
+    for (_, ans) in answers.iter_mut() {
+        let Some(probs) = ans.get_mut("probabilities").and_then(|p| p.as_object_mut()) else {
+            continue;
+        };
+        let mut items: Vec<(String, f64)> = probs
+            .iter()
+            .map(|(key, val)| (key.clone(), val.as_f64().unwrap_or(0.0)))
+            .collect();
+        items.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        items.truncate(k);
+        let kept: serde_json::Map<String, serde_json::Value> = items
+            .into_iter()
+            .map(|(key, val)| (key, serde_json::json!(val)))
+            .collect();
+        *probs = kept;
+    }
+}
+
 /// MTP draft depth: 0 = serial, 2..=6 = speculative. A single draft is never
 /// worth a round, so depth 1 is rejected rather than silently routed.
 fn parse_depth(s: &str) -> Result<usize, String> {
@@ -62,6 +111,49 @@ enum Command {
     Inspect {
         #[arg(long)]
         model: ModelDir,
+    },
+    /// Load a typed-decision model (e.g. Laya) and run it.
+    Decide {
+        #[arg(long)]
+        model: ModelDir,
+        /// Run a fixed probe input and print the logits/action.
+        #[arg(long)]
+        probe: bool,
+        /// JSON state (object/array, or a plain string).
+        #[arg(long)]
+        state: Option<String>,
+        /// JSON questions object, keyed by question id.
+        #[arg(long)]
+        questions: Option<String>,
+        /// Read `{"state":…,"questions":…}` from a JSON file.
+        #[arg(long)]
+        input: Option<PathBuf>,
+
+        // Overrides of `rl_agent_config.json` (validated 4 < head_max_len < max_len <= 8192).
+        /// Option-prompt token budget shared across a question's options.
+        #[arg(long)]
+        head_max_len: Option<usize>,
+        /// Total token budget (option prompt + state).
+        #[arg(long)]
+        max_len: Option<usize>,
+        /// Per-type temperatures for choice,score,noul (e.g. `0.7,1.0,1.0`).
+        /// Beats the shipped config buckets; clamped to [0.5, 5.0] (noul excepted).
+        /// `--temperature-by-options` is applied after this and wins.
+        #[arg(long, value_delimiter = ',')]
+        temperature: Option<Vec<f32>>,
+        /// Bucketed temperature, repeatable, `TYPE:SIZE=TEMP`; SIZE must be one of
+        /// `2`, `3-5`, `6-10`, `11+` (e.g. `choice:6-10=0.7`). Wins over
+        /// `--temperature` and the shipped config. Clamped to [0.5, 5.0] (noul excepted).
+        #[arg(long = "temperature-by-options")]
+        temperature_by_options: Vec<String>,
+
+        /// Device override: `metal` | `cpu`.
+        #[arg(long)]
+        device: Option<String>,
+
+        /// Keep only the top-k probabilities per answer (display).
+        #[arg(long)]
+        top_k: Option<usize>,
     },
     /// Load a model and generate.
     Run {
@@ -279,9 +371,12 @@ fn build_sampler(
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    // Resolve the device backend up front (`LISA_DEVICE`, default `metal`) so
-    // an unavailable backend fails early and clearly.
-    lisa_mlx::backend::Backend::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Resolve the device backend: `LISA_DEVICE`, else Metal when present, else
+    // CPU. Announce a non-default (CPU) selection.
+    let backend = lisa_mlx::backend::Backend::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
+    if backend != lisa_mlx::backend::Backend::Metal {
+        eprintln!("device: {}", backend.name());
+    }
     lisa_mlx::ffi::install_error_handler();
     // Cap how far the Metal buffer pool may grow past load-steady-state before
     // a sweep is forced. Without a cap a pipelined prefill or MTP round pins
@@ -304,6 +399,67 @@ fn main() -> anyhow::Result<()> {
     }
     match cli.command {
         Command::Smoke => smoke::run_all(),
+        Command::Decide {
+            model,
+            probe,
+            state,
+            questions,
+            input,
+            head_max_len,
+            max_len,
+            temperature,
+            temperature_by_options,
+            device,
+            top_k,
+        } => {
+            let backend = match device.as_deref() {
+                Some(d) => lisa_mlx::backend::Backend::from_name(d).map_err(|e| anyhow::anyhow!("{e}"))?,
+                None => lisa_mlx::backend::Backend::from_env().map_err(|e| anyhow::anyhow!("{e}"))?,
+            };
+            let model_type = lisa_engine::models::model_type_of(&model)?;
+            anyhow::ensure!(
+                model_type == "laya",
+                "{} has model_type {model_type:?}, not a decision model",
+                model.display()
+            );
+            let dev = match backend {
+                lisa_mlx::backend::Backend::Metal => LayaDevice::Metal,
+                lisa_mlx::backend::Backend::Cpu => LayaDevice::Cpu,
+            };
+            let mut laya = Laya::load_device(&model, dev)?;
+            let by_options = parse_temp_by_options(&temperature_by_options)?;
+            laya.apply_overrides(head_max_len, max_len, temperature, &by_options)?;
+
+            let emit = |v: &serde_json::Value| -> anyhow::Result<()> {
+                let mut v = v.clone();
+                if let Some(k) = top_k {
+                    trim_topk(&mut v, k);
+                }
+                println!("{}", serde_json::to_string_pretty(&v)?);
+                Ok(())
+            };
+            if let Some(path) = input {
+                let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+                let st = v.get("state").cloned().unwrap_or(serde_json::Value::Null);
+                let qs = v.get("questions").cloned().unwrap_or(serde_json::Value::Null);
+                emit(&laya.system_one(&st, &qs)?)
+            } else if let (Some(st), Some(qs)) = (state, questions) {
+                let st = parse_state(&st);
+                let qs: serde_json::Value = serde_json::from_str(&qs)?;
+                emit(&laya.system_one(&st, &qs)?)
+            } else {
+                println!("{}", laya.summary());
+                if probe {
+                    // Fixed input matching the Python reference harness:
+                    // ids [1000..6000, 7, 8], qtype 0, markers [6, 7].
+                    let ids = [1000u32, 2000, 3000, 4000, 5000, 6000, 7, 8];
+                    let (logits, action) = laya.decide(&ids, 0, &[6, 7])?;
+                    println!("probe logits: {:?}", logits);
+                    println!("probe action: {:?}", action);
+                }
+                Ok(())
+            }
+        }
         Command::Inspect { model } => {
             let config = config::ModelConfig::from_json(&model.join("config.json"))?;
             println!(
@@ -560,6 +716,28 @@ fn main() -> anyhow::Result<()> {
             depth,
             max_batch,
         } => {
+            let cfg = serve::ServerConfig {
+                addr,
+                max_tokens,
+                temperature,
+                top_p,
+                top_k,
+                min_p,
+                rep_penalty,
+                depth,
+                max_batch,
+            };
+            // Non-generative decision models get their own endpoint.
+            if lisa_engine::models::model_type_of(&model)? == "laya" {
+                let t0 = std::time::Instant::now();
+                match lisa_engine::models::load_dir(&model)? {
+                    lisa_engine::Loaded::Decision(m) => {
+                        eprintln!("loaded in {:.1}s", t0.elapsed().as_secs_f64());
+                        return serve::run_decisions(m, cfg);
+                    }
+                    lisa_engine::Loaded::Language(_) => unreachable!("model_type was laya"),
+                }
+            }
             let config = config::ModelConfig::from_json(&model.join("config.json"))?;
             let t0 = std::time::Instant::now();
             let mut tower = model::Tower::load(&model, config)?;
@@ -572,17 +750,6 @@ fn main() -> anyhow::Result<()> {
             )?;
             tower.warmup(&warm)?;
             mlx_mem_line("serve-warm");
-            let cfg = serve::ServerConfig {
-                addr,
-                max_tokens,
-                temperature,
-                top_p,
-                top_k,
-                min_p,
-                rep_penalty,
-                depth,
-                max_batch,
-            };
             serve::run(&mut tower, &tok, cfg)
         }
 

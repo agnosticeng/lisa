@@ -14,6 +14,7 @@
 //! Device backends are a separate axis (see `lisa_mlx`): the runtime talks to
 //! an `Array`/`Stream` surface, and a backend supplies it.
 
+pub mod laya;
 pub mod qwen4;
 
 use std::path::{Path, PathBuf};
@@ -86,19 +87,75 @@ pub trait LanguageModel {
     }
 }
 
+/// A model kind the runtime can load.
+pub enum Loaded {
+    /// A decoder-only text model (generation, batching, speculative decode).
+    Language(Box<dyn LanguageModel>),
+    /// A non-generative model with its own interface (e.g. typed decisions).
+    Decision(Box<dyn DecisionModel>),
+}
+
+/// The interface a non-generative (encoder/decision) model exposes.
+///
+/// These models are not driven by the generation runtime; a caller addresses
+/// them through their own API (e.g. `lisa decide`). This trait is the loading
+/// seam, so a decision model can be resolved and dispatched like any other.
+pub trait DecisionModel {
+    /// The model family name (`"laya"`).
+    fn name(&self) -> &str;
+    /// The resolved model directory.
+    fn dir(&self) -> &Path;
+    /// A human-readable structural summary for diagnostics.
+    fn summary(&self) -> String;
+    /// One decision forward: `(logits per marker, action)`.
+    fn decide(
+        &self,
+        ids: &[u32],
+        qtype: i32,
+        marker_pos: &[i32],
+    ) -> anyhow::Result<(Vec<f32>, Vec<f32>)>;
+    /// Run a `state` + typed `questions` request and return the answer JSON.
+    fn system_one(&self, _state: &serde_json::Value, _questions: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        anyhow::bail!("this decision model has no typed-question interface")
+    }
+}
+
 /// Load a model from a local directory or a Hugging Face repo id, dispatching
-/// on the `model_type` in its `config.json`.
-pub fn load(target: &str) -> anyhow::Result<Box<dyn LanguageModel>> {
-    let dir = resolve_model_dir(target)?;
-    let model_type = model_type_of(&dir)?;
+/// on the structure read from its config.
+pub fn load(target: &str) -> anyhow::Result<Loaded> {
+    load_dir(&resolve_model_dir(target)?)
+}
+
+/// Load a model from an already-resolved directory, on the selected backend.
+pub fn load_dir(dir: &Path) -> anyhow::Result<Loaded> {
+    let backend = lisa_mlx::backend::Backend::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
+    load_dir_with(dir, backend)
+}
+
+/// Load a model from an already-resolved directory on an explicit backend.
+pub fn load_dir_with(dir: &Path, backend: lisa_mlx::backend::Backend) -> anyhow::Result<Loaded> {
+    let model_type = model_type_of(dir)?;
     match model_type.as_str() {
         // Qwen 3.8 Flash-Next (hybrid attention + GDN, sparse MoE, PLE, MTP).
         "qwen4_exp" | "qwen4_exp_text" => {
+            anyhow::ensure!(
+                backend == lisa_mlx::backend::Backend::Metal,
+                "the qwen4 model requires the metal backend (got {})",
+                backend.name()
+            );
             let config = qwen4::ModelConfig::from_json(&dir.join("config.json"))?;
-            Ok(Box::new(qwen4::Tower::load(&dir, config)?))
+            Ok(Loaded::Language(Box::new(qwen4::Tower::load(dir, config)?)))
+        }
+        // Laya (ModernBERT encoder + typed-decision head; non-generative).
+        "laya" => {
+            let device = match backend {
+                lisa_mlx::backend::Backend::Metal => laya::LayaDevice::Metal,
+                lisa_mlx::backend::Backend::Cpu => laya::LayaDevice::Cpu,
+            };
+            Ok(Loaded::Decision(Box::new(laya::Laya::load_device(dir, device)?)))
         }
         other => anyhow::bail!(
-            "unsupported model_type {other:?} in {}; supported: qwen4_exp",
+            "unsupported model_type {other:?} in {}; supported: qwen4_exp, laya",
             dir.display()
         ),
     }
@@ -149,20 +206,40 @@ pub fn resolve_model_dir(target: &str) -> anyhow::Result<PathBuf> {
 /// `text_config.model_type` wins when present.
 pub fn model_type_of(dir: &Path) -> anyhow::Result<String> {
     let path = dir.join("config.json");
-    let data = std::fs::read_to_string(&path)
-        .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
-    let v: serde_json::Value = serde_json::from_str(&data)?;
-    if let Some(t) = v
-        .get("text_config")
-        .and_then(|t| t.get("model_type"))
-        .and_then(|t| t.as_str())
-    {
-        return Ok(t.to_string());
+    if path.is_file() {
+        let data = std::fs::read_to_string(&path)?;
+        let v: serde_json::Value = serde_json::from_str(&data)?;
+        if let Some(t) = v
+            .get("text_config")
+            .and_then(|t| t.get("model_type"))
+            .and_then(|t| t.as_str())
+        {
+            return Ok(t.to_string());
+        }
+        if let Some(t) = v.get("model_type").and_then(|t| t.as_str()) {
+            return Ok(t.to_string());
+        }
+        anyhow::bail!("{} has no model_type", path.display());
     }
-    if let Some(t) = v.get("model_type").and_then(|t| t.as_str()) {
-        return Ok(t.to_string());
+
+    // Configless checkpoints: Laya keeps its encoder config in `encoder/` and
+    // its decision-head config in `rl_agent_config.json`.
+    let enc = dir.join("encoder/config.json");
+    if enc.is_file() {
+        if dir.join("rl_agent_config.json").is_file() {
+            return Ok("laya".to_string());
+        }
+        let data = std::fs::read_to_string(&enc)?;
+        let v: serde_json::Value = serde_json::from_str(&data)?;
+        if let Some(t) = v.get("model_type").and_then(|t| t.as_str()) {
+            return Ok(t.to_string());
+        }
     }
-    anyhow::bail!("{} has no model_type", path.display())
+
+    anyhow::bail!(
+        "no config.json or encoder/config.json under {}",
+        dir.display()
+    )
 }
 
 /// The lisa model cache root: `$LISA_MODEL_DIR`, else `~/.cache/lisa-models`.

@@ -18,6 +18,8 @@ use crate::error::{Error, Result};
 pub enum Backend {
     /// Apple-Silicon GPU via Metal.
     Metal,
+    /// Host CPU (only models with a host forward path, e.g. Laya).
+    Cpu,
 }
 
 impl Backend {
@@ -25,25 +27,41 @@ impl Backend {
     pub fn from_name(name: &str) -> Result<Self> {
         match name.to_ascii_lowercase().as_str() {
             "metal" | "gpu" => Ok(Backend::Metal),
-            "cpu" => Err(Error::Msg(
-                "the cpu backend is not implemented yet".to_string(),
-            )),
+            "cpu" => Ok(Backend::Cpu),
             other => Err(Error::Msg(format!(
-                "unknown device {other:?}; available: metal"
+                "unknown device {other:?}; available: metal, cpu"
             ))),
         }
     }
 
-    /// The backend selected by `LISA_DEVICE` (default `metal`).
+    /// Resolve an explicit name, or auto-select when none is given: Metal if a
+    /// Metal device exists, else CPU.
+    pub fn resolve(explicit: Option<&str>) -> Result<Self> {
+        match explicit {
+            Some(name) => Self::from_name(name),
+            None => Ok(if metal_available() { Backend::Metal } else { Backend::Cpu }),
+        }
+    }
+
+    /// The backend selected by `LISA_DEVICE`, else auto (Metal if available,
+    /// otherwise CPU).
     pub fn from_env() -> Result<Self> {
-        let name = std::env::var("LISA_DEVICE").unwrap_or_else(|_| "metal".to_string());
-        Self::from_name(&name)
+        let name = std::env::var("LISA_DEVICE").ok();
+        Self::resolve(name.as_deref())
     }
 
     /// The backend's canonical name.
     pub fn name(self) -> &'static str {
         match self {
             Backend::Metal => "metal",
+            Backend::Cpu => "cpu",
         }
     }
+}
+
+/// Whether a Metal device is present. `MTLCreateSystemDefaultDevice` returns
+/// `None` when there is no GPU (or Metal is unavailable), in which case
+/// [`Backend::resolve`] falls back to CPU.
+pub fn metal_available() -> bool {
+    objc2_metal::MTLCreateSystemDefaultDevice().is_some()
 }

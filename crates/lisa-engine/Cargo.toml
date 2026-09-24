@@ -8,6 +8,8 @@ description = "Qwen 3.8 Flash-Next engine library"
 anyhow = "1.0.104"
 clap = { version = "4.6.6", features = ["derive"] }
 half = "2.7.1"
+libm = "0.2.15"
+rayon = "1.11.0"
 memmap2 = "0.9.11"
 lisa-mlx = { path = "../lisa-mlx" }
 serde = { version = "1.0.229", features = ["derive"] }
