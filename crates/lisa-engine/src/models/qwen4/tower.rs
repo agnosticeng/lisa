@@ -130,6 +130,55 @@ impl DecoderLayer {
     }
 }
 
+/// Low vocabulary ids up to this bound are the frequency-ranked BPE tokens
+/// (the tokenizer assigns ids in merge order). The MTP drafter only needs to
+/// rank these plus the trailing special ids.
+const DRAFT_SHORTLIST_LOW: usize = 98304;
+/// Special/added tokens live from here to the end of the vocabulary.
+const DRAFT_SHORTLIST_SPECIAL_FROM: usize = 248044;
+
+/// Build the draft-only shortlist head from `lm_head`: gather the low ids and
+/// the trailing special ids into a smaller affine-quantized linear layer. Group
+/// quantization is along the contraction axis, so gathering output rows is
+/// exact. Returns `(None, None)` for a vocabulary that does not fit the shape.
+fn build_draft_shortlist(
+    lm_head: &QuantizedLinear,
+    vocab: usize,
+) -> (Option<QuantizedLinear>, Option<Array>) {
+    let low = DRAFT_SHORTLIST_LOW.min(vocab);
+    let special_from = DRAFT_SHORTLIST_SPECIAL_FROM.min(vocab);
+    if special_from <= low {
+        return (None, None);
+    }
+    let mut ids: Vec<i32> = (0..low as i32).collect();
+    ids.extend(special_from as i32..vocab as i32);
+    // `quantized_matmul` prefers a multiple-of-8 row count; the pad rows map to
+    // id 0 (a real row, so an argmax tie still resolves to id 0).
+    while ids.len() % 8 != 0 {
+        ids.push(0);
+    }
+    let idx = Array::from_slice(&ids, &[ids.len() as i32]);
+    let head = (|| {
+        Some(QuantizedLinear {
+            weight: lm_head.weight.take_axis(&idx, 0).ok()?,
+            scales: lm_head.scales.take_axis(&idx, 0).ok()?,
+            biases: lm_head.biases.take_axis(&idx, 0).ok()?,
+        })
+    })();
+    let map = Array::from_slice(
+        &ids.iter().map(|&x| x as u32).collect::<Vec<u32>>(),
+        &[ids.len() as i32],
+    );
+    eprintln!(
+        "[mtp] draft shortlist head engaged: {} rows (ids <{} + {}..{})",
+        ids.len(),
+        low,
+        special_from,
+        vocab
+    );
+    (head, Some(map))
+}
+
 /// The full text tower.
 pub struct Tower {
     pub embed_tokens: QuantizedEmbedding,
@@ -143,6 +192,14 @@ pub struct Tower {
     pub eos_token_id: i64,
     /// The embedded MTP head (loaded, driven by the speculative path).
     pub mtp: Option<crate::models::qwen4::mtp::MtpHead>,
+    /// Draft-only shortlist of `lm_head` rows: the low (frequency-ranked) ids
+    /// plus the trailing special ids. The draft argmax runs on this reduced
+    /// head (`mlxfast`/FR-Spec); a miss only rejects a draft, never changes an
+    /// emitted token, so the target path stays exact.
+    pub draft_head: Option<QuantizedLinear>,
+    /// Shortlist row -> real vocabulary id (device, uint32), used to map the
+    /// draft argmax back to a token.
+    pub draft_ids: Option<Array>,
 }
 
 impl Tower {
@@ -281,6 +338,9 @@ impl Tower {
         }
         let final_mixer = GatedResidual::load(&mut w, "model.hyper_connection_mixer", hidden, hc, false)?;
 
+        // Draft-only shortlist of `lm_head` rows, built once at load.
+        let (draft_head, draft_ids) = build_draft_shortlist(&lm_head, config.vocab_size);
+
         // The embedded MTP head is a sibling of `model` in the checkpoint.
         let mtp = crate::models::qwen4::mtp::MtpHead::load(&mut w, &config)?;
 
@@ -303,6 +363,8 @@ impl Tower {
             config,
             ngram_history: None,
             mtp: Some(mtp),
+            draft_head,
+            draft_ids,
         };
         for layer in tower.layers.iter_mut() {
             if let Some(ple) = layer.ple.as_mut() {
@@ -687,7 +749,15 @@ impl crate::models::LanguageModel for Tower {
             h.trim_caches(n);
         }
     }
-    fn draft_step(&mut self, tokens: &Array, multi: &Array) -> anyhow::Result<(u32, Array)> {
+    fn drafter_offset(&self) -> usize {
+        self.mtp.as_ref().map(|h| h.cache_offset()).unwrap_or(0)
+    }
+    fn drafter_restore_offset(&mut self, n: usize) {
+        if let Some(h) = self.mtp.as_mut() {
+            h.restore_offset(n);
+        }
+    }
+    fn draft_step(&mut self, tokens: &Array, multi: &Array) -> anyhow::Result<(Array, Array)> {
         use lisa_mlx::ops::indexing::IndexOp;
         let offset = self.mtp.as_ref().map(|h| h.cache_offset()).unwrap_or(0);
         let head = self
@@ -696,7 +766,12 @@ impl crate::models::LanguageModel for Tower {
             .ok_or_else(|| anyhow::anyhow!("this model has no MTP head"))?;
         let (sample, head_multi) = head.forward(tokens, multi, &self.embed_tokens, offset)?;
         let last = sample.index((.., sample.dim(1) - 1, ..));
-        let logits = self.lm_head.forward(&last)?;
+        // The draft argmax rides the shortlist head when available; a shortlist
+        // miss only rejects a draft (the target verifies every token).
+        let logits = match &self.draft_head {
+            Some(h) => h.forward(&last)?,
+            None => self.lm_head.forward(&last)?,
+        };
         if std::env::var("LISA_DUMP_DRAFT").is_ok() {
             static ROUND: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             let r = ROUND.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -713,7 +788,19 @@ impl crate::models::LanguageModel for Tower {
                 );
             }
         }
-        let draft = crate::models::qwen4::speculate::argmax_id(&logits)?;
+        // Keep the draft token on the device as `[1, 1]` so the chain does
+        // not round-trip through the host between draft steps. The id stays
+        // uint32 (the only integer dtype the indexing/cast kernels emit);
+        // `token_rows` reads it as i32, same bit pattern.
+        let short_idx = lisa_mlx::ops::indexing::argmax_axis(&logits, -1, None)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let draft_id = match (&self.draft_head, &self.draft_ids) {
+            (Some(_), Some(map)) => map
+                .take_axis(&short_idx, 0)
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+            _ => short_idx,
+        };
+        let draft_id = draft_id.reshape(&[1, 1])?;
         let m = head_multi
             .index((.., head_multi.dim(1) - 1, ..))
             .contiguous()?;
@@ -729,6 +816,6 @@ impl crate::models::LanguageModel for Tower {
                 eprintln!("[draft-m] step#{r} n={} sum={:.6e} head={:?}", v.len(), sum, &v[..4.min(v.len())]);
             }
         }
-        Ok((draft, m))
+        Ok((draft_id, m))
     }
 }

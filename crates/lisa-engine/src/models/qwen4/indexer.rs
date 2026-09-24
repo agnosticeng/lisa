@@ -184,7 +184,10 @@ impl QsaIndexer {
         let complete = Array::from_slice(&complete_v, &[1i32, s]);
         let block_ids: Vec<i32> = (0..blocks as i32).collect();
         let block_ids = Array::from_slice(&block_ids, &[1i32, 1, blocks as i32]);
-        let visible = lisa_mlx::ops::broadcast_to(&block_ids, &[b, s, blocks as i32])?.lt(&complete.expand_dims(-1)?)?;
+        // `lt` does not mix dtypes: compare in f32 (block ids < 2^24).
+        let block_ids_f = block_ids.as_dtype(Dtype::Float32)?;
+        let visible = lisa_mlx::ops::broadcast_to(&block_ids_f, &[b, s, blocks as i32])?
+            .lt(&complete.expand_dims(-1)?)?;
         let neg_inf = lisa_mlx::ops::broadcast_to(&Array::from_f32(f32::NEG_INFINITY), scores.shape())?;
         let scores = lisa_mlx::ops::r#where(&visible, &scores, &neg_inf)?;
 

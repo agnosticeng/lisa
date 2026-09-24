@@ -129,22 +129,6 @@ impl MtpHead {
         let (st, moe_out, inject_w) =
             self.layer.forward(&hyper, None, None, cache, &self.rope, offset, &positions, None, false)?;
 
-            let r = 200;
-            if r >= 200 {
-                let d2 = |name: &str, a: &lisa_mlx::Array| {
-                    if let Ok(f) = a.as_dtype(lisa_mlx::Dtype::Float32) {
-                        {
-                                let v = f.as_slice::<f32>();
-                            let v: &[f32] = v;
-                            let sum: f32 = v.iter().sum();
-                            eprintln!("[head] step#{r} {name} n={} sum={:.6e} h={:?}", v.len(), sum, &v[..4.min(v.len())]);
-                        }
-                    }
-                };
-                d2("st", &st);
-                d2("moe_out", &moe_out);
-                d2("inject_w", &inject_w);
-            }
         // Final mixer: injectNorm then the inject-less hcMix (the engine's
         // `TrackFastHead` tail). `multi_next` is the new stream for the chain.
         let final_scale = self.mixer.norm_scale_q().map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -188,6 +172,15 @@ impl MtpHead {
         match self.caches.first() {
             Some(LayerCache::Full(f)) => f.offset,
             _ => 0,
+        }
+    }
+
+    /// Rewind the head's KV cache to a captured offset (prefix snapshot).
+    pub fn restore_offset(&mut self, n: usize) {
+        for c in self.caches.iter_mut() {
+            if let LayerCache::Full(f) = c {
+                f.restore_offset(n);
+            }
         }
     }
 

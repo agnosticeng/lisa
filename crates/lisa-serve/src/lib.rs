@@ -20,6 +20,7 @@ use serde_json::{json, Value};
 
 use lisa_engine::core::generate::is_eos;
 use lisa_engine::models::qwen4::tower::Tower;
+use lisa_engine::models::LanguageModel;
 use lisa_engine::DecisionModel;
 use lisa_engine::core::sampler::Sampler;
 use lisa_engine::core::session::Session;
@@ -36,6 +37,8 @@ pub struct ServerConfig {
     pub depth: usize,
     /// Maximum streams stepped together (admission queue width).
     pub max_batch: usize,
+    /// The checkpoint's `chat_template.jinja`, when available.
+    pub chat_template: Option<String>,
 }
 
 enum Reply {
@@ -85,7 +88,15 @@ pub fn run(tower: &mut Tower, tok: &Tokenizer, cfg: ServerConfig) -> anyhow::Res
         });
     }
 
-    let mut sessions: HashMap<String, Session> = HashMap::new();
+    let chat_tmpl = cfg
+        .chat_template
+        .as_deref()
+        .map(ChatTemplate::new)
+        .transpose()?;
+    if chat_tmpl.is_some() {
+        println!("  chat_template.jinja loaded");
+    }
+    let mut sessions: HashMap<String, (Session, Vec<ChatMessage>)> = HashMap::new();
     loop {
         // Block for one request, then drain whatever else is queued (up to the
         // batch width) so several arrivals are served together.
@@ -108,8 +119,8 @@ pub fn run(tower: &mut Tower, tok: &Tokenizer, cfg: ServerConfig) -> anyhow::Res
                 batch_jobs.push(job);
             }
         }
-        for job in sess_jobs {
-            if let Err(e) = run_session(tower, tok, &mut sessions, &job, &cfg) {
+    for job in sess_jobs {
+            if let Err(e) = run_session(tower, tok, &mut sessions, &job, &cfg, chat_tmpl.as_ref()) {
                 let _ = job.reply.send(Reply::Error(e.to_string()));
             }
         }
@@ -122,16 +133,16 @@ pub fn run(tower: &mut Tower, tok: &Tokenizer, cfg: ServerConfig) -> anyhow::Res
                 .into_iter()
                 .partition(|j| depth_for(j, &cfg) > 0);
             for job in spec {
-                if let Err(e) = complete(tower, tok, &job, &cfg) {
+                if let Err(e) = complete(tower, tok, &job, &cfg, chat_tmpl.as_ref()) {
                     let _ = job.reply.send(Reply::Error(e.to_string()));
                 }
             }
             if !plain.is_empty() {
                 if plain.len() == 1 {
-                    if let Err(e) = complete(tower, tok, &plain[0], &cfg) {
+                    if let Err(e) = complete(tower, tok, &plain[0], &cfg, chat_tmpl.as_ref()) {
                         let _ = plain[0].reply.send(Reply::Error(e.to_string()));
                     }
-                } else if let Err(e) = run_wave(tower, tok, plain, &cfg) {
+                } else if let Err(e) = run_wave(tower, tok, plain, &cfg, chat_tmpl.as_ref()) {
                     eprintln!("[serve] wave error: {e}");
                 }
             }
@@ -163,9 +174,9 @@ fn resolve_depth(job: &Job, cfg: &ServerConfig) -> anyhow::Result<usize> {
 }
 
 /// Build the scheduler request for a stateless HTTP job.
-fn build_request(id: usize, tok: &Tokenizer, job: &Job, cfg: &ServerConfig) -> anyhow::Result<lisa_engine::core::sched::Request> {
+fn build_request(id: usize, tok: &Tokenizer, job: &Job, cfg: &ServerConfig, tmpl: Option<&ChatTemplate>) -> anyhow::Result<lisa_engine::core::sched::Request> {
     let messages = parse_messages(&job.body)?;
-    let prompt = tokenizer::generation_prompt(&messages);
+    let prompt = render_prompt(tmpl, &messages, true)?;
     let ids = tok.encode(&prompt, false)?;
     let max_tokens = job
         .body
@@ -183,11 +194,11 @@ fn build_request(id: usize, tok: &Tokenizer, job: &Job, cfg: &ServerConfig) -> a
 
 /// Serve a wave of stateless requests through the continuous-batch scheduler,
 /// streaming each request's tokens back to its own connection.
-fn run_wave(tower: &mut Tower, tok: &Tokenizer, jobs: Vec<Job>, cfg: &ServerConfig) -> anyhow::Result<()> {
+fn run_wave(tower: &mut Tower, tok: &Tokenizer, jobs: Vec<Job>, cfg: &ServerConfig, tmpl: Option<&ChatTemplate>) -> anyhow::Result<()> {
     let mut job_of: Vec<usize> = Vec::new();
     let mut reqs: Vec<lisa_engine::core::sched::Request> = Vec::new();
     for (ji, job) in jobs.iter().enumerate() {
-        match build_request(reqs.len(), tok, job, cfg) {
+        match build_request(reqs.len(), tok, job, cfg, tmpl) {
             Ok(r) => {
                 job_of.push(ji);
                 reqs.push(r);
@@ -246,9 +257,10 @@ fn run_wave(tower: &mut Tower, tok: &Tokenizer, jobs: Vec<Job>, cfg: &ServerConf
 fn run_session(
     tower: &mut Tower,
     tok: &Tokenizer,
-    sessions: &mut HashMap<String, Session>,
+    sessions: &mut HashMap<String, (Session, Vec<ChatMessage>)>,
     job: &Job,
     cfg: &ServerConfig,
+    tmpl: Option<&ChatTemplate>,
 ) -> anyhow::Result<()> {
     let sid = job.session_id.clone().expect("session job");
     let depth = match resolve_depth(job, cfg) {
@@ -259,17 +271,66 @@ fn run_session(
         }
     };
     let messages = parse_messages(&job.body)?;
-    let prompt = tokenizer::generation_prompt(&messages);
-    let ids = tok.encode(&prompt, false)?;
+    let new_str = render_prompt(tmpl, &messages, true)?;
 
-    let mut sess = sessions.remove(&sid).unwrap_or_else(|| Session::new(tower));
-    let cp = common_prefix(&sess.fed, &ids);
-    if cp < sess.fed.len() {
-        // The request diverges from the cached conversation: start over.
-        sess = Session::new(tower);
-    }
-    let cp = cp.min(sess.fed.len());
-    let suffix: Vec<u32> = ids[cp..].to_vec();
+    let (mut sess, mut conversation) = sessions.remove(&sid).unwrap_or_else(|| {
+        let mut s = Session::new(tower);
+        s.enable_snapshots();
+        (s, Vec::new())
+    });
+    sess.capture_snapshot(conversation.len(), tower.drafter_offset());
+
+    // Structural match against the tracked conversation. Raw token matching
+    // fails (re-encoding BPE-merges the generation prompt's newline into the
+    // assistant content); message-level matching picks the right turn boundary.
+    let k = structural_prefix(&messages, &conversation).min(conversation.len());
+    let diverges = k < conversation.len();
+
+    // String-suffix path (canonical template only): feed only the messages
+    // after the shared prefix. On divergence, rewind the recurrent state to the
+    // snapshot taken at that message boundary first.
+    let string_suffix: Option<Vec<u32>> = if tmpl.is_some() && k > 0 {
+        if diverges && sess.restore_snapshot(tower, k).is_none() {
+            let mut s = Session::new(tower);
+            s.enable_snapshots();
+            sess = s;
+        }
+        render_prompt(tmpl, &messages[..k], false)
+            .ok()
+            .and_then(|prefix| new_str.strip_prefix(&prefix).map(|r| r.to_string()))
+            .filter(|r| !r.is_empty())
+            // The assistant turn's closing newline lives in the stripped
+            // prefix but not in the cached tokens; carry it over.
+            .map(|rest| tok.encode(&format!("\n{rest}"), false))
+            .transpose()?
+    } else {
+        None
+    };
+
+    let suffix: Vec<u32> = match string_suffix {
+        Some(sfx) if !sfx.is_empty() => {
+            eprintln!(
+                "[serve] session {sid}: {} reuse, {} prefilled",
+                if diverges { "snapshot" } else { "string-suffix" },
+                sfx.len()
+            );
+            sfx
+        }
+        _ => {
+            let ids = tok.encode(&new_str, false)?;
+            let cp0 = common_prefix(&sess.fed, &ids);
+            let fed_len = sess.fed.len();
+            if cp0 < fed_len {
+                let mut s = Session::new(tower);
+                s.enable_snapshots();
+                sess = s;
+            }
+            let cp = cp0.min(sess.fed.len());
+            let sfx = ids[cp..].to_vec();
+            eprintln!("[serve] session {sid}: full prefill {}", sfx.len());
+            sfx
+        }
+    };
     anyhow::ensure!(!suffix.is_empty(), "session request has no new tokens");
 
     let max_tokens = job
@@ -305,10 +366,18 @@ fn run_session(
     } else {
         sess.generate(tower, &suffix, max_tokens, &mut sampler, &mut emit)?
     };
-    sessions.insert(sid, sess);
-
     let stopped = generated.last().map(|&t| is_eos(t)).unwrap_or(false);
     let content = if streaming { last } else { tok.decode(&acc)? };
+
+    // Track the conversation including this assistant turn.
+    conversation = messages.clone();
+    let (reasoning, answer) = split_reasoning(&content);
+    conversation.push(ChatMessage {
+        role: "assistant".to_string(),
+        content: answer,
+        reasoning_content: reasoning,
+    });
+    sessions.insert(sid, (sess, conversation));
     let _ = job.reply.send(Reply::Done {
         content,
         prompt_tokens: suffix.len(),
@@ -316,6 +385,19 @@ fn run_session(
         finish: if stopped { "stop".into() } else { "length".into() },
     });
     Ok(())
+}
+
+fn structural_prefix(a: &[ChatMessage], b: &[ChatMessage]) -> usize {
+    let n = a.len().min(b.len());
+    let mut i = 0;
+    while i < n
+        && a[i].role == b[i].role
+        && a[i].content == b[i].content
+        && a[i].reasoning_content == b[i].reasoning_content
+    {
+        i += 1;
+    }
+    i
 }
 
 fn common_prefix(a: &[u32], b: &[u32]) -> usize {
@@ -477,9 +559,10 @@ fn complete(
     tok: &Tokenizer,
     job: &Job,
     cfg: &ServerConfig,
+    tmpl: Option<&ChatTemplate>,
 ) -> anyhow::Result<()> {
     let messages = parse_messages(&job.body)?;
-    let prompt = tokenizer::generation_prompt(&messages);
+    let prompt = render_prompt(tmpl, &messages, true)?;
     let ids = tok.encode(&prompt, false)?;
 
     let max_tokens = job
@@ -544,10 +627,128 @@ fn complete(
     Ok(())
 }
 
-fn parse_messages(body: &Value) -> anyhow::Result<Vec<(String, String)>> {
-    let mut out: Vec<(String, String)> = Vec::new();
+/// One parsed chat message. `reasoning_content` carries the assistant's
+/// thinking (separate from `content`) so the checkpoint template can render the
+/// canonical ` thinking… response` block.
+#[derive(Clone)]
+pub struct ChatMessage {
+    pub role: String,
+    pub content: String,
+    pub reasoning_content: Option<String>,
+}
+
+/// The checkpoint's `chat_template.jinja`, rendered with minijinja. Using the
+/// real template keeps multi-turn prompts canonical (reasoning/content split,
+/// the reasoning-instructions system block, exact special tokens).
+pub struct ChatTemplate {
+    env: minijinja::Environment<'static>,
+}
+
+impl ChatTemplate {
+    pub fn new(src: &str) -> anyhow::Result<Self> {
+        let mut env = minijinja::Environment::new();
+        env.add_function(
+            "raise_exception",
+            |msg: minijinja::Value| -> Result<minijinja::Value, minijinja::Error> {
+                Err(minijinja::Error::new(
+                    minijinja::ErrorKind::InvalidOperation,
+                    msg.to_string(),
+                ))
+            },
+        );
+        // minijinja has no Python string methods; rewrite the two the template
+        // uses (tool-response detection) to registered functions.
+        env.add_function("startswith", |s: String, p: String| s.starts_with(&p));
+        env.add_function("endswith", |s: String, p: String| s.ends_with(&p));
+        let patched = src
+            .replace(
+                "content.startswith('<tool_response>')",
+                "startswith(content, '<tool_response>')",
+            )
+            .replace(
+                "content.endswith('</tool_response>')",
+                "endswith(content, '</tool_response>')",
+            );
+        env.add_template_owned("chat", patched)
+            .map_err(|e| anyhow::anyhow!("chat template parse: {e}"))?;
+        Ok(Self { env })
+    }
+
+    pub fn render(&self, messages: &[ChatMessage], add_generation_prompt: bool) -> anyhow::Result<String> {
+        let msgs: Vec<Value> = messages
+            .iter()
+            .map(|m| {
+                let mut o = json!({"role": m.role, "content": m.content});
+                if let Some(r) = &m.reasoning_content {
+                    o["reasoning_content"] = json!(r);
+                }
+                o
+            })
+            .collect();
+        let tmpl = self
+            .env
+            .get_template("chat")
+            .map_err(|e| anyhow::anyhow!("chat template: {e}"))?;
+        tmpl.render(minijinja::context! {
+            messages => msgs,
+            add_generation_prompt => add_generation_prompt,
+            enable_thinking => true,
+            reasoning_effort => "xhigh",
+            preserve_thinking => true,
+        })
+        .map_err(|e| anyhow::anyhow!("chat template render: {e}"))
+    }
+}
+
+/// Render the prompt with the checkpoint template when available, else fall
+/// back to the engine's text-only rendering.
+fn render_prompt(
+    tmpl: Option<&ChatTemplate>,
+    messages: &[ChatMessage],
+    add_generation_prompt: bool,
+) -> anyhow::Result<String> {
+    if let Some(t) = tmpl {
+        return t.render(messages, add_generation_prompt);
+    }
+    let pairs: Vec<(String, String)> = messages
+        .iter()
+        .map(|m| (m.role.clone(), m.content.clone()))
+        .collect();
+    Ok(tokenizer::generation_prompt(&pairs))
+}
+
+/// Close the ` thinking` block a generation prompt opened, splitting the model's
+/// raw output into (reasoning, answer). Falls back to all-content.
+fn split_reasoning(text: &str) -> (Option<String>, String) {
+    const CLOSE: &str = " response";
+    if let Some(idx) = text.find(CLOSE) {
+        let reasoning = text[..idx].trim().to_string();
+        let answer = text[idx + CLOSE.len()..].trim_start().to_string();
+        (Some(reasoning), answer)
+    } else {
+        (None, text.to_string())
+    }
+}
+
+fn parse_messages(body: &Value) -> anyhow::Result<Vec<ChatMessage>> {
+    let mut out: Vec<ChatMessage> = Vec::new();
+    let as_content = |m: &Value| -> String {
+        match m.get("content") {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Array(parts)) => parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join(""),
+            _ => String::new(),
+        }
+    };
     if let Some(sys) = body.get("system").and_then(|v| v.as_str()) {
-        out.push(("system".to_string(), sys.to_string()));
+        out.push(ChatMessage {
+            role: "system".to_string(),
+            content: sys.to_string(),
+            reasoning_content: None,
+        });
     }
     if let Some(arr) = body.get("messages").and_then(|v| v.as_array()) {
         for m in arr {
@@ -556,19 +757,31 @@ fn parse_messages(body: &Value) -> anyhow::Result<Vec<(String, String)>> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("user")
                 .to_string();
-            let content = match m.get("content") {
-                Some(Value::String(s)) => s.clone(),
-                Some(Value::Array(parts)) => parts
-                    .iter()
-                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                    .collect::<Vec<_>>()
-                    .join(""),
-                _ => String::new(),
-            };
-            out.push((role, content));
+            let raw = as_content(m);
+            let mut reasoning = m
+                .get("reasoning_content")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let mut content = raw;
+            if role == "assistant" && reasoning.is_none() {
+                let (r, c) = split_reasoning(&content);
+                if r.is_some() {
+                    reasoning = r;
+                    content = c;
+                }
+            }
+            out.push(ChatMessage {
+                role,
+                content,
+                reasoning_content: reasoning,
+            });
         }
     } else if let Some(p) = body.get("prompt").and_then(|v| v.as_str()) {
-        out.push(("user".to_string(), p.to_string()));
+        out.push(ChatMessage {
+            role: "user".to_string(),
+            content: p.to_string(),
+            reasoning_content: None,
+        });
     }
     anyhow::ensure!(!out.is_empty(), "request has no messages or prompt");
     Ok(out)
@@ -734,4 +947,28 @@ fn handle_decision_conn(mut stream: TcpStream, model: &dyn DecisionModel) -> any
 fn bad_request(stream: &mut TcpStream, msg: String) -> anyhow::Result<()> {
     let body = json!({ "error": { "message": msg } }).to_string();
     write_response(stream, "400 Bad Request", "application/json", body.as_bytes(), "")
+}
+
+#[cfg(test)]
+mod render_test {
+    use super::{ChatMessage, ChatTemplate};
+
+    #[test]
+    #[ignore]
+    fn render_real_template() {
+        let dir = std::env::var("HOME").unwrap()
+            + "/.cache/lisa-models/Qwen3.8-Flash-Next-MLX-4bit-MTP";
+        let src = match std::fs::read_to_string(format!("{dir}/chat_template.jinja")) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let t = ChatTemplate::new(&src).expect("template parse");
+        let msgs = vec![
+            ChatMessage { role: "user".into(), content: "Name three colors.".into(), reasoning_content: None },
+            ChatMessage { role: "assistant".into(), content: "Red, green, blue.".into(), reasoning_content: Some("Thinking about colors.".into()) },
+            ChatMessage { role: "user".into(), content: "Which is warmest?".into(), reasoning_content: None },
+        ];
+        let out = t.render(&msgs, true).expect("render");
+        eprintln!("---RENDER---\n{out}\n---END---");
+    }
 }

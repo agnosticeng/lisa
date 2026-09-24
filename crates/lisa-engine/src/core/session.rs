@@ -25,7 +25,27 @@ pub struct Session {
     /// which keeps the per-turn bookkeeping trivial.
     pub mtp_tokens: Vec<u32>,
     pub mtp_multi: Vec<Array>,
+    /// The MTP head cache offset that corresponds to `mtp_tokens` at the end of
+    /// the last turn (the number of committed history pairs it holds). Used to
+    /// persist the head across turns instead of re-priming the whole history.
+    pub mtp_head_len: usize,
+    /// Prefix snapshots `(boundary, per-layer state)` taken at the start of
+    /// each turn. On a divergent request the server can rewind to the largest
+    /// boundary at or below the common prefix and prefill only the tail.
+    pub snapshots: Vec<(usize, usize, usize, Vec<LayerSnapshot>)>, // (boundary, msgs_len, head_offset, state)
+    pub snapshots_enabled: bool,
 }
+
+/// A per-layer prefix snapshot: the full-attention live length, or the GDN
+/// recurrent state (short-conv, fp32 SSM, PLE conv).
+#[derive(Clone)]
+pub struct LayerSnapshot {
+    pub full_offset: Option<usize>,
+    pub gdn: Option<(Option<Array>, Option<Array>, Option<Array>)>,
+}
+
+/// Keep at most this many prefix snapshots (the GDN state is ~113 MB each).
+const SNAPSHOT_KEEP: usize = 4;
 
 impl Session {
     /// A fresh conversation. Resets the PLE n-gram context so the first suffix
@@ -38,7 +58,96 @@ impl Session {
             last_mixed: None,
             mtp_tokens: Vec::new(),
             mtp_multi: Vec::new(),
+            mtp_head_len: 0,
+            snapshots: Vec::new(),
+            snapshots_enabled: false,
         }
+    }
+
+    /// Enable prefix snapshots (server sessions only; the Clone cost is per turn).
+    pub fn enable_snapshots(&mut self) {
+        self.snapshots_enabled = true;
+    }
+
+    /// Snapshot the committed state; call before feeding a turn's suffix.
+    pub fn capture_snapshot(&mut self, msgs_len: usize, head_offset: usize) {
+        if !self.snapshots_enabled {
+            return;
+        }
+        let snaps: Vec<LayerSnapshot> = self
+            .caches
+            .iter()
+            .map(|c| match c {
+                LayerCache::Full(f) => LayerSnapshot {
+                    full_offset: Some(f.offset),
+                    gdn: None,
+                },
+                LayerCache::Linear(g) => LayerSnapshot {
+                    full_offset: None,
+                    gdn: Some(g.snapshot_state()),
+                },
+            })
+            .collect();
+        self.snapshots.push((self.fed.len(), msgs_len, head_offset, snaps));
+        if self.snapshots.len() > SNAPSHOT_KEEP {
+            let drop = self.snapshots.len() - SNAPSHOT_KEEP;
+            self.snapshots.drain(0..drop);
+        }
+    }
+
+    /// Rewind to the largest snapshot boundary `<= cp` (a divergent request).
+    /// Returns that boundary, or `None` when no snapshot is at or below `cp`.
+    pub fn restore_snapshot(&mut self, tower: &mut dyn LanguageModel, msgs_len: usize) -> Option<usize> {
+        let idx = self.snapshots.iter().rposition(|(_, m, _, _)| *m <= msgs_len)?;
+        let boundary = self.snapshots[idx].0;
+        let head = self.snapshots[idx].2;
+        let snaps = self.snapshots[idx].3.clone();
+        for (c, s) in self.caches.iter_mut().zip(snaps.iter()) {
+            match (c, s) {
+                (LayerCache::Full(f), LayerSnapshot { full_offset: Some(o), .. }) => {
+                    f.restore_offset(*o)
+                }
+                (LayerCache::Linear(g), LayerSnapshot { gdn: Some(st), .. }) => {
+                    g.restore_state(st)
+                }
+                _ => {}
+            }
+        }
+        self.fed.truncate(boundary);
+        self.snapshots.truncate(idx + 1);
+        // Rewind the head's KV cache to the snapshot too, so no re-prime is
+        // needed (the history pairs are its offset + 1).
+        tower.drafter_restore_offset(head);
+        self.truncate_head(head + 1);
+        self.mtp_head_len = head;
+        Some(boundary)
+    }
+
+    /// Truncate the MTP head's stored token/multi history to `boundary` rows.
+    fn truncate_head(&mut self, boundary: usize) {
+        self.mtp_tokens.truncate(boundary);
+        let mut out: Vec<Array> = Vec::new();
+        let mut rem = boundary;
+        for chunk in &self.mtp_multi {
+            if rem == 0 {
+                break;
+            }
+            let sh = chunk.shape();
+            let rows: usize = sh[..sh.len() - 1].iter().map(|&d| d as usize).product();
+            let d = chunk.dim(-1);
+            if rows <= rem {
+                out.push(chunk.clone());
+                rem -= rows;
+            } else {
+                if let Ok(r) = chunk.reshape(&[1, rows as i32, d]) {
+                    if let Ok(sliced) = r.index((.., 0..rem as i32, ..)).contiguous() {
+                        out.push(sliced);
+                    }
+                }
+                rem = 0;
+            }
+        }
+        self.mtp_multi = out;
     }
 
     /// Prefill `tokens` (the appended suffix) and return the logits at the last
@@ -199,8 +308,17 @@ impl Session {
         let first = crate::models::qwen4::speculate::argmax_id(&logits)?;
         let t_s = tokens.len() as i32;
 
-        // 2. Re-prime the head from scratch with the whole committed history.
-        tower.drafter_reset();
+        // 2. Prime the head with the committed history. When the head's cache
+        // still matches the history it primed last turn, only the new pairs are
+        // fed (the MTP head is a single layer whose K/V is a pure function of
+        // the committed token/multi sequence); otherwise it is reset and fully
+        // re-primed.
+        let head_off = if tower.drafter_offset() == self.mtp_head_len {
+            self.mtp_head_len
+        } else {
+            tower.drafter_reset();
+            0
+        };
         let mut history: Vec<u32> = self.mtp_tokens.clone();
         history.extend_from_slice(tokens);
         let mut all_multi: Vec<Array> = self.mtp_multi.clone();
@@ -208,6 +326,23 @@ impl Session {
         let init_multis = concat_chunks(&all_multi)?;
         let mut init_tokens: Vec<i32> = history[1..].iter().map(|&t| t as i32).collect();
         init_tokens.push(first as i32);
+        // The head already holds `head_off` pairs; feed the rest.
+        anyhow::ensure!(
+            head_off < init_tokens.len(),
+            "MTP head offset {head_off} exceeds history pairs {}",
+            init_tokens.len()
+        );
+        let init_multis = init_multis
+            .index((.., head_off as i32.., ..))
+            .contiguous()?;
+        let init_tokens: Vec<i32> = init_tokens[head_off..].to_vec();
+        if std::env::var("LISA_DEBUG_SESSION").is_ok() {
+            eprintln!(
+                "[mtp-prime] head_off={head_off} pairs_fed={} history={}",
+                init_tokens.len(),
+                history.len()
+            );
+        }
 
         // Prime the head in windows. A single whole-history forward sits at
         // `offset == 0`, where the head's attention takes the DENSE fallback and
@@ -215,7 +350,8 @@ impl Session {
         // fails the buffer allocation. Windows keep the head's cache advancing,
         // so from the second window on the block-sparse QSA path serves it.
         const PRIME_CHUNK: usize = 2048;
-        let mut primed: Option<(u32, Array)> = None;
+        let t_prime = std::time::Instant::now();
+        let mut primed: Option<(Array, Array)> = None;
         {
             let toks = &init_tokens;
             let mul = &init_multis;
@@ -229,6 +365,13 @@ impl Session {
                 lisa_mlx::memory::trim_cache();
             }
         }
+        if std::env::var("LISA_DEBUG_MTP").is_ok() {
+            eprintln!(
+                "[mtp-prime-time] {:.1} ms pairs={}",
+                t_prime.elapsed().as_secs_f64() * 1e3,
+                init_tokens.len()
+            );
+        }
 
         let mut generated: Vec<u32> = vec![first];
         on_token(first)?;
@@ -238,6 +381,11 @@ impl Session {
         let mut backlog: Vec<(u32, Array)> = Vec::new();
         let mut carry_token: u32 = first;
         let mut carry_multi: Array = multi.index((.., t_s - 1, ..)).contiguous()?;
+        // Prompt-lookup (context-copy) state: the committed token sequence for
+        // this turn and a k-gram index over it.
+        let mut committed: Vec<u32> = history.clone();
+        committed.push(first);
+        let mut copy_index = CopyIndex::new(COPY_K);
         let ctx_len = tower.context_window();
         let mut tail: Vec<i64> = history[history.len().saturating_sub(ctx_len)..]
             .iter()
@@ -248,8 +396,12 @@ impl Session {
             && !is_eos(*generated.last().expect("generated is non-empty"))
         {
             let t_round = std::time::Instant::now();
-            // --- Draft ---
-            let drafts = {
+            // --- Draft (device chain) ---
+            // The draft id stays on the GPU as a `[1,1]` tensor and is fed
+            // straight into the next chain step, so the chain no longer
+            // round-trips through the host between steps (one readback per
+            // round instead).
+            let draft_parts: Vec<Array> = {
                 let (mut d, mut m) = match primed.take() {
                     Some(p) => p,
                     None => {
@@ -263,26 +415,45 @@ impl Session {
                         tower.draft_step(&tok_arr, &mul_arr)?
                     }
                 };
-                let mut drafts: Vec<u32> = Vec::with_capacity(depth);
-                drafts.push(d);
+                let mut parts: Vec<Array> = Vec::with_capacity(depth);
+                parts.push(d.reshape(&[1, 1])?);
                 for _ in 1..depth {
-                    let tok = Array::from_slice(&[d as i32], &[1i32, 1]);
                     let mul = m.reshape(&[1, 1, m.dim(-1)])?;
-                    let (d2, m2) = tower.draft_step(&tok, &mul)?;
+                    let (d2, m2) = tower.draft_step(&d, &mul)?;
                     d = d2;
                     m = m2;
-                    drafts.push(d);
+                    parts.push(d.reshape(&[1, 1])?);
                 }
-                drafts
+                parts
             };
             let t_draft = t_round.elapsed();
 
+            // --- Prompt-lookup (context-copy) proposal ---
+            // If the last COPY_K committed tokens recur earlier, the tokens
+            // that followed that occurrence are a strong draft. It is only a
+            // proposal: the target verifies every token, so a miss costs one
+            // rejected draft, never an emitted token.
+            copy_index.extend(&committed, committed.len().saturating_sub(COPY_K));
+            let copy: Option<Vec<u32>> = copy_lookup(&committed, &copy_index, COPY_K, depth);
+            let used_copy = copy.is_some();
+
             // --- Verify over [carry, drafts...] ---
             tower.set_context_tails(vec![tail.clone()]);
-            let mut verify_tokens: Vec<i32> = Vec::with_capacity(depth + 1);
-            verify_tokens.push(carry_token as i32);
-            verify_tokens.extend(drafts.iter().map(|&t| t as i32));
-            let v_arr = Array::from_slice(&verify_tokens, &[1i32, (depth + 1) as i32]);
+            let carry_arr = Array::from_slice(&[carry_token], &[1i32, 1]);
+            let v_arr = if let Some(c) = &copy {
+                let mut vt: Vec<i32> = Vec::with_capacity(depth + 1);
+                vt.push(carry_token as i32);
+                vt.extend(c.iter().map(|&t| t as i32));
+                Array::from_slice(&vt, &[1i32, (depth + 1) as i32])
+            } else {
+                let mut verify_parts: Vec<&Array> = Vec::with_capacity(depth + 1);
+                verify_parts.push(&carry_arr);
+                for p in &draft_parts {
+                    verify_parts.push(p);
+                }
+                lisa_mlx::ops::concatenate(&verify_parts, 1)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+            };
             let (v_mixed, v_multi) = tower.forward_capture(&v_arr, Some(&mut self.caches), true)?;
             let v_logits = tower.head(&v_mixed)?;
             let top = argmax_axis(&v_logits, -1, None).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -294,6 +465,17 @@ impl Session {
                 .iter()
                 .map(|&t| t as u32)
                 .collect();
+            // The draft ids: the copy proposal, or the device chain read back
+            // together with the verify sync.
+            let drafts: Vec<u32> = match &copy {
+                Some(c) => c.clone(),
+                None => v_arr
+                    .as_slice::<i32>()
+                    .iter()
+                    .skip(1)
+                    .map(|&t| t as u32)
+                    .collect(),
+            };
             if std::env::var("LISA_DUMP_LOGITS").is_ok() {
                 let vl = v_logits.index((.., v_logits.dim(1) - 1, ..));
                 let l = vl.as_dtype(lisa_mlx::Dtype::Float32).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -324,7 +506,7 @@ impl Session {
             let advance = depth + 1;
             let n = a + 1;
             if std::env::var("LISA_DEBUG_MTP").is_ok() {
-                eprintln!("[mtp]   a={a} n={n} advance={advance}");
+                eprintln!("[mtp]   a={a} n={n} advance={advance} copy={used_copy}");
             }
 
             // Emit the committed tokens, stopping at EOS or the token budget.
@@ -357,6 +539,7 @@ impl Session {
                 }
                 store_tokens.extend_from_slice(&main_tokens[..emitted]);
                 store_multi.push(v_multi.index((.., 0..emitted as i32, ..)).contiguous()?);
+                committed.extend_from_slice(&main_tokens[..emitted]);
                 break 'outer;
             }
 
@@ -383,6 +566,7 @@ impl Session {
             }
             store_tokens.extend_from_slice(&main_tokens[..=a]);
             store_multi.push(v_multi.index((.., 0..(a + 1) as i32, ..)).contiguous()?);
+            committed.extend_from_slice(&main_tokens[..=a]);
             if std::env::var("LISA_PROFILE_MTP").is_ok() {
                 let total = t_round.elapsed();
                 eprintln!(
@@ -398,17 +582,130 @@ impl Session {
         }
 
         // 3. Persist the turn's tokens/multi for the next turn's priming.
+        // Rebuild the head's committed tail first: the round loop feeds a
+        // round's committed tokens only at the start of the *next* round, so
+        // after the last round the head is one round behind and may hold
+        // rejected-draft rows. Trim back to the post-priming offset and feed the
+        // generated tokens explicitly, so the persisted head is exactly the
+        // committed prefix (rows 0..len-2 for the committed history).
+        let after_prime = history.len();
+        let off = tower.drafter_offset();
+        let tail_pairs = store_tokens.len().saturating_sub(1);
+        self.mtp_head_len = if off >= after_prime {
+            tower.drafter_trim(off - after_prime);
+            if tail_pairs > 0 {
+                let tail: Vec<i32> = store_tokens[1..].iter().map(|&t| t as i32).collect();
+                let tok = Array::from_slice(&tail, &[1i32, tail_pairs as i32]);
+                let mul_all = concat_chunks(&store_multi)?;
+                let mul = mul_all.index((.., 0..tail_pairs as i32, ..)).contiguous()?;
+                let _ = tower.draft_step(&tok, &mul)?;
+            }
+            after_prime + tail_pairs
+        } else {
+            usize::MAX
+        };
         self.mtp_tokens.extend_from_slice(tokens);
         self.mtp_tokens.extend_from_slice(&store_tokens);
         self.mtp_multi.push(multi.index((.., 0..t_s, ..)).contiguous()?);
         self.mtp_multi.extend(store_multi);
+        if std::env::var("LISA_DEBUG_SESSION").is_ok() {
+            eprintln!(
+                "[mtp-off] head_off={} target={} mtp_tokens={} fed={}",
+                tower.drafter_offset(),
+                self.mtp_head_len,
+                self.mtp_tokens.len(),
+                self.fed.len()
+            );
+        }
         Ok(generated)
     }
 }
 
-/// Concatenate `multi` chunks along the sequence axis (each chunk is `[1,S,D]`).
+/// Concatenate `multi` chunks along the sequence axis. Chunks may be rank 2
+/// (`[1, D]`) or rank 3 (`[1, S, D]`); normalize to `[1, S, D]` first.
 fn concat_chunks(chunks: &[Array]) -> anyhow::Result<Array> {
     anyhow::ensure!(!chunks.is_empty(), "empty multi store");
-    let refs: Vec<&Array> = chunks.iter().collect();
+    let mut rows: Vec<Array> = Vec::with_capacity(chunks.len());
+    for m in chunks {
+        let d = m.dim(-1);
+        let n: i32 = m.shape()[..m.shape().len() - 1].iter().product();
+        rows.push(m.reshape(&[1, n, d])?);
+    }
+    let refs: Vec<&Array> = rows.iter().collect();
     lisa_mlx::ops::concatenate(&refs, 1).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// Prompt-lookup n-gram size for the context-copy drafter.
+const COPY_K: usize = 4;
+
+/// A rolling index from a k-gram to the latest position it started at, over
+/// the committed token sequence. Used by the context-copy drafter: when the
+/// trailing k-gram recurs, the tokens that followed that occurrence are a
+/// strong (but verified) draft.
+struct CopyIndex {
+    k: usize,
+    map: std::collections::HashMap<u64, Vec<u32>>,
+    indexed: usize,
+}
+
+impl CopyIndex {
+    fn new(k: usize) -> Self {
+        Self {
+            k,
+            map: std::collections::HashMap::new(),
+            indexed: 0,
+        }
+    }
+
+    fn hash(&self, t: &[u32]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &x in t {
+            h ^= x as u64;
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+        h
+    }
+
+    /// Index every k-gram whose start is `< upto`, keeping the two most recent
+    /// positions (the newest is often a self-match with a short continuation,
+    /// so the previous one is the useful occurrence).
+    fn extend(&mut self, s: &[u32], upto: usize) {
+        let end = upto.min(s.len().saturating_sub(self.k));
+        while self.indexed < end {
+            let h = self.hash(&s[self.indexed..self.indexed + self.k]);
+            let e = self.map.entry(h).or_default();
+            e.push(self.indexed as u32);
+            if e.len() > 2 {
+                e.remove(0);
+            }
+            self.indexed += 1;
+        }
+    }
+
+    /// Indexed occurrences of the trailing k-gram of `s`, newest first.
+    fn lookup(&self, s: &[u32]) -> Vec<usize> {
+        if s.len() < self.k {
+            return Vec::new();
+        }
+        self.map
+            .get(&self.hash(&s[s.len() - self.k..]))
+            .map(|v| v.iter().rev().map(|&p| p as usize).collect())
+            .unwrap_or_default()
+    }
+}
+
+/// A `depth`-token copy proposal for the token after the committed tail, or
+/// `None` when the trailing k-gram has no earlier occurrence with enough
+/// committed continuation.
+fn copy_lookup(s: &[u32], idx: &CopyIndex, k: usize, depth: usize) -> Option<Vec<u32>> {
+    if k != idx.k || s.len() < k + depth {
+        return None;
+    }
+    for p in idx.lookup(s) {
+        let start = p + k;
+        if start + depth <= s.len() {
+            return Some(s[start..start + depth].to_vec());
+        }
+    }
+    None
 }

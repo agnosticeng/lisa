@@ -84,58 +84,84 @@
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint block = lane; block < valid_count; block += WIDTH) {
-            const size_t pooled_base = (size_t)block * pooled_strides[1];
-            float score_sum = 0.0f;
-            for (uint head = 0; head < HEADS; ++head) {
-                float dot = 0.0f;
-                const size_t q_base =
-                    (size_t)row * q_strides[1] +
-                    (size_t)head * q_strides[2];
-                if (stage_q && vector_loads) {
-                    const device uint4* kv =
-                        (const device uint4*)(pooled + pooled_base);
+        if (stage_q && vector_loads) {
+            // Staged-query fast path: load each pooled block element once and
+            // dot all HEADS against it. Each head's fp32 accumulation still
+            // walks the dims in the same order, so the score is bit-identical;
+            // the device pooled traffic drops by a factor of HEADS.
+            for (uint block = lane; block < valid_count; block += WIDTH) {
+                const size_t pooled_base = (size_t)block * pooled_strides[1];
+                const device uint4* kv =
+                    (const device uint4*)(pooled + pooled_base);
+                float dots[HEADS];
+                #pragma clang loop unroll(full)
+                for (uint h = 0; h < HEADS; ++h) {
+                    dots[h] = 0.0f;
+                }
+                #pragma clang loop unroll(full)
+                for (uint chunk = 0; chunk < HEAD_DIM / 8u; ++chunk) {
+                    const uint4 b = kv[chunk];
                     #pragma clang loop unroll(full)
-                    for (uint chunk = 0; chunk < HEAD_DIM / 8u; ++chunk) {
-                        const uint4 b = kv[chunk];
+                    for (uint i = 0; i < 8u; ++i) {
+                        const float k_value = qsa_unpack_trunc(b, i, gemm_operand_mask);
                         #pragma clang loop unroll(full)
-                        for (uint i = 0; i < 8u; ++i) {
-                            dot += q_shared[head * HEAD_DIM + chunk * 8u + i] *
-                                   qsa_unpack_trunc(b, i, gemm_operand_mask);
+                        for (uint h = 0; h < HEADS; ++h) {
+                            dots[h] += q_shared[h * HEAD_DIM + chunk * 8u + i] *
+                                       k_value;
                         }
-                    }
-                } else if (vector_loads) {
-                    const device uint4* qv =
-                        (const device uint4*)(q + q_base);
-                    const device uint4* kv =
-                        (const device uint4*)(pooled + pooled_base);
-                    #pragma clang loop unroll(full)
-                    for (uint chunk = 0; chunk < HEAD_DIM / 8u; ++chunk) {
-                        const uint4 a = qv[chunk];
-                        const uint4 b = kv[chunk];
-                        #pragma clang loop unroll(full)
-                        for (uint i = 0; i < 8u; ++i) {
-                            dot += qsa_unpack_trunc(a, i, gemm_operand_mask) *
-                                   qsa_unpack_trunc(b, i, gemm_operand_mask);
-                        }
-                    }
-                } else {
-                    for (uint dim = 0; dim < HEAD_DIM; ++dim) {
-                        const float q_value = qsa_mlx_gemm_operand(
-                            float(q[q_base + (size_t)dim * q_strides[3]]),
-                            gemm_operand_mask);
-                        const float k_value = qsa_mlx_gemm_operand(
-                            float(pooled[
-                                pooled_base + (size_t)dim * pooled_strides[2]]),
-                            gemm_operand_mask);
-                        dot += q_value * k_value;
                     }
                 }
-                score_sum += metal::max(dot, 0.0f);
+                float score_sum = 0.0f;
+                #pragma clang loop unroll(full)
+                for (uint h = 0; h < HEADS; ++h) {
+                    score_sum += metal::max(dots[h], 0.0f);
+                }
+                const float score = score_sum / SQRT_HEAD_DIM;
+                score_scratch[scratch_base + block] =
+                    score - float(block) * 1.0e-12f;
             }
-            const float score = score_sum / SQRT_HEAD_DIM;
-            const float adjusted = score - float(block) * 1.0e-12f;
-            score_scratch[scratch_base + block] = adjusted;
+        } else {
+            for (uint block = lane; block < valid_count; block += WIDTH) {
+                const size_t pooled_base = (size_t)block * pooled_strides[1];
+                float score_sum = 0.0f;
+                for (uint head = 0; head < HEADS; ++head) {
+                    float dot = 0.0f;
+                    const size_t q_base =
+                        (size_t)row * q_strides[1] +
+                        (size_t)head * q_strides[2];
+                    if (vector_loads) {
+                        const device uint4* qv =
+                            (const device uint4*)(q + q_base);
+                        const device uint4* kv =
+                            (const device uint4*)(pooled + pooled_base);
+                        #pragma clang loop unroll(full)
+                        for (uint chunk = 0; chunk < HEAD_DIM / 8u; ++chunk) {
+                            const uint4 a = qv[chunk];
+                            const uint4 b = kv[chunk];
+                            #pragma clang loop unroll(full)
+                            for (uint i = 0; i < 8u; ++i) {
+                                dot += qsa_unpack_trunc(a, i, gemm_operand_mask) *
+                                       qsa_unpack_trunc(b, i, gemm_operand_mask);
+                            }
+                        }
+                    } else {
+                        for (uint dim = 0; dim < HEAD_DIM; ++dim) {
+                            const float q_value = qsa_mlx_gemm_operand(
+                                float(q[q_base + (size_t)dim * q_strides[3]]),
+                                gemm_operand_mask);
+                            const float k_value = qsa_mlx_gemm_operand(
+                                float(pooled[
+                                    pooled_base + (size_t)dim * pooled_strides[2]]),
+                                gemm_operand_mask);
+                            dot += q_value * k_value;
+                        }
+                    }
+                    score_sum += metal::max(dot, 0.0f);
+                }
+                const float score = score_sum / SQRT_HEAD_DIM;
+                const float adjusted = score - float(block) * 1.0e-12f;
+                score_scratch[scratch_base + block] = adjusted;
+            }
         }
         threadgroup_barrier(
             mem_flags::mem_threadgroup | mem_flags::mem_device);

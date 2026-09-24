@@ -726,6 +726,7 @@ fn main() -> anyhow::Result<()> {
                 rep_penalty,
                 depth,
                 max_batch,
+                chat_template: std::fs::read_to_string(model.join("chat_template.jinja")).ok(),
             };
             // Non-generative decision models get their own endpoint.
             if lisa_engine::models::model_type_of(&model)? == "laya" {
