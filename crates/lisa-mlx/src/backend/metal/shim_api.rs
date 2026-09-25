@@ -1458,7 +1458,9 @@ pub mod ops {
                 bits,
             ) {
                 Ok(o) => o,
-                Err(_) if k % 64 == 0 => {
+                Err(_) if k % 64 == 0 && x.t.device().nax() => {
+                    // `qmm_nax` is the MPP fallback; without it, surface the
+                    // split-K error rather than compiling a NAX kernel.
                     crate::mlx_rt::qmm_nax(x.t.device(), &x2, &w.t, &sc, &b2, group_size, bits)?
                 }
                 Err(e) => return Err(e),
@@ -1505,6 +1507,40 @@ pub mod ops {
         let mut out_shape: Vec<usize> = x.shape()[..rank - 2].iter().map(|&d| d as usize).collect();
         out_shape.push(x.dim(rank as i32 - 2) as usize);
         out_shape.push(n);
+        if !x.t.device().nax() {
+            // Non-NAX: the rows are sorted by expert, so run the split-K
+            // quantized GEMM once per contiguous expert group — the same math
+            // without the MPP gather kernel.
+            let ids = rhs.as_dtype(Dtype::Uint32)?;
+            let idv = ids.as_slice::<u32>();
+            let rows = x.dim(0) as usize;
+            let mut pieces: Vec<Array> = Vec::new();
+            let mut s = 0usize;
+            while s < rows {
+                let eid = idv[s];
+                let mut e = s + 1;
+                while e < rows && idv[e] == eid {
+                    e += 1;
+                }
+                let sel: Vec<i32> = (s as i32..e as i32).collect();
+                let sel = Array::from_slice(&sel, &[(e - s) as i32]);
+                let one = Array::from_slice(&[eid as i32], &[1]);
+                let xr = x.take_axis(&sel, 0)?;
+                let we = w.take_axis(&one, 0)?.reshape(&[w.dim(1), w.dim(2)])?;
+                let se = scales
+                    .take_axis(&one, 0)?
+                    .reshape(&[scales.dim(1), scales.dim(2)])?;
+                let be = bi
+                    .take_axis(&one, 0)?
+                    .reshape(&[bi.dim(1), bi.dim(2)])?;
+                pieces.push(quantized_matmul(&xr, &we, &se, Some(&be), true, group_size, bits)?);
+                s = e;
+            }
+            let refs: Vec<&Array> = pieces.iter().collect();
+            let cat = Array::concatenate(&refs, 0)?;
+            let shape: Vec<i32> = out_shape.iter().map(|&d| d as i32).collect();
+            return Ok(cat.reshape(&shape)?);
+        }
         Ok(Array::new(crate::mlx_rt::gather_qmm_rhs_nax(
             x.t.device(),
             None,

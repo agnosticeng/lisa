@@ -178,6 +178,11 @@ pub fn prefill_flash(
     scale: f32,
     stream: &Stream,
 ) -> Option<Array> {
+    // The block-sparse consumer is an MPP/NAX kernel; on older GPUs decline and
+    // let the caller use the dense-keep SDPA fallback.
+    if !crate::runtime::nax_available() {
+        return None;
+    }
     let kernel = match kernel().as_ref() {
         Some(k) => k,
         None => return None,

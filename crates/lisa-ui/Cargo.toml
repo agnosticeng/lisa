@@ -1,0 +1,85 @@
+[package]
+name = "lisa-ui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde_json = "1"
+lisa-engine = { path = "../lisa-engine" }
+lisa-serve = { path = "../lisa-serve" }
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "NSObject",
+    "NSString",
+    "NSArray",
+    "NSDictionary",
+    "NSSet",
+    "NSGeometry",
+    "NSValue",
+    "NSNotification",
+    "NSURL",
+    "NSFileManager",
+    "NSBundle",
+    "NSEnumerator",
+    "NSIndexSet",
+    "NSRange",
+    "NSError",
+    "NSIndexPath",
+    "NSPathUtilities",
+    "NSProcessInfo",
+    "NSRunLoop",
+    "NSTimer",
+] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication",
+    "NSWindow",
+    "NSWindowController",
+    "NSPanel",
+    "NSEvent",
+    "NSView",
+    "NSGraphics",
+    "NSGlassEffectView",
+    "NSViewController",
+    "NSSplitViewController",
+    "NSSplitViewItem",
+    "NSSplitView",
+    "NSResponder",
+    "NSControl",
+    "NSCell",
+    "NSProgressIndicator",
+    "NSButton",
+    "NSText",
+    "NSTextField",
+    "NSTextView",
+    "NSTableView",
+    "NSTableColumn",
+    "NSTableCellView",
+    "NSTableHeaderView",
+    "NSTableRowView",
+    "NSUserInterfaceItemIdentification",
+    "NSScrollView",
+    "NSClipView",
+    "NSStackView",
+    "NSGridView",
+    "NSSwitch",
+    "NSAlert",
+    "NSBox",
+    "NSColor",
+    "NSFont",
+    "NSImage",
+    "NSImageView",
+    "NSLayoutConstraint",
+    "NSLayoutAnchor",
+    "NSMenu",
+    "NSMenuItem",
+    "NSOpenPanel",
+    "NSSavePanel",
+    "NSPasteboard",
+    "NSVisualEffectView",
+    "NSParagraphStyle",
+    "objc2-core-foundation",
+] }
+
+[[bin]]
+name = "lisa-ui"
+path = "src/main.rs"

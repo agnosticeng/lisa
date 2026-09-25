@@ -27,6 +27,7 @@ use objc2_metal::{
     MTLBarrierScope, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
     MTLCommandQueue, MTLCompileOptions, MTLComputeCommandEncoder, MTLComputePipelineState,
     MTLDataType, MTLDevice, MTLDispatchType, MTLFence, MTLFunction, MTLFunctionConstantValues,
+    MTLGPUFamily,
     MTLLibrary, MTLMathFloatingPointFunctions, MTLMathMode, MTLCreateSystemDefaultDevice,
     MTLResource, MTLResourceOptions, MTLSize,
 };
@@ -899,12 +900,26 @@ unsafe impl Send for MetalRuntime {}
 unsafe impl Sync for MetalRuntime {}
 
 /// Owns the device, queue, pool, pipeline cache and command batching.
+/// A process-wide mirror of the last-created runtime's NAX capability, for
+/// engine code that has no easy handle on the device.
+static NAX_AVAILABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the MPP tensor ops (M5/NAX) are available to the active runtime.
+pub fn nax_available() -> bool {
+    NAX_AVAILABLE.load(Ordering::Relaxed)
+}
+
 pub struct MetalRuntime {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     pub pool: Arc<BufferPool>,
     pub commands: Arc<Commands>,
     pipelines: Mutex<HashMap<String, ComputePipeline>>,
+    /// Whether the MetalPerformancePrimitives tensor ops (the M5/Apple10
+    /// "NAX" path) are usable on this GPU. False on M1–M4, where the runtime
+    /// routes to the non-NAX steel/vector kernels instead. `LISA_NO_NAX=1`
+    /// forces the fallback (for testing it on an M5).
+    nax: bool,
 }
 
 /// Which compile options a kernel needs. The two paths in the tree disagree,
@@ -943,7 +958,7 @@ pub enum ConstVal {
     Int(i32),
 }
 
-fn compile_options(math: Math) -> Retained<MTLCompileOptions> {
+fn compile_options(math: Math, nax: bool) -> Retained<MTLCompileOptions> {
     use objc2_metal::MTLLanguageVersion;
     let opts = MTLCompileOptions::new();
     match math {
@@ -956,7 +971,11 @@ fn compile_options(math: Math) -> Retained<MTLCompileOptions> {
             if math == Math::Safe {
                 opts.setMathFloatingPointFunctions(MTLMathFloatingPointFunctions::Precise);
             }
-            let lang = if objc2::available!(macos = 27.0) {
+            // Metal 4 language features (MPP tensor ops) are only legal on the
+            // GPUs that support them; older GPUs stay on MSL 3.2.
+            let lang = if !nax {
+                (3 << 16) + 2
+            } else if objc2::available!(macos = 27.0) {
                 (4 << 16) + 1
             } else if objc2::available!(macos = 26.0) {
                 4 << 16
@@ -984,17 +1003,27 @@ impl MetalRuntime {
         let queue = device.newCommandQueue().ok_or_else(|| err("newCommandQueue"))?;
         let pool = Arc::new(BufferPool::new());
         let commands = Arc::new(Commands::new(queue.clone(), device.clone(), per_buffer)?);
+        // MPP tensor ops are the Apple10 (M5) "NAX" path; M1–M4 fall back.
+        let nax = !env_flag("LISA_NO_NAX") && device.supportsFamily(MTLGPUFamily::Apple10);
+        NAX_AVAILABLE.store(nax, Ordering::Relaxed);
         Ok(Self {
             device,
             queue,
             pool,
             commands,
             pipelines: Mutex::new(HashMap::new()),
+            nax,
         })
     }
 
     pub fn device(&self) -> &ProtocolObject<dyn MTLDevice> {
         &self.device
+    }
+
+    /// Whether the MPP tensor ops (the M5/NAX path) are available. When false,
+    /// callers must use the non-NAX fallbacks.
+    pub fn nax(&self) -> bool {
+        self.nax
     }
 
     /// The raw `MTLDevice` (for callers that need it directly).
@@ -1098,7 +1127,7 @@ impl MetalRuntime {
         if let Some(p) = self.pipelines.lock().unwrap().get(&key) {
             return Ok(p.clone());
         }
-        let opts = compile_options(math);
+        let opts = compile_options(math, self.nax);
         let lib = self
             .device
             .newLibraryWithSource_options_error(&ns(source), Some(&opts))
