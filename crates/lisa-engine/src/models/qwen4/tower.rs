@@ -15,7 +15,7 @@ use crate::models::qwen4::gdn::GatedDeltaNet;
 use crate::models::qwen4::hyper::GatedResidual;
 use crate::core::loader::{Checkpoint, Weights};
 use crate::core::norm::Rotary;
-use crate::models::qwen4::ple::PleLayer;
+use crate::models::qwen4::ple::{NgramTable, PleLayer};
 use crate::core::quant::{QuantizedEmbedding, QuantizedLinear};
 
 
@@ -163,6 +163,8 @@ fn build_draft_shortlist(
             weight: lm_head.weight.take_axis(&idx, 0).ok()?,
             scales: lm_head.scales.take_axis(&idx, 0).ok()?,
             biases: lm_head.biases.take_axis(&idx, 0).ok()?,
+            group_size: lm_head.group_size,
+            bits: lm_head.bits,
         })
     })();
     let map = Array::from_slice(
@@ -209,13 +211,18 @@ impl Tower {
         let map = checkpoint.weight_map.clone();
 
         // The n-gram table is read from disk, never loaded as parameters.
+        // Two checkpoint layouts: sharded tensors in the index (HF/MLX), or one
+        // merged `ngram.safetensors` (the mlx-serve pack).
         let ngram_prefix = "model.layers.1.ple.ple_embedding.ngram_embedding";
-        let ngram_table = Arc::new(RwLock::new(crate::models::qwen4::ple::NgramTable::open(
-            dir,
-            &map,
-            ngram_prefix,
-            config.split_ngram_parts,
-        )?));
+        let sharded = map.keys().any(|n| n.contains("ngram_embedding.shard_"));
+        let ngram_table = Arc::new(RwLock::new(if sharded {
+            NgramTable::open(dir, &map, ngram_prefix, config.split_ngram_parts)?
+        } else {
+            NgramTable::open_merged(
+                &dir.join("ngram.safetensors"),
+                config.split_ngram_parts,
+            )?
+        }));
 
         // Stream the shards into a sanitized weight map, excluding the
         // n-gram shards (they stay on disk behind the row source) and the
@@ -290,6 +297,8 @@ impl Tower {
                     config.linear_key_head_dim,
                     config.linear_value_head_dim,
                     config.linear_conv_kernel_dim,
+                    crate::core::quant::GROUP_SIZE,
+                    crate::core::quant::BITS,
                 )?)
             } else {
                 Block::Attention(Attention::load(

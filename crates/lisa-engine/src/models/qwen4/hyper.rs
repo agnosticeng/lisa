@@ -49,7 +49,7 @@ impl GatedResidual {
             let w = mix_up.weight.take_axis(&idx, 0)?;
             let sc = mix_up.scales.take_axis(&idx, 0)?;
             let bi = mix_up.biases.take_axis(&idx, 0)?;
-            Some(QuantizedLinear { weight: w, scales: sc, biases: bi })
+            Some(QuantizedLinear { weight: w, scales: sc, biases: bi, group_size: mix_up.group_size, bits: mix_up.bits })
         } else {
             None
         };

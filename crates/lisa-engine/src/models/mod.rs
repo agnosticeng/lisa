@@ -15,6 +15,7 @@
 //! an `Array`/`Stream` surface, and a backend supplies it.
 
 pub mod laya;
+pub mod qwen3_5;
 pub mod qwen4;
 
 use std::path::{Path, PathBuf};
@@ -152,6 +153,16 @@ pub fn load_dir_with(dir: &Path, backend: lisa_mlx::backend::Backend) -> anyhow:
             );
             let config = qwen4::ModelConfig::from_json(&dir.join("config.json"))?;
             Ok(Loaded::Language(Box::new(qwen4::Tower::load(dir, config)?)))
+        }
+        // Qwen 3.8 27B (dense hybrid GDN + full-attention, native MTP head).
+        "qwen3_5" | "qwen3_5_text" => {
+            anyhow::ensure!(
+                backend == lisa_mlx::backend::Backend::Metal,
+                "the qwen3_5 model requires the metal backend (got {})",
+                backend.name()
+            );
+            let config = qwen3_5::Qwen35Config::from_json(&dir.join("config.json"))?;
+            Ok(Loaded::Language(Box::new(qwen3_5::Qwen35Tower::load(dir, config)?)))
         }
         // Laya (ModernBERT encoder + typed-decision head; non-generative).
         "laya" => {
