@@ -38,6 +38,13 @@ pub struct GatedDeltaNet {
     pub value_head_dim: usize,
     pub conv_kernel_size: usize,
     pub conv_dim: usize,
+    /// Qwen3.5 (27B) normalizes q/k with an L2 norm (divides by `‖x‖`), while
+    /// Flash-Next uses MLX mean-RMS. Same scales `1/hd`, `1/√hd`; the base
+    /// differs by `√hd`.
+    pub l2_norm: bool,
+    /// Qwen3.5 (`output_gate_type=swish`) gates the GDN output with `silu(z)`;
+    /// Flash-Next uses `sigmoid(z)`.
+    pub output_gate_silu: bool,
 }
 
 impl GatedDeltaNet {
@@ -50,6 +57,8 @@ impl GatedDeltaNet {
         key_head_dim: usize,
         value_head_dim: usize,
         conv_kernel_size: usize,
+        group_size: i32,
+        bits: i32,
     ) -> anyhow::Result<Self> {
         let key_dim = key_heads * key_head_dim;
         let value_dim = value_heads * value_head_dim;
@@ -60,10 +69,16 @@ impl GatedDeltaNet {
         if cs.len() == 3 && cs[1] == 1 && cs[2] > 1 {
             conv1d_weight = conv1d_weight.transpose_axes(&[0, 2, 1])?;
         }
-        let in_proj_qkv = QuantizedLinear::load(src, prefix, "in_proj_qkv")?;
-        let in_proj_z = QuantizedLinear::load(src, prefix, "in_proj_z")?;
-        let in_proj_b = QuantizedLinear::load(src, prefix, "in_proj_b")?;
-        let in_proj_a = QuantizedLinear::load(src, prefix, "in_proj_a")?;
+        let mut in_proj_qkv = QuantizedLinear::load(src, prefix, "in_proj_qkv")?;
+        in_proj_qkv.set_quant(group_size, bits);
+        let mut in_proj_z = QuantizedLinear::load(src, prefix, "in_proj_z")?;
+        in_proj_z.set_quant(group_size, bits);
+        let mut in_proj_b = QuantizedLinear::load(src, prefix, "in_proj_b")?;
+        in_proj_b.set_quant(group_size, bits);
+        let mut in_proj_a = QuantizedLinear::load(src, prefix, "in_proj_a")?;
+        in_proj_a.set_quant(group_size, bits);
+        let mut out_proj = QuantizedLinear::load(src, prefix, "out_proj")?;
+        out_proj.set_quant(group_size, bits);
         // Fused form for the S=1 decode kernel: one GEMM over the concatenation
         // of the four parts. Row concatenation is exact on the GEMV paths.
         let cat = |a: &Array, b: &Array| lisa_mlx::ops::concatenate(&[a, b], 0).unwrap();
@@ -83,6 +98,8 @@ impl GatedDeltaNet {
                 let qzb = cat(&qz, &in_proj_b.biases);
                 cat(&qzb, &in_proj_a.biases)
             },
+            group_size: in_proj_qkv.group_size,
+            bits: in_proj_qkv.bits,
         };
         let proj_width = in_proj_all.dims_out() as i32;
         let z_offset = in_proj_qkv.dims_out() as i32;
@@ -106,13 +123,15 @@ impl GatedDeltaNet {
             neg_exp_alog,
             dt_bias: src.get_bf16(&format!("{prefix}.dt_bias"))?,
             norm: RmsNormGated::load(src, &format!("{prefix}.norm"), eps)?,
-            out_proj: QuantizedLinear::load(src, prefix, "out_proj")?,
+            out_proj,
             value_heads,
             key_heads,
             key_head_dim,
             value_head_dim,
             conv_kernel_size,
             conv_dim,
+            l2_norm: false,
+            output_gate_silu: false,
         })
     }
 
@@ -310,8 +329,17 @@ impl GatedDeltaNet {
             let kk = kk.reshape(&[b, s, self.key_heads as i32, self.key_head_dim as i32])?;
             let vv = vv.reshape(&[b, s, self.value_heads as i32, self.value_head_dim as i32])?;
             let inv_scale = (self.key_head_dim as f32).powf(-0.5);
-            let qq = fast_rms_none(&qq, 1e-6)? * crate::core::norm::bf16_scalar(inv_scale * inv_scale);
-            let kk = fast_rms_none(&kk, 1e-6)? * crate::core::norm::bf16_scalar(inv_scale);
+            // L2 (Qwen3.5) vs mean-RMS (Flash-Next): the mean-RMS base is
+            // `‖x‖/√hd`, so one extra `1/√hd` converts it to the L2 base.
+            let base_adj = if self.l2_norm {
+                (self.key_head_dim as f32).powf(-0.5)
+            } else {
+                1.0
+            };
+            let qq = fast_rms_none(&qq, 1e-6)?
+                * crate::core::norm::bf16_scalar(inv_scale * inv_scale * base_adj);
+            let kk = fast_rms_none(&kk, 1e-6)?
+                * crate::core::norm::bf16_scalar(inv_scale * base_adj);
             let bb = ops::sigmoid(&b_proj)?.as_dtype(Dtype::Float32)?;
             let neg_exp_alog = self.neg_exp_alog.clone();
             let ax = a_proj.add(&self.dt_bias)?;
@@ -430,7 +458,10 @@ impl GatedDeltaNet {
 
         // Output gating: sigmoid(z) * rmsNorm(out) with a plain-scale weight.
         // Fused `track_gated_rms` (butterfly RMS + sigmoid in one launch).
-        let normed = {
+        let normed = if self.output_gate_silu {
+            let rms = lisa_mlx::fast::rms_norm(&out, Some(&self.norm.weight), self.norm.eps)?;
+            crate::core::norm::bf16_silu(&z)?.multiply(&rms)?
+        } else {
             let stream = lisa_mlx::Stream::thread_local_or_default();
             let z_flat = z.reshape(&[b, s, (self.value_heads * self.value_head_dim) as i32])?;
             let hv = self.value_heads as i32;
@@ -474,6 +505,10 @@ impl GatedDeltaNet {
         let kc = self.conv_kernel_size as i32;
         let conv_dim = self.conv_dim as i32;
         if dk != 128 || dv != 128 || kc <= 1 || conv_dim != (2 * hk + hv) * 128 {
+            return None;
+        }
+        // The fused kernel hardcodes the sigmoid gate; the 27B needs silu.
+        if self.output_gate_silu {
             return None;
         }
         if self.proj_width != self.in_proj_all.dims_out() as i32 {

@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use half::bf16;
 use lisa_mlx::ops::indexing::{Ellipsis, IndexOp};
@@ -111,7 +112,7 @@ impl NgramConstants {
 // ---------------------------------------------------------------------------
 
 struct ShardMap {
-    map: Mmap,
+    map: Arc<Mmap>,
     weight_off: usize,
     scales_off: usize,
     biases_off: usize,
@@ -185,7 +186,7 @@ impl NgramTable {
             let scales_off = abs(s_info["data_offsets"].as_array().unwrap()[0].as_u64().unwrap());
             let biases_off = abs(b_info["data_offsets"].as_array().unwrap()[0].as_u64().unwrap());
             maps.push(Some(ShardMap {
-                map: mmap,
+                map: Arc::new(mmap),
                 weight_off,
                 scales_off,
                 biases_off,
@@ -194,6 +195,42 @@ impl NgramTable {
         Ok(Self {
             maps,
             rows_per_shard: 0, // set by caller from constants
+            row_dims: 160,
+        })
+    }
+
+    /// Open a single merged `ngram.safetensors` (the mlx-serve pack:
+    /// `ngram.weight/scales/biases`). The file is the concatenation of
+    /// `shard_count` equal row-runs, so it is exposed as `shard_count` windows
+    /// into one mmap — `gather` then addresses it exactly like the sharded form.
+    pub fn open_merged(path: &Path, shard_count: usize) -> anyhow::Result<Self> {
+        let f = std::fs::File::open(path)?;
+        let mmap = Arc::new(unsafe { Mmap::map(&f)? });
+        let header_len = u64::from_le_bytes(mmap[0..8].try_into().unwrap()) as usize;
+        let header: serde_json::Value = serde_json::from_slice(&mmap[8..8 + header_len])?;
+        let abs = |off: u64| 8 + header_len + off as usize;
+        let w0 = abs(header["ngram.weight"]["data_offsets"][0].as_u64().unwrap());
+        let s0 = abs(header["ngram.scales"]["data_offsets"][0].as_u64().unwrap());
+        let b0 = abs(header["ngram.biases"]["data_offsets"][0].as_u64().unwrap());
+        let rows = header["ngram.weight"]["shape"][0].as_u64().unwrap() as usize;
+        if shard_count == 0 || rows % shard_count != 0 {
+            anyhow::bail!("merged ngram: {rows} rows not divisible by {shard_count} shards");
+        }
+        let rps = rows / shard_count;
+        const W_BYTES: usize = 20 * 4; // 160 values / 8 per u32
+        const G_BYTES: usize = 5 * 2; // 160 / 32 groups, bf16
+        let mut maps = Vec::with_capacity(shard_count);
+        for i in 0..shard_count {
+            maps.push(Some(ShardMap {
+                map: mmap.clone(),
+                weight_off: w0 + i * rps * W_BYTES,
+                scales_off: s0 + i * rps * G_BYTES,
+                biases_off: b0 + i * rps * G_BYTES,
+            }));
+        }
+        Ok(Self {
+            maps,
+            rows_per_shard: rps,
             row_dims: 160,
         })
     }

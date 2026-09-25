@@ -810,9 +810,13 @@ fn main() -> anyhow::Result<()> {
             rep_penalty,
             seed,
         } => {
-            let config = config::ModelConfig::from_json(&model.join("config.json"))?;
             let t0 = std::time::Instant::now();
-            let mut tower = model::Tower::load(&model, config)?;
+            let mut tower = match lisa_engine::models::load_dir(&model)? {
+                lisa_engine::models::Loaded::Language(m) => m,
+                lisa_engine::models::Loaded::Decision(_) => {
+                    anyhow::bail!("run expects a language model")
+                }
+            };
             println!("loaded in {:.1}s", t0.elapsed().as_secs_f64());
             let tok = tokenizer::Tokenizer::load(&model)?;
             generate::set_eos_ids(tok.im_end_ids.clone());
@@ -822,11 +826,19 @@ fn main() -> anyhow::Result<()> {
             } else {
                 tokenizer::generation_prompt(&[("user".to_string(), prompt.clone())])
             };
-            let prompt_ids = tok.encode(&text, false)?;
+            let prompt_ids: Vec<u32> = if let Ok(s) = std::env::var("LISA_PROMPT_IDS") {
+                s.split(',').filter_map(|x| x.trim().parse::<u32>().ok()).collect()
+            } else {
+                tok.encode(&text, false)?
+            };
             println!("prompt: {} tokens", prompt_ids.len());
 
+            let dump_ids = std::env::var("LISA_DUMP_IDS").is_ok();
             let mut sampler = build_sampler(temperature, top_k, top_p, min_p, rep_penalty, seed);
-            let (generated, stats) = generate::generate(&mut tower, &prompt_ids, max_tokens, &mut sampler, &mut |t| {
+            let (generated, stats) = generate::generate(&mut *tower, &prompt_ids, max_tokens, &mut sampler, &mut |t| {
+                if dump_ids {
+                    eprintln!("ID {}", t);
+                }
                 let piece = tok.decode(&[t])?;
                 print!("{piece}");
                 use std::io::Write;
