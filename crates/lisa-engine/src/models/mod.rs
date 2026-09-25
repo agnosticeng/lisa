@@ -14,6 +14,7 @@
 //! Device backends are a separate axis (see `lisa_mlx`): the runtime talks to
 //! an `Array`/`Stream` surface, and a backend supplies it.
 
+pub mod hf;
 pub mod laya;
 pub mod qwen3_5;
 pub mod qwen4;
@@ -142,6 +143,10 @@ pub fn load_dir(dir: &Path) -> anyhow::Result<Loaded> {
 
 /// Load a model from an already-resolved directory on an explicit backend.
 pub fn load_dir_with(dir: &Path, backend: lisa_mlx::backend::Backend) -> anyhow::Result<Loaded> {
+    // A caller switching models drops the previous one first; sweep the shared
+    // buffer pool so the old model's device buffers are actually released
+    // before the next model reserves its own (avoids stacking both in memory).
+    let _ = lisa_mlx::memory::clear_cache();
     let model_type = model_type_of(dir)?;
     match model_type.as_str() {
         // Qwen 3.8 Flash-Next (hybrid attention + GDN, sparse MoE, PLE, MTP).
@@ -173,7 +178,7 @@ pub fn load_dir_with(dir: &Path, backend: lisa_mlx::backend::Backend) -> anyhow:
             Ok(Loaded::Decision(Box::new(laya::Laya::load_device(dir, device)?)))
         }
         other => anyhow::bail!(
-            "unsupported model_type {other:?} in {}; supported: qwen4_exp, laya",
+            "unsupported model_type {other:?} in {}; supported: qwen4_exp, qwen3_5, laya",
             dir.display()
         ),
     }
@@ -182,9 +187,8 @@ pub fn load_dir_with(dir: &Path, backend: lisa_mlx::backend::Backend) -> anyhow:
 /// Resolve `target` to a local directory holding `config.json`.
 ///
 /// A path that exists is used as-is. Otherwise `target` is treated as a
-/// Hugging Face repo id and resolved against, in order: `$LISA_MODEL_DIR`
-/// (else `~/.cache/lisa-models`) by the repo's short name, the Hugging Face
-/// hub cache, then `hf download` into `$LISA_MODEL_DIR`.
+/// Hugging Face repo id and resolved against the Hugging Face hub cache; if it
+/// is not cached, it is fetched with `hf download` into the same cache.
 pub fn resolve_model_dir(target: &str) -> anyhow::Result<PathBuf> {
     let direct = Path::new(target);
     if direct.is_dir() {
@@ -194,30 +198,18 @@ pub fn resolve_model_dir(target: &str) -> anyhow::Result<PathBuf> {
         anyhow::bail!("{} exists but is not a directory", direct.display());
     }
 
-    let short = target.rsplit('/').next().unwrap_or(target);
-    let lisa_cache = lisa_model_dir();
-    let local = lisa_cache.join(short);
-    if local.is_dir() {
-        return Ok(local);
-    }
     if let Some(dir) = hf_snapshot_dir(target) {
         return Ok(dir);
     }
 
-    // Not present locally: fetch it with the Hugging Face CLI.
-    if which("hf").is_none() {
-        anyhow::bail!(
-            "model {target:?} is not local and `hf` is not on PATH; \
-             install huggingface_hub or pass a local path"
-        );
-    }
-    std::fs::create_dir_all(&lisa_cache)?;
-    let status = std::process::Command::new("hf")
-        .args(["download", target, "--local-dir"])
-        .arg(&local)
-        .status()?;
-    anyhow::ensure!(status.success(), "`hf download {target}` failed");
-    Ok(local)
+    // Not cached: download it into the hub cache with our own curl-based
+    // fetcher (no `huggingface_hub` dependency).
+    let dir = hf::download_repo(target)?;
+    anyhow::ensure!(
+        hf::is_model_dir(&dir),
+        "downloaded {target} but found no model config (is it a model repo?)"
+    );
+    Ok(dir)
 }
 
 /// The `model_type` string from `dir/config.json`. The nested
@@ -260,41 +252,22 @@ pub fn model_type_of(dir: &Path) -> anyhow::Result<String> {
     )
 }
 
-/// The lisa model cache root: `$LISA_MODEL_DIR`, else `~/.cache/lisa-models`.
-fn lisa_model_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("LISA_MODEL_DIR") {
-        return PathBuf::from(dir);
-    }
-    home_dir().join(".cache").join("lisa-models")
-}
-
 /// A snapshot directory in the Hugging Face hub cache that holds a `config.json`.
 fn hf_snapshot_dir(repo: &str) -> Option<PathBuf> {
-    let hub = match std::env::var_os("HF_HOME") {
-        Some(h) => PathBuf::from(h).join("hub"),
-        None => home_dir().join(".cache").join("huggingface").join("hub"),
-    };
-    let slug = format!("models--{}", repo.replace('/', "--"));
-    let snapshots = hub.join(slug).join("snapshots");
+    let snapshots = hf::repo_dir(repo).join("snapshots");
     let mut entries: Vec<PathBuf> = std::fs::read_dir(&snapshots)
         .ok()?
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.join("config.json").is_file())
+        .filter(|p| {
+            // An in-progress download (`<rev>.lisa-partial`) is not a snapshot.
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| !n.contains(".lisa-partial"))
+                .unwrap_or(false)
+                && hf::is_model_dir(p)
+        })
         .collect();
     entries.sort();
     entries.pop()
 }
 
-fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-}
-
-/// Whether `name` resolves on `PATH`.
-fn which(name: &str) -> Option<PathBuf> {
-    let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths)
-        .map(|p| p.join(name))
-        .find(|p| p.is_file())
-}

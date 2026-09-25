@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/lisa-engine", "crates/lisa-serve", "crates/lisa-cli", "crates/lisa-mlx"]
+members = ["crates/lisa-engine", "crates/lisa-serve", "crates/lisa-cli", "crates/lisa-mlx", "crates/lisa-ui"]
 resolver = "3"
 
 [profile.release]

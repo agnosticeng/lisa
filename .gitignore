@@ -2,3 +2,4 @@ reference/
 /models/
 /target/
 *.log
+.DS_Store

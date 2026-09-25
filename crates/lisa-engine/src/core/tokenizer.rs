@@ -47,6 +47,13 @@ impl Tokenizer {
             .decode(ids, false)
             .map_err(|e| anyhow::anyhow!("decode: {e}"))
     }
+
+    /// Decode without rendering special tokens (`<im_end>` and friends).
+    pub fn decode_clean(&self, ids: &[u32]) -> anyhow::Result<String> {
+        self.inner
+            .decode(ids, true)
+            .map_err(|e| anyhow::anyhow!("decode: {e}"))
+    }
 }
 
 /// A minimal ChatML applier matching the checkpoint's chat template for
@@ -83,13 +90,45 @@ pub fn apply_chat_template(messages: &[(String, String)]) -> String {
 /// open `<think>` block (thinking enabled, matching the template default).
 /// The assistant header with an open think block, verbatim from the
 /// checkpoint's `chat_template.jinja`.
-pub const ASSISTANT_PROMPT: &str = "<|im_start|>assistant\n<think\n";
+pub const ASSISTANT_PROMPT: &str = "assistant\n<think>\n";
 
 /// The generation prompt: the rendered conversation plus the assistant header.
 pub fn generation_prompt(messages: &[(String, String)]) -> String {
     let mut out = apply_chat_template(messages);
     out.push_str(ASSISTANT_PROMPT);
     out
+}
+
+/// Non-thinking generation prompt: a pre-closed `<think>` block, matching the
+/// template's `enable_thinking=false`, so the model answers directly with no
+/// visible reasoning. Used by the UI.
+pub fn generation_prompt_no_think(messages: &[(String, String)]) -> String {
+    let mut out = apply_chat_template(messages);
+    out.push_str("assistant\n<think>\n\n</think>\n\n");
+    out
+}
+
+/// Build a Qwen ChatML prompt using the real special tokens. With
+/// `think == false` the think block is pre-closed so the model answers directly.
+pub fn chat_prompt_special(text: &str, think: bool) -> String {
+    chat_prompt_special_with_system(text, None, think)
+}
+
+/// Like [`chat_prompt_special`], optionally prefixed with a `system` turn.
+pub fn chat_prompt_special_with_system(text: &str, system: Option<&str>, think: bool) -> String {
+    let start = concat!("<|", "im_start", "|>");
+    let end = concat!("<|", "im_end", "|>");
+    let tail = if think {
+        "<think>\n"
+    } else {
+        "<think>\n\n</think>\n\n"
+    };
+    match system.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(sys) => format!(
+            "{start}system\n{sys}{end}\n{start}user\n{text}{end}\n{start}assistant\n{tail}"
+        ),
+        None => format!("{start}user\n{text}{end}\n{start}assistant\n{tail}"),
+    }
 }
 
 /// The tokens a new chat turn appends to the committed conversation: close the
@@ -103,4 +142,34 @@ pub fn chat_turn_suffix(msg: &str, first: bool) -> String {
     out.push_str(&apply_chat_template(&[("user".to_string(), msg.to_string())]));
     out.push_str(ASSISTANT_PROMPT);
     out
+}
+
+/// Like [`chat_turn_suffix`], but using the real ChatML special tokens and a
+/// pre-closed think block when `think == false`, matching
+/// [`chat_prompt_special_with_system`]. Used for multi-turn sessions so each
+/// turn continues the committed conversation.
+///
+/// `assistant_im_end` distinguishes templates that close an assistant turn with
+/// `` (e.g. MiMo) from Qwen's, which relies on a plain newline.
+pub fn chat_turn_suffix_special(
+    msg: &str,
+    first: bool,
+    think: bool,
+    assistant_im_end: bool,
+) -> String {
+    let start = concat!("<|", "im_start", "|>");
+    let end = concat!("<|", "im_end", "|>");
+    let tail = if think {
+        " thinking\n"
+    } else {
+        " thinking\n\n response\n\n"
+    };
+    let lead = if first {
+        String::new()
+    } else if assistant_im_end {
+        format!("{end}\n")
+    } else {
+        "\n".to_string()
+    };
+    format!("{lead}{start}user\n{msg}{end}\n{start}assistant\n{tail}")
 }

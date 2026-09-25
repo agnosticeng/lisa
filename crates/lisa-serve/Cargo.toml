@@ -7,5 +7,6 @@ description = "OpenAI-compatible serving layer for lisa"
 [dependencies]
 anyhow = "1.0.104"
 serde_json = "1.0.151"
-minijinja = "2.24"
+hf-chat-template = "1"
 lisa-engine = { path = "../lisa-engine" }
+lisa-mlx = { path = "../lisa-mlx" }

@@ -105,11 +105,13 @@ The engine depends on the kernels crate as
 ### 3.1 Models
 
 A model is addressed by a **local directory or a Hugging Face repo id**.
-`models::resolve_model_dir` maps either to a local dir (a path as-is; else
-`$LISA_MODEL_DIR` / `~/.cache/lisa-models` by short name, then the HF hub cache,
-then `hf download`), `models::model_type_of` reads the structure from
-`config.json`, and `models::load` dispatches on it. The CLI's `--model` accepts
-both forms (resolved at argument-parse time by `ModelDir`).
+`models::resolve_model_dir` maps either to a local dir (a path as-is, else the
+HF hub cache, then a download into that cache — `models::hf` lists the repo
+through the Hub API and fetches each file with `curl`, writing the standard
+`blobs/` + `snapshots/<rev>` layout, resumable and with no `huggingface_hub`
+dependency), `models::model_type_of` reads the structure from `config.json`, and
+`models::load` dispatches on it. The CLI's `--model` accepts both forms (resolved
+at argument-parse time by `ModelDir`).
 
 **Adding a model:** add `<name>/` under `src/models/` (a config, a tower
 implementing [`LanguageModel`] or [`DecisionModel`], its kernels) and register
@@ -624,8 +626,9 @@ change the result): `LISA_PROFILE`, `LISA_PROFILE_DECODE`, `LISA_PROFILE_MOE`,
 `LISA_DIAG`, `LISA_DUMP_DIR`, `LISA_DUMP_TOKENS`, `LISA_KEEP`, `LISA_TRUNC`,
 `LISA_TOPK`, `LISA_SHAPE_DEBUG`, `LISA_INDEXER_DEBUG`, `LISA_QSA_PROF`,
 `LISA_MEM_TRACE`, `LISA_LDTOKENS`, `LISA_FROM`/`LISA_TO`. Real config:
-`LISA_DEVICE` (backend, default `metal`); `LISA_MODEL_DIR` (model cache root);
-`LISA_METALLIB` (AOT metallib path); `LISA_METAL_COMPUTE_PER_BUFFER`.
+`LISA_DEVICE` (backend, default `metal`);
+`LISA_METALLIB` (AOT metallib path); `LISA_METAL_COMPUTE_PER_BUFFER`;
+`LISA_NO_NAX=1` (force the non-NAX fallbacks, e.g. to exercise them on an M5).
 `--model` is a local directory or a Hugging Face repo id.
 
 ---

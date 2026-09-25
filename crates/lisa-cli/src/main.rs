@@ -739,19 +739,21 @@ fn main() -> anyhow::Result<()> {
                     lisa_engine::Loaded::Language(_) => unreachable!("model_type was laya"),
                 }
             }
-            let config = config::ModelConfig::from_json(&model.join("config.json"))?;
             let t0 = std::time::Instant::now();
-            let mut tower = model::Tower::load(&model, config)?;
+            let mut tower = match lisa_engine::models::load_dir(&model)? {
+                lisa_engine::Loaded::Language(m) => m,
+                lisa_engine::Loaded::Decision(_) => unreachable!("model_type was not laya"),
+            };
             eprintln!("loaded in {:.1}s", t0.elapsed().as_secs_f64());
             let tok = tokenizer::Tokenizer::load(&model)?;
             generate::set_eos_ids(tok.im_end_ids.clone());
             let warm = tok.encode(
-                "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n thinking\n",
+                "user\nhi\nassistant\n thinking\n",
                 false,
             )?;
             tower.warmup(&warm)?;
             mlx_mem_line("serve-warm");
-            serve::run(&mut tower, &tok, cfg)
+            serve::run(tower.as_mut(), &tok, cfg)
         }
 
         Command::PrefillBench {

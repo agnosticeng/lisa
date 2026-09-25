@@ -3160,6 +3160,9 @@ pub fn sdpa(
     let ql = q.dims()[2];
     let d = q.dims()[3];
     let gqa = q.dims()[1] / k.dims()[1];
+    // The fused NAX attention requires MPP tensor ops; without them fall back
+    // to the dense op chain (which itself uses the generic GEMM).
+    let nax = device.nax();
     if mask.is_some() {
         // The fused kernels' array-mask branches are not ported; MLX itself
         // routes d == 192/256 array-mask attention to the dense op chain.
@@ -3170,7 +3173,7 @@ pub fn sdpa(
     }
     if ql <= 8 {
         if ql * gqa > 32 {
-            if d == 256 && do_causal {
+            if nax && d == 256 && do_causal {
                 return sdpa_full_nax(device, None, q, k, v, scale, do_causal);
             }
             return sdpa_dense(device, q, k, v, scale, do_causal, None);
@@ -3191,12 +3194,16 @@ pub fn sdpa(
         } else {
             sdpa_vector(device, q, k, v, scale, dc)
         }
-    } else if ql >= 1024 && d == 256 && do_causal {
+    } else if nax && ql >= 1024 && d == 256 && do_causal {
         sdpa_full_nax(device, None, q, k, v, scale, do_causal)
     } else if matches!(d, 192 | 256) {
         sdpa_dense(device, q, k, v, scale, do_causal, None)
     } else if matches!(d, 64 | 96 | 128) {
-        sdpa_full_nax(device, None, q, k, v, scale, do_causal)
+        if nax {
+            sdpa_full_nax(device, None, q, k, v, scale, do_causal)
+        } else {
+            sdpa_dense(device, q, k, v, scale, do_causal, None)
+        }
     } else {
         crate::bail!("sdpa: dense fallback for head_dim {d} not ported")
     }
@@ -3207,6 +3214,15 @@ pub fn sdpa(
 /// (`qL*gqa > 32`) and for array-mask / ragged batching. The batched matmuls
 /// are the MLX NAX GEMM (`matmul_nax`) applied per (batch, kv-head, repeat)
 /// slice; the softmax is the ported precise softmax kernel.
+/// 2-D GEMM that follows the device: the NAX tensor-core GEMM on M5+, the
+/// generic steel GEMM (`Array::matmul` -> `dense_gemm`) on older GPUs.
+fn matmul_2d(device: &Device, a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    if device.nax() {
+        return matmul_nax(device, None, a, b, false, false);
+    }
+    a.matmul(b)
+}
+
 pub fn sdpa_dense(
     device: &Device,
     q: &Tensor,
@@ -3234,7 +3250,7 @@ pub fn sdpa_dense(
             let kt = k_t.i((bi, hi))?.contiguous()?;
             for ri in 0..r {
                 let qq = qs.i((bi, hi * r + ri))?.contiguous()?;
-                rows.push(matmul_nax(device, None, &qq, &kt, false, false)?);
+                rows.push(matmul_2d(device, &qq, &kt)?);
             }
         }
     }
@@ -3270,7 +3286,7 @@ pub fn sdpa_dense(
             let vv = v.i((bi, hi))?.contiguous()?;
             for ri in 0..r {
                 let sc = probs.i3(bi, hi, ri)?.contiguous()?;
-                outs.push(matmul_nax(device, None, &sc, &vv, false, false)?);
+                outs.push(matmul_2d(device, &sc, &vv)?);
             }
         }
     }

@@ -7,6 +7,8 @@
 
 # lisa
 
+![The lisa desktop app: model library sidebar, streaming chat, and the in-process serve panel](docs/images/screenshot.png)
+
 **LLM Inference for Silicon Architecture**
 
 `lisa` is a **pure-Rust, from-scratch inference engine** for large language
@@ -17,18 +19,27 @@ shader sources at startup, so the whole stack ships as one native binary.
 It is built on two open extension axes — **models** and **device backends** — so
 the first model it implements is not the last:
 
-- **Models.** Today: `Qwen 3.8 Flash-Next` (125B total / A6B active), a hybrid
-  gated-DeltaNet + full-attention decoder with a 512-expert sparse MoE, a
+- **Models.** Three today. `Qwen 3.8 Flash-Next` (125B total / A6B active): a
+  hybrid gated-DeltaNet + full-attention decoder with a 512-expert sparse MoE, a
   per-layer n-gram embedding, and MTP speculative decoding on the M5's NAX
-  tensor cores — and `Laya`, a non-generative typed-decision model. Bringing up
-  another model is a `<name>/` module plus one `model_type` arm.
+  tensor cores. `Qwen 3.8 27B`: a dense hybrid (full attention every 4th layer,
+  gated DeltaNet elsewhere, no MoE/PLE) with output-gated attention and an MTP
+  head. `Laya`: a non-generative typed-decision model (Metal or CPU). Bringing
+  up another model is a `<name>/` module plus one `model_type` arm.
 - **Devices.** Metal (GPU) and CPU, selected with `LISA_DEVICE` and defaulting
   to Metal when a device is present, CPU otherwise. Adding a backend is a
   `backend/<name>/` module plus one `Backend` variant.
 
 On top of the engine: serial generation, multi-turn sessions, cohort / ragged /
-continuous batching, and an **OpenAI-compatible HTTP server**
-(`/v1/chat/completions`, plus `/v1/decisions` for decision models).
+continuous batching, and an **OpenAI-compatible HTTP server** —
+`/v1/chat/completions` (streaming, tool calling, JSON mode / structured outputs,
+logprobs, `n>1`, rate-limit headers), legacy `/v1/completions`, the
+`/v1/responses` API (resource schema, streaming events, `previous_response_id`
+chaining, background mode), and Anthropic `/v1/messages` +
+`/v1/messages/count_tokens`. Decision models get `/v1/decisions`.
+
+A **native macOS app** (`crates/lisa-ui`) ships on top: a model library,
+streaming markdown chat, and the server runnable in-process.
 
 It stays exact where it matters: **256/256** on the public long-copy golden,
 serial and MTP `--depth 1..6`.
@@ -41,11 +52,9 @@ Build from source on any Apple Silicon Mac (Xcode 26 / Metal 4 toolchain):
 cargo build --release      # -> target/release/lisa
 ```
 
-Model weights come from the Hugging Face cache; fetch them with the `hf` CLI:
-
-```bash
-brew install hf            # or: pip install -U huggingface_hub
-```
+Model weights are resolved from the Hugging Face cache; if a repo isn't cached,
+`lisa` downloads it itself (Hub API + `curl`, resumable, `HF_TOKEN` honored), so
+no separate download step is needed.
 
 ## Run
 
@@ -78,6 +87,21 @@ lisa decide --model convaiinnovations/laya \
 temperature overrides (`--temperature`, `--temperature-by-options`). See
 `AGENTS.md` §20.
 
+## Desktop app
+
+A native macOS front end ships in the workspace (`crates/lisa-ui`, AppKit via
+`objc2`): a model library with background downloads, streaming multi-turn chat
+with markdown/math rendering, and the OpenAI-compatible server runnable
+in-process — chat and serving share the one engine thread. Run it in release
+(debug hits loader alignment UB):
+
+```bash
+cargo build --release -p lisa-ui
+./target/release/lisa-ui
+# or bundle a Lisa.app:
+./crates/lisa-ui/bundle.sh
+```
+
 ## Architecture
 
 ```
@@ -89,10 +113,13 @@ crates/
   lisa-engine/       the inference library
     src/models/mod.rs  LanguageModel/DecisionModel traits + registry + resolution
     src/models/qwen4/  the Flash-Next implementation
+    src/models/qwen3_5/ the Qwen 3.8 27B dense-hybrid implementation
     src/models/laya/   the Laya decision model (Metal + host forward)
+    src/models/hf.rs   the Hugging Face hub downloader (Hub API + curl)
     src/core/          loading, quantization, norms, caches, generation,
                        session, batching, scheduler, sampling, tokenizer
   lisa-serve/        OpenAI-compatible HTTP server (+ decisions endpoint)
+  lisa-ui/           the macOS desktop app (AppKit via objc2)
   lisa-cli/          the `lisa` binary
 ```
 
@@ -124,9 +151,15 @@ closures (`kernels/nax/`).
 
 A model is addressed by a **local directory or a Hugging Face repo id**; its
 structure is read from the config and dispatched to the matching implementation
-(`qwen4_exp` or `laya`). A device backend is chosen with `LISA_DEVICE`
-(`metal` or `cpu`); when unset, Metal is used if a device is present, otherwise
-CPU. Today: `qwen4_exp` on Metal, and Laya on Metal **or** CPU.
+(`qwen4_exp`, `qwen3_5`, or `laya`). A device backend is chosen with
+`LISA_DEVICE` (`metal` or `cpu`); when unset, Metal is used if a device is
+present, otherwise CPU. Today: `qwen4_exp` and `qwen3_5` on Metal, and Laya on
+Metal **or** CPU.
+
+The runtime adapts to the GPU: on M5 it uses the MetalPerformancePrimitives
+tensor ops (the NAX path); on M1–M4 it automatically falls back to the
+non-NAX steel/vector kernels (generic GEMM, split-K quantized matmul, dense
+attention), so the same binary runs on any Apple Silicon Mac.
 
 Adding a model is a `<name>/` module plus one `model_type` arm; adding a backend
 is a `backend/<name>/` module plus one `Backend` variant — see `AGENTS.md`

@@ -81,7 +81,8 @@ impl SparseMoeBlock {
                 return o.reshape(&[b, s, -1]);
             }
         }
-        if rows >= 32
+        if lisa_mlx::runtime::nax_available()
+            && rows >= 32
             && rows <= 1024
             && hidden == 2560
             && self.gate.shape() == [512, 2560]
@@ -98,6 +99,11 @@ impl SparseMoeBlock {
     /// table (`track_prefill_tile_table` -> `track_prefill_indirect_gate_up` ->
     /// `track_prefill_indirect_down`) then the sorted combine.
     fn forward_prefill(&self, x: &Array) -> Option<Array> {
+        // The indirect expert GEMM is NAX/MPP-only; without it the generic
+        // gather_qmm path (with its non-NAX fallback) handles wide windows.
+        if !lisa_mlx::runtime::nax_available() {
+            return None;
+        }
         let b = x.dim(0);
         let s = x.dim(1);
         let hidden = x.dim(-1);
