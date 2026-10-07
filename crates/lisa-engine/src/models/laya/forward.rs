@@ -8,22 +8,11 @@
 //! fp16) for a first correct implementation; fp16 parity is a follow-up.
 
 use anyhow::{Context, Result};
-use lisa_mlx::ops::indexing::IndexOp;
 use lisa_mlx::Array;
+use lisa_mlx::ops::indexing::IndexOp;
 
 use super::{Laya, LayaConfig};
 use crate::core::loader::array_from_bytes;
-
-/// First 5 channels of token 0, as f32 — for the `LISA_LAYATRACE` diagnostic.
-fn first5(x: &Array) -> Vec<f32> {
-    let Ok(row) = x.index((0, .., ..)).as_dtype(lisa_mlx::Dtype::Float32) else {
-        return Vec::new();
-    };
-    let Ok(flat) = row.reshape(&[-1]) else {
-        return Vec::new();
-    };
-    flat.as_slice::<f32>().iter().take(5).copied().collect()
-}
 
 impl Laya {
     /// Materialize an original-name tensor as an f32 `Array`.
@@ -79,9 +68,14 @@ impl Laya {
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .unary("Erf")
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let half = x.multiply(Array::from_f32(0.5)).map_err(|e| anyhow::anyhow!("{e}"))?;
-        half.multiply(&e.add(Array::from_f32(1.0)).map_err(|e| anyhow::anyhow!("{e}"))?)
-            .map_err(|e| anyhow::anyhow!("{e}"))
+        let half = x
+            .multiply(Array::from_f32(0.5))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        half.multiply(
+            &e.add(Array::from_f32(1.0))
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))
     }
 
     /// GPT-NeoX RoPE (MLX `traditional=False`): rotate pairs `(i, i+d/2)` with
@@ -116,7 +110,8 @@ impl Laya {
     }
 
     fn relu(x: &Array) -> Result<Array> {
-        x.maximum(Array::from_f32(0.0)).map_err(|e| anyhow::anyhow!("{e}"))
+        x.maximum(Array::from_f32(0.0))
+            .map_err(|e| anyhow::anyhow!("{e}"))
     }
 
     /// Additive attention mask `[1,1,S,S]`: 0 where a key is visible, else a
@@ -139,12 +134,21 @@ impl Laya {
     }
 
     /// ModernBERT attention block. `x` is `[S, H]`.
-    fn encoder_attn(&self, x: &Array, prefix: &str, base: f32, mask: &Array, cfg: &LayaConfig) -> Result<Array> {
+    fn encoder_attn(
+        &self,
+        x: &Array,
+        prefix: &str,
+        base: f32,
+        mask: &Array,
+        cfg: &LayaConfig,
+    ) -> Result<Array> {
         let s = x.dim(0);
         let h = cfg.num_heads as i32;
         let d = cfg.head_dim as i32;
         let qkv = self.linear(x, &format!("{prefix}.attn.Wqkv.weight"), None)?;
-        let qkv = qkv.reshape(&[s, 3, h, d]).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let qkv = qkv
+            .reshape(&[s, 3, h, d])
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         let parts = qkv.split_equal(3, 1).map_err(|e| anyhow::anyhow!("{e}"))?;
         // split_equal keeps the split axis (size 1); drop it, then [S,h,d] -> [1,h,S,d]
         let to_bhsd = |a: &Array| -> Result<Array> {
@@ -158,11 +162,17 @@ impl Laya {
         let v = to_bhsd(&parts[2])?;
         let (q, k) = (Self::rope_neox(&q, base)?, Self::rope_neox(&k, base)?);
         let scale = 1.0 / (d as f32).sqrt();
-        let kt = k.transpose_axes(&[0, 2, 1]).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let kt = k
+            .transpose_axes(&[0, 2, 1])
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         let mut scores = q.matmul(&kt).map_err(|e| anyhow::anyhow!("{e}"))?;
-        scores = scores.multiply(Array::from_f32(scale)).map_err(|e| anyhow::anyhow!("{e}"))?;
+        scores = scores
+            .multiply(Array::from_f32(scale))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         scores = scores.add(mask).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let probs = scores.softmax_axis(-1).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let probs = scores
+            .softmax_axis(-1)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         let out = probs.matmul(&v).map_err(|e| anyhow::anyhow!("{e}"))?;
         // [h, S, d] -> [S, h*d]
         let out = out
@@ -179,7 +189,9 @@ impl Laya {
         let y = self.linear(x, &format!("{prefix}.mlp.Wi.weight"), None)?;
         let parts = y.split_equal(2, -1).map_err(|e| anyhow::anyhow!("{e}"))?;
         let value = Self::gelu(&parts[0])?;
-        let gated = value.multiply(&parts[1]).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let gated = value
+            .multiply(&parts[1])
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         debug_assert_eq!(gated.dim(-1), inter);
         self.linear(&gated, &format!("{prefix}.mlp.Wo.weight"), None)
     }
@@ -203,15 +215,17 @@ impl Laya {
             cfg.norm_eps,
         )?;
 
-        let trace = std::env::var("LISA_LAYATRACE").is_ok();
-        if trace { eprintln!("[laya] emb   {:?}", first5(&x)); }
         let full_mask = Self::key_mask(s, true, cfg.local_attention, &valid);
         let local_mask = Self::key_mask(s, false, cfg.local_attention, &valid);
 
         for i in 0..cfg.num_layers {
             let prefix = format!("encoder.layers.{i}");
             let global = cfg.layer_global[i];
-            let base = if global { cfg.rope_theta_global } else { cfg.rope_theta_local };
+            let base = if global {
+                cfg.rope_theta_global
+            } else {
+                cfg.rope_theta_local
+            };
             let mask = if global { &full_mask } else { &local_mask };
 
             // Pre-attention norm (layer 0 reuses the embeddings norm, applied
@@ -228,7 +242,6 @@ impl Laya {
             };
             let att = self.encoder_attn(&normed, &prefix, base, mask, cfg)?;
             x = x.add(&att).map_err(|e| anyhow::anyhow!("{e}"))?;
-            if trace && i == 0 { eprintln!("[laya] L0att  {:?}", first5(&x)); }
 
             let normed = Self::layer_norm(
                 &x,
@@ -238,9 +251,6 @@ impl Laya {
             )?;
             let mlp = self.encoder_mlp(&normed, &prefix, cfg)?;
             x = x.add(&mlp).map_err(|e| anyhow::anyhow!("{e}"))?;
-            if trace && (i < 3 || i + 1 == cfg.num_layers) {
-                eprintln!("[laya] L{i:<2}    {:?}", first5(&x));
-            }
         }
         Self::layer_norm(
             &x,
@@ -264,8 +274,14 @@ impl Laya {
             cfg.norm_eps,
         )?;
         let s = normed.dim(0);
-        let qkv = self.linear(&normed, &format!("{p}.self_attn.in_proj_weight"), Some(&format!("{p}.self_attn.in_proj_bias")))?;
-        let qkv = qkv.reshape(&[s, 3, heads, d]).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let qkv = self.linear(
+            &normed,
+            &format!("{p}.self_attn.in_proj_weight"),
+            Some(&format!("{p}.self_attn.in_proj_bias")),
+        )?;
+        let qkv = qkv
+            .reshape(&[s, 3, heads, d])
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         let parts = qkv.split_equal(3, 1).map_err(|e| anyhow::anyhow!("{e}"))?;
         let to_bhsd = |a: &Array| -> Result<Array> {
             a.reshape(&[s, heads, d])?
@@ -273,8 +289,14 @@ impl Laya {
                 .contiguous()
                 .map_err(|e| anyhow::anyhow!("{e}"))
         };
-        let (q, k, v) = (to_bhsd(&parts[0])?, to_bhsd(&parts[1])?, to_bhsd(&parts[2])?);
-        let kt = k.transpose_axes(&[0, 2, 1]).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let (q, k, v) = (
+            to_bhsd(&parts[0])?,
+            to_bhsd(&parts[1])?,
+            to_bhsd(&parts[2])?,
+        );
+        let kt = k
+            .transpose_axes(&[0, 2, 1])
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         let scores = q
             .matmul(&kt)
             .map_err(|e| anyhow::anyhow!("{e}"))?
@@ -282,7 +304,9 @@ impl Laya {
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .add(mask)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let probs = scores.softmax_axis(-1).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let probs = scores
+            .softmax_axis(-1)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         let att = probs
             .matmul(&v)
             .map_err(|e| anyhow::anyhow!("{e}"))?
@@ -290,7 +314,11 @@ impl Laya {
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .reshape(&[s, dims])
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let att = self.linear(&att, &format!("{p}.self_attn.out_proj.weight"), Some(&format!("{p}.self_attn.out_proj.bias")))?;
+        let att = self.linear(
+            &att,
+            &format!("{p}.self_attn.out_proj.weight"),
+            Some(&format!("{p}.self_attn.out_proj.bias")),
+        )?;
         let mut x = x.add(&att).map_err(|e| anyhow::anyhow!("{e}"))?;
 
         let normed = Self::layer_norm(
@@ -299,9 +327,17 @@ impl Laya {
             Some(self.w(&format!("{p}.norm2.bias"))?),
             cfg.norm_eps,
         )?;
-        let hid = self.linear(&normed, &format!("{p}.linear1.weight"), Some(&format!("{p}.linear1.bias")))?;
+        let hid = self.linear(
+            &normed,
+            &format!("{p}.linear1.weight"),
+            Some(&format!("{p}.linear1.bias")),
+        )?;
         let hid = Self::relu(&hid)?;
-        let mlp = self.linear(&hid, &format!("{p}.linear2.weight"), Some(&format!("{p}.linear2.bias")))?;
+        let mlp = self.linear(
+            &hid,
+            &format!("{p}.linear2.weight"),
+            Some(&format!("{p}.linear2.bias")),
+        )?;
         x = x.add(&mlp).map_err(|e| anyhow::anyhow!("{e}"))?;
         Ok(x)
     }
@@ -357,14 +393,12 @@ impl Laya {
             .to_vec();
 
         // probabilities over markers
-        let p = logits.softmax_axis(-1).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let p = logits
+            .softmax_axis(-1)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         let p_v: Vec<f32> = p.as_slice::<f32>().to_vec();
         let k = marker_pos.len().max(2) as f32;
-        let entropy: f32 = -p_v
-            .iter()
-            .map(|&x| x * x.max(1e-9).ln())
-            .sum::<f32>()
-            / k.ln();
+        let entropy: f32 = -p_v.iter().map(|&x| x * x.max(1e-9).ln()).sum::<f32>() / k.ln();
         let mut sorted = p_v.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let top1 = *sorted.last().unwrap();
@@ -372,8 +406,12 @@ impl Laya {
         let features = Array::from_slice(&[top1, top1 - top2, entropy, k / 255.0], &[1, 4]);
 
         // pooled = [h[:,0], features]; action = act_head(pooled)
-        let h0 = h.index((0, ..)).reshape(&[1, cfg.hidden_size as i32]).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let pooled = Array::concatenate(&[&h0, &features], 1).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let h0 = h
+            .index((0, ..))
+            .reshape(&[1, cfg.hidden_size as i32])
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let pooled =
+            Array::concatenate(&[&h0, &features], 1).map_err(|e| anyhow::anyhow!("{e}"))?;
         let a = self.linear(&pooled, "act_head.0.weight", Some("act_head.0.bias"))?;
         let a = Self::gelu(&a)?;
         let action = self.linear(&a, "act_head.2.weight", Some("act_head.2.bias"))?;

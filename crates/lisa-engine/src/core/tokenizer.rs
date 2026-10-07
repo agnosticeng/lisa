@@ -15,8 +15,7 @@ impl Tokenizer {
     /// Load a `tokenizer.json` from an explicit path (some checkpoints keep it
     /// in a `tokenizer/` subdirectory).
     pub fn load_file(path: &std::path::Path) -> anyhow::Result<Self> {
-        let inner = HfTokenizer::from_file(path)
-            .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
+        let inner = HfTokenizer::from_file(path).map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
         // <|im_end|> and <|endoftext|>
         let mut im_end_ids = Vec::new();
         for token in ["<|im_end|>", "<|endoftext|>"] {
@@ -124,9 +123,9 @@ pub fn chat_prompt_special_with_system(text: &str, system: Option<&str>, think: 
         "<think>\n\n</think>\n\n"
     };
     match system.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(sys) => format!(
-            "{start}system\n{sys}{end}\n{start}user\n{text}{end}\n{start}assistant\n{tail}"
-        ),
+        Some(sys) => {
+            format!("{start}system\n{sys}{end}\n{start}user\n{text}{end}\n{start}assistant\n{tail}")
+        }
         None => format!("{start}user\n{text}{end}\n{start}assistant\n{tail}"),
     }
 }
@@ -139,7 +138,10 @@ pub fn chat_turn_suffix(msg: &str, first: bool) -> String {
     if !first {
         out.push_str("<|im_end|>\n");
     }
-    out.push_str(&apply_chat_template(&[("user".to_string(), msg.to_string())]));
+    out.push_str(&apply_chat_template(&[(
+        "user".to_string(),
+        msg.to_string(),
+    )]));
     out.push_str(ASSISTANT_PROMPT);
     out
 }

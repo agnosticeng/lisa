@@ -2,7 +2,7 @@
 
 use anyhow::Context;
 use lisa_mlx::ops::indexing::IndexOp;
-use lisa_mlx::{ops, Array, Dtype};
+use lisa_mlx::{Array, Dtype, ops};
 use std::path::{Path, PathBuf};
 
 use crate::models::qwen4::config::ModelConfig;
@@ -80,12 +80,17 @@ pub fn run(model: &Path) -> anyhow::Result<()> {
     let _ = &tower;
 
     // Re-run the tiny forward manually using the tower's modules.
-    let golden: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string("reference/correctness_prompts/public_longcopy_gate_english_1024_256.json")?)?;
-    let take: usize = std::env::var("LISA_LDTOKENS").ok().and_then(|v| v.parse().ok()).unwrap_or(48);
+    let golden: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
+        "reference/correctness_prompts/public_longcopy_gate_english_1024_256.json",
+    )?)?;
+    let take: usize = 48;
     let ptok: Vec<i32> = golden["cases"][0]["prompt_tokens"]
-        .as_array().unwrap().iter().take(take)
-        .filter_map(|v| v.as_i64().map(|x| x as i32)).collect();
+        .as_array()
+        .unwrap()
+        .iter()
+        .take(take)
+        .filter_map(|v| v.as_i64().map(|x| x as i32))
+        .collect();
     let n_tok = ptok.len() as i32;
     let ids = Array::from_slice(&ptok, &[1i32, n_tok]);
     let hidden = tower.embed_tokens.forward(&ids)?;
@@ -95,13 +100,6 @@ pub fn run(model: &Path) -> anyhow::Result<()> {
 
     let layer = &tower.layers[0];
     let normed = layer.attn_hc.hc_norm.forward(&hidden)?;
-    if std::env::var("LISA_DUMP03").is_ok() {
-        let f = normed.as_dtype(Dtype::Float32)?;
-        let v = f.as_slice::<f32>().to_vec();
-        std::fs::write("/tmp/rms-trace/zz03.bin", unsafe {
-            std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4)
-        }).ok();
-    }
     diff("03_hc_norm", &normed)?;
     let lo = layer.attn_hc.mix_down.forward(&normed)?;
     diff("04_down", &lo)?;
@@ -116,8 +114,14 @@ pub fn run(model: &Path) -> anyhow::Result<()> {
     lead.push(2560);
     let mixed = (w.reshape(&lead)?.multiply(&normed.reshape(&lead)?)?).mean_axis(-2, None)?;
     diff("06_mixed", &mixed)?;
-    let inj = layer.attn_hc.block_inject.as_ref().unwrap().forward(&normed)?;
-    let inj = ops::sigmoid(&(inj / crate::core::norm::bf16_scalar(4.0)))? * crate::core::norm::bf16_scalar(2.0);
+    let inj = layer
+        .attn_hc
+        .block_inject
+        .as_ref()
+        .unwrap()
+        .forward(&normed)?;
+    let inj = ops::sigmoid(&(inj / crate::core::norm::bf16_scalar(4.0)))?
+        * crate::core::norm::bf16_scalar(2.0);
     diff("07_inject_w", &inj)?;
 
     // GDN
@@ -134,7 +138,8 @@ pub fn run(model: &Path) -> anyhow::Result<()> {
     let b_proj = gdn.in_proj_b.forward(&mixed)?;
     let a_proj = gdn.in_proj_a.forward(&mixed)?;
 
-    let zeros = ops::zeros::<half::bf16>(&[b, (gdn.conv_kernel_size - 1) as i32, gdn.conv_dim as i32])?;
+    let zeros =
+        ops::zeros::<half::bf16>(&[b, (gdn.conv_kernel_size - 1) as i32, gdn.conv_dim as i32])?;
     let conv_input = ops::concatenate(&[&zeros, &mixed_qkv], 1)?;
     let conv_out = ops::conv1d(
         &conv_input,
@@ -155,7 +160,8 @@ pub fn run(model: &Path) -> anyhow::Result<()> {
     let k = k.reshape(&[b, s, gdn.key_heads as i32, gdn.key_head_dim as i32])?;
     let v = v.reshape(&[b, s, gdn.value_heads as i32, gdn.value_head_dim as i32])?;
     let inv_scale = (gdn.key_head_dim as f32).powf(-0.5);
-    let q = lisa_mlx::fast::rms_norm(&q, None, 1e-6)? * crate::core::norm::bf16_scalar(inv_scale * inv_scale);
+    let q = lisa_mlx::fast::rms_norm(&q, None, 1e-6)?
+        * crate::core::norm::bf16_scalar(inv_scale * inv_scale);
     let k = lisa_mlx::fast::rms_norm(&k, None, 1e-6)? * crate::core::norm::bf16_scalar(inv_scale);
     diff("10_q", &q)?;
     diff("11_k", &k)?;
@@ -190,7 +196,8 @@ pub fn run(model: &Path) -> anyhow::Result<()> {
     let attended = gdn.out_proj.forward(&normed_out)?;
     diff("17_attended", &attended)?;
 
-    let stream2 = crate::models::qwen4::hyper::inject(&hidden, &attended, &inj).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let stream2 = crate::models::qwen4::hyper::inject(&hidden, &attended, &inj)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     diff("18_after_attn_inject", &stream2)?;
 
     // MLP side
@@ -202,18 +209,29 @@ pub fn run(model: &Path) -> anyhow::Result<()> {
     let w2 = ops::sigmoid(&w2)?;
     let mixed2 = (w2.reshape(&lead)?.multiply(&normed2.reshape(&lead)?)?).mean_axis(-2, None)?;
     diff("19_moe_in", &mixed2)?;
-    let inj2 = layer.mlp_hc.block_inject.as_ref().unwrap().forward(&normed2)?;
-    let inj2 = ops::sigmoid(&(inj2 / crate::core::norm::bf16_scalar(4.0)))? * crate::core::norm::bf16_scalar(2.0);
+    let inj2 = layer
+        .mlp_hc
+        .block_inject
+        .as_ref()
+        .unwrap()
+        .forward(&normed2)?;
+    let inj2 = ops::sigmoid(&(inj2 / crate::core::norm::bf16_scalar(4.0)))?
+        * crate::core::norm::bf16_scalar(2.0);
 
     let moe = &layer.mlp;
-    let logits_r = ops::matmul(&mixed2.as_dtype(Dtype::Float32)?, moe.gate.transpose_axes(&[1, 0])?)?;
+    let logits_r = ops::matmul(
+        &mixed2.as_dtype(Dtype::Float32)?,
+        moe.gate.transpose_axes(&[1, 0])?,
+    )?;
     diff("20_routerlogits", &logits_r)?;
     let indices = ops::argpartition_axis(&(-&logits_r), (moe.top_k - 1) as i32, -1)?;
     let indices = indices.index((.., .., 0..moe.top_k as i32));
     let selected = logits_r.take_along_axis(&indices, -1)?;
     let weights = ops::softmax_axis(&selected, -1, true)?;
     diff("20_router_w", &weights)?;
-    let idx_f = indices.as_dtype(Dtype::Float32).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let idx_f = indices
+        .as_dtype(Dtype::Float32)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     diff("21_router_idx", &idx_f)?;
 
     let rows = b * s;
@@ -223,19 +241,47 @@ pub fn run(model: &Path) -> anyhow::Result<()> {
     let idx_flat = indices.reshape(&[rows * moe.top_k as i32])?;
     let gq = |inp: &Array, key: &str| -> lisa_mlx::error::Result<Array> {
         let (sw, ss, sb) = match key {
-            "gate_proj" => (&moe.switch_mlp.gate_proj, &moe.switch_mlp.gate_scales, &moe.switch_mlp.gate_biases),
-            "up_proj" => (&moe.switch_mlp.up_proj, &moe.switch_mlp.up_scales, &moe.switch_mlp.up_biases),
-            _ => (&moe.switch_mlp.down_proj, &moe.switch_mlp.down_scales, &moe.switch_mlp.down_biases),
+            "gate_proj" => (
+                &moe.switch_mlp.gate_proj,
+                &moe.switch_mlp.gate_scales,
+                &moe.switch_mlp.gate_biases,
+            ),
+            "up_proj" => (
+                &moe.switch_mlp.up_proj,
+                &moe.switch_mlp.up_scales,
+                &moe.switch_mlp.up_biases,
+            ),
+            _ => (
+                &moe.switch_mlp.down_proj,
+                &moe.switch_mlp.down_scales,
+                &moe.switch_mlp.down_biases,
+            ),
         };
-        ops::gather_qmm(inp, sw, ss, Some(sb), None, Some(&idx_flat), true, 32, 4, false)?
-            .reshape(&[rows * moe.top_k as i32, -1])
+        ops::gather_qmm(
+            inp,
+            sw,
+            ss,
+            Some(sb),
+            None,
+            Some(&idx_flat),
+            true,
+            32,
+            4,
+            false,
+        )?
+        .reshape(&[rows * moe.top_k as i32, -1])
     };
     let gate_out = gq(&x_rep, "gate_proj")?;
     let up_out = gq(&x_rep, "up_proj")?;
     let act = lisa_mlx::nn::silu(&gate_out)?.multiply(&up_out)?;
-    let down_out = gq(&act.reshape(&[rows * moe.top_k as i32, 1, act.dim(-1)])?, "down_proj")?;
+    let down_out = gq(
+        &act.reshape(&[rows * moe.top_k as i32, 1, act.dim(-1)])?,
+        "down_proj",
+    )?;
     let down = down_out.reshape(&[b, s, moe.top_k as i32, -1])?;
-    let routed = down.multiply(&weights.expand_dims(-1)?)?.sum_axis(-2, None)?;
+    let routed = down
+        .multiply(&weights.expand_dims(-1)?)?
+        .sum_axis(-2, None)?;
     let routed = routed.as_dtype(mixed2.dtype())?;
     diff("22_routed", &routed)?;
 
@@ -243,7 +289,10 @@ pub fn run(model: &Path) -> anyhow::Result<()> {
     let sh = moe.shared_gate_proj.forward(&mixed2)?;
     let sh = lisa_mlx::nn::silu(&sh)?.multiply(&moe.shared_up_proj.forward(&mixed2)?)?;
     let sh = moe.shared_down_proj.forward(&sh)?;
-    diff("23_moe_out", &routed.add(&sh.multiply(&ops::sigmoid(&sg)?)?)?)?;
+    diff(
+        "23_moe_out",
+        &routed.add(&sh.multiply(&ops::sigmoid(&sg)?)?)?,
+    )?;
 
     let moe_added = routed.add(&sh.multiply(&ops::sigmoid(&sg)?)?)?;
     let layer_out = crate::models::qwen4::hyper::inject(&stream2, &moe_added, &inj2)
@@ -265,7 +314,11 @@ fn diff_rest(tower: &mut Tower, mut hidden: Array, ids: &Array) -> anyhow::Resul
     let (ple_out, last_embed, last_gated) = {
         let ple = tower.layers[1].ple.as_mut().unwrap();
         let out = ple.forward(&hidden, &token_rows, &prev_ctx, &mut None, false, &mut None)?;
-        (out, ple.last_embed.clone().unwrap(), ple.last_gated.clone().unwrap())
+        (
+            out,
+            ple.last_embed.clone().unwrap(),
+            ple.last_gated.clone().unwrap(),
+        )
     };
     diff("30_ple_embed", &last_embed)?;
     diff("31_ple_gated", &last_gated)?;
@@ -288,13 +341,24 @@ fn diff_rest(tower: &mut Tower, mut hidden: Array, ids: &Array) -> anyhow::Resul
     let (mixed3, inj3) = {
         let normed = layer3.attn_hc.hc_norm.forward(&hidden)?;
         let lo = layer3.attn_hc.mix_down.forward(&normed)?;
-        let wmix = ops::sigmoid(&layer3.attn_hc.mix_up.forward(&lisa_mlx::nn::silu(&(lo / crate::core::norm::bf16_scalar(4.0)))?)?)?;
+        let wmix = ops::sigmoid(&layer3.attn_hc.mix_up.forward(&lisa_mlx::nn::silu(
+            &(lo / crate::core::norm::bf16_scalar(4.0)),
+        )?)?)?;
         let mut lead = wmix.shape().to_vec();
         lead.pop();
         lead.push(4);
         lead.push(2560);
-        let mixed = (wmix.reshape(&lead)?.multiply(&normed.reshape(&lead)?)?).mean_axis(-2, None)?;
-        let inj = ops::sigmoid(&(layer3.attn_hc.block_inject.as_ref().unwrap().forward(&normed)? / crate::core::norm::bf16_scalar(4.0)))? * crate::core::norm::bf16_scalar(2.0);
+        let mixed =
+            (wmix.reshape(&lead)?.multiply(&normed.reshape(&lead)?)?).mean_axis(-2, None)?;
+        let inj = ops::sigmoid(
+            &(layer3
+                .attn_hc
+                .block_inject
+                .as_ref()
+                .unwrap()
+                .forward(&normed)?
+                / crate::core::norm::bf16_scalar(4.0)),
+        )? * crate::core::norm::bf16_scalar(2.0);
         (mixed, inj)
     };
     diff("41_layer3_mixed", &mixed3)?;
@@ -337,7 +401,10 @@ fn diff_rest(tower: &mut Tower, mut hidden: Array, ids: &Array) -> anyhow::Resul
     diff("47_q_rope", &q4)?;
     diff("48_k_rope", &k4)?;
     let out = lisa_mlx::fast::scaled_dot_product_attention(
-        &q4, &k4, &v4, attn.scale,
+        &q4,
+        &k4,
+        &v4,
+        attn.scale,
         lisa_mlx::fast::ScaledDotProductAttentionMask::Causal,
         None,
     )?;
@@ -380,5 +447,6 @@ fn run_linear_body(tower: &Tower, idx: &usize, hidden: Array) -> anyhow::Result<
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let (input2, residual2, mlp_inject) = layer.mlp_hc.mix_with_inject(&stream)?;
     let out = layer.mlp.forward(&input2)?;
-    crate::models::qwen4::hyper::inject(&residual2, &out, &mlp_inject).map_err(|e| anyhow::anyhow!("{e}"))
+    crate::models::qwen4::hyper::inject(&residual2, &out, &mlp_inject)
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }

@@ -3,7 +3,7 @@
 //! variants (full attention, gated deltanet) are Qwen4-shaped for now.
 
 use lisa_mlx::ops::indexing::{IndexMutOp, IndexOp};
-use lisa_mlx::{ops, Array};
+use lisa_mlx::{Array, Dtype, ops};
 
 pub struct IndexerTape {
     /// Raw indexer keys `[B, cap, D]`, appended in place (doubling), so an
@@ -23,7 +23,15 @@ pub struct IndexerTape {
 
 impl IndexerTape {
     pub fn new() -> Self {
-        Self { raw: None, cap: 0, total: 0, pooled: None, pcap: 0, pooled_upto: 0, cr: 0 }
+        Self {
+            raw: None,
+            cap: 0,
+            total: 0,
+            pooled: None,
+            pcap: 0,
+            pooled_upto: 0,
+            cr: 0,
+        }
     }
 
     fn grow_raw(&mut self, needed: usize, b: i32, d: i32) -> lisa_mlx::error::Result<()> {
@@ -31,7 +39,11 @@ impl IndexerTape {
         if self.cap >= needed && same_batch {
             return Ok(());
         }
-        let mut new_cap = if self.cap == 0 { needed + 256 } else { self.cap };
+        let mut new_cap = if self.cap == 0 {
+            needed + 256
+        } else {
+            self.cap
+        };
         while new_cap < needed {
             new_cap *= 2;
         }
@@ -80,7 +92,11 @@ impl IndexerTape {
         let needed = self.pooled_upto + n_new;
         let same_batch = self.pooled.as_ref().map_or(true, |p| p.dim(0) == b);
         if self.pcap < needed || !same_batch {
-            let mut new_cap = if self.pcap == 0 { needed + 256 } else { self.pcap };
+            let mut new_cap = if self.pcap == 0 {
+                needed + 256
+            } else {
+                self.pcap
+            };
             while new_cap < needed {
                 new_cap *= 2;
             }
@@ -124,6 +140,36 @@ impl IndexerTape {
         self.total = offset;
         self.pooled_upto = self.pooled_upto.min(offset / self.cr);
     }
+
+    /// Host-side clone of the tape (prefix-cache entries outlive the session,
+    /// so the buffers are cloned, not borrowed).
+    pub fn snapshot(&self) -> TapeSnapshot {
+        TapeSnapshot {
+            raw: self.raw.clone(),
+            total: self.total,
+            pooled: self.pooled.clone(),
+            pooled_upto: self.pooled_upto,
+            cr: self.cr,
+        }
+    }
+
+    pub fn restore(&mut self, s: &TapeSnapshot) {
+        self.raw = s.raw.clone();
+        self.total = s.total;
+        self.pooled = s.pooled.clone();
+        self.pooled_upto = s.pooled_upto;
+        self.cr = s.cr;
+    }
+}
+
+/// A [`IndexerTape`] clone for a prefix-cache entry.
+#[derive(Clone)]
+pub struct TapeSnapshot {
+    raw: Option<Array>,
+    total: usize,
+    pooled: Option<Array>,
+    pooled_upto: usize,
+    cr: usize,
 }
 
 /// Contiguous KV cache for one full-attention layer: `[B, kvHeads, capacity, D]`
@@ -140,7 +186,7 @@ pub struct FullAttentionCache {
     pub head_dim: usize,
     pub indexer_tape: IndexerTape,
     /// Whether `indexer_tape` is the full token history of this stream. False for
-    /// packed/compacted caches (their tape is not maintained), so the QSA
+    /// packed/compacted caches (the tape is not maintained there), so the QSA
     /// indexer is skipped and attention stays exact causal.
     pub indexer_ok: bool,
     /// Ragged batching: each stream's next absolute position. `None` = a single
@@ -183,7 +229,12 @@ impl FullAttentionCache {
         while new_cap < needed {
             new_cap *= 2;
         }
-        let shape = &[b, self.kv_heads as i32, new_cap as i32, self.head_dim as i32];
+        let shape = &[
+            b,
+            self.kv_heads as i32,
+            new_cap as i32,
+            self.head_dim as i32,
+        ];
         let mut new_keys = ops::zeros::<half::bf16>(shape)?;
         let mut new_values = ops::zeros::<half::bf16>(shape)?;
         if let (Some(old_k), Some(old_v)) = (&self.keys, &self.values) {
@@ -201,7 +252,11 @@ impl FullAttentionCache {
 
     /// Append `keys`/`values` `[B, kvHeads, S, D]`; returns the live views
     /// `[B, kvHeads, offset', D]`.
-    pub fn update(&mut self, keys: &Array, values: &Array) -> lisa_mlx::error::Result<(Array, Array)> {
+    pub fn update(
+        &mut self,
+        keys: &Array,
+        values: &Array,
+    ) -> lisa_mlx::error::Result<(Array, Array)> {
         let s = keys.dim(2) as usize;
         self.grow(self.offset + s, keys.dim(0))?;
         let stream = lisa_mlx::Stream::thread_local_or_default();
@@ -223,7 +278,10 @@ impl FullAttentionCache {
         self.offset += s as usize;
         let live = 0..self.offset as i32;
         Ok((
-            self.keys.as_ref().unwrap().index((.., .., live.clone(), ..)),
+            self.keys
+                .as_ref()
+                .unwrap()
+                .index((.., .., live.clone(), ..)),
             self.values.as_ref().unwrap().index((.., .., live, ..)),
         ))
     }
@@ -293,20 +351,13 @@ impl GdnCache {
         let k = (conv_kernel - 1) as i32;
         self.conv = Some(ci.index((.., n..(n + k), ..)).contiguous()?);
         // Roll the PLE short-conv state back too (its own state length).
-        if std::env::var("LISA_DEBUG_MTP").is_ok() {
-            eprintln!(
-                "[rollback] n={n} ple_full={} ple_conv={:?}",
-                self.capture_ple_full.is_some(),
-                self.ple_conv.as_ref().map(|a| a.shape().to_vec())
-            );
-        }
         if let (Some(full), Some(side)) = (self.capture_ple_full.as_ref(), self.ple_conv.as_ref()) {
             let k = side.dim(1);
             self.ple_conv = Some(full.index((.., n..(n + k), ..)).contiguous()?);
         }
         Ok(())
     }
-/// Clone the recurrent state for a prefix snapshot.
+    /// Clone the recurrent state for a prefix snapshot.
     pub fn snapshot_state(&self) -> (Option<Array>, Option<Array>, Option<Array>) {
         (self.conv.clone(), self.ssm.clone(), self.ple_conv.clone())
     }
@@ -339,5 +390,346 @@ impl LayerCache {
             LayerCache::Full(f) => (&mut f.ple_conv, &mut f.capture_ple_full),
             LayerCache::Linear(g) => (&mut g.ple_conv, &mut g.capture_ple_full),
         }
+    }
+
+    /// Clone the live state at a prefix boundary for a cross-request cache
+    /// entry. Only the live KV rows are copied (the entry outlives the
+    /// session's buffers); the GDN/PLE recurrent states clone the proven
+    /// `snapshot_state` way.
+    pub fn snapshot_prefix(&self) -> LayerState {
+        match self {
+            LayerCache::Full(f) => {
+                let keys = f
+                    .keys
+                    .as_ref()
+                    .map(|k| k.index((.., .., 0..f.offset as i32, ..)).contiguous().ok());
+                let values = f
+                    .values
+                    .as_ref()
+                    .map(|v| v.index((.., .., 0..f.offset as i32, ..)).contiguous().ok());
+                LayerState::Full(FullPrefixState {
+                    keys: keys.unwrap_or(None),
+                    values: values.unwrap_or(None),
+                    offset: f.offset,
+                    tape: f.indexer_tape.snapshot(),
+                    ple_conv: f.ple_conv.clone(),
+                })
+            }
+            LayerCache::Linear(g) => {
+                let (conv, ssm, ple_conv) = g.snapshot_state();
+                LayerState::Linear(LinearPrefixState {
+                    conv,
+                    ssm,
+                    ple_conv,
+                })
+            }
+        }
+    }
+
+    /// Install a prefix-cache entry's state into this (fresh) cache.
+    pub fn restore_prefix(&mut self, s: &LayerState) {
+        match (self, s) {
+            (LayerCache::Full(f), LayerState::Full(st)) => {
+                f.keys = st.keys.clone();
+                f.values = st.values.clone();
+                f.offset = st.offset;
+                f.capacity = st.keys.as_ref().map(|k| k.dim(2) as usize).unwrap_or(0);
+                f.indexer_tape.restore(&st.tape);
+                f.ple_conv = st.ple_conv.clone();
+                // The tape is the full history of the restored prefix, so the
+                // indexer stays exact-causal-correct (contract kept uniform).
+                f.indexer_ok = true;
+            }
+            (LayerCache::Linear(g), LayerState::Linear(st)) => {
+                g.restore_state(&(st.conv.clone(), st.ssm.clone(), st.ple_conv.clone()))
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Cross-request prefix state for one full-attention layer.
+#[derive(Clone)]
+pub struct FullPrefixState {
+    keys: Option<Array>,
+    values: Option<Array>,
+    offset: usize,
+    tape: TapeSnapshot,
+    ple_conv: Option<Array>,
+}
+
+/// Cross-request prefix state for one GDN layer.
+#[derive(Clone)]
+pub struct LinearPrefixState {
+    conv: Option<Array>,
+    ssm: Option<Array>,
+    ple_conv: Option<Array>,
+}
+
+/// Cross-request prefix state for one layer (see [`LayerCache`]).
+#[derive(Clone)]
+pub enum LayerState {
+    Full(FullPrefixState),
+    Linear(LinearPrefixState),
+}
+
+// --- SSD-spill codec (core/prefix_cache.rs) ---------------------------------
+// A `LayerState` serializes to host bytes: one u8 presence tag per array,
+// then dtype tag + shape + raw LE payload. `decode` rebuilds the arrays as
+// host-backed (`Array::from_raw_data`); MLX copies them to the GPU on first
+// use, exactly like the safetensors-restore path in the reference spill
+// design. Keyed by a content hash of the entry's tokens in prefix_cache.rs.
+
+fn dtype_tag(d: Dtype) -> u8 {
+    match d {
+        Dtype::Bool => 1,
+        Dtype::Uint8 => 2,
+        Dtype::Uint16 => 3,
+        Dtype::Uint32 => 4,
+        Dtype::Int8 => 5,
+        Dtype::Int16 => 6,
+        Dtype::Int32 => 7,
+        Dtype::Int64 => 8,
+        Dtype::Float16 => 9,
+        Dtype::Float32 => 10,
+        Dtype::Float64 => 11,
+        Dtype::Bfloat16 => 12,
+        _ => 0,
+    }
+}
+
+fn dtype_from_tag(t: u8) -> Option<Dtype> {
+    Some(match t {
+        1 => Dtype::Bool,
+        2 => Dtype::Uint8,
+        3 => Dtype::Uint16,
+        4 => Dtype::Uint32,
+        5 => Dtype::Int8,
+        6 => Dtype::Int16,
+        7 => Dtype::Int32,
+        8 => Dtype::Int64,
+        9 => Dtype::Float16,
+        10 => Dtype::Float32,
+        11 => Dtype::Float64,
+        12 => Dtype::Bfloat16,
+        _ => return None,
+    })
+}
+
+macro_rules! enc_payload {
+    ($a:expr, $out:expr) => {{
+        $a.eval()?;
+        macro_rules! one {
+            ($t:ty) => {{
+                let s = $a.as_slice::<$t>();
+                let n = s.len() * std::mem::size_of::<$t>();
+                $out.extend((n as u64).to_le_bytes());
+                let ptr = s.as_ptr() as *const u8;
+                $out.extend_from_slice(unsafe { std::slice::from_raw_parts(ptr, n) });
+            }};
+        }
+        match $a.dtype() {
+            Dtype::Bfloat16 => one!(half::bf16),
+            Dtype::Float16 => one!(half::f16),
+            Dtype::Float32 => one!(f32),
+            Dtype::Float64 => one!(f64),
+            Dtype::Bool | Dtype::Uint8 => one!(u8),
+            Dtype::Uint16 => one!(u16),
+            Dtype::Uint32 => one!(u32),
+            Dtype::Int8 => one!(i8),
+            Dtype::Int16 => one!(i16),
+            Dtype::Int32 => one!(i32),
+            Dtype::Int64 => one!(i64),
+            other => anyhow::bail!("prefix spill: unsupported dtype {other:?}"),
+        }
+    }};
+}
+
+fn enc_arr(out: &mut Vec<u8>, a: &Option<Array>) -> anyhow::Result<()> {
+    let Some(a) = a else {
+        out.push(0);
+        return Ok(());
+    };
+    out.push(1);
+    out.push(dtype_tag(a.dtype()));
+    let shape = a.shape();
+    out.extend((shape.len() as u32).to_le_bytes());
+    for &d in shape {
+        out.extend(d.to_le_bytes());
+    }
+    enc_payload!(a, out);
+    Ok(())
+}
+
+fn take_bytes<'a>(cur: &mut &'a [u8], n: usize) -> anyhow::Result<&'a [u8]> {
+    if cur.len() < n {
+        anyhow::bail!("prefix spill: truncated record");
+    }
+    let (h, t) = cur.split_at(n);
+    *cur = t;
+    Ok(h)
+}
+
+fn rd_u8(cur: &mut &[u8]) -> anyhow::Result<u8> {
+    Ok(take_bytes(cur, 1)?[0])
+}
+
+fn rd_u32(cur: &mut &[u8]) -> anyhow::Result<u32> {
+    Ok(u32::from_le_bytes(take_bytes(cur, 4)?.try_into().unwrap()))
+}
+
+fn rd_u64(cur: &mut &[u8]) -> anyhow::Result<u64> {
+    Ok(u64::from_le_bytes(take_bytes(cur, 8)?.try_into().unwrap()))
+}
+
+fn dec_arr(cur: &mut &[u8]) -> anyhow::Result<Option<Array>> {
+    if rd_u8(cur)? == 0 {
+        return Ok(None);
+    }
+    let dtype = dtype_from_tag(rd_u8(cur)?)
+        .ok_or_else(|| anyhow::anyhow!("prefix spill: bad dtype tag"))?;
+    let ndim = rd_u32(cur)? as usize;
+    let mut shape = Vec::with_capacity(ndim);
+    for _ in 0..ndim {
+        shape.push(rd_u32(cur)?);
+    }
+    let n: usize = shape.iter().map(|&d| d as usize).product();
+    let nbytes = rd_u64(cur)? as usize;
+    let bytes = take_bytes(cur, nbytes)?.to_vec();
+    if n * dtype.size_of() != nbytes {
+        anyhow::bail!("prefix spill: payload size mismatch");
+    }
+    let shape_i: Vec<i32> = shape.iter().map(|&d| d as i32).collect();
+    let a = unsafe { Array::from_raw_data(bytes.as_ptr() as *const std::ffi::c_void, &shape_i, dtype) };
+    Ok(Some(a))
+}
+
+impl LayerState {
+    /// Host-byte encoding for the SSD spill tier. Eval + readback of every
+    /// array: the spill runs on eviction only, off the serve hot path.
+    pub fn encode(&self) -> anyhow::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        match self {
+            LayerState::Full(s) => {
+                out.push(0);
+                out.extend((s.offset as u64).to_le_bytes());
+                enc_arr(&mut out, &s.keys)?;
+                enc_arr(&mut out, &s.values)?;
+                enc_arr(&mut out, &s.tape.raw)?;
+                out.extend((s.tape.total as u64).to_le_bytes());
+                enc_arr(&mut out, &s.tape.pooled)?;
+                out.extend((s.tape.pooled_upto as u64).to_le_bytes());
+                out.extend((s.tape.cr as u64).to_le_bytes());
+                enc_arr(&mut out, &s.ple_conv)?;
+            }
+            LayerState::Linear(s) => {
+                out.push(1);
+                enc_arr(&mut out, &s.conv)?;
+                enc_arr(&mut out, &s.ssm)?;
+                enc_arr(&mut out, &s.ple_conv)?;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Rebuild a `LayerState` from [`LayerState::encode`] bytes, advancing
+    /// `cur` past the consumed record (layers are variable-length, so the
+    /// spill reader decodes in sequence off one flat buffer).
+    pub fn decode(cur: &mut &[u8]) -> anyhow::Result<LayerState> {
+        let kind = if cur.is_empty() {
+            anyhow::bail!("prefix spill: empty layer record")
+        } else {
+            let k = cur[0];
+            *cur = &cur[1..];
+            k
+        };
+        Ok(match kind {
+            0 => {
+                let offset = rd_u64(cur)? as usize;
+                let keys = dec_arr(cur)?;
+                let values = dec_arr(cur)?;
+                let tape_raw = dec_arr(cur)?;
+                let total = rd_u64(cur)? as usize;
+                let pooled = dec_arr(cur)?;
+                let pooled_upto = rd_u64(cur)? as usize;
+                let cr = rd_u64(cur)? as usize;
+                let ple_conv = dec_arr(cur)?;
+                LayerState::Full(FullPrefixState {
+                    keys,
+                    values,
+                    offset,
+                    tape: TapeSnapshot {
+                        raw: tape_raw,
+                        total,
+                        pooled,
+                        pooled_upto,
+                        cr,
+                    },
+                    ple_conv,
+                })
+            }
+            1 => {
+                let conv = dec_arr(cur)?;
+                let ssm = dec_arr(cur)?;
+                let ple_conv = dec_arr(cur)?;
+                LayerState::Linear(LinearPrefixState { conv, ssm, ple_conv })
+            }
+            k => anyhow::bail!("prefix spill: bad layer kind {k}"),
+        })
+    }
+}
+
+#[cfg(test)]
+mod spill_codec_tests {
+    use super::*;
+
+    /// The spill codec round-trips a Full layer state: shapes, dtypes and
+    /// offset/tape scalars survive; the restored arrays are host-backed and
+    /// carry the same values.
+    #[test]
+    fn layer_state_codec_round_trips() -> anyhow::Result<()> {
+        let keys: Option<Array> = Some(Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[1, 2, 1, 2]));
+        let values = Some(Array::from_slice(
+            &[
+                half::bf16::from_f32(0.5),
+                half::bf16::from_f32(0.25),
+                half::bf16::from_f32(1.0),
+                half::bf16::from_f32(2.0),
+            ],
+            &[1, 1, 2, 2],
+        ));
+        let tape_raw = Some(Array::from_slice(&[7u32, 8, 9], &[3]));
+        let st = LayerState::Full(FullPrefixState {
+            keys,
+            values,
+            offset: 2,
+            tape: TapeSnapshot {
+                raw: tape_raw,
+                total: 3,
+                pooled: None,
+                pooled_upto: 1,
+                cr: 4,
+            },
+            ple_conv: None,
+        });
+        let bytes = st.encode()?;
+        let mut cur: &[u8] = &bytes;
+        let back = LayerState::decode(&mut cur)?;
+        assert!(cur.is_empty(), "one record consumes the whole buffer");
+        let LayerState::Full(b) = back else {
+            anyhow::bail!("kind mismatch");
+        };
+        assert_eq!(b.offset, 2);
+        assert_eq!(b.tape.total, 3);
+        assert_eq!(b.tape.pooled_upto, 1);
+        assert_eq!(b.tape.cr, 4);
+        let k = b.keys.as_ref().expect("keys");
+        assert_eq!(k.shape(), &[1, 2, 1, 2]);
+        assert_eq!(k.as_slice::<f32>(), &[1.0, 2.0, 3.0, 4.0]);
+        let t = b.tape.raw.as_ref().expect("tape");
+        assert_eq!(t.as_slice::<u32>(), &[7, 8, 9]);
+        let v = b.values.as_ref().expect("values");
+        assert_eq!(v.dtype(), Dtype::Bfloat16);
+        Ok(())
     }
 }

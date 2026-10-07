@@ -67,7 +67,10 @@ impl LayaConfig {
         let hidden_size = int_of(&enc, "hidden_size").context("hidden_size")?;
         let num_heads = int_of(&enc, "num_attention_heads").context("num_attention_heads")?;
         let num_layers = int_of(&enc, "num_hidden_layers").context("num_hidden_layers")?;
-        anyhow::ensure!(num_heads > 0 && hidden_size % num_heads == 0, "hidden_size % heads");
+        anyhow::ensure!(
+            num_heads > 0 && hidden_size % num_heads == 0,
+            "hidden_size % heads"
+        );
         let head_dim = hidden_size / num_heads;
         anyhow::ensure!(head_dim % 2 == 0, "head_dim must be even for RoPE");
 
@@ -94,10 +97,16 @@ impl LayaConfig {
             f32_of(&enc, "local_rope_theta").unwrap_or(10_000.0),
         );
         if let Some(rp) = enc.get("rope_parameters") {
-            if let Some(v) = rp.pointer("/full_attention/rope_theta").and_then(|v| v.as_f64()) {
+            if let Some(v) = rp
+                .pointer("/full_attention/rope_theta")
+                .and_then(|v| v.as_f64())
+            {
                 theta_global = v as f32;
             }
-            if let Some(v) = rp.pointer("/sliding_attention/rope_theta").and_then(|v| v.as_f64()) {
+            if let Some(v) = rp
+                .pointer("/sliding_attention/rope_theta")
+                .and_then(|v| v.as_f64())
+            {
                 theta_local = v as f32;
             }
         }
@@ -139,7 +148,10 @@ impl LayaConfig {
             clamp_temperature(["choice", "score", "noul"][i], t);
         }
         let mut temperature_by_options = BTreeMap::new();
-        if let Some(m) = agent.get("temperature_by_options").and_then(|v| v.as_object()) {
+        if let Some(m) = agent
+            .get("temperature_by_options")
+            .and_then(|v| v.as_object())
+        {
             for (k, v) in m {
                 let mut t = v.as_f64().unwrap_or(1.0) as f32;
                 clamp_temperature(k, &mut t);
@@ -204,7 +216,7 @@ impl LayaConfig {
     }
 }
 
-/// `clampTemperature` of the reference: a fitted temperature below 0.5 sharpens
+/// A fitted temperature below 0.5 sharpens
 /// the logits enough to report a coin flip as a certainty.
 pub(crate) fn clamp_temperature(name: &str, t: &mut f32) {
     const TEMP_MIN: f32 = 0.5;
@@ -232,7 +244,9 @@ pub(crate) fn clamp_temperature_warn(name: &str, orig: f32) -> f32 {
                 "warning: temperature {name}={orig} clamped to {applied} (below floor 0.5; cannot sharpen further)"
             );
         } else {
-            eprintln!("warning: temperature {name}={orig} clamped to {applied} (above ceiling 5.0)");
+            eprintln!(
+                "warning: temperature {name}={orig} clamped to {applied} (above ceiling 5.0)"
+            );
         }
     }
     applied
@@ -256,14 +270,21 @@ impl LayaConfig {
         if let Some(h) = head_max_len {
             self.head_max_len = h;
         }
-        let (h, m, mp) = (self.head_max_len, self.max_len, self.max_position_embeddings);
+        let (h, m, mp) = (
+            self.head_max_len,
+            self.max_len,
+            self.max_position_embeddings,
+        );
         anyhow::ensure!(
             4 < h && h < m && m <= mp,
             "want 4 < head_max_len ({h}) < max_len ({m}) <= max_position_embeddings ({mp})"
         );
 
         if let Some(t) = temperature {
-            anyhow::ensure!(t.len() == 3, "--temperature needs exactly 3 values (choice,score,noul)");
+            anyhow::ensure!(
+                t.len() == 3,
+                "--temperature needs exactly 3 values (choice,score,noul)"
+            );
             // `--temperature` wins over the shipped buckets for the three types;
             // `--temperature-by-options` is applied after and wins over this.
             self.temperature_by_options.clear();
@@ -273,15 +294,16 @@ impl LayaConfig {
         }
         for (key, v) in by_options {
             super::prompt::validate_bucket(key)?;
-            self.temperature_by_options.insert(key.clone(), clamp_temperature_warn(key, *v));
+            self.temperature_by_options
+                .insert(key.clone(), clamp_temperature_warn(key, *v));
         }
         Ok(())
     }
 }
 
 fn read_json(path: &Path) -> anyhow::Result<serde_json::Value> {
-    let data = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let data =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     Ok(serde_json::from_str(&data)?)
 }
 
@@ -308,7 +330,7 @@ fn mask_text(v: &serde_json::Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::prompt::{effective_scale, QType};
+    use super::super::prompt::{QType, effective_scale};
     use super::*;
 
     const ENCODER: &str = include_str!("../../../tests/fixtures/laya_encoder_config.json");
@@ -351,7 +373,8 @@ mod tests {
         let mut cfg = real_config("temp");
         // Shipped `choice:3-5` is ~1.76; the per-type `--temperature` must win.
         assert!((effective_scale(&cfg, QType::Choice, 5).1 - 1.76015).abs() < 1e-3);
-        cfg.apply_overrides(None, None, Some(vec![0.7, 1.0, 1.0]), &[]).unwrap();
+        cfg.apply_overrides(None, None, Some(vec![0.7, 1.0, 1.0]), &[])
+            .unwrap();
         assert!((effective_scale(&cfg, QType::Choice, 5).1 - 0.7).abs() < 1e-6);
         assert!(cfg.temperature_by_options.is_empty());
     }

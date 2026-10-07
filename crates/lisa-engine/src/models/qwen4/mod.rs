@@ -4,7 +4,6 @@
 
 pub mod attention;
 pub mod config;
-pub mod gdn;
 pub mod hyper;
 pub mod indexer;
 pub mod layerdiff;
@@ -12,7 +11,6 @@ pub mod moe;
 pub mod mtp;
 pub mod ple;
 pub mod smoke;
-pub mod speculate;
 pub mod tower;
 
 pub use config::ModelConfig;

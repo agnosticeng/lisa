@@ -2,15 +2,14 @@
 //! boolean keep mask combined with causal attention.
 
 use lisa_mlx::ops::indexing::{Ellipsis, IndexOp};
-use lisa_mlx::{ops, Array, Dtype};
+use lisa_mlx::{Array, Dtype, ops};
 
-use crate::core::loader::TensorSource;
 use crate::core::cache::IndexerTape;
-use crate::core::norm::{rope_partial, RmsNorm, Rotary};
+use crate::core::loader::TensorSource;
+use crate::core::norm::{RmsNorm, Rotary, rope_partial};
 use crate::core::quant::QuantizedLinear;
 
 /// The indexer key tape: EXACT storage (no reserve), one row per token.
-
 
 /// QSA indexer for one full-attention layer.
 pub struct QsaIndexer {
@@ -132,26 +131,18 @@ impl QsaIndexer {
         {
             let stream = lisa_mlx::Stream::thread_local_or_default();
             let total = (offset + s as usize) as i32;
-            let qsa_prof = lisa_mlx::env_flag("LISA_QSA_PROF");
-            let t0 = std::time::Instant::now();
-            let sel = lisa_mlx::qsa::select_blocks(&q, &pooled, offset as i32, total, blocks, &stream);
-            if qsa_prof {
-                if let Some((ref ids, _)) = sel {
-                    let _ = ids.eval();
-                }
-                eprintln!(
-                    "[qsa-prof] offset={offset} s={s} blocks={blocks} select {:.2} ms",
-                    t0.elapsed().as_secs_f64() * 1e3
-                );
-            }
-            if let Some((ids, valid)) = sel
-            {
+            let sel =
+                lisa_mlx::qsa::select_blocks(&q, &pooled, offset as i32, total, blocks, &stream);
+            if let Some((ids, valid)) = sel {
                 let ids = ids.reshape(&[b, s, 512])?;
                 let valid = valid.reshape(&[b, s, 512])?;
                 // Host-side: Metal binary kernels have no i32 variant,
                 // and these are [1, s] index arrays anyway.
                 let q_pos_v: Vec<i32> = (offset as i32..(offset + s as usize) as i32).collect();
-                let complete_v: Vec<f32> = q_pos_v.iter().map(|&p| ((p + 1).max(0) / cr) as f32).collect();
+                let complete_v: Vec<f32> = q_pos_v
+                    .iter()
+                    .map(|&p| ((p + 1).max(0) / cr) as f32)
+                    .collect();
                 let q_pos = Array::from_slice(&q_pos_v, &[1i32, s]);
                 let complete = Array::from_slice(&complete_v, &[1i32, s]);
                 return Ok(Some(QsaSelection {
@@ -188,7 +179,8 @@ impl QsaIndexer {
         let block_ids_f = block_ids.as_dtype(Dtype::Float32)?;
         let visible = lisa_mlx::ops::broadcast_to(&block_ids_f, &[b, s, blocks as i32])?
             .lt(&complete.expand_dims(-1)?)?;
-        let neg_inf = lisa_mlx::ops::broadcast_to(&Array::from_f32(f32::NEG_INFINITY), scores.shape())?;
+        let neg_inf =
+            lisa_mlx::ops::broadcast_to(&Array::from_f32(f32::NEG_INFINITY), scores.shape())?;
         let scores = lisa_mlx::ops::r#where(&visible, &scores, &neg_inf)?;
 
         // Model contract tie-break: `score - block_id * 1e-12`. It makes the

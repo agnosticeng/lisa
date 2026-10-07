@@ -5,9 +5,9 @@
 //! checkpoints load without a config hint; `bits` is still taken from the
 //! checkpoint config (2/4/8) and passed to `set_quant`.
 
-use lisa_mlx::{ops, Array, Dtype};
+use lisa_mlx::{Array, Dtype, ops};
 
-use crate::core::loader::{array_from_bytes, Shard, TensorSource};
+use crate::core::loader::{Shard, TensorSource, array_from_bytes};
 
 pub const GROUP_SIZE: i32 = 32;
 pub const BITS: i32 = 4;
@@ -50,8 +50,8 @@ impl QuantizedLinear {
     /// Forward: [..., K] -> [..., N]
     ///
     /// The input is flattened to 2-D for the quantized matmul: mlx-c's
-    /// quantized_matmul mis-handles batched (3-D+) inputs at M > 1 (values
-    /// diverge from the reference entirely), while 2-D is exact.
+    /// quantized_matmul mis-handles batched (3-D+) inputs at M > 1 (the values
+    /// are wrong entirely), while 2-D is exact.
     pub fn forward(&self, x: &Array) -> lisa_mlx::error::Result<Array> {
         let shape = x.shape();
         let rows: i32 = shape[..shape.len() - 1].iter().product::<i32>().max(1);
@@ -75,9 +75,8 @@ impl QuantizedLinear {
     /// fallback when the shapes are inconsistent.
     pub fn set_quant(&mut self, group_size: i32, bits: i32) {
         self.bits = bits;
-        self.group_size =
-            detect_group_size(self.weight.shape()[1], self.scales.shape()[1], bits)
-                .unwrap_or(group_size);
+        self.group_size = detect_group_size(self.weight.shape()[1], self.scales.shape()[1], bits)
+            .unwrap_or(group_size);
     }
 
     /// Load `{prefix}.{key}.weight/.scales/.biases`. `key` may be empty for
@@ -108,7 +107,6 @@ impl QuantizedLinear {
     pub fn dims_out(&self) -> usize {
         self.weight.shape()[0] as usize
     }
-
 }
 
 /// An affine-quantized embedding table. Lookups dequantize only the
@@ -148,9 +146,8 @@ impl QuantizedEmbedding {
     /// the packed shapes for the given `bits`; `group_size` is the fallback.
     pub fn set_quant(&mut self, group_size: i32, bits: i32) {
         self.bits = bits;
-        self.group_size =
-            detect_group_size(self.weight.shape()[1], self.scales.shape()[1], bits)
-                .unwrap_or(group_size);
+        self.group_size = detect_group_size(self.weight.shape()[1], self.scales.shape()[1], bits)
+            .unwrap_or(group_size);
     }
 
     pub fn load<S: TensorSource>(src: &mut S, prefix: &str) -> anyhow::Result<Self> {

@@ -17,33 +17,154 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use lisa_engine::core::generate::is_eos;
-use lisa_engine::models::LanguageModel;
 use lisa_engine::DecisionModel;
+use lisa_engine::core::generate::is_eos;
+use lisa_engine::core::prefix_cache::PrefixCache;
 use lisa_engine::core::sampler::Sampler;
-use lisa_engine::core::session::Session;
+use lisa_engine::core::session::{MtpDepth, Session};
 use lisa_engine::core::tokenizer::{self, Tokenizer};
+use lisa_engine::models::LanguageModel;
 
 pub struct ServerConfig {
     pub addr: String,
     pub max_tokens: usize,
-    pub temperature: f32,
-    pub top_p: f32,
-    pub top_k: usize,
-    pub min_p: f32,
-    pub rep_penalty: f32,
+    /// Request/flag-level sampling overrides; `None` falls through to the
+    /// checkpoint's `generation_config.json` recommendations, then hardcoded
+    /// greedy defaults (see `sampler_from`).
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub top_k: Option<usize>,
+    pub min_p: Option<f32>,
+    pub rep_penalty: Option<f32>,
+    /// The checkpoint's own sampling/thinking recommendations
+    /// (`generation_config.json`): `temperature`, `top_p`, `top_k`,
+    /// `repetition_penalty`, and `default_chat_template_kwargs
+    /// .enable_thinking` (the model author's thinking default).
+    pub gen_defaults: GenDefaults,
     pub depth: usize,
+    /// Prompt-lookup (PLD) speculative draft depth (0 = off; greedy only).
+    pub pld: usize,
+    /// Cross-request prompt prefix cache: max entries (LRU; 0 = off).
+    pub prefix_cache: usize,
     /// Maximum streams stepped together (admission queue width).
     pub max_batch: usize,
     /// The checkpoint's `chat_template.jinja`, when available.
     pub chat_template: Option<String>,
+    /// The loaded model's id as advertised on `/v1/models` and echoed in
+    /// response payloads. Derived from the resolved checkpoint (never a
+    /// hardcoded placeholder).
+    pub model_id: String,
+}
+
+/// The id of the model loaded from `dir`: the Hugging Face repo id when the
+/// checkpoint lives in a hub cache (`models--ORG--NAME/snapshots/...`), the
+/// directory's own name otherwise.
+pub fn model_id_of(dir: &std::path::Path) -> String {
+    for anc in dir.ancestors() {
+        if let Some(name) = anc.file_name().and_then(|n| n.to_str()) {
+            if let Some(rest) = name.strip_prefix("models--") {
+                return rest.replace("--", "/");
+            }
+        }
+    }
+    dir.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+/// The advertised model id for response payloads. Set once at server start
+/// from [`ServerConfig::model_id`] (payload helpers run deep in call sites
+/// with no config in scope); falls back to the checkpoint-derived default.
+fn model_id() -> &'static str {
+    MODEL_ID.get().map(|s| s.as_str()).unwrap_or("unknown")
+}
+
+static MODEL_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The checkpoint's own defaults, from `generation_config.json`. `None` fields
+/// fall through to the hardcoded greedy defaults. `thinking` is
+/// `default_chat_template_kwargs.enable_thinking` — the model author's
+/// declared thinking default for silent requests.
+#[derive(Default, Debug, Clone)]
+pub struct GenDefaults {
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub top_k: Option<usize>,
+    pub rep_penalty: Option<f32>,
+    pub thinking: Option<bool>,
+}
+
+impl GenDefaults {
+    /// Parse a checkpoint's `generation_config.json`. Missing file or fields
+    /// are fine — every default stays `None`/greedy.
+    pub fn from_model_dir(dir: &std::path::Path) -> Self {
+        let Ok(text) = std::fs::read_to_string(dir.join("generation_config.json")) else {
+            return Self::default();
+        };
+        let Ok(v) = serde_json::from_str::<Value>(&text) else {
+            eprintln!("[serve] generation_config.json: unparseable, ignoring");
+            return Self::default();
+        };
+        let f = |k: &str| {
+            v.get(k)
+                .and_then(|x| x.as_f64())
+                .map(|x| x as f32)
+        };
+        let mut out = Self {
+            temperature: f("temperature"),
+            top_p: f("top_p"),
+            top_k: v
+                .get("top_k")
+                .and_then(|x| x.as_i64())
+                .and_then(|x| usize::try_from(x).ok()),
+            rep_penalty: f("repetition_penalty"),
+            thinking: None,
+        };
+        if let Some(et) = v
+            .get("default_chat_template_kwargs")
+            .and_then(|c| c.get("enable_thinking"))
+            .and_then(|x| x.as_bool())
+        {
+            out.thinking = Some(et);
+        }
+        out
+    }
+}
+
+/// Sentinel prefixed onto a refusal carried through `anyhow` so the HTTP layer
+/// can tell "out of budget" (503) from a genuine engine failure (500).
+const REFUSED_MARKER: &str = "\u{1}refused\u{1}";
+
+/// HTTP status for a drained-reply error: 503 when the engine refused for
+/// memory (O3), 500 otherwise.
+fn http_status_for(e: &anyhow::Error) -> &'static str {
+    if e.to_string().starts_with(REFUSED_MARKER) {
+        "503 Service Unavailable"
+    } else {
+        "500 Internal Server Error"
+    }
+}
+
+/// User-facing message for a drained-reply error: strips the refusal sentinel
+/// (and the `retry-after=` prefix) so it never leaks into the JSON body.
+fn error_message_for(e: &anyhow::Error) -> String {
+    match e.to_string().strip_prefix(REFUSED_MARKER) {
+        Some(rest) => rest
+            .split_once("; ")
+            .map(|(_, m)| m.to_string())
+            .unwrap_or_else(|| rest.to_string()),
+        None => e.to_string(),
+    }
 }
 
 enum Reply {
     /// Sent once at the start of a streamed reply, carrying the prompt size.
-    Start { prompt_tokens: usize },
+    Start {
+        prompt_tokens: usize,
+    },
     /// A streamed text delta, optionally carrying a per-token logprob entry.
     Delta {
         text: String,
@@ -55,11 +176,21 @@ enum Reply {
         tool_calls: Vec<Value>,
         prompt_tokens: usize,
         completion_tokens: usize,
+        /// Prompt tokens served from the cross-request prefix cache (O2/P2).
+        /// Reported as OpenAI's `prompt_tokens_details.cached_tokens` — the only
+        /// way a client (and llmprobe) can SEE that the cache engaged.
+        cached_tokens: usize,
         finish: String,
         logprobs: Option<Value>,
         stop_sequence: Option<String>,
     },
     Error(String),
+    /// O3: the request was refused BEFORE any forward because it would exceed
+    /// the memory budget. Maps to HTTP 503, not 500.
+    Refused {
+        retry_after_s: u64,
+        reason: String,
+    },
 }
 
 /// Which HTTP surface a job came in on. The engine path is shared; only the
@@ -71,6 +202,7 @@ enum Surface {
     Messages,
     Responses,
     CountTokens,
+    Embeddings,
 }
 
 struct Job {
@@ -101,18 +233,23 @@ pub struct Server {
     cfg: std::sync::Arc<ServerConfig>,
     jobs: Receiver<Job>,
     sessions: HashMap<String, (Session, Vec<ChatMessage>)>,
+    prefix: PrefixCache,
     chat_tmpl: Option<ChatTemplate>,
     stop: std::sync::Arc<AtomicBool>,
     /// Held so the bound port stays open until [`Server::shutdown`] drops it.
     listener: Option<std::sync::Arc<TcpListener>>,
     accept: Option<std::thread::JoinHandle<()>>,
     addr: std::net::SocketAddr,
+    /// O3: byte-level admission budget. `None` = the kill-switch is off (no
+    /// `LISA_RAM_CAP_GB`), in which case no request is ever refused.
+    admission: Option<lisa_engine::core::admission::MemoryBudget>,
 }
 
 impl Server {
     pub fn start(cfg: ServerConfig, stop: std::sync::Arc<AtomicBool>) -> anyhow::Result<Server> {
-        let listener = TcpListener::bind(&cfg.addr)
-            .map_err(|e| anyhow::anyhow!("bind {}: {e}", cfg.addr))?;
+        let _ = MODEL_ID.set(cfg.model_id.clone());
+        let listener =
+            TcpListener::bind(&cfg.addr).map_err(|e| anyhow::anyhow!("bind {}: {e}", cfg.addr))?;
         listener.set_nonblocking(true)?;
         let addr = listener.local_addr()?;
         let chat_tmpl = cfg
@@ -122,6 +259,7 @@ impl Server {
             .transpose()?;
 
         let (tx, rx) = mpsc::channel::<Job>();
+        let prefix = PrefixCache::new(cfg.prefix_cache);
         let cfg = std::sync::Arc::new(cfg);
         // Share the listener with the accept thread but keep it owned here too,
         // so joining that thread on shutdown actually closes the socket before
@@ -151,15 +289,21 @@ impl Server {
                 }
             })
         };
+        // O3: admission is kill-switched — armed only when the operator sets
+        // `LISA_RAM_CAP_GB`, so the default path can never refuse a request.
+        let admission = std::env::var_os("LISA_RAM_CAP_GB")
+            .map(|_| lisa_engine::core::admission::MemoryBudget::from_host());
         Ok(Server {
             cfg,
             jobs: rx,
             sessions: HashMap::new(),
+            prefix,
             chat_tmpl,
             stop,
             listener: Some(listener),
             accept: Some(accept),
             addr,
+            admission,
         })
     }
 
@@ -181,6 +325,43 @@ impl Server {
             }
         }
 
+        // O3: byte-level admission at wave intake, kill-switched on
+        // `LISA_RAM_CAP_GB`. A request that cannot fit the budget is refused
+        // BEFORE any forward (503 upstream) instead of driving the box into
+        // swap. Admitted bytes cover this wave's transient KV and are released
+        // at the end of the step; long-lived session state stays bounded by the
+        // existing pad-waste / max-batch limits.
+        let mut admitted = 0usize;
+        if let Some(b) = self.admission.as_mut() {
+            let kv = tower.kv_bytes_per_token();
+            if kv > 0 {
+                let state = tower.stream_state_bytes();
+                let mut kept = Vec::with_capacity(wave.len());
+                for job in wave {
+                    let want = lisa_engine::core::admission::stream_bytes(
+                        request_max_tokens(&job, &self.cfg),
+                        kv,
+                        state,
+                        2,
+                    );
+                    if b.try_admit(want) {
+                        admitted += want;
+                        kept.push(job);
+                    } else {
+                        let _ = job.reply.send(Reply::Refused {
+                            retry_after_s: 1,
+                            reason: format!(
+                                "out of memory budget: round needs {} MiB, headroom {} MiB",
+                                want >> 20,
+                                b.headroom() >> 20
+                            ),
+                        });
+                    }
+                }
+                wave = kept;
+            }
+        }
+
         // Stateful (session) requests are serial; stateless ones batch.
         let mut sess_jobs = Vec::new();
         let mut batch_jobs = Vec::new();
@@ -194,36 +375,107 @@ impl Server {
         let cfg = self.cfg.clone();
         let chat_tmpl = self.chat_tmpl.as_ref();
         for job in sess_jobs {
-            if let Err(e) = run_session(tower, tok, &mut self.sessions, &job, &cfg, chat_tmpl) {
+            eprintln!("[batched] job serial: session stateful (prefix reuse)");
+            if let Err(e) = run_session(
+                tower,
+                tok,
+                &mut self.sessions,
+                &mut self.prefix,
+                &job,
+                &cfg,
+                chat_tmpl,
+            ) {
                 let _ = job.reply.send(Reply::Error(e.to_string()));
             }
         }
         if !batch_jobs.is_empty() {
-            let (spec, plain): (Vec<Job>, Vec<Job>) = batch_jobs
-                .into_iter()
-                .partition(|j| depth_for(j, &cfg) > 0 || has_tools(j) || j.surface != Surface::Chat);
-            for job in spec {
-                let r = if job.surface == Surface::CountTokens {
-                    count_tokens_job(tok, &job, chat_tmpl)
+            // Wave-level batching policy. Speculative requests are serialized one
+            // stream at a time (`maximumSpeculativeBatch == 1`), so N concurrent
+            // streams pay N sequential prefill+decode passes. Batching them
+            // trades per-stream speculation for shared work: measured at equal
+            // steps (4 streams x 64 engine steps, 3 interleaved pairs,
+            // `tools/4stream.py`) batched 3.44 s vs serialized MTP 4.71 s =
+            // **1.37x**, and ~3x on the worst TTFT (2183 vs 6569 ms).
+            //
+            // The decision is PER WAVE, not per job: a lone request keeps its
+            // speculation (which is where MTP wins). Requests that need the
+            // serial paths (tools, stops, logprobs) stay serial either way.
+            //
+            // Crossover measured on BOTH sides (4 streams x 64 engine steps,
+            // medians of 3 interleaved pairs, `tools/4stream.py`): B=1 MTP
+            // 1.11 s; B=2 MTP 2.22 s vs batched 2.81 s (MTP wins); B=4 MTP
+            // 4.71 s vs batched 3.91 s (batched wins). B=3 was measured batched
+            // only (3.07 s), so the threshold is 4 BY MEASUREMENT, not by
+            // interpolation. The batched path emits different tokens than the
+            // speculative one (near-tie class, AGENTS.md §9.6).
+            const BATCH_WAVE_MIN: usize = 4;
+            let (spec, plain): (Vec<Job>, Vec<Job>) =
+                if batch_jobs.len() >= BATCH_WAVE_MIN {
+                    eprintln!(
+                        "[batched] wave of {} jobs -> continuous batch \
+                         (per-stream speculation dropped, maximumSpeculativeBatch == 1)",
+                        batch_jobs.len()
+                    );
+                    batch_jobs.into_iter().partition(|j| !is_wave_eligible(j))
                 } else {
-                    complete(tower, tok, &job, &cfg, chat_tmpl)
+                    batch_jobs.into_iter().partition(|j| !is_plain_job(j, &cfg))
+                };
+            for job in &spec {
+                let why = if depth_for(job, &cfg) > 0 {
+                    format!("mtp depth={}", depth_for(job, &cfg))
+                } else if has_tools(job) {
+                    "tool calls".to_string()
+                } else if !request_stops(job).is_empty() {
+                    "stop sequences".to_string()
+                } else if wants_logprobs(&job.body) {
+                    "logprobs".to_string()
+                } else {
+                    "non-chat surface".to_string()
+                };
+                eprintln!("[batched] job serial: {why}");
+                let job = job;
+                let r = if job.surface == Surface::CountTokens {
+                    count_tokens_job(tok, &job, chat_tmpl, &cfg)
+                } else if job.surface == Surface::Embeddings {
+                    run_embeddings(tower, tok, &job)
+                } else {
+                    complete(tower, tok, &job, &cfg, &mut self.prefix, chat_tmpl)
                 };
                 if let Err(e) = r {
                     let _ = job.reply.send(Reply::Error(e.to_string()));
                 }
             }
             if !plain.is_empty() {
-                if plain.len() == 1 {
-                    if let Err(e) = complete(tower, tok, &plain[0], &cfg, chat_tmpl) {
-                        let _ = plain[0].reply.send(Reply::Error(e.to_string()));
-                    }
-                } else if let Err(e) = run_wave(tower, tok, plain, &cfg, chat_tmpl) {
+                // Late arrivals are polled mid-wave so they join the live
+                // batch; anything non-plain comes back and runs serial here.
+                let mut leftover: Vec<Job> = Vec::new();
+                if let Err(e) = run_wave(
+                    tower,
+                    tok,
+                    plain,
+                    &cfg,
+                    chat_tmpl,
+                    Some(&self.jobs),
+                    &mut leftover,
+                ) {
                     eprintln!("[serve] wave error: {e}");
+                }
+                for job in leftover {
+                    let r = if job.surface == Surface::CountTokens {
+                        count_tokens_job(tok, &job, chat_tmpl, &cfg)
+                    } else if job.surface == Surface::Embeddings {
+                        run_embeddings(tower, tok, &job)
+                    } else {
+                        complete(tower, tok, &job, &cfg, &mut self.prefix, chat_tmpl)
+                    };
+                    if let Err(e) = r {
+                        let _ = job.reply.send(Reply::Error(e.to_string()));
+                    }
                 }
             }
         }
-        if std::env::var("LISA_PROFILE").is_ok() {
-            lisa_engine::core::mem::mlx_mem_line("serve-wave");
+        if let Some(b) = self.admission.as_mut() {
+            b.release(admitted);
         }
         true
     }
@@ -271,6 +523,16 @@ fn depth_for(job: &Job, cfg: &ServerConfig) -> usize {
         .unwrap_or(cfg.depth)
 }
 
+/// Map a configured depth to the generation policy: the `auto` sentinel
+/// becomes the EV controller when the tower ships a drafter, fixed otherwise.
+fn mtp_depth(depth: usize, tower: &dyn LanguageModel) -> MtpDepth {
+    if depth == lisa_engine::core::round_cost::AUTO_DEPTH && tower.has_drafter() {
+        MtpDepth::Auto
+    } else {
+        MtpDepth::Fixed(depth.clamp(2, 6))
+    }
+}
+
 /// Resolve the request's draft depth, rejecting depth 1 (a single draft never
 /// pays for a speculative round; use 0 or 2..=6).
 fn resolve_depth(job: &Job, cfg: &ServerConfig) -> anyhow::Result<usize> {
@@ -283,9 +545,21 @@ fn resolve_depth(job: &Job, cfg: &ServerConfig) -> anyhow::Result<usize> {
 }
 
 /// Build the scheduler request for a stateless HTTP job.
-fn build_request(id: usize, tok: &Tokenizer, job: &Job, cfg: &ServerConfig, tmpl: Option<&ChatTemplate>) -> anyhow::Result<lisa_engine::core::sched::Request> {
+fn build_request(
+    id: usize,
+    tok: &Tokenizer,
+    job: &Job,
+    cfg: &ServerConfig,
+    tmpl: Option<&ChatTemplate>,
+) -> anyhow::Result<lisa_engine::core::sched::Request> {
     let messages = parse_messages(&job.body)?;
-    let prompt = render_prompt(tmpl, &messages, true, &request_tools(job), true)?;
+    let prompt = render_prompt(
+        tmpl,
+        &messages,
+        true,
+        &request_tools(job),
+        request_thinking(&job.body, cfg),
+    )?;
     let ids = tok.encode(&prompt, false)?;
     let max_tokens = request_max_tokens(job, cfg);
     Ok(lisa_engine::core::sched::Request {
@@ -293,68 +567,208 @@ fn build_request(id: usize, tok: &Tokenizer, job: &Job, cfg: &ServerConfig, tmpl
         prompt: ids,
         max_tokens,
         sampler: sampler_from(&job.body, cfg),
+        ignore_eos: job
+            .body
+            .get("ignore_eos")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
     })
 }
 
+/// Whether a job takes the continuous-batch wave path: a stateless plain chat
+/// completion that needs none of the features only the serial paths implement
+/// (stop sequences, per-token logprobs — the scheduler streams bare tokens).
+fn is_plain_job(job: &Job, cfg: &ServerConfig) -> bool {
+    depth_for(job, cfg) == 0 && is_wave_eligible(job)
+}
+
+/// Everything [`is_plain_job`] requires EXCEPT the depth clause: the features
+/// that genuinely need the serial paths (tool calls, stop sequences, per-token
+/// logprobs, non-chat surfaces, persistent sessions). The wave-level batching
+/// policy may drop a request's SPECULATION, but never these.
+fn is_wave_eligible(job: &Job) -> bool {
+    !has_tools(job)
+        && job.surface == Surface::Chat
+        && job.session_id.is_none()
+        && request_stops(job).is_empty()
+        && !wants_logprobs(&job.body)
+}
+
+/// Whether a request asked for per-token logprobs.
+fn wants_logprobs(body: &Value) -> bool {
+    body.get("logprobs").and_then(|v| v.as_bool()).unwrap_or(false)
+        || body
+            .get("top_logprobs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            > 0
+}
+
 /// Serve a wave of stateless requests through the continuous-batch scheduler,
-/// streaming each request's tokens back to its own connection.
-fn run_wave(tower: &mut dyn LanguageModel, tok: &Tokenizer, jobs: Vec<Job>, cfg: &ServerConfig, tmpl: Option<&ChatTemplate>) -> anyhow::Result<()> {
-    let mut job_of: Vec<usize> = Vec::new();
-    let mut reqs: Vec<lisa_engine::core::sched::Request> = Vec::new();
-    for (ji, job) in jobs.iter().enumerate() {
-        match build_request(reqs.len(), tok, job, cfg, tmpl) {
-            Ok(r) => {
-                job_of.push(ji);
-                reqs.push(r);
-            }
+/// streaming each request's tokens back to its own connection. `late`, when
+/// given, is polled between decode rounds: a plain request that arrives while
+/// the wave is decoding joins the live batch (continuous admission) instead of
+/// waiting for the wave to drain. Non-plain late jobs are returned to the
+/// caller for the serial paths.
+fn run_wave(
+    tower: &mut dyn LanguageModel,
+    tok: &Tokenizer,
+    jobs: Vec<Job>,
+    cfg: &ServerConfig,
+    tmpl: Option<&ChatTemplate>,
+    late: Option<&Receiver<Job>>,
+    leftover: &mut Vec<Job>,
+) -> anyhow::Result<()> {
+    // Job registry: slot i is job i; `dead[i]` jobs already errored.
+    let jobs: Vec<Job> = jobs;
+    let mut dead: Vec<bool> = vec![false; jobs.len()];
+    let mut reqs: Vec<lisa_engine::core::sched::Request> = Vec::with_capacity(jobs.len());
+    for (i, job) in jobs.iter().enumerate() {
+        match build_request(i, tok, job, cfg, tmpl) {
+            Ok(r) => reqs.push(r),
             Err(e) => {
+                dead[i] = true;
                 let _ = job.reply.send(Reply::Error(e.to_string()));
             }
         }
     }
-    if reqs.is_empty() {
+    if reqs.is_empty() && late.is_none() {
         return Ok(());
     }
-    let n = reqs.len();
-    let plens: Vec<usize> = reqs.iter().map(|r| r.prompt.len()).collect();
-    let mut acc: Vec<Vec<u32>> = vec![Vec::new(); n];
-    let mut stopped: Vec<bool> = vec![false; n];
-    let mut last: Vec<String> = vec![String::new(); n];
-    let stream_flags: Vec<bool> = job_of.iter().map(|&ji| jobs[ji].stream).collect();
-    let replies: Vec<Sender<Reply>> = job_of.iter().map(|&ji| jobs[ji].reply.clone()).collect();
+    let n = jobs.len();
+    let mut plens: Vec<usize> = vec![0; n];
+    for (i, r) in reqs.iter().enumerate() {
+        plens[i] = r.prompt.len();
+    }
+    // Shared between the token callback and the late-arrival poll (which both
+    // run inside the scheduler loop) — RefCell keeps the borrows disjoint.
+    let acc: std::cell::RefCell<Vec<Vec<u32>>> = std::cell::RefCell::new(vec![Vec::new(); n]);
+    let stopped: std::cell::RefCell<Vec<bool>> = std::cell::RefCell::new(vec![false; n]);
+    let last: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(vec![String::new(); n]);
+    let stream_flags: std::cell::RefCell<Vec<bool>> =
+        std::cell::RefCell::new(jobs.iter().map(|j| j.stream).collect());
+    // `ignore_eos` must reach the wave's token callback: testing `is_eos` there
+    // without consulting it truncated every forced-length batched reply at the
+    // model's natural EOS (measured 53 of 64 tokens) while the engine — which
+    // does honour it after the decode_round fix — kept decoding.
+    let ignore_eos_flags: std::cell::RefCell<Vec<bool>> = std::cell::RefCell::new(
+        jobs.iter()
+            .map(|j| {
+                j.body
+                    .get("ignore_eos")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+            })
+            .collect(),
+    );
+    let replies: Vec<Sender<Reply>> = jobs.iter().map(|j| j.reply.clone()).collect();
+    let replies: std::cell::RefCell<Vec<Sender<Reply>>> = std::cell::RefCell::new(replies);
+    let jobs: std::cell::RefCell<Vec<Job>> = std::cell::RefCell::new(jobs);
+    let dead: std::cell::RefCell<Vec<bool>> = std::cell::RefCell::new(vec![false; n]);
+    let plens: std::cell::RefCell<Vec<usize>> = std::cell::RefCell::new(plens);
 
-    lisa_engine::core::sched::run(tower, reqs, cfg.max_batch, 0, &mut |id, t| {
-        if is_eos(t) {
-            stopped[id] = true;
-            return Ok(());
-        }
-        acc[id].push(t);
-        if stream_flags[id] {
-            let text = tok.decode(&acc[id])?;
-            if text.len() > last[id].len() {
-                let delta = text[last[id].len()..].to_string();
-                let _ = replies[id].send(Reply::Delta { text: delta, logprobs: None });
+    // A job is admissible to the batch when it is a plain stateless chat
+    // completion (see `is_plain_job`); anything else takes a serial path.
+    let is_plain = |job: &Job| is_plain_job(job, cfg);
+
+    // Late-arrival poll: pull plain jobs into the batch mid-wave, defer the rest.
+    let mut next = || -> Option<lisa_engine::core::sched::Request> {
+        let rx = late?;
+        loop {
+            let job = rx.try_recv().ok()?;
+            if is_plain(&job) {
+                let id = jobs.borrow().len();
+                match build_request(id, tok, &job, cfg, tmpl) {
+                    Ok(r) => {
+                        plens.borrow_mut().push(r.prompt.len());
+                        acc.borrow_mut().push(Vec::new());
+                        stopped.borrow_mut().push(false);
+                        last.borrow_mut().push(String::new());
+                        dead.borrow_mut().push(false);
+                        stream_flags.borrow_mut().push(job.stream);
+                        ignore_eos_flags.borrow_mut().push(
+                            job.body
+                                .get("ignore_eos")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false),
+                        );
+                        replies.borrow_mut().push(job.reply.clone());
+                        jobs.borrow_mut().push(job);
+                        return Some(r);
+                    }
+                    Err(e) => {
+                        let _ = job.reply.send(Reply::Error(e.to_string()));
+                    }
+                }
+            } else {
+                leftover.push(job);
             }
-            last[id] = text;
         }
-        Ok(())
-    })?;
+    };
 
+    lisa_engine::core::sched::run_streaming(
+        tower,
+        reqs,
+        cfg.max_batch,
+        &mut |id, t| {
+            if is_eos(t) {
+                // `ignore_eos`: EOS never ends the reply (the engine's
+                // decode_round agrees after the same fix). Skip the token — it
+                // is not part of the answer — and keep collecting.
+                if ignore_eos_flags.borrow()[id] {
+                    return Ok(());
+                }
+                stopped.borrow_mut()[id] = true;
+                return Ok(());
+            }
+            acc.borrow_mut()[id].push(t);
+            if stream_flags.borrow()[id] {
+                // Shape the streamed text the same way the serial paths do:
+                // nothing while a `<think>` block is open, the answer once it
+                // closes — never the raw scratchpad.
+                let text = tok.decode(&acc.borrow()[id])?;
+                let shown = streaming_answer(&text).to_string();
+                let mut last = last.borrow_mut();
+                if shown.len() > last[id].len() {
+                    let delta = shown[last[id].len()..].to_string();
+                    let _ = replies.borrow()[id].send(Reply::Delta {
+                        text: delta,
+                        logprobs: None,
+                    });
+                }
+                last[id] = shown;
+            }
+            Ok(())
+        },
+        &mut next,
+    )?;
+
+    let n = jobs.borrow().len();
     for id in 0..n {
-        let content = if stream_flags[id] {
-            std::mem::take(&mut last[id])
-        } else {
-            tok.decode(&acc[id])?
-        };
-        let _ = replies[id].send(Reply::Done {
+        if dead.borrow()[id] {
+            continue;
+        }
+        // Same shaping as the serial paths: always decode from the raw token
+        // stream (NOT the shaped stream text — that has the `<think>` block
+        // stripped, which would drop `reasoning` from the streamed Done), so a
+        // streamed reply and a non-streamed one carry identical content and
+        // reasoning.
+        let full = tok.decode(&acc.borrow()[id])?;
+        let (reasoning, content) = split_reasoning(&full);
+        let _ = replies.borrow()[id].send(Reply::Done {
             content,
-            reasoning: None,
+            reasoning,
             tool_calls: Vec::new(),
             logprobs: None,
             stop_sequence: None,
-            prompt_tokens: plens[id],
-            completion_tokens: acc[id].len(),
-            finish: if stopped[id] { "stop".into() } else { "length".into() },
+            cached_tokens: 0,
+            prompt_tokens: plens.borrow()[id],
+            completion_tokens: acc.borrow()[id].len(),
+            finish: if stopped.borrow()[id] {
+                "stop".into()
+            } else {
+                "length".into()
+            },
         });
     }
     Ok(())
@@ -366,6 +780,7 @@ fn run_session(
     tower: &mut dyn LanguageModel,
     tok: &Tokenizer,
     sessions: &mut HashMap<String, (Session, Vec<ChatMessage>)>,
+    prefix: &mut PrefixCache,
     job: &Job,
     cfg: &ServerConfig,
     tmpl: Option<&ChatTemplate>,
@@ -380,13 +795,27 @@ fn run_session(
     };
     let messages = parse_messages(&job.body)?;
     let tools = request_tools(job);
-    let new_str = render_prompt(tmpl, &messages, true, &tools, true)?;
+    let thinking = request_thinking(&job.body, cfg);
+    let new_str = render_prompt(tmpl, &messages, true, &tools, thinking)?;
 
     let (mut sess, mut conversation) = sessions.remove(&sid).unwrap_or_else(|| {
         let mut s = Session::new(tower);
         s.enable_snapshots();
         (s, Vec::new())
     });
+    // Cross-request prefix cache: a brand-new session whose prompt extends a
+    // cached prompt token-exactly resumes at the split point.
+    let ids_full = tok.encode(&new_str, false)?;
+    if sess.fed.is_empty() && prefix.enabled() {
+        if let Some((l, restored)) = prefix.restore_session(tower, &ids_full) {
+            eprintln!(
+                "[serve] session {sid}: prefix-cache resume {l}/{}",
+                ids_full.len()
+            );
+            sess = restored;
+            sess.enable_snapshots();
+        }
+    }
     sess.capture_snapshot(conversation.len(), tower.drafter_offset());
 
     // Structural match against the tracked conversation. Raw token matching
@@ -404,7 +833,7 @@ fn run_session(
             s.enable_snapshots();
             sess = s;
         }
-        render_prompt(tmpl, &messages[..k], false, &tools, true)
+        render_prompt(tmpl, &messages[..k], false, &tools, thinking)
             .ok()
             .and_then(|prefix| new_str.strip_prefix(&prefix).map(|r| r.to_string()))
             .filter(|r| !r.is_empty())
@@ -420,13 +849,17 @@ fn run_session(
         Some(sfx) if !sfx.is_empty() => {
             eprintln!(
                 "[serve] session {sid}: {} reuse, {} prefilled",
-                if diverges { "snapshot" } else { "string-suffix" },
+                if diverges {
+                    "snapshot"
+                } else {
+                    "string-suffix"
+                },
                 sfx.len()
             );
             sfx
         }
         _ => {
-            let ids = tok.encode(&new_str, false)?;
+            let ids = ids_full.clone();
             let cp0 = common_prefix(&sess.fed, &ids);
             let fed_len = sess.fed.len();
             if cp0 < fed_len {
@@ -455,6 +888,19 @@ fn run_session(
 
     let stops = request_stops(job);
     let parallel = parallel_tools(job);
+    // `ignore_eos`: EOS never ends the reply.
+    // The serial paths stop inside `generate*` via the process EOS set, so
+    // clear it for this one job and restore after (one job at a time here;
+    // the continuous-batch path carries the flag per Request instead).
+    let ignore_eos = job
+        .body
+        .get("ignore_eos")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let im_end = tok.im_end_ids.clone();
+    if ignore_eos {
+        lisa_engine::core::generate::set_eos_ids(Vec::new());
+    }
     let mut acc: Vec<u32> = Vec::new();
     let mut last = String::new();
     let hit_stop = std::cell::Cell::new(false);
@@ -465,7 +911,10 @@ fn run_session(
         acc.push(t);
         if !stops.is_empty() {
             let text = tok.decode(&acc)?;
-            if stops.iter().any(|s| !s.is_empty() && text.contains(s.as_str())) {
+            if stops
+                .iter()
+                .any(|s| !s.is_empty() && text.contains(s.as_str()))
+            {
                 hit_stop.set(true);
                 return Err(anyhow::anyhow!("stop sequence"));
             }
@@ -478,22 +927,50 @@ fn run_session(
                 None => ans.to_string(),
             };
             if let Some(delta) = stream_delta(&last, &shown) {
-                let _ = reply.send(Reply::Delta { text: delta, logprobs: None });
+                let _ = reply.send(Reply::Delta {
+                    text: delta,
+                    logprobs: None,
+                });
             }
             last = shown;
         }
         Ok(())
     };
-    let generated = if depth > 0 && greedy {
-        sess.generate_mtp(tower, &suffix, max_tokens, depth, &mut emit)
+    // Snapshot the full prompt at the clean boundary (prompt fed, nothing
+    // decoded) so later requests sharing it resume there.
+    let mut after_prefill = |caches: &[lisa_engine::core::cache::LayerCache]| {
+        prefix.insert(&ids_full, caches);
+    };
+    let generated = if depth > 0 {
+        let md = mtp_depth(depth, tower);
+        sess.generate_mtp_depth(
+            tower,
+            &suffix,
+            max_tokens,
+            md,
+            Some(&mut after_prefill),
+            if greedy { None } else { Some(&mut sampler) },
+            &mut emit,
+        )
     } else {
-        sess.generate(tower, &suffix, max_tokens, &mut sampler, &mut emit)
+        sess.generate(
+            tower,
+            &suffix,
+            max_tokens,
+            &mut sampler,
+            cfg.pld,
+            Some(&mut after_prefill),
+            &mut emit,
+        )
     };
     let generated = match generated {
         Ok(g) => g,
         Err(_) if hit_stop.get() => Vec::new(),
         Err(e) => return Err(e),
     };
+    if ignore_eos {
+        lisa_engine::core::generate::set_eos_ids(im_end);
+    }
     let stopped = generated.last().map(|&t| is_eos(t)).unwrap_or(false);
     let full = tok.decode(&acc)?;
     let (content, reasoning, tool_calls) = shape_reply(&full, &tools, parallel, &stops);
@@ -522,6 +999,7 @@ fn run_session(
         tool_calls,
         prompt_tokens: suffix.len(),
         completion_tokens: acc.len(),
+        cached_tokens: 0, // the session path does not consult the prefix cache for reporting
         finish: finish.into(),
         logprobs: None,
         stop_sequence: None,
@@ -556,22 +1034,41 @@ fn handle_conn(mut stream: TcpStream, tx: Sender<Job>, cfg: &ServerConfig) -> an
         Ok(Some(r)) => r,
         Ok(None) => return Ok(()),
         Err(e) => {
-            let payload = json!({"error": {"message": e.to_string(), "type": "invalid_request_error"}});
-            let _ = write_response(&mut stream, "400 Bad Request", "application/json", payload.to_string().as_bytes(), "");
+            let payload =
+                json!({"error": {"message": e.to_string(), "type": "invalid_request_error"}});
+            let _ = write_response(
+                &mut stream,
+                "400 Bad Request",
+                "application/json",
+                payload.to_string().as_bytes(),
+                "",
+            );
             return Ok(());
         }
     };
     let (method, path, body) = req;
     if method == "GET" && (path == "/health" || path == "/healthz") {
         let payload = json!({"status": "ok"});
-        return write_response(&mut stream, "200 OK", "application/json", payload.to_string().as_bytes(), "");
+        return write_response(
+            &mut stream,
+            "200 OK",
+            "application/json",
+            payload.to_string().as_bytes(),
+            "",
+        );
     }
     if method == "GET" && path.starts_with("/v1/models") {
         let payload = json!({
             "object": "list",
-            "data": [{ "id": MODEL_ID, "object": "model", "owned_by": "lisa" }]
+            "data": [{ "id": model_id(), "object": "model", "owned_by": "lisa" }]
         });
-        return write_response(&mut stream, "200 OK", "application/json", payload.to_string().as_bytes(), "");
+        return write_response(
+            &mut stream,
+            "200 OK",
+            "application/json",
+            payload.to_string().as_bytes(),
+            "",
+        );
     }
     if method == "POST" && (path == "/v1/chat/completions" || path == "/v1/completions") {
         let surface = if path == "/v1/completions" {
@@ -590,10 +1087,14 @@ fn handle_conn(mut stream: TcpStream, tx: Sender<Job>, cfg: &ServerConfig) -> an
     if method == "POST" && path == "/v1/responses" {
         return dispatch_or_400(&mut stream, &body, tx, cfg, Surface::Responses);
     }
+    if method == "POST" && path == "/v1/embeddings" {
+        return dispatch_or_400(&mut stream, &body, tx, cfg, Surface::Embeddings);
+    }
     if method == "GET" && path.starts_with("/v1/responses/") {
         let id = path.trim_start_matches("/v1/responses/").to_string();
-        let payload = stored_response(&id)
-            .unwrap_or_else(|| json!({"error": {"message": "response not found", "type": "invalid_request_error"}}));
+        let payload = stored_response(&id).unwrap_or_else(
+            || json!({"error": {"message": "response not found", "type": "invalid_request_error"}}),
+        );
         return write_response(
             &mut stream,
             "200 OK",
@@ -603,10 +1104,14 @@ fn handle_conn(mut stream: TcpStream, tx: Sender<Job>, cfg: &ServerConfig) -> an
         );
     }
 
-    write_response(&mut stream, "404 Not Found", "application/json", br#"{"error":{"message":"not found"}}"#, "")
+    write_response(
+        &mut stream,
+        "404 Not Found",
+        "application/json",
+        br#"{"error":{"message":"not found"}}"#,
+        "",
+    )
 }
-
-const MODEL_ID: &str = "qwen3.8-flash-next";
 
 /// Rate/quota headers advertised on every response (llmprobe's frontier
 /// rate-limit check, and honest for a single-stream server).
@@ -672,13 +1177,14 @@ fn dispatch_completion(
     _cfg: &ServerConfig,
     surface: Surface,
 ) -> anyhow::Result<()> {
-    let mut body: Value = serde_json::from_slice(body)
-        .map_err(|e| anyhow::anyhow!("invalid JSON body: {e}"))?;
+    let mut body: Value =
+        serde_json::from_slice(body).map_err(|e| anyhow::anyhow!("invalid JSON body: {e}"))?;
     match surface {
         Surface::Completions => normalize_completion_prompt(&mut body),
         Surface::Messages | Surface::CountTokens => normalize_messages_body(&mut body),
         Surface::Responses => normalize_responses_body(&mut body),
         Surface::Chat => {}
+        Surface::Embeddings => {}
     }
     if surface == Surface::Responses {
         apply_previous_response(&mut body);
@@ -687,13 +1193,18 @@ fn dispatch_completion(
         // Anthropic's spec makes `max_tokens` required.
         anyhow::bail!("max_tokens is required");
     }
-    if surface != Surface::CountTokens {
+    if surface != Surface::CountTokens && surface != Surface::Embeddings {
         // Validate the request shape up front so client errors are 400s, not 500s.
         parse_messages(&body)?;
     }
     // `background: true` runs the job off the request (llmprobe checks the
     // immediate status is queued/in_progress).
-    if surface == Surface::Responses && body.get("background").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if surface == Surface::Responses
+        && body
+            .get("background")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    {
         let id = response_id();
         let (rtx, rrx) = mpsc::channel::<Reply>();
         if tx
@@ -719,7 +1230,7 @@ fn dispatch_completion(
             "object": "response",
             "created_at": now(),
             "status": "queued",
-            "model": MODEL_ID,
+            "model": model_id(),
             "output": [],
             "output_text": "",
             "usage": Value::Null,
@@ -732,7 +1243,10 @@ fn dispatch_completion(
             "",
         );
     }
-    let stream_mode = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    let stream_mode = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let include_usage = body
         .get("stream_options")
         .and_then(|v| v.get("include_usage"))
@@ -775,6 +1289,7 @@ struct ReplyData {
     tool_calls: Vec<Value>,
     prompt_tokens: usize,
     completion_tokens: usize,
+    cached_tokens: usize,
     finish: String,
     logprobs: Option<Value>,
     stop_sequence: Option<String>,
@@ -792,6 +1307,7 @@ fn drain_reply(rx: Receiver<Reply>) -> anyhow::Result<ReplyData> {
                 tool_calls,
                 prompt_tokens,
                 completion_tokens,
+                cached_tokens,
                 finish,
                 logprobs,
                 stop_sequence,
@@ -802,33 +1318,34 @@ fn drain_reply(rx: Receiver<Reply>) -> anyhow::Result<ReplyData> {
                     tool_calls,
                     prompt_tokens,
                     completion_tokens,
+                    cached_tokens,
                     finish,
                     logprobs,
                     stop_sequence,
                 });
             }
             Ok(Reply::Error(e)) => anyhow::bail!("{e}"),
+            Ok(Reply::Refused {
+                retry_after_s,
+                reason,
+            }) => anyhow::bail!("{REFUSED_MARKER}retry-after={retry_after_s}; {reason}"),
             Err(_) => anyhow::bail!("engine worker dropped the request"),
         }
     }
 }
 
-/// Log-softmax probability of `token` under `logits` (last axis = vocab).
-fn token_logprob(logits: &lisa_mlx::Array, token: u32) -> anyhow::Result<f32> {
-    let v = logits
-        .as_dtype(lisa_mlx::Dtype::Float32)?
-        .to_vec1::<f32>()?;
-    let m = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let sum: f32 = v.iter().map(|x| (x - m).exp()).sum();
-    let lse = m + sum.ln();
-    let idx = token as usize;
-    Ok(if idx < v.len() { v[idx] - lse } else { 0.0 })
-}
+/// Log-softmax probability of `token` under `logits` — re-exported from
+/// lisa-engine's sampler so this crate doesn't depend on the tensor runtime.
+use lisa_engine::sampler::token_logprob;
 
-fn usage_json(prompt_tokens: usize, completion_tokens: usize) -> Value {
+fn usage_json(prompt_tokens: usize, completion_tokens: usize, cached_tokens: usize) -> Value {
     json!({
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
+        // OpenAI-standard detail: the only way a client can SEE that a
+        // cross-request prefix cache engaged (llmprobe's benchmark reads it —
+        // without it the cache reads as "not detected" however well it works).
+        "prompt_tokens_details": { "cached_tokens": cached_tokens },
         "total_tokens": prompt_tokens + completion_tokens,
     })
 }
@@ -880,9 +1397,9 @@ fn single_payload(d: &ReplyData, surface: Surface) -> Value {
         "id": completion_id(),
         "object": object,
         "created": now(),
-        "model": MODEL_ID,
+        "model": model_id(),
         "choices": [choice],
-        "usage": usage_json(d.prompt_tokens, d.completion_tokens),
+        "usage": usage_json(d.prompt_tokens, d.completion_tokens, d.cached_tokens),
     })
 }
 
@@ -895,10 +1412,10 @@ fn collect_surface(
     let d = match drain_reply(rx) {
         Ok(d) => d,
         Err(e) => {
-            let payload = json!({"error": {"message": e.to_string(), "type": "engine_error"}});
+            let payload = json!({"error": {"message": error_message_for(&e), "type": "engine_error"}});
             return write_response(
                 stream,
-                "500 Internal Server Error",
+                http_status_for(&e),
                 "application/json",
                 payload.to_string().as_bytes(),
                 &rate_headers(),
@@ -913,6 +1430,9 @@ fn collect_surface(
             store_conversation(&id, req_body, &d, &p);
             p
         }
+        // The embeddings job serializes its whole OpenAI payload itself.
+        Surface::Embeddings => serde_json::from_str(&d.content)
+            .unwrap_or_else(|_| json!({"error": {"message": "embedding payload corrupt"}})),
         _ => single_payload(&d, surface),
     };
     write_response(
@@ -972,7 +1492,7 @@ fn messages_payload(d: &ReplyData) -> Value {
         "id": format!("msg_{:x}{:x}", now(), SEQ.fetch_add(1, Ordering::Relaxed)),
         "type": "message",
         "role": "assistant",
-        "model": MODEL_ID,
+        "model": model_id(),
         "content": content,
         "stop_reason": stop_reason,
         "stop_sequence": stop_sequence,
@@ -992,7 +1512,7 @@ fn empty_response_resource(id: &str, status: &str) -> Value {
         "completed_at": Value::Null,
         "status": status,
         "incomplete_details": Value::Null,
-        "model": MODEL_ID,
+        "model": model_id(),
         "previous_response_id": Value::Null,
         "instructions": Value::Null,
         "output": [],
@@ -1051,8 +1571,19 @@ fn responses_payload_with_id(d: &ReplyData, id: &str) -> Value {
         }));
     }
     let incomplete = d.finish == "length";
-    let mut resp = empty_response_resource(id, if incomplete { "incomplete" } else { "completed" });
-    resp["completed_at"] = if incomplete { Value::Null } else { json!(now()) };
+    let mut resp = empty_response_resource(
+        id,
+        if incomplete {
+            "incomplete"
+        } else {
+            "completed"
+        },
+    );
+    resp["completed_at"] = if incomplete {
+        Value::Null
+    } else {
+        json!(now())
+    };
     resp["output"] = Value::Array(output);
     resp["output_text"] = json!(d.content);
     resp["usage"] = json!({
@@ -1085,6 +1616,7 @@ fn collect_choices(
     let mut choices = Vec::with_capacity(n);
     let mut prompt_tokens = 0;
     let mut completion_tokens = 0;
+    let mut cached_tokens = 0;
     for i in 0..n {
         let mut b = body.clone();
         b["seed"] = json!(base.wrapping_add(i as u64));
@@ -1100,10 +1632,10 @@ fn collect_choices(
         let d = match drain_reply(rrx) {
             Ok(d) => d,
             Err(e) => {
-                let payload = json!({"error": {"message": e.to_string(), "type": "engine_error"}});
+                let payload = json!({"error": {"message": error_message_for(&e), "type": "engine_error"}});
                 return write_response(
                     stream,
-                    "500 Internal Server Error",
+                    http_status_for(&e),
                     "application/json",
                     payload.to_string().as_bytes(),
                     &rate_headers(),
@@ -1111,6 +1643,7 @@ fn collect_choices(
             }
         };
         prompt_tokens = d.prompt_tokens;
+        cached_tokens = d.cached_tokens;
         completion_tokens += d.completion_tokens;
         choices.push(if surface == Surface::Completions {
             completion_choice(&d, i)
@@ -1127,9 +1660,9 @@ fn collect_choices(
         "id": completion_id(),
         "object": object,
         "created": now(),
-        "model": MODEL_ID,
+        "model": model_id(),
         "choices": choices,
-        "usage": usage_json(prompt_tokens, completion_tokens),
+        "usage": usage_json(prompt_tokens, completion_tokens, cached_tokens),
     });
     write_response(
         stream,
@@ -1166,12 +1699,16 @@ fn stream_chunk(object: &str, id: &str, choice: Value) -> Value {
         "id": id,
         "object": object,
         "created": now(),
-        "model": MODEL_ID,
+        "model": model_id(),
         "choices": [choice],
     })
 }
 
-fn stream_chat(stream: &mut TcpStream, rx: Receiver<Reply>, include_usage: bool) -> anyhow::Result<()> {
+fn stream_chat(
+    stream: &mut TcpStream,
+    rx: Receiver<Reply>,
+    include_usage: bool,
+) -> anyhow::Result<()> {
     let id = completion_id();
     let chunk = |delta: Value, finish: Value, logprobs: Option<Value>| {
         let mut choice = json!({ "index": 0, "delta": delta, "finish_reason": finish });
@@ -1180,19 +1717,24 @@ fn stream_chat(stream: &mut TcpStream, rx: Receiver<Reply>, include_usage: bool)
         }
         stream_chunk("chat.completion.chunk", &id, choice)
     };
-    write_sse(stream, &chunk(json!({"role": "assistant"}), Value::Null, None))?;
+    write_sse(
+        stream,
+        &chunk(json!({"role": "assistant"}), Value::Null, None),
+    )?;
 
     for reply in rx {
         match reply {
             Reply::Start { .. } => {}
-            Reply::Delta { text, logprobs } => {
-                write_sse(stream, &chunk(json!({"content": text}), Value::Null, logprobs))?
-            }
+            Reply::Delta { text, logprobs } => write_sse(
+                stream,
+                &chunk(json!({"content": text}), Value::Null, logprobs),
+            )?,
             Reply::Done {
                 finish,
                 tool_calls,
                 prompt_tokens,
                 completion_tokens,
+                cached_tokens,
                 ..
             } => {
                 if !tool_calls.is_empty() {
@@ -1208,7 +1750,10 @@ fn stream_chat(stream: &mut TcpStream, rx: Receiver<Reply>, include_usage: bool)
                             })
                         })
                         .collect();
-                    write_sse(stream, &chunk(json!({"tool_calls": deltas}), Value::Null, None))?;
+                    write_sse(
+                        stream,
+                        &chunk(json!({"tool_calls": deltas}), Value::Null, None),
+                    )?;
                 }
                 write_sse(stream, &chunk(json!({}), json!(finish), None))?;
                 if include_usage {
@@ -1216,13 +1761,24 @@ fn stream_chat(stream: &mut TcpStream, rx: Receiver<Reply>, include_usage: bool)
                         "id": id,
                         "object": "chat.completion.chunk",
                         "created": now(),
-                        "model": MODEL_ID,
+                        "model": model_id(),
                         "choices": [],
-                        "usage": usage_json(prompt_tokens, completion_tokens),
+                        "usage": usage_json(prompt_tokens, completion_tokens, cached_tokens),
                     });
                     write_sse(stream, &usage)?;
                 }
                 write_chunk(stream, b"data: [DONE]\n\n")?;
+                write_chunk(stream, b"")?;
+                break;
+            }
+            Reply::Refused {
+                retry_after_s,
+                reason,
+            } => {
+                write_sse(
+                    stream,
+                    &json!({"error": {"message": reason, "type": "insufficient_memory", "retry_after_s": retry_after_s}}),
+                )?;
                 write_chunk(stream, b"")?;
                 break;
             }
@@ -1237,7 +1793,11 @@ fn stream_chat(stream: &mut TcpStream, rx: Receiver<Reply>, include_usage: bool)
     Ok(())
 }
 
-fn stream_completions(stream: &mut TcpStream, rx: Receiver<Reply>, include_usage: bool) -> anyhow::Result<()> {
+fn stream_completions(
+    stream: &mut TcpStream,
+    rx: Receiver<Reply>,
+    include_usage: bool,
+) -> anyhow::Result<()> {
     let id = completion_id();
     for reply in rx {
         match reply {
@@ -1256,6 +1816,7 @@ fn stream_completions(stream: &mut TcpStream, rx: Receiver<Reply>, include_usage
                 finish,
                 prompt_tokens,
                 completion_tokens,
+                cached_tokens,
                 ..
             } => {
                 write_sse(
@@ -1271,13 +1832,24 @@ fn stream_completions(stream: &mut TcpStream, rx: Receiver<Reply>, include_usage
                         "id": id,
                         "object": "text_completion",
                         "created": now(),
-                        "model": MODEL_ID,
+                        "model": model_id(),
                         "choices": [],
-                        "usage": usage_json(prompt_tokens, completion_tokens),
+                        "usage": usage_json(prompt_tokens, completion_tokens, cached_tokens),
                     });
                     write_sse(stream, &usage)?;
                 }
                 write_chunk(stream, b"data: [DONE]\n\n")?;
+                write_chunk(stream, b"")?;
+                break;
+            }
+            Reply::Refused {
+                retry_after_s,
+                reason,
+            } => {
+                write_sse(
+                    stream,
+                    &json!({"error": {"message": reason, "type": "insufficient_memory", "retry_after_s": retry_after_s}}),
+                )?;
                 write_chunk(stream, b"")?;
                 break;
             }
@@ -1325,7 +1897,7 @@ fn stream_messages(stream: &mut TcpStream, rx: Receiver<Reply>) -> anyhow::Resul
                                 "id": id,
                                 "type": "message",
                                 "role": "assistant",
-                                "model": MODEL_ID,
+                                "model": model_id(),
                                 "content": [],
                                 "stop_reason": Value::Null,
                                 "stop_sequence": Value::Null,
@@ -1429,7 +2001,23 @@ fn stream_messages(stream: &mut TcpStream, rx: Receiver<Reply>) -> anyhow::Resul
                         "usage": { "output_tokens": completion_tokens },
                     }),
                 )?;
-                sse_event(stream, Some("message_stop"), &json!({ "type": "message_stop" }))?;
+                sse_event(
+                    stream,
+                    Some("message_stop"),
+                    &json!({ "type": "message_stop" }),
+                )?;
+                write_chunk(stream, b"")?;
+                break;
+            }
+            Reply::Refused {
+                retry_after_s,
+                reason,
+            } => {
+                sse_event(
+                    stream,
+                    Some("error"),
+                    &json!({ "type": "error", "error": { "type": "insufficient_memory", "message": reason, "retry_after_s": retry_after_s } }),
+                )?;
                 write_chunk(stream, b"")?;
                 break;
             }
@@ -1448,7 +2036,11 @@ fn stream_messages(stream: &mut TcpStream, rx: Receiver<Reply>) -> anyhow::Resul
     Ok(())
 }
 
-fn stream_responses(stream: &mut TcpStream, rx: Receiver<Reply>, req_body: &Value) -> anyhow::Result<()> {
+fn stream_responses(
+    stream: &mut TcpStream,
+    rx: Receiver<Reply>,
+    req_body: &Value,
+) -> anyhow::Result<()> {
     let id = response_id();
     let mut seq = 0u64;
     let mut next_seq = || {
@@ -1517,6 +2109,7 @@ fn stream_responses(stream: &mut TcpStream, rx: Receiver<Reply>, req_body: &Valu
                 tool_calls,
                 prompt_tokens,
                 completion_tokens,
+                cached_tokens,
                 finish,
                 logprobs,
                 stop_sequence,
@@ -1527,6 +2120,7 @@ fn stream_responses(stream: &mut TcpStream, rx: Receiver<Reply>, req_body: &Valu
                     tool_calls: tool_calls.clone(),
                     prompt_tokens,
                     completion_tokens,
+                    cached_tokens,
                     finish: finish.clone(),
                     logprobs,
                     stop_sequence,
@@ -1641,6 +2235,18 @@ fn stream_responses(stream: &mut TcpStream, rx: Receiver<Reply>, req_body: &Valu
                 write_chunk(stream, b"")?;
                 break;
             }
+            Reply::Refused {
+                retry_after_s,
+                reason,
+            } => {
+                sse_event(
+                    stream,
+                    None,
+                    &json!({ "type": "error", "error": { "type": "insufficient_memory", "message": reason, "retry_after_s": retry_after_s } }),
+                )?;
+                write_chunk(stream, b"")?;
+                break;
+            }
             Reply::Error(e) => {
                 sse_event(
                     stream,
@@ -1735,13 +2341,10 @@ fn normalize_messages_body(body: &mut Value) {
                                 }));
                             }
                             "tool_result" => {
-                                let id = b
-                                    .get("tool_use_id")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("");
-                                let content = block_content_text(
-                                    b.get("content").unwrap_or(&Value::Null),
-                                );
+                                let id =
+                                    b.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("");
+                                let content =
+                                    block_content_text(b.get("content").unwrap_or(&Value::Null));
                                 out.push(json!({
                                     "role": "tool",
                                     "tool_call_id": id,
@@ -1807,7 +2410,11 @@ fn normalize_messages_body(body: &mut Value) {
             };
             body["tool_choice"] = mapped;
         }
-        if tc.get("disable_parallel_tool_use").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if tc
+            .get("disable_parallel_tool_use")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
             parallel_off = true;
         }
     }
@@ -1869,7 +2476,9 @@ fn normalize_responses_body(body: &mut Value) {
                             for p in parts {
                                 match p.get("type").and_then(|t| t.as_str()) {
                                     Some("input_text") | Some("output_text") => {
-                                        text.push_str(p.get("text").and_then(|t| t.as_str()).unwrap_or(""));
+                                        text.push_str(
+                                            p.get("text").and_then(|t| t.as_str()).unwrap_or(""),
+                                        );
                                     }
                                     Some("input_image") | Some("image") => image = true,
                                     _ => {}
@@ -1972,13 +2581,15 @@ fn store_conversation(id: &str, req_body: &Value, d: &ReplyData, payload: &Value
     }
     conv.push(assistant);
     conv_store().lock().unwrap().insert(id.to_string(), conv);
-    payload_store().lock().unwrap().insert(id.to_string(), payload.clone());
+    payload_store()
+        .lock()
+        .unwrap()
+        .insert(id.to_string(), payload.clone());
 }
 
 fn conv_store() -> &'static std::sync::Mutex<std::collections::HashMap<String, Vec<Value>>> {
-    static S: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, Vec<Value>>>,
-    > = std::sync::OnceLock::new();
+    static S: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Vec<Value>>>> =
+        std::sync::OnceLock::new();
     S.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -2016,9 +2627,14 @@ fn apply_previous_response(body: &mut Value) {
 // ─────────────────────── token counting ───────────────────────
 
 /// Worker-side `messages/count_tokens`: render the prompt and count its tokens.
-fn count_tokens_job(tok: &Tokenizer, job: &Job, tmpl: Option<&ChatTemplate>) -> anyhow::Result<()> {
+fn count_tokens_job(
+    tok: &Tokenizer,
+    job: &Job,
+    tmpl: Option<&ChatTemplate>,
+    cfg: &ServerConfig,
+) -> anyhow::Result<()> {
     let messages = parse_messages(&job.body)?;
-    let prompt = render_prompt(tmpl, &messages, true, &[], true)?;
+    let prompt = render_prompt(tmpl, &messages, true, &[], request_thinking(&job.body, cfg))?;
     let ids = tok.encode(&prompt, false)?;
     let _ = job.reply.send(Reply::Done {
         content: String::new(),
@@ -2026,6 +2642,7 @@ fn count_tokens_job(tok: &Tokenizer, job: &Job, tmpl: Option<&ChatTemplate>) -> 
         tool_calls: Vec::new(),
         prompt_tokens: ids.len(),
         completion_tokens: 0,
+        cached_tokens: 0,
         finish: "stop".to_string(),
         logprobs: None,
         stop_sequence: None,
@@ -2037,10 +2654,10 @@ fn collect_count_tokens(stream: &mut TcpStream, rx: Receiver<Reply>) -> anyhow::
     let d = match drain_reply(rx) {
         Ok(d) => d,
         Err(e) => {
-            let payload = json!({"error": {"message": e.to_string(), "type": "engine_error"}});
+            let payload = json!({"error": {"message": error_message_for(&e), "type": "engine_error"}});
             return write_response(
                 stream,
-                "500 Internal Server Error",
+                http_status_for(&e),
                 "application/json",
                 payload.to_string().as_bytes(),
                 "",
@@ -2057,11 +2674,22 @@ fn collect_count_tokens(stream: &mut TcpStream, rx: Receiver<Reply>) -> anyhow::
     )
 }
 
+/// The prompt tokens still to feed: everything after the resumed prefix-cache
+/// boundary and after the two-stage prefill boundary.
+fn unfed_prefix(ids: &[u32], resumed: Option<&usize>, prefeed: &Option<Vec<u32>>) -> Vec<u32> {
+    let skip = resumed
+        .copied()
+        .unwrap_or(0)
+        .max(prefeed.as_ref().map_or(0, |p| p.len()));
+    ids[skip..].to_vec()
+}
+
 fn complete(
     tower: &mut dyn LanguageModel,
     tok: &Tokenizer,
     job: &Job,
     cfg: &ServerConfig,
+    prefix: &mut PrefixCache,
     tmpl: Option<&ChatTemplate>,
 ) -> anyhow::Result<()> {
     let mut messages = parse_messages(&job.body)?;
@@ -2087,25 +2715,27 @@ fn complete(
     let tools = request_tools(job);
     let stops = request_stops(job);
     let parallel = parallel_tools(job);
-    let think_off = job
+    // `ignore_eos` for the serial completion path (see the session path note).
+    let ignore_eos = job
         .body
-        .get("chat_template_kwargs")
-        .and_then(|c| c.get("enable_thinking"))
+        .get("ignore_eos")
         .and_then(|v| v.as_bool())
-        == Some(false)
-        || job.body.get("reasoning_effort").and_then(|v| v.as_str()) == Some("none")
-        || job
-            .body
-            .get("reasoning")
-            .and_then(|r| r.get("effort"))
-            .and_then(|v| v.as_str())
-            == Some("none");
-    let thinking = job.surface != Surface::Completions && !think_off;
+        .unwrap_or(false);
+    let im_end = tok.im_end_ids.clone();
+    if ignore_eos {
+        lisa_engine::core::generate::set_eos_ids(Vec::new());
+    }
+    // Raw completions never get a think-prompt (parity with the old
+    // surface-gated resolution); explicit enable_thinking there is ignored.
+    let thinking = job.surface != Surface::Completions && request_thinking(&job.body, cfg);
     // Anthropic semantics: a trailing assistant message is a prefill. Render the
     // generation header, then the partial assistant text, and let the model
     // continue it (rather than closing the turn and starting a new one).
     let prompt = if job.surface == Surface::Messages
-        && messages.last().map(|m| m.role == "assistant").unwrap_or(false)
+        && messages
+            .last()
+            .map(|m| m.role == "assistant")
+            .unwrap_or(false)
     {
         let prefill = messages.pop().map(|m| m.content).unwrap_or_default();
         format!(
@@ -2140,14 +2770,66 @@ fn complete(
         .get("logprobs")
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
-        || job.body.get("top_logprobs").and_then(|v| v.as_u64()).unwrap_or(0) > 0;
+        || job
+            .body
+            .get("top_logprobs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            > 0;
     let mut collected: Vec<u32> = Vec::new();
     let mut last_text = String::new();
     let reply = job.reply.clone();
     let hit_stop = std::cell::Cell::new(false);
     let mut lp_entries: Vec<Value> = Vec::new();
 
-    let mut session = Session::new(tower);
+    // Cross-request prefix cache: resume at a cached prompt boundary when the
+    // prompt extends it token-exactly; otherwise prefill in stages so a
+    // mid-prompt boundary (the shared system-prefix cell) gets snapshotted.
+    let mut resumed: Option<usize> = None;
+    let mut session = if prefix.enabled() {
+        match prefix.restore_session(tower, &ids) {
+            Some((l, s)) => {
+                eprintln!("[serve] prefix-cache resume {l}/{}", ids.len());
+                resumed = Some(l);
+                s
+            }
+            None => Session::new(tower),
+        }
+    } else {
+        Session::new(tower)
+    };
+    let mut prefeed: Option<Vec<u32>> = None;
+    // Populate the cache BEFORE generation, with the boundary one token short
+    // of the prompt end. `PrefixCache::lookup` serves only STRICT extensions
+    // (entry len < prompt len — a resumed state must be fed a fresh token to
+    // yield logits), so an entry at the full boundary can never serve an
+    // identical repeat. llmprobe's prefix probe (1580-token prompt, warm ==
+    // cold prompt) measured 0/1580 cached and warm TTFT SLOWER than cold
+    // (8.5 s vs 6.5 s): every warm request re-prefilled the whole prompt AND
+    // paid the snapshot clone. One token short, a warm repeat IS a strict
+    // extension: it resumes at the boundary and prefills exactly one token.
+    if prefix.enabled() && ids.len() > lisa_engine::core::prefix_cache::MIN_PREFIX_TOKENS {
+        let split = ids.len() - 1;
+        let pos = resumed.unwrap_or(0);
+        if pos < split {
+            // Mid-prompt boundary only past the natural prefill-chunk size,
+            // and ON a chunk multiple: feeding [..b] then the rest dispatches
+            // exactly the windows a plain chunked prefill would, so the cache
+            // never changes the computed values.
+            if ids.len() > 2048 {
+                let b = (ids.len() / 2048) * 2048;
+                if b > pos && b <= split {
+                    session.feed(tower, &ids[pos..b])?;
+                    prefix.insert(&ids[..b], &session.caches);
+                    prefeed = Some(ids[..b].to_vec());
+                }
+            }
+            let start = prefeed.as_ref().map_or(pos, |p| p.len());
+            session.feed(tower, &ids[start..split])?;
+            prefix.insert(&ids[..split], &session.caches);
+            prefeed = Some(ids[..split].to_vec());
+        }
+    }
     let generated = {
         let mut emit = |t: u32, lp: Option<Value>| -> anyhow::Result<()> {
             if let Some(entry) = &lp {
@@ -2158,7 +2840,10 @@ fn complete(
                 collected.push(t);
                 if !stops.is_empty() {
                     let text = tok.decode(&collected)?;
-                    if stops.iter().any(|s| !s.is_empty() && text.contains(s.as_str())) {
+                    if stops
+                        .iter()
+                        .any(|s| !s.is_empty() && text.contains(s.as_str()))
+                    {
                         hit_stop.set(true);
                         return Err(anyhow::anyhow!("stop sequence"));
                     }
@@ -2189,7 +2874,8 @@ fn complete(
             // Logprobs require the logits at every step; MTP drafts would skip
             // them, so this path runs one token at a time.
             let mut out: Vec<u32> = Vec::new();
-            let mut logits = session.feed(tower, &ids)?;
+            let gen_ids = unfed_prefix(&ids, resumed.as_ref(), &prefeed);
+            let mut logits = session.feed(tower, &gen_ids)?;
             loop {
                 let t = sampler.draw(&logits, &session.fed)?;
                 let entry = json!({
@@ -2210,10 +2896,31 @@ fn complete(
                 logits = session.feed(tower, &[t])?;
             }
             Ok(out)
-        } else if depth > 0 && greedy {
-            session.generate_mtp(tower, &ids, max_tokens, depth, &mut |t| emit(t, None))
+        } else if depth > 0 {
+            let gen_ids = unfed_prefix(&ids, resumed.as_ref(), &prefeed);
+            anyhow::ensure!(!gen_ids.is_empty(), "request has no new tokens");
+            let md = mtp_depth(depth, tower);
+            session.generate_mtp_depth(
+                tower,
+                &gen_ids,
+                max_tokens,
+                md,
+                None,
+                if greedy { None } else { Some(&mut sampler) },
+                &mut |t| emit(t, None),
+            )
         } else {
-            session.generate(tower, &ids, max_tokens, &mut sampler, &mut |t| emit(t, None))
+            let gen_ids = unfed_prefix(&ids, resumed.as_ref(), &prefeed);
+            anyhow::ensure!(!gen_ids.is_empty(), "request has no new tokens");
+            session.generate(
+                tower,
+                &gen_ids,
+                max_tokens,
+                &mut sampler,
+                cfg.pld,
+                None,
+                &mut |t| emit(t, None),
+            )
         }
     };
     let generated = match generated {
@@ -2231,33 +2938,76 @@ fn complete(
     };
 
     let full = tok.decode(&collected)?;
-    if (!tools.is_empty() || json_schema.is_some())
-        && std::env::var_os("LISA_DEBUG_TOOLS").is_some()
-    {
-        eprintln!("[raw] {full}");
-    }
     let (content, reasoning, tool_calls) = if json_schema.is_some() {
+        let sc = json_schema.clone().unwrap_or(json!({ "type": "object" }));
         let raw = strip_stops(&full, &stops);
         let body = strip_think_prefix(raw);
-        let content = match extract_json(body) {
+        let (mut content, mut errors) = match extract_json(body) {
             Some(s) => {
                 let mut v: Value = serde_json::from_str(&s).unwrap_or(Value::String(s));
-                if let Some(sc) = &json_schema {
-                    repair_json(&mut v, sc);
-                }
-                v.to_string()
+                repair_json(&mut v, &sc);
+                let errs = json_schema_errors(&v, &sc);
+                (v.to_string(), errs)
             }
-            None => body.trim().to_string(),
+            None => (
+                body.trim().to_string(),
+                vec!["the reply was not parseable as JSON".to_string()],
+            ),
         };
+        // Validate-and-retry: the engine has no grammar-constrained decoding,
+        // so a reply that still violates the schema after repair gets ONE
+        // corrective turn — the failed output plus the violations are fed back
+        // and the model regenerates. The second attempt goes through the same
+        // extract/repair/validate pipeline (it wins even if imperfect: the
+        // first attempt already failed validation).
+        if !errors.is_empty() && !content.trim().is_empty() {
+            eprintln!("[serve] json-schema retry: {}", errors.join("; "));
+            let corrective = format!(
+                "\n{}\nThat reply violates the requested JSON Schema ({}). \
+                 Output only the corrected JSON value, nothing else.",
+                content.trim(),
+                errors.join("; ")
+            );
+            let retry_ids = tok.encode(&corrective, false)?;
+            let mut noop = |_t: u32| -> anyhow::Result<()> { Ok(()) };
+            let retry = session.generate(
+                tower,
+                &retry_ids,
+                max_tokens,
+                &mut sampler,
+                0,
+                None,
+                &mut noop,
+            );
+            if let Ok(retry) = retry {
+                let retry_text = tok.decode(&retry)?;
+                let rbody = strip_think_prefix(strip_stops(&retry_text, &stops));
+                if let Some(s) = extract_json(rbody) {
+                    let mut v: Value = serde_json::from_str(&s).unwrap_or(Value::String(s));
+                    repair_json(&mut v, &sc);
+                    let rerrs = json_schema_errors(&v, &sc);
+                    if rerrs.len() <= errors.len() {
+                        content = v.to_string();
+                        errors = rerrs;
+                    }
+                }
+            }
+        }
+        if !errors.is_empty() {
+            eprintln!("[serve] json-schema still invalid after retry: {}", errors.join("; "));
+        }
         (content, None, Vec::new())
     } else {
         shape_reply(&full, &tools, parallel, &stops)
     };
-    if streaming && json_schema.is_some() {
-        let _ = job.reply.send(Reply::Delta { text: content.clone(), logprobs: None });
+    if ignore_eos {
+        lisa_engine::core::generate::set_eos_ids(im_end);
     }
-    if !tools.is_empty() && std::env::var_os("LISA_DEBUG_TOOLS").is_some() {
-        eprintln!("[parsed] {tool_calls:?}");
+    if streaming && json_schema.is_some() {
+        let _ = job.reply.send(Reply::Delta {
+            text: content.clone(),
+            logprobs: None,
+        });
     }
     let stopped_by = if hit_stop.get() {
         stops
@@ -2282,9 +3032,85 @@ fn complete(
         tool_calls,
         prompt_tokens: ids.len(),
         completion_tokens: collected.len(),
+        cached_tokens: resumed.unwrap_or(0),
         finish: finish.to_string(),
         logprobs,
         stop_sequence: stopped_by,
+    });
+    Ok(())
+}
+
+/// Serve POST /v1/embeddings: encode each input, run one forward over the
+/// trunk, mean-pool the last hidden states over the sequence, L2-normalize.
+/// The OpenAI payload is serialized into `Reply::Done.content` (the surface
+/// writer hands it straight through).
+fn run_embeddings(
+    tower: &mut dyn LanguageModel,
+    tok: &Tokenizer,
+    job: &Job,
+) -> anyhow::Result<()> {
+    use lisa_mlx::Array as MlxArray;
+    let inputs: Vec<String> = match job.body.get("input") {
+        Some(Value::String(s)) => vec![s.clone()],
+        Some(Value::Array(a)) => {
+            let mut v = Vec::with_capacity(a.len());
+            for x in a {
+                match x {
+                    Value::String(s) => v.push(s.clone()),
+                    other => v.push(other.to_string()),
+                }
+            }
+            v
+        }
+        _ => anyhow::bail!("input must be a string or an array of strings"),
+    };
+    anyhow::ensure!(!inputs.is_empty(), "input must not be empty");
+
+    let mut data = Vec::with_capacity(inputs.len());
+    let mut total_tokens = 0usize;
+    for text in &inputs {
+        let ids = tok.encode(text, false)?;
+        anyhow::ensure!(
+            !ids.is_empty(),
+            "input encoded to zero tokens: {text:?}"
+        );
+        total_tokens += ids.len();
+        let arr = MlxArray::from_slice(
+            &ids.iter().map(|&t| t as i32).collect::<Vec<_>>(),
+            &[1i32, ids.len() as i32],
+        );
+        let mut caches = tower.new_caches();
+        let (mixed, _multi) = tower.forward(&arr, Some(&mut caches))?;
+        // mixed: [1, S, H] -> mean over S -> [1, H]
+        let pooled = mixed.mean_axis(1, false)?.as_dtype(lisa_mlx::Dtype::Float32)?;
+        let _ = pooled.eval();
+        let host = pooled.as_slice::<f32>();
+        // L2 normalization in host order (H is small).
+        let norm: f32 = host.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+        data.push(host.iter().map(|x| x / norm).collect::<Vec<f32>>());
+    }
+
+    let embeddings: Vec<Value> = data
+        .into_iter()
+        .enumerate()
+        .map(|(i, e)| json!({ "object": "embedding", "index": i, "embedding": e }))
+        .collect();
+    let payload = json!({
+        "object": "list",
+        "data": embeddings,
+        "model": model_id(),
+        "usage": { "prompt_tokens": total_tokens, "total_tokens": total_tokens },
+    });
+    let _ = job.reply.send(Reply::Done {
+        content: payload.to_string(),
+        reasoning: None,
+        tool_calls: Vec::new(),
+        prompt_tokens: total_tokens,
+        completion_tokens: 0,
+        cached_tokens: 0,
+        finish: "stop".into(),
+        logprobs: None,
+        stop_sequence: None,
     });
     Ok(())
 }
@@ -2343,13 +3169,32 @@ impl ChatTemplate {
                 msg.extra.insert("tool_call_id".to_string(), json!(id));
             }
             if !m.tool_calls.is_empty() {
-                msg.tool_calls = m.tool_calls.clone();
+                let mut calls = m.tool_calls.clone();
+                // OpenAI wire format carries `arguments` as a JSON string;
+                // the template iterates it as an object (`arguments|items`).
+                // Parse it here so the canonical render never sees a string.
+                for c in &mut calls {
+                    if let Some(f) = c.get_mut("function") {
+                        if let Some(a) = f.get("arguments").and_then(|v| v.as_str()) {
+                            let parsed: Value = serde_json::from_str(a)
+                                .unwrap_or_else(|_| json!({}));
+                            f["arguments"] = parsed;
+                        }
+                    }
+                }
+                msg.tool_calls = calls;
             }
             input.messages.push(msg);
         }
-        input.extra.insert("enable_thinking".to_string(), json!(thinking));
-        input.extra.insert("reasoning_effort".to_string(), json!("xhigh"));
-        input.extra.insert("preserve_thinking".to_string(), json!(true));
+        input
+            .extra
+            .insert("enable_thinking".to_string(), json!(thinking));
+        input
+            .extra
+            .insert("reasoning_effort".to_string(), json!("xhigh"));
+        input
+            .extra
+            .insert("preserve_thinking".to_string(), json!(true));
         self.inner
             .render(&input)
             .map_err(|e| anyhow::anyhow!("chat template render: {e}"))
@@ -2514,7 +3359,11 @@ fn parse_tool_call(
     let mut raw = Value::Null;
     if name.is_empty() {
         if let Some(obj) = find_json_object(body) {
-            name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            name = obj
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             raw = obj
                 .get("arguments")
                 .or_else(|| obj.get("parameters"))
@@ -2525,8 +3374,16 @@ fn parse_tool_call(
     let declared = types.get(&name);
     let coerce = |key: &str, val: &str| -> Value {
         match declared.and_then(|m| m.get(key)).map(String::as_str) {
-            Some("integer") => val.trim().parse::<i64>().map(Value::from).unwrap_or_else(|_| Value::String(val.to_string())),
-            Some("number") => val.trim().parse::<f64>().map(Value::from).unwrap_or_else(|_| Value::String(val.to_string())),
+            Some("integer") => val
+                .trim()
+                .parse::<i64>()
+                .map(Value::from)
+                .unwrap_or_else(|_| Value::String(val.to_string())),
+            Some("number") => val
+                .trim()
+                .parse::<f64>()
+                .map(Value::from)
+                .unwrap_or_else(|_| Value::String(val.to_string())),
             Some("boolean") => match val.trim() {
                 "true" => Value::Bool(true),
                 "false" => Value::Bool(false),
@@ -2562,7 +3419,10 @@ fn parse_tool_call(
                 let Some(eq) = nv.find('=') else {
                     break;
                 };
-                let k = nv[eq + 1..].trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+                let k = nv[eq + 1..]
+                    .trim()
+                    .trim_matches(|c| c == '"' || c == '\'')
+                    .to_string();
                 let Some((_, r2)) = r.split_once('>') else {
                     break;
                 };
@@ -2583,7 +3443,9 @@ fn parse_tool_call(
                 }
             };
             if !key.is_empty() {
-                args.insert(key.clone(), coerce(&key, &val));
+                // The template's documented XML form puts the value on its own
+                // line(s); edge whitespace is format, not data.
+                args.insert(key.clone(), coerce(&key, val.trim()));
             }
             match after {
                 Some(a) => rest = a,
@@ -3120,6 +3982,83 @@ fn repair_json(v: &mut Value, schema: &Value) {
     }
 }
 
+/// Validate a parsed JSON value against (the subset of JSON Schema the server
+/// honors): types, `required` object properties, `enum`, and nested
+/// `properties`/`items`. Returns human-readable violations; empty == valid.
+/// This backs the validate+retry path for `response_format` — the engine has
+/// no grammar-constrained decoding, so conformance is checked after
+/// generation (repair first, then one corrective retry, documented in the
+/// serving-api spec).
+fn json_schema_errors(v: &Value, schema: &Value) -> Vec<String> {
+    let mut errs = Vec::new();
+    let ty = schema.get("type").and_then(|t| t.as_str());
+    let type_ok = |v: &Value, ty: &str| match ty {
+        "object" => v.is_object(),
+        "array" => v.is_array(),
+        "string" => v.is_string(),
+        "integer" => v.is_i64() || v.is_u64(),
+        "number" => v.is_number(),
+        "boolean" => v.is_boolean(),
+        "null" => v.is_null(),
+        _ => true,
+    };
+    if let Some(ty) = ty {
+        if !type_ok(v, ty) {
+            errs.push(format!("expected {ty}, got {}", type_name_of(v)));
+            return errs;
+        }
+    }
+    if let Some(e) = schema.get("enum").and_then(|e| e.as_array()) {
+        if !e.iter().any(|x| x == v) {
+            errs.push(format!("value {v} not in enum"));
+        }
+    }
+    match ty {
+        Some("object") | None if v.is_object() => {
+            if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
+                for (k, ps) in props {
+                    if let Some(x) = v.get(k) {
+                        for e in json_schema_errors(x, ps) {
+                            errs.push(format!("{k}: {e}"));
+                        }
+                    }
+                }
+            }
+            if let Some(req) = schema.get("required").and_then(|r| r.as_array()) {
+                for r in req {
+                    if let Some(k) = r.as_str() {
+                        if !v.get(k).map(|x| !x.is_null()).unwrap_or(false) {
+                            errs.push(format!("missing required property {k:?}"));
+                        }
+                    }
+                }
+            }
+        }
+        Some("array") => {
+            if let (Some(items), Value::Array(a)) = (schema.get("items"), v) {
+                for (i, x) in a.iter().enumerate() {
+                    for e in json_schema_errors(x, items) {
+                        errs.push(format!("[{i}]: {e}"));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    errs
+}
+
+fn type_name_of(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
 fn find_json_array(s: &str) -> Option<Value> {
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -3160,33 +4099,70 @@ fn find_json_array(s: &str) -> Option<Value> {
     None
 }
 
+/// Sampling decision chain: request body >
+/// server flags > checkpoint `generation_config.json` > hardcoded defaults
+/// (greedy). Applied identically on every generation path (batched, serial,
+/// MTP-verify), so a silent request samples the same way everywhere.
 fn sampler_from(body: &Value, cfg: &ServerConfig) -> Sampler {
-    let f = |k: &str, d: f32| {
+    let f = |k: &str, flag: Option<f32>, generation: Option<f32>, d: f32| {
         body.get(k)
             .and_then(|v| v.as_f64())
             .map(|v| v as f32)
+            .or(flag)
+            .or(generation)
             .unwrap_or(d)
     };
-    let u = |k: &str, d: usize| {
+    let u = |k: &str, flag: Option<usize>, generation: Option<usize>, d: usize| {
         body.get(k)
             .and_then(|v| v.as_u64())
             .map(|v| v as usize)
+            .or(flag)
+            .or(generation)
             .unwrap_or(d)
     };
-    let seed = body
-        .get("seed")
-        .and_then(|v| v.as_u64())
-        .filter(|&v| v != 0)
-        .unwrap_or(0x9E37_79B9_7F4A_7C15);
+    let seed = body.get("seed").and_then(|v| v.as_u64()).unwrap_or(0x9E37_79B9_7F4A_7C15);
     Sampler {
-        temperature: f("temperature", cfg.temperature),
-        top_k: u("top_k", cfg.top_k),
-        top_p: f("top_p", cfg.top_p),
-        min_p: f("min_p", cfg.min_p),
-        repetition_penalty: f("repetition_penalty", cfg.rep_penalty),
+        temperature: f("temperature", cfg.temperature, cfg.gen_defaults.temperature, 0.0),
+        top_k: u("top_k", cfg.top_k, cfg.gen_defaults.top_k, 0),
+        top_p: f("top_p", cfg.top_p, cfg.gen_defaults.top_p, 1.0),
+        min_p: f("min_p", cfg.min_p, None, 0.0),
+        repetition_penalty: f(
+            "repetition_penalty",
+            cfg.rep_penalty,
+            cfg.gen_defaults.rep_penalty,
+            1.0,
+        ),
         seed,
         ..Default::default()
     }
+}
+
+/// Whether a request renders its generation prompt with thinking on: an
+/// explicit request value wins (`chat_template_kwargs.enable_thinking`,
+/// `reasoning_effort` / `reasoning.effort`), then the checkpoint's own
+/// declaration (`generation_config.json` →
+/// `default_chat_template_kwargs.enable_thinking`), then off. Silent requests
+/// default to off.
+fn request_thinking(body: &Value, cfg: &ServerConfig) -> bool {
+    if let Some(v) = body
+        .get("chat_template_kwargs")
+        .and_then(|c| c.get("enable_thinking"))
+        .and_then(|v| v.as_bool())
+    {
+        return v;
+    }
+    let effort = body
+        .get("reasoning_effort")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            body.get("reasoning")
+                .and_then(|r| r.get("effort"))
+                .and_then(|v| v.as_str())
+        });
+    if let Some(e) = effort {
+        return e != "none";
+    }
+    cfg.gen_defaults.thinking.unwrap_or(false)
 }
 
 fn read_request(stream: &mut TcpStream) -> anyhow::Result<Option<(String, String, Vec<u8>)>> {
@@ -3214,7 +4190,10 @@ fn read_request(stream: &mut TcpStream) -> anyhow::Result<Option<(String, String
         }
     }
     const MAX_BODY: usize = 8 << 20;
-    anyhow::ensure!(content_length <= MAX_BODY, "request body too large ({content_length} bytes)");
+    anyhow::ensure!(
+        content_length <= MAX_BODY,
+        "request body too large ({content_length} bytes)"
+    );
     let mut body = vec![0u8; content_length];
     if content_length > 0 {
         reader.read_exact(&mut body)?;
@@ -3301,11 +4280,23 @@ fn handle_decision_conn(mut stream: TcpStream, model: &dyn DecisionModel) -> any
         return Ok(());
     };
     if method == "GET" && (path == "/health" || path == "/healthz") {
-        return write_response(&mut stream, "200 OK", "application/json", br#"{"status":"ok"}"#, "");
+        return write_response(
+            &mut stream,
+            "200 OK",
+            "application/json",
+            br#"{"status":"ok"}"#,
+            "",
+        );
     }
     if method == "GET" && path.starts_with("/v1/models") {
         let payload = json!({"object":"list","data":[{"id":model.name(),"object":"model"}]});
-        return write_response(&mut stream, "200 OK", "application/json", payload.to_string().as_bytes(), "");
+        return write_response(
+            &mut stream,
+            "200 OK",
+            "application/json",
+            payload.to_string().as_bytes(),
+            "",
+        );
     }
     if method == "POST" && path == "/v1/decisions" {
         let req: Value = match serde_json::from_slice(&body) {
@@ -3315,21 +4306,39 @@ fn handle_decision_conn(mut stream: TcpStream, model: &dyn DecisionModel) -> any
         let state = req.get("state").cloned().unwrap_or(Value::Null);
         let questions = req.get("questions").cloned().unwrap_or(Value::Null);
         return match model.system_one(&state, &questions) {
-            Ok(ans) => write_response(&mut stream, "200 OK", "application/json", ans.to_string().as_bytes(), ""),
+            Ok(ans) => write_response(
+                &mut stream,
+                "200 OK",
+                "application/json",
+                ans.to_string().as_bytes(),
+                "",
+            ),
             Err(e) => bad_request(&mut stream, e.to_string()),
         };
     }
-    write_response(&mut stream, "404 Not Found", "application/json", br#"{"error":{"message":"not found"}}"#, "")
+    write_response(
+        &mut stream,
+        "404 Not Found",
+        "application/json",
+        br#"{"error":{"message":"not found"}}"#,
+        "",
+    )
 }
 
 fn bad_request(stream: &mut TcpStream, msg: String) -> anyhow::Result<()> {
     let body = json!({ "error": { "message": msg } }).to_string();
-    write_response(stream, "400 Bad Request", "application/json", body.as_bytes(), "")
+    write_response(
+        stream,
+        "400 Bad Request",
+        "application/json",
+        body.as_bytes(),
+        "",
+    )
 }
 
 #[cfg(test)]
 mod render_test {
-    use super::{extract_tool_calls, find_json_object, salvage_json_object, ChatMessage, ChatTemplate};
+    use super::{ChatMessage, ChatTemplate, extract_tool_calls};
     use serde_json::json;
 
     #[test]
@@ -3348,7 +4357,8 @@ mod render_test {
 
     #[test]
     fn parses_json_form_tool_calls() {
-        let t1 = "<tool_call><function=run_command>{\"command\":\"npm test\"}</function></tool_call>";
+        let t1 =
+            "<tool_call><function=run_command>{\"command\":\"npm test\"}</function></tool_call>";
         let (_, c1) = extract_tool_calls(t1, &[]);
         assert_eq!(c1.len(), 1);
         assert_eq!(c1[0]["function"]["name"], "run_command");
@@ -3492,21 +4502,41 @@ mod render_test {
     #[test]
     #[ignore]
     fn render_real_template() {
-        let dir = match lisa_engine::models::resolve_model_dir(
-            "agnosticeng/Qwen3.8-Flash-Next-4bit",
-        ) {
-            Ok(d) => d,
-            Err(_) => return,
-        };
+        let dir =
+            match lisa_engine::models::resolve_model_dir("agnosticeng/Qwen3.8-Flash-Next-4bit") {
+                Ok(d) => d,
+                Err(_) => return,
+            };
         let src = match std::fs::read_to_string(dir.join("chat_template.jinja")) {
             Ok(s) => s,
             Err(_) => return,
         };
         let t = ChatTemplate::new(&src).expect("template parse");
         let msgs = vec![
-            ChatMessage { role: "user".into(), content: "Name three colors.".into(), reasoning_content: None, tool_calls: Vec::new(), tool_call_id: None, parts: None },
-            ChatMessage { role: "assistant".into(), content: "Red, green, blue.".into(), reasoning_content: Some("Thinking about colors.".into()), tool_calls: Vec::new(), tool_call_id: None, parts: None },
-            ChatMessage { role: "user".into(), content: "Which is warmest?".into(), reasoning_content: None, tool_calls: Vec::new(), tool_call_id: None, parts: None },
+            ChatMessage {
+                role: "user".into(),
+                content: "Name three colors.".into(),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                parts: None,
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: "Red, green, blue.".into(),
+                reasoning_content: Some("Thinking about colors.".into()),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                parts: None,
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "Which is warmest?".into(),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                parts: None,
+            },
         ];
         let out = t.render(&msgs, true, &[], true).expect("render");
         eprintln!("---RENDER---\n{out}\n---END---");

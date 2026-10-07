@@ -4,7 +4,7 @@
 //! f32 `Vec`s; matmuls are parallelised over rows with rayon. It is much slower
 //! than the Metal path but needs no GPU.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 
 use super::{Laya, LayaConfig};
@@ -60,7 +60,14 @@ impl Laya {
     }
 
     /// LayerNorm over the last axis, rows independent.
-    fn cpu_layer_norm(x: &[f32], rows: usize, cols: usize, w: &Mat, b: Option<&Mat>, eps: f32) -> Vec<f32> {
+    fn cpu_layer_norm(
+        x: &[f32],
+        rows: usize,
+        cols: usize,
+        w: &Mat,
+        b: Option<&Mat>,
+        eps: f32,
+    ) -> Vec<f32> {
         let (wf, _) = w;
         let bias = b.as_ref().map(|(v, _)| v.as_slice());
         let mut y = vec![0f32; rows * cols];
@@ -183,18 +190,31 @@ impl Laya {
         out
     }
 
-    fn cpu_encoder_attn(&self, x: &[f32], prefix: &str, base: f32, mask: &[f32], cfg: &LayaConfig) -> Result<Vec<f32>> {
+    fn cpu_encoder_attn(
+        &self,
+        x: &[f32],
+        prefix: &str,
+        base: f32,
+        mask: &[f32],
+        cfg: &LayaConfig,
+    ) -> Result<Vec<f32>> {
         let s = x.len() / cfg.hidden_size;
         let h = cfg.num_heads;
         let d = cfg.head_dim;
-        let qkv = self.cpu_linear(x, s, &self.wf32(&format!("{prefix}.attn.Wqkv.weight"))?, None)?;
+        let qkv = self.cpu_linear(
+            x,
+            s,
+            &self.wf32(&format!("{prefix}.attn.Wqkv.weight"))?,
+            None,
+        )?;
         // [S, 3, h, d] -> per-part [S, h, d] -> [h, S, d]
         let mut parts = vec![vec![0f32; s * h * d]; 3];
         for si in 0..s {
             for p in 0..3 {
                 for hi in 0..h {
                     for di in 0..d {
-                        parts[p][si * h * d + hi * d + di] = qkv[si * 3 * h * d + p * h * d + hi * d + di];
+                        parts[p][si * h * d + hi * d + di] =
+                            qkv[si * 3 * h * d + p * h * d + hi * d + di];
                     }
                 }
             }
@@ -206,7 +226,12 @@ impl Laya {
         Self::cpu_rope_neox(&mut k, h, s, d, base);
         let out = Self::cpu_attn(&q, &k, &v, h, s, d, mask);
         let merged = Self::merge_heads(&out, s, h, d);
-        self.cpu_linear(&merged, s, &self.wf32(&format!("{prefix}.attn.Wo.weight"))?, None)
+        self.cpu_linear(
+            &merged,
+            s,
+            &self.wf32(&format!("{prefix}.attn.Wo.weight"))?,
+            None,
+        )
     }
 
     fn cpu_encoder_mlp(&self, x: &[f32], prefix: &str, cfg: &LayaConfig) -> Result<Vec<f32>> {
@@ -216,12 +241,19 @@ impl Laya {
         let mut value = vec![0f32; s * inter];
         let mut gate = vec![0f32; s * inter];
         for r in 0..s {
-            value[r * inter..(r + 1) * inter].copy_from_slice(&wi[r * 2 * inter..r * 2 * inter + inter]);
-            gate[r * inter..(r + 1) * inter].copy_from_slice(&wi[r * 2 * inter + inter..(r + 1) * 2 * inter]);
+            value[r * inter..(r + 1) * inter]
+                .copy_from_slice(&wi[r * 2 * inter..r * 2 * inter + inter]);
+            gate[r * inter..(r + 1) * inter]
+                .copy_from_slice(&wi[r * 2 * inter + inter..(r + 1) * 2 * inter]);
         }
         let g = Self::cpu_gelu(&value);
         let gated: Vec<f32> = g.iter().zip(gate.iter()).map(|(a, b)| a * b).collect();
-        self.cpu_linear(&gated, s, &self.wf32(&format!("{prefix}.mlp.Wo.weight"))?, None)
+        self.cpu_linear(
+            &gated,
+            s,
+            &self.wf32(&format!("{prefix}.mlp.Wo.weight"))?,
+            None,
+        )
     }
 
     /// The ModernBERT encoder on the host; returns final-norm hidden `[S, H]`.
@@ -234,7 +266,8 @@ impl Laya {
         let (emb, es) = self.wf32("encoder.embeddings.tok_embeddings.weight")?;
         let mut x = vec![0f32; s * h];
         for (i, &id) in ids.iter().enumerate() {
-            x[i * h..(i + 1) * h].copy_from_slice(&emb[id as usize * es[1]..(id as usize + 1) * es[1]]);
+            x[i * h..(i + 1) * h]
+                .copy_from_slice(&emb[id as usize * es[1]..(id as usize + 1) * es[1]]);
         }
         let emb_norm = self.wf32("encoder.embeddings.norm.weight")?;
         x = Self::cpu_layer_norm(&x, s, h, &emb_norm, None, cfg.norm_eps);
@@ -245,18 +278,36 @@ impl Laya {
         for i in 0..cfg.num_layers {
             let prefix = format!("encoder.layers.{i}");
             let global = cfg.layer_global[i];
-            let base = if global { cfg.rope_theta_global } else { cfg.rope_theta_local };
+            let base = if global {
+                cfg.rope_theta_global
+            } else {
+                cfg.rope_theta_local
+            };
             let mask = if global { &full } else { &local };
             let normed = if i == 0 {
                 x.clone()
             } else {
-                Self::cpu_layer_norm(&x, s, h, &self.wf32(&format!("{prefix}.attn_norm.weight"))?, None, cfg.norm_eps)
+                Self::cpu_layer_norm(
+                    &x,
+                    s,
+                    h,
+                    &self.wf32(&format!("{prefix}.attn_norm.weight"))?,
+                    None,
+                    cfg.norm_eps,
+                )
             };
             let att = self.cpu_encoder_attn(&normed, &prefix, base, mask, cfg)?;
             for (a, b) in x.iter_mut().zip(att.iter()) {
                 *a += *b;
             }
-            let normed = Self::cpu_layer_norm(&x, s, h, &self.wf32(&format!("{prefix}.mlp_norm.weight"))?, None, cfg.norm_eps);
+            let normed = Self::cpu_layer_norm(
+                &x,
+                s,
+                h,
+                &self.wf32(&format!("{prefix}.mlp_norm.weight"))?,
+                None,
+                cfg.norm_eps,
+            );
             let mlp = self.cpu_encoder_mlp(&normed, &prefix, cfg)?;
             for (a, b) in x.iter_mut().zip(mlp.iter()) {
                 *a += *b;
@@ -266,7 +317,13 @@ impl Laya {
         Ok(Self::cpu_layer_norm(&x, s, h, &fin, None, cfg.norm_eps))
     }
 
-    fn head_layer_cpu(&self, x: &[f32], i: usize, mask: &[f32], cfg: &LayaConfig) -> Result<Vec<f32>> {
+    fn head_layer_cpu(
+        &self,
+        x: &[f32],
+        i: usize,
+        mask: &[f32],
+        cfg: &LayaConfig,
+    ) -> Result<Vec<f32>> {
         let p = format!("head.layers.{i}");
         let s = x.len() / cfg.hidden_size;
         let dims = cfg.hidden_size;
@@ -284,7 +341,8 @@ impl Laya {
             for pi in 0..3 {
                 for hi in 0..heads {
                     for di in 0..d {
-                        parts[pi][si * heads * d + hi * d + di] = qkv[si * 3 * heads * d + pi * heads * d + hi * d + di];
+                        parts[pi][si * heads * d + hi * d + di] =
+                            qkv[si * 3 * heads * d + pi * heads * d + hi * d + di];
                     }
                 }
             }
@@ -344,7 +402,8 @@ impl Laya {
         // scorer on the marker rows
         let mut markers = vec![0f32; marker_pos.len() * dims];
         for (mi, &pos) in marker_pos.iter().enumerate() {
-            markers[mi * dims..(mi + 1) * dims].copy_from_slice(&h[pos as usize * dims..(pos as usize + 1) * dims]);
+            markers[mi * dims..(mi + 1) * dims]
+                .copy_from_slice(&h[pos as usize * dims..(pos as usize + 1) * dims]);
         }
         let m = marker_pos.len();
         let s0w = self.wf32("scorer.0.weight")?;

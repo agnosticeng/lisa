@@ -1,7 +1,7 @@
 //! Smoke tests for the lisa-mlx + custom Metal kernel stack.
 
 use lisa_mlx::ops::indexing::IndexOp;
-use lisa_mlx::{ops, Array, Dtype, Stream};
+use lisa_mlx::{Array, Dtype, Stream, ops};
 
 fn lcg(seed: &mut u64) -> f32 {
     *seed = seed
@@ -62,21 +62,46 @@ fn gdn_parity(t: usize) -> anyhow::Result<(f32, f32)> {
     let dv = 128usize;
     let mut seed = 7u64;
 
-    let q = Array::from_slice(&rand_f32(b*t*hk*dk, &mut seed), &[b as i32,t as i32,hk as i32,dk as i32]).as_dtype(Dtype::Bfloat16)?;
-    let k = Array::from_slice(&rand_f32(b*t*hk*dk, &mut seed), &[b as i32,t as i32,hk as i32,dk as i32]).as_dtype(Dtype::Bfloat16)?;
+    let q = Array::from_slice(
+        &rand_f32(b * t * hk * dk, &mut seed),
+        &[b as i32, t as i32, hk as i32, dk as i32],
+    )
+    .as_dtype(Dtype::Bfloat16)?;
+    let k = Array::from_slice(
+        &rand_f32(b * t * hk * dk, &mut seed),
+        &[b as i32, t as i32, hk as i32, dk as i32],
+    )
+    .as_dtype(Dtype::Bfloat16)?;
     // normalize k
     let k = {
         let kn = k.as_dtype(Dtype::Float32)?;
         let norm = lisa_mlx::ops::rsqrt(&(&kn * &kn).sum_axis(-1, Some(true))?)? / 11.313708f32;
         (kn * norm).as_dtype(Dtype::Bfloat16)?
     };
-    let v = Array::from_slice(&rand_f32(b*t*hv*dv, &mut seed), &[b as i32,t as i32,hv as i32,dv as i32]).as_dtype(Dtype::Bfloat16)?;
-    let g = ops::sigmoid(&Array::from_slice(&rand_f32(b*t*hv, &mut seed), &[b as i32,t as i32,hv as i32]))?.as_dtype(Dtype::Float32)?;
-    let beta = ops::sigmoid(&Array::from_slice(&rand_f32(b*t*hv, &mut seed), &[b as i32,t as i32,hv as i32]))?.as_dtype(Dtype::Float32)?;
-    let state = Array::from_slice(&rand_f32(b*hv*dv*dk, &mut seed), &[b as i32,hv as i32,dv as i32,dk as i32]).as_dtype(Dtype::Float32)?;
+    let v = Array::from_slice(
+        &rand_f32(b * t * hv * dv, &mut seed),
+        &[b as i32, t as i32, hv as i32, dv as i32],
+    )
+    .as_dtype(Dtype::Bfloat16)?;
+    let g = ops::sigmoid(&Array::from_slice(
+        &rand_f32(b * t * hv, &mut seed),
+        &[b as i32, t as i32, hv as i32],
+    ))?
+    .as_dtype(Dtype::Float32)?;
+    let beta = ops::sigmoid(&Array::from_slice(
+        &rand_f32(b * t * hv, &mut seed),
+        &[b as i32, t as i32, hv as i32],
+    ))?
+    .as_dtype(Dtype::Float32)?;
+    let state = Array::from_slice(
+        &rand_f32(b * hv * dv * dk, &mut seed),
+        &[b as i32, hv as i32, dv as i32, dk as i32],
+    )
+    .as_dtype(Dtype::Float32)?;
     let stream = Stream::thread_local_or_default();
-    let (yk, sk) = gated_delta_kernel(&q,&k,&v,&g,&beta,&state,false,&stream).ok_or_else(|| anyhow::anyhow!("kernel fail"))?;
-    let (yo, so) = gated_delta_ops(&q,&k,&v,&g,&beta,Some(&state))?;
+    let (yk, sk) = gated_delta_kernel(&q, &k, &v, &g, &beta, &state, false, &stream)
+        .ok_or_else(|| anyhow::anyhow!("kernel fail"))?;
+    let (yo, so) = gated_delta_ops(&q, &k, &v, &g, &beta, Some(&state))?;
     let dy = (yk - yo).abs()?.max(None)?.item_cast::<f32>();
     let ds = (sk - so).abs()?.max(None)?.item_cast::<f32>();
     Ok((dy, ds))
@@ -156,10 +181,7 @@ pub fn run_qmm_m_test() -> anyhow::Result<()> {
         .as_slice::<f32>()
         .to_vec();
     for m in [1usize, 2, 8, 64, 256] {
-        let xs = x
-            .index(0..m as i32)
-            .contiguous()
-            .unwrap();
+        let xs = x.index(0..m as i32).contiguous().unwrap();
         let y = ops::quantized_matmul(&xs, &wq, &scales, Some(&biases), true, 32, 4).unwrap();
         let _ = y.eval();
         let arr: Vec<f32> = y
@@ -194,14 +216,15 @@ pub fn run_rounding_test() -> anyhow::Result<()> {
     let fused = lisa_mlx::nn::silu(&x)?;
     // stepped: s = 1/(1+exp(|x|)) mirrored, each step bf16
     let ax = ops::abs(&x)?;
-    let e = ops::exp(&ax)?;                         // bf16 out
+    let e = ops::exp(&ax)?; // bf16 out
     let denom = Array::from_f32(1.0).as_dtype(Dtype::Bfloat16)? + e;
     let inv = reciprocal(&denom)?;
     let one_minus = Array::from_f32(1.0).as_dtype(Dtype::Bfloat16)? - &inv;
     let mirrored = lisa_mlx::ops::r#where(
         &x.lt(&Array::from_f32(0.0).as_dtype(Dtype::Bfloat16)?)?,
         &inv,
-        &one_minus)?;
+        &one_minus,
+    )?;
     let stepped = x.multiply(&mirrored)?;
     let d = (fused - stepped).abs()?.max(None)?.item_cast::<f32>();
     println!("silu fused-vs-stepped max diff: {d:.6}");
@@ -223,14 +246,17 @@ pub fn run_rounding_test() -> anyhow::Result<()> {
     let zero = Array::from_f32(0.0).as_dtype(Dtype::Bfloat16)?;
     let mx_ = ops::maximum(&x, &zero)?;
     let mn = ops::minimum(&x, &zero)?;
-    let emn = ops::exp(&mn)?;                        // bf16
+    let emn = ops::exp(&mn)?; // bf16
     let l1p = {
         // log1p via log(1+e) in bf16
         let one_e = Array::from_f32(1.0).as_dtype(Dtype::Bfloat16)? + emn;
         ops::log(&one_e)?
     };
     let stepped_la = mx_.add(&l1p)?;
-    let d = (la_f32.as_dtype(Dtype::Bfloat16)? - stepped_la).abs()?.max(None)?.item_cast::<f32>();
+    let d = (la_f32.as_dtype(Dtype::Bfloat16)? - stepped_la)
+        .abs()?
+        .max(None)?
+        .item_cast::<f32>();
     println!("logaddexp0 f32-vs-stepped-bf16 max diff: {d:.6}");
     Ok(())
 }
@@ -246,7 +272,11 @@ pub fn run_negslice_test() -> anyhow::Result<()> {
     let m = Array::from_slice(&c, &[1i32, 6, 4]);
     let neg = m.index((.., -3.., ..));
     let _ = neg.eval();
-    println!("m[(.., -3.., ..)] shape {:?} data {:?}", neg.shape(), neg.as_slice::<f32>());
+    println!(
+        "m[(.., -3.., ..)] shape {:?} data {:?}",
+        neg.shape(),
+        neg.as_slice::<f32>()
+    );
     println!("expected shape [1,3,4], data [12..23]");
     Ok(())
 }
@@ -281,7 +311,11 @@ fn smoke_rms_row_exact() -> anyhow::Result<()> {
     // Read the same buffer a second time (independent cast + eval): if the two
     // reads disagree, the buffer is being modified between reads.
     let got_f2 = got.as_dtype(Dtype::Float32)?.as_slice::<f32>().to_vec();
-    let reread = got_f.iter().zip(got_f2.iter()).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+    let reread = got_f
+        .iter()
+        .zip(got_f2.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
     eprintln!("[rms] got re-read stability: {reread}");
 
     let xb: Vec<f32> = x.as_dtype(Dtype::Float32)?.as_slice::<f32>().to_vec();
@@ -331,7 +365,10 @@ fn smoke_rms_row_exact() -> anyhow::Result<()> {
             }
             let total = v2[0];
             if std::env::var("RMS_TOTALS").is_ok() {
-                eprintln!("host total[{r}][{g}] = {total:.6} inv={:.6}", (total / h as f32 + eps).sqrt().recip());
+                eprintln!(
+                    "host total[{r}][{g}] = {total:.6} inv={:.6}",
+                    (total / h as f32 + eps).sqrt().recip()
+                );
             }
             let inv = (total / h as f32 + eps).sqrt().recip();
             for off in 0..h {
@@ -347,10 +384,12 @@ fn smoke_rms_row_exact() -> anyhow::Result<()> {
     if std::env::var("RMS_TOTALS").is_ok() {
         std::fs::write("/tmp/rms-trace/host_want.bin", unsafe {
             std::slice::from_raw_parts(want.as_ptr() as *const u8, want.len() * 4)
-        }).ok();
+        })
+        .ok();
         std::fs::write("/tmp/rms-trace/host_got.bin", unsafe {
             std::slice::from_raw_parts(got_f.as_ptr() as *const u8, got_f.len() * 4)
-        }).ok();
+        })
+        .ok();
     }
     println!("rms_row_exact vs host reference: max abs diff {max:.6}");
 
@@ -363,11 +402,23 @@ fn smoke_rms_row_exact() -> anyhow::Result<()> {
             &[2i32, 3i32, 16i32],
         )
         .as_dtype(Dtype::Bfloat16)?;
-        let v = a.index((lisa_mlx::ops::indexing::Ellipsis, 0..4)).contiguous()?;
+        let v = a
+            .index((lisa_mlx::ops::indexing::Ellipsis, 0..4))
+            .contiguous()?;
         let vf = v.as_dtype(Dtype::Float32)?.as_slice::<f32>().to_vec();
-        let want: Vec<f32> = (0..6).flat_map(|r| (0..4).map(move |c| (r * 16 + c) as f32)).collect();
-        let d = vf.iter().zip(want.iter()).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
-        println!("narrow-last-axis contiguous: max diff {d:.6}  got={:?} want={:?}", &vf[..4.min(vf.len())], &want[..4]);
+        let want: Vec<f32> = (0..6)
+            .flat_map(|r| (0..4).map(move |c| (r * 16 + c) as f32))
+            .collect();
+        let d = vf
+            .iter()
+            .zip(want.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        println!(
+            "narrow-last-axis contiguous: max diff {d:.6}  got={:?} want={:?}",
+            &vf[..4.min(vf.len())],
+            &want[..4]
+        );
     }
     if max > 1.0 {
         anyhow::bail!("rms_row_exact diverges from the host reference: {max}");
@@ -397,20 +448,30 @@ pub fn run_cache_test() -> anyhow::Result<()> {
         let expect_len = (chunk + 1) * 500;
         assert_eq!(lk.dim(2) as usize, expect_len);
         // check the first row of this chunk landed at the right offset
-        let row = lk.index((.., .., (chunk * 500) as i32, ..))
+        let row = lk
+            .index((.., .., (chunk * 500) as i32, ..))
             .as_dtype(Dtype::Float32)?;
         let row_v = row.as_slice::<f32>();
         let want = &data[..256];
-        let maxd: f32 = row_v.iter().zip(want.iter()).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+        let maxd: f32 = row_v
+            .iter()
+            .zip(want.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
         println!("chunk {chunk}: first-row max diff {maxd}");
         assert!(maxd < 0.01);
         // check the last row too
-        let row = lk.index((.., .., (expect_len - 1) as i32, ..))
+        let row = lk
+            .index((.., .., (expect_len - 1) as i32, ..))
             .as_dtype(Dtype::Float32)?;
         let row_v = row.as_slice::<f32>();
         let off = (expect_len - 1 - chunk * 500) as usize * 256;
         let want = &data[off..off + 256];
-        let maxd: f32 = row_v.iter().zip(want.iter()).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+        let maxd: f32 = row_v
+            .iter()
+            .zip(want.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
         println!("chunk {chunk}: last-row max diff {maxd}");
         assert!(maxd < 0.01);
     }
