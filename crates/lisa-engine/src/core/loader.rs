@@ -58,7 +58,11 @@ impl Shard {
                 };
                 let shape: Vec<i32> = info["shape"]
                     .as_array()
-                    .map(|a| a.iter().filter_map(|v| v.as_i64().map(|x| x as i32)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_i64().map(|x| x as i32))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let range = info["data_offsets"].as_array().unwrap();
                 let start = range[0].as_u64().unwrap() as usize;
@@ -74,20 +78,13 @@ impl Shard {
                 );
             }
         }
-        Ok(Self {
-            map,
-            tensors,
-        })
+        Ok(Self { map, tensors })
     }
 
     /// Raw byte slice of one tensor.
     pub fn tensor_bytes(&self, name: &str) -> Option<(&[u8], Dtype, &[i32])> {
         let info = self.tensors.get(name)?;
-        Some((
-            &self.map[info.start..info.end],
-            info.dtype,
-            &info.shape[..],
-        ))
+        Some((&self.map[info.start..info.end], info.dtype, &info.shape[..]))
     }
 
     pub fn tensor_names(&self) -> impl Iterator<Item = &String> {
@@ -114,7 +111,10 @@ impl Checkpoint {
             .clone();
         let mut weight_map = HashMap::new();
         for (name, shard) in map {
-            let shard = shard.as_str().context("shard name not a string")?.to_string();
+            let shard = shard
+                .as_str()
+                .context("shard name not a string")?
+                .to_string();
             weight_map.insert(name.to_string(), shard);
         }
         Ok(Self {
@@ -122,11 +122,14 @@ impl Checkpoint {
             weight_map,
         })
     }
-
 }
 
 /// Create an MLX array from raw tensor bytes (copies onto the device).
-pub fn array_from_bytes(bytes: &[u8], dtype: Dtype, shape: &[i32]) -> lisa_mlx::error::Result<Array> {
+pub fn array_from_bytes(
+    bytes: &[u8],
+    dtype: Dtype,
+    shape: &[i32],
+) -> lisa_mlx::error::Result<Array> {
     unsafe {
         match dtype {
             Dtype::Bfloat16 => Ok(Array::from_raw_data(
@@ -166,7 +169,7 @@ pub fn array_from_bytes(bytes: &[u8], dtype: Dtype, shape: &[i32]) -> lisa_mlx::
     }
 }
 
-/// Sanitize a checkpoint tensor name the way the reference does:
+/// Sanitize a checkpoint tensor name:
 /// drop `language_model.` / `model.language_model.`, remap `model.mtp.` ->
 /// `mtp.`, drop the vision tower, and drop n-gram shards.
 pub fn sanitize_name(raw: &str) -> Option<String> {
@@ -189,7 +192,7 @@ pub fn sanitize_name(raw: &str) -> Option<String> {
         return None;
     }
     // The checkpoint's I64 n-gram buffers are never used: the values are
-    // rebuilt from configuration (the reference does the same).
+    // rebuilt from configuration.
     if key.ends_with(".layer_multipliers")
         || key.ends_with(".ngram_heads_vocab_sizes")
         || key.ends_with(".ngram_heads_offsets")
@@ -200,7 +203,6 @@ pub fn sanitize_name(raw: &str) -> Option<String> {
     // Handled by the caller at load time (shape inspection).
     Some(key)
 }
-
 
 /// Fully materialized weight tensors keyed by sanitized name.
 pub type Weights = HashMap<String, Array>;

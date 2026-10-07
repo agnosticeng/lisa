@@ -6,19 +6,17 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 use lisa_mlx::ops::indexing::IndexOp;
-use lisa_mlx::{ops, Array, Dtype};
+use lisa_mlx::{Array, ops};
 
 use crate::core::cache::{FullAttentionCache, GdnCache, LayerCache};
-use crate::models::qwen4::attention::Attention;
-use crate::models::qwen4::config::ModelConfig;
-use crate::models::qwen4::gdn::GatedDeltaNet;
-use crate::models::qwen4::hyper::GatedResidual;
 use crate::core::loader::{Checkpoint, Weights};
 use crate::core::norm::Rotary;
-use crate::models::qwen4::ple::{NgramTable, PleLayer};
 use crate::core::quant::{QuantizedEmbedding, QuantizedLinear};
-
-
+use crate::models::gdn::GatedDeltaNet;
+use crate::models::qwen4::attention::Attention;
+use crate::models::qwen4::config::ModelConfig;
+use crate::models::qwen4::hyper::GatedResidual;
+use crate::models::qwen4::ple::{NgramTable, PleLayer};
 
 /// One decoder layer.
 pub struct DecoderLayer {
@@ -52,8 +50,14 @@ impl DecoderLayer {
         ple_args: Option<(&[Vec<i64>], &[Vec<i64>])>,
         capture: bool,
     ) -> anyhow::Result<(Array, Array, Array)> {
-        let attn_scale = self.attn_hc.norm_scale_q().map_err(|e| anyhow::anyhow!("{e}"))?;
-        let mlp_scale = self.mlp_hc.norm_scale_q().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let attn_scale = self
+            .attn_hc
+            .norm_scale_q()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mlp_scale = self
+            .mlp_hc
+            .norm_scale_q()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         let hc = self.attn_hc.hc_count as i32;
         let hidden = (self.attn_hc.hidden / self.attn_hc.hc_count) as i32;
         let eps = self.attn_hc.hc_norm.eps;
@@ -61,14 +65,19 @@ impl DecoderLayer {
         let rows = b * s;
         let stream = lisa_mlx::Stream::thread_local_or_default();
         let w = hc * hidden;
-        let run_in =
-            |res: &Array, out: Option<&Array>, inj: Option<&Array>, scale: &Array| -> anyhow::Result<(Array, Array)> {
-                // Wide windows use the `_wide` variant (bit-identical, ~20x fewer
-                // threads per row).
-                let r = lisa_mlx::kernels::inject_norm(res, out, inj, scale, hc, hidden, rows, false, eps, &stream);
-                let (st, nm) = r.ok_or_else(|| anyhow::anyhow!("inject_norm kernel unavailable"))?;
-                Ok((st.reshape(&[b, s, w])?, nm.reshape(&[b, s, w])?))
-            };
+        let run_in = |res: &Array,
+                      out: Option<&Array>,
+                      inj: Option<&Array>,
+                      scale: &Array|
+         -> anyhow::Result<(Array, Array)> {
+            // Wide windows use the `_wide` variant (bit-identical, ~20x fewer
+            // threads per row).
+            let r = lisa_mlx::kernels::inject_norm(
+                res, out, inj, scale, hc, hidden, rows, false, eps, &stream,
+            );
+            let (st, nm) = r.ok_or_else(|| anyhow::anyhow!("inject_norm kernel unavailable"))?;
+            Ok((st.reshape(&[b, s, w])?, nm.reshape(&[b, s, w])?))
+        };
 
         // PLE adds into the stream BEFORE this layer's attention mixer: the
         // engine materializes the stream, adds the PLE, then norms again.
@@ -80,7 +89,14 @@ impl DecoderLayer {
                         let (slot, cap) = c.ple_conv_mut();
                         ple.forward(&s1, token_rows, previous_context, slot, capture, cap)?
                     }
-                    None => ple.forward(&s1, token_rows, previous_context, &mut None, capture, &mut None)?,
+                    None => ple.forward(
+                        &s1,
+                        token_rows,
+                        previous_context,
+                        &mut None,
+                        capture,
+                        &mut None,
+                    )?,
                 };
                 let s2 = s1.add(&ple_out)?;
                 run_in(&s2, None, None, &attn_scale)?
@@ -89,39 +105,20 @@ impl DecoderLayer {
         };
 
         let (input, attn_inject) = self.attn_hc.mix_from_normed(&normed, true)?;
-        if let Ok(dir) = std::env::var("LISA_DUMP_DIR") {
-            static L0: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-            if s == 1024 && L0.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                for (nm, arr) in [("normed", &normed), ("mix_in", &input)] {
-                    let f = arr.as_dtype(lisa_mlx::Dtype::Float32).map_err(|e| anyhow::anyhow!("{e}"))?;
-                    let a = f.as_slice::<f32>();
-                    let _ = std::fs::write(format!("{dir}/{nm}.bin"),
-                        unsafe { std::slice::from_raw_parts(a.as_ptr() as *const u8, a.len() * 4) });
-                }
-            }
-        }
         let attended = match (&mut self.block, cache) {
-            (Block::Linear(gdn), Some(LayerCache::Linear(c))) => gdn.forward(&input, Some(c), capture)?,
+            (Block::Linear(gdn), Some(LayerCache::Linear(c))) => {
+                gdn.forward(&input, Some(c), capture)?
+            }
             (Block::Linear(gdn), None) => gdn.forward(&input, None, capture)?,
             (Block::Attention(attn), Some(LayerCache::Full(c))) => {
                 attn.forward(&input, rope, Some(c), offset, positions)?
             }
-            (Block::Attention(attn), None) => attn.forward(&input, rope, None, offset, positions)?,
+            (Block::Attention(attn), None) => {
+                attn.forward(&input, rope, None, offset, positions)?
+            }
             _ => anyhow::bail!("cache kind does not match layer kind"),
         };
 
-        if let Ok(dir) = std::env::var("LISA_DUMP_DIR") {
-            static ATTN_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let ac = ATTN_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let want = std::env::var("LISA_MATTN_CALL").ok().and_then(|v| v.parse::<usize>().ok());
-            if want == Some(ac) {
-                let a = attended.as_dtype(Dtype::Float32).map_err(|e| anyhow::anyhow!("{e}"))?;
-                let a = a.as_slice::<f32>();
-                std::fs::write(format!("{dir}/attn{ac}.bin"), unsafe {
-                    std::slice::from_raw_parts(a.as_ptr() as *const u8, a.len() * 4)
-                })?;
-            }
-        }
         let (stream_v2, normed2) =
             run_in(&stream_v, Some(&attended), Some(&attn_inject), &mlp_scale)?;
         let (input2, mlp_inject) = self.mlp_hc.mix_from_normed(&normed2, true)?;
@@ -212,16 +209,13 @@ impl Tower {
 
         // The n-gram table is read from disk, never loaded as parameters.
         // Two checkpoint layouts: sharded tensors in the index (HF/MLX), or one
-        // merged `ngram.safetensors` (the mlx-serve pack).
+        // merged `ngram.safetensors` (the merged pack).
         let ngram_prefix = "model.layers.1.ple.ple_embedding.ngram_embedding";
         let sharded = map.keys().any(|n| n.contains("ngram_embedding.shard_"));
         let ngram_table = Arc::new(RwLock::new(if sharded {
             NgramTable::open(dir, &map, ngram_prefix, config.split_ngram_parts)?
         } else {
-            NgramTable::open_merged(
-                &dir.join("ngram.safetensors"),
-                config.split_ngram_parts,
-            )?
+            NgramTable::open_merged(&dir.join("ngram.safetensors"), config.split_ngram_parts)?
         }));
 
         // Stream the shards into a sanitized weight map, excluding the
@@ -253,6 +247,10 @@ impl Tower {
             }
         }
 
+        // t0: the full checkpoint materialized into the map — the baseline every
+        // later ledger point is read against (see specs/00 §3 Rule 4).
+        crate::core::mem::mlx_mem_line("t0-map-only");
+
         let missing: Vec<&String> = expected
             .iter()
             .filter(|n| !weights.contains_key(*n))
@@ -264,6 +262,10 @@ impl Tower {
                 &missing[..missing.len().min(5)]
             );
         }
+
+        // Compile every qwen4 Metal-kernel handle up front (see
+        // `warm_kernels`), before the generic-shape warmup below.
+        lisa_mlx::warm_kernels();
 
         Self::from_weights(weights, config, ngram_table)
     }
@@ -310,9 +312,25 @@ impl Tower {
                     config.head_dim,
                 )?)
             };
-            let mlp = crate::models::qwen4::moe::SparseMoeBlock::load(&mut w, &format!("{prefix}.mlp"), config.num_experts_per_tok)?;
-            let attn_hc = GatedResidual::load(&mut w, &format!("{prefix}.attn_hyper_connection"), hidden, hc, true)?;
-            let mlp_hc = GatedResidual::load(&mut w, &format!("{prefix}.mlp_hyper_connection"), hidden, hc, true)?;
+            let mlp = crate::models::qwen4::moe::SparseMoeBlock::load(
+                &mut w,
+                &format!("{prefix}.mlp"),
+                config.num_experts_per_tok,
+            )?;
+            let attn_hc = GatedResidual::load(
+                &mut w,
+                &format!("{prefix}.attn_hyper_connection"),
+                hidden,
+                hc,
+                true,
+            )?;
+            let mlp_hc = GatedResidual::load(
+                &mut w,
+                &format!("{prefix}.mlp_hyper_connection"),
+                hidden,
+                hc,
+                true,
+            )?;
             let ple = if let Some(ordinal) = ple_indices.iter().position(|&p| p == i) {
                 Some(PleLayer::load(
                     &mut w,
@@ -345,14 +363,31 @@ impl Tower {
                 has_ple,
             });
         }
-        let final_mixer = GatedResidual::load(&mut w, "model.hyper_connection_mixer", hidden, hc, false)?;
+        let final_mixer =
+            GatedResidual::load(&mut w, "model.hyper_connection_mixer", hidden, hc, false)?;
+        crate::core::mem::mlx_mem_line("t2-layers");
 
-        // Draft-only shortlist of `lm_head` rows, built once at load.
-        let (draft_head, draft_ids) = build_draft_shortlist(&lm_head, config.vocab_size);
+        // Draft-only shortlist of `lm_head` rows, built once at load. **OFF by
+        // default** — the standing RAM decision (footprint first): the shortlist
+        // costs resident memory for decode speed. `LISA_SHORTLIST_HEAD=1`
+        // restores it for a latency-first run.
+        let (draft_head, draft_ids) = if matches!(
+            std::env::var("LISA_SHORTLIST_HEAD").as_deref(),
+            Ok("1") | Ok("on") | Ok("true")
+        ) {
+            let dh = build_draft_shortlist(&lm_head, config.vocab_size);
+            crate::core::mem::mlx_mem_line("t3-shortlist");
+            dh
+        } else {
+            crate::core::mem::mlx_mem_line("t3-shortlist-skipped");
+            (None, None)
+        };
 
         // The embedded MTP head is a sibling of `model` in the checkpoint.
         let mtp = crate::models::qwen4::mtp::MtpHead::load(&mut w, &config)?;
+        crate::core::mem::mlx_mem_line("t4-mtp-head");
 
+        crate::core::mem::mlx_mem_line("t5-map-check");
         let leftover: Vec<String> = w.keys().cloned().collect();
         if !leftover.is_empty() {
             anyhow::bail!(
@@ -387,18 +422,20 @@ impl Tower {
         let b = ids.dim(0) as usize;
         let s = ids.dim(1) as usize;
         // Read the native i32 (Metal `to_dtype` lacks I32 -> I64).
-        let flat: Vec<i64> = ids
-            .as_slice::<i32>()
-            .iter()
-            .map(|&v| v as i64)
-            .collect();
-        Ok((0..b).map(|bi| flat[bi * s..(bi + 1) * s].to_vec()).collect())
+        let flat: Vec<i64> = ids.as_slice::<i32>().iter().map(|&v| v as i64).collect();
+        Ok((0..b)
+            .map(|bi| flat[bi * s..(bi + 1) * s].to_vec())
+            .collect())
     }
 
     /// Forward the tower. Returns `(mixed, multi)` where `mixed` is the
     /// collapsed hidden state [B, S, H] and `multi` is the pre-final-mixer
     /// hyper stream [B, S, hc*H] (consumed by the MTP head later).
-    pub fn forward(&mut self, ids: &Array, mut caches: Option<&mut Vec<LayerCache>>) -> anyhow::Result<(Array, Array)> {
+    pub fn forward(
+        &mut self,
+        ids: &Array,
+        mut caches: Option<&mut Vec<LayerCache>>,
+    ) -> anyhow::Result<(Array, Array)> {
         self.forward_capture(ids, caches.as_deref_mut(), false)
     }
 
@@ -467,23 +504,14 @@ impl Tower {
         mut caches: Option<&mut Vec<LayerCache>>,
         capture: bool,
     ) -> anyhow::Result<(Array, Array)> {
+        let _trace_fwd = lisa_mlx::trace::span("tower.forward");
         let b = ids.dim(0) as usize;
         let s = ids.dim(1) as usize;
         let token_rows = Self::token_rows(ids)?;
 
         let hidden = self.embed_tokens.forward(ids)?;
-        if let Ok(dir) = std::env::var("LISA_DUMP_DIR") {
-            if s == 1024 {
-                let f = hidden.as_dtype(lisa_mlx::Dtype::Float32).map_err(|e| anyhow::anyhow!("{e}"))?;
-                let a = f.as_slice::<f32>();
-                let _ = std::fs::write(
-                    format!("{dir}/embed.bin"),
-                    unsafe { std::slice::from_raw_parts(a.as_ptr() as *const u8, a.len() * 4) },
-                );
-            }
-        }
-        let mut residual =
-            ops::tile(&hidden, &[1, 1, self.config.hc_count as i32]).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut residual = ops::tile(&hidden, &[1, 1, self.config.hc_count as i32])
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         // The n-gram hash reads ids in order; the history carries across calls.
         let ctx_len = self.config.ngram_size - 1;
@@ -501,17 +529,21 @@ impl Tower {
 
         let offset = caches
             .as_deref()
-            .and_then(|c| c.iter().find_map(|lc| match lc {
-                LayerCache::Full(f) => Some(f.offset),
-                _ => None,
-            }))
+            .and_then(|c| {
+                c.iter().find_map(|lc| match lc {
+                    LayerCache::Full(f) => Some(f.offset),
+                    _ => None,
+                })
+            })
             .unwrap_or(0);
         // RoPE positions. Ragged batching carries a per-stream next position on
         // the packed attention caches; otherwise every stream shares `offset`.
-        let positions: Array = match caches.as_deref().and_then(|c| c.iter().find_map(|lc| match lc {
-            LayerCache::Full(f) => f.next_pos.clone(),
-            _ => None,
-        })) {
+        let positions: Array = match caches.as_deref().and_then(|c| {
+            c.iter().find_map(|lc| match lc {
+                LayerCache::Full(f) => f.next_pos.clone(),
+                _ => None,
+            })
+        }) {
             Some(next) => {
                 let mut data: Vec<f32> = Vec::with_capacity(next.len() * s);
                 for p in &next {
@@ -524,10 +556,6 @@ impl Tower {
             None => crate::core::norm::positions(offset, s)?,
         };
 
-        let profile = lisa_mlx::env_flag("LISA_PROFILE");
-        if lisa_mlx::env_flag("LISA_ATTN_DEBUG") {
-            eprintln!("[model] ids={:?} s={s} positions={:?}", ids.shape(), positions.shape());
-        }
         // Prefill pipeline: the engine overlaps CPU graph construction with GPU
         // execution by `asyncEval`-ing in short chunks. Without it Lisa builds
         // the whole 48-layer graph, then the single terminal `eval` runs it with
@@ -536,17 +564,14 @@ impl Tower {
         let eval_chunk = 3usize;
         let mut pending_out: Option<Array> = None;
         let mut pending_inject: Option<Array> = None;
-        static TOWER_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let tcall = TOWER_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let layer_call = std::env::var("LISA_LAYER_CALL").ok().and_then(|v| v.parse::<usize>().ok());
         for (i, layer) in self.layers.iter_mut().enumerate() {
+            let _trace_layer = lisa_mlx::trace::span_detail("tower.layer", i as u64);
             let cache = caches.as_deref_mut().map(|c| &mut c[i]);
             let ple_args = if layer.has_ple {
                 Some((&token_rows[..], &previous_context[..]))
             } else {
                 None
             };
-            let t0 = std::time::Instant::now();
             let (stream, out, inject_w) = layer.forward(
                 &residual,
                 pending_out.as_ref(),
@@ -561,11 +586,7 @@ impl Tower {
             residual = stream;
             pending_out = Some(out);
             pending_inject = Some(inject_w);
-            if profile {
-                residual.eval().map_err(|e| anyhow::anyhow!("{e}"))?;
-                let kind = if layer.has_ple { "ple" } else if matches!(layer.block, Block::Linear(_)) { "gdn" } else { "attn" };
-                eprintln!("layer {i:2} ({kind}) s={s}: {:>8.3} ms", t0.elapsed().as_secs_f64() * 1e3);
-            } else if s > 1 && eval_chunk > 0 && (i + 1) % eval_chunk == 0 {
+            if s > 1 && eval_chunk > 0 && (i + 1) % eval_chunk == 0 {
                 let mut outs: Vec<&Array> = vec![&residual];
                 if let Some(o) = pending_out.as_ref() {
                     outs.push(o);
@@ -575,47 +596,38 @@ impl Tower {
                 }
                 lisa_mlx::transforms::async_eval(outs).map_err(|e| anyhow::anyhow!("{e}"))?;
             }
-            if let Ok(dir) = std::env::var("LISA_DUMP_DIR") {
-                let name = if lisa_mlx::env_flag("LISA_DUMP_ALL") {
-                    format!("{dir}/T{tcall}_L{i:02}.bin")
-                } else if layer_call == Some(tcall) {
-                    format!("{dir}/L{tcall}_layer_{i:02}.bin")
-                } else {
-                    format!("{dir}/layer_{i:02}.bin")
-                };
-                let a = residual.as_dtype(Dtype::Float32).map_err(|e| anyhow::anyhow!("{e}"))?;
-                let a = a.as_slice::<f32>();
-                std::fs::write(name, unsafe {
-                    std::slice::from_raw_parts(a.as_ptr() as *const u8, a.len() * 4)
-                })?;
-            }
         }
 
         // Final mixer: injectNorm(residual, pendingOut, pendingInject) then the
         // inject-less hcMix. `multi` is the resulting stream.
-        let final_scale = self.final_mixer.norm_scale_q().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let final_scale = self
+            .final_mixer
+            .norm_scale_q()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         let hc = self.config.hc_count as i32;
         let hidden_i = self.config.hidden_size as i32;
         let rows = (b * s) as i32;
         let stream = lisa_mlx::Stream::thread_local_or_default();
         let final_r = lisa_mlx::kernels::inject_norm(
-            &residual, pending_out.as_ref(), pending_inject.as_ref(), &final_scale,
-            hc, hidden_i, rows, false, self.config.rms_norm_eps, &stream,
+            &residual,
+            pending_out.as_ref(),
+            pending_inject.as_ref(),
+            &final_scale,
+            hc,
+            hidden_i,
+            rows,
+            false,
+            self.config.rms_norm_eps,
+            &stream,
         );
         let (multi, final_normed) =
             final_r.ok_or_else(|| anyhow::anyhow!("inject_norm kernel unavailable"))?;
         let multi = multi.reshape(&[b as i32, s as i32, hc * hidden_i])?;
         let final_normed = final_normed.reshape(&[b as i32, s as i32, hc * hidden_i])?;
-        let (mixed, _) = self.final_mixer.mix_from_normed(&final_normed, false).map_err(|e| anyhow::anyhow!("{e}"))?;
-        if let Ok(dir) = std::env::var("LISA_DUMP_DIR") {
-            for (name, arr) in [("mixed", &mixed), ("multi", &multi)] {
-                let a = arr.as_dtype(Dtype::Float32).map_err(|e| anyhow::anyhow!("{e}"))?;
-                let a = a.as_slice::<f32>();
-                std::fs::write(format!("{dir}/{name}.bin"), unsafe {
-                    std::slice::from_raw_parts(a.as_ptr() as *const u8, a.len() * 4)
-                })?;
-            }
-        }
+        let (mixed, _) = self
+            .final_mixer
+            .mix_from_normed(&final_normed, false)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         Ok((mixed, multi))
     }
 
@@ -632,13 +644,13 @@ impl Tower {
 
     /// JIT-compile and warm every kernel/MoE path (both the narrow decode paths
     /// and the wide prefill paths) so the first measured forward does not pay
-    /// Metal kernel compilation. The reference engine warms at init too.
+    /// Metal kernel compilation.
     ///
     /// The warm inputs are drawn from `seed` (the real prompt) rather than
     /// synthetic zeros: an all-zero activation exercises a different branch and
     /// must not be used here.
     pub fn warmup(&mut self, seed: &[u32]) -> anyhow::Result<()> {
-        let shapes: Vec<usize> = vec![1, 9, 40, Self::PREFILL_CHUNK];
+        let shapes: Vec<usize> = vec![1, 9, 10, 40, Self::PREFILL_CHUNK];
         let fallback: Vec<u32> = (0..64).map(|i| 128 + (i * 37) % 4096).collect();
         let base: &[u32] = if seed.is_empty() { &fallback } else { seed };
         for s in shapes {
@@ -651,9 +663,15 @@ impl Tower {
             lisa_mlx::transforms::eval([&logits, &multi]).map_err(|e| anyhow::anyhow!("{e}"))?;
         }
         self.ngram_history = None;
-        // Release the warmup buffers before the worker serves (the reference
-        // engine's low-memory profile does the same): keeps unified memory free
-        // for the real KV/activations. Compiled kernels are unaffected.
+        if lisa_mlx::trace::enabled() {
+            eprintln!(
+                "[trace] jit compiles after warmup: {}",
+                lisa_mlx::runtime::jit_compiles()
+            );
+        }
+        // Release the warmup buffers before the worker serves: keeps unified
+        // memory free for the real KV/activations. Compiled kernels are
+        // unaffected.
         let _ = lisa_mlx::memory::clear_cache();
         Ok(())
     }
@@ -697,6 +715,16 @@ impl crate::models::LanguageModel for Tower {
     }
     fn new_caches(&self) -> Vec<LayerCache> {
         self.new_caches()
+    }
+    /// O3: full-attention layers × kv_heads × head_dim × (K+V) × bf16 (2 o).
+    fn kv_bytes_per_token(&self) -> usize {
+        let full = self
+            .config
+            .layer_types
+            .iter()
+            .filter(|t| t.as_str() == "full_attention")
+            .count();
+        full * self.config.num_key_value_heads * self.config.head_dim * 2 * 2
     }
     fn forward(
         &mut self,
@@ -748,6 +776,12 @@ impl crate::models::LanguageModel for Tower {
     fn has_drafter(&self) -> bool {
         self.mtp.is_some()
     }
+    fn mtp_cost_key(&self) -> String {
+        format!(
+            "qwen4_exp-{}L-{}h",
+            self.config.num_hidden_layers, self.config.hidden_size
+        )
+    }
     fn drafter_reset(&mut self) {
         if let Some(h) = self.mtp.as_mut() {
             h.reset_caches();
@@ -781,22 +815,6 @@ impl crate::models::LanguageModel for Tower {
             Some(h) => h.forward(&last)?,
             None => self.lm_head.forward(&last)?,
         };
-        if std::env::var("LISA_DUMP_DRAFT").is_ok() {
-            static ROUND: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let r = ROUND.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if r >= 200 {
-                let l = logits
-                    .as_dtype(lisa_mlx::Dtype::Float32)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-                let v: Vec<f32> = l.as_slice::<f32>().to_vec();
-                let mut idx: Vec<usize> = (0..v.len()).collect();
-                idx.sort_by(|&a, &b| v[b].partial_cmp(&v[a]).unwrap());
-                eprintln!(
-                    "[draft-logits] step#{r} top5: {:?}",
-                    idx[..5].iter().map(|&i| (i, v[i])).collect::<Vec<_>>()
-                );
-            }
-        }
         // Keep the draft token on the device as `[1, 1]` so the chain does
         // not round-trip through the host between draft steps. The id stays
         // uint32 (the only integer dtype the indexing/cast kernels emit);
@@ -809,22 +827,21 @@ impl crate::models::LanguageModel for Tower {
                 .map_err(|e| anyhow::anyhow!("{e}"))?,
             _ => short_idx,
         };
+        // Oracle (specs/08): record the shortlist-head readout with its
+        // row→id map, so the driver can rank the target's true token inside
+        // it after verify. Diagnostic; a no-op unless the CLI enabled it.
+        // No map + a shortlist head = the ids would be misread, so that
+        // (unreachable: the head and the map are built together) records
+        // nothing rather than something wrong.
+        if self.draft_head.is_none() {
+            crate::core::oracle::push_arrays(None, &logits)?;
+        } else if self.draft_ids.is_some() {
+            crate::core::oracle::push_arrays(self.draft_ids.as_ref(), &logits)?;
+        }
         let draft_id = draft_id.reshape(&[1, 1])?;
         let m = head_multi
             .index((.., head_multi.dim(1) - 1, ..))
             .contiguous()?;
-        if std::env::var("LISA_DUMP_DRAFT").is_ok() {
-            static MCALL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let r = MCALL.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if r >= 200 {
-                let f = m
-                    .as_dtype(lisa_mlx::Dtype::Float32)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-                let v: Vec<f32> = f.as_slice::<f32>().to_vec();
-                let sum: f32 = v.iter().sum();
-                eprintln!("[draft-m] step#{r} n={} sum={:.6e} head={:?}", v.len(), sum, &v[..4.min(v.len())]);
-            }
-        }
         Ok((draft_id, m))
     }
 }

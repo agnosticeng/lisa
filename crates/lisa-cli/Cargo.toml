@@ -3,6 +3,7 @@ name = "lisa-cli"
 version = "0.1.0"
 edition = "2024"
 description = "lisa CLI"
+default-run = "lisa"
 
 [[bin]]
 name = "lisa"

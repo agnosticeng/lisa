@@ -1,10 +1,9 @@
 mod app;
 mod ui;
 
-use objc2::runtime::ProtocolObject;
 use objc2::MainThreadMarker;
+use objc2::runtime::ProtocolObject;
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
-
 
 use app::AppDelegate;
 

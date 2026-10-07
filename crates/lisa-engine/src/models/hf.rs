@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
 /// The Hugging Face hub cache root: `$HF_HOME/hub`, else
@@ -35,8 +35,7 @@ pub fn is_model_dir(dir: &Path) -> bool {
 
 /// The cache directory for one repo (`models--org--name`).
 pub fn repo_dir(repo: &str) -> PathBuf {
-    hub_root()
-        .join(format!("models--{}", repo.replace('/', "--")))
+    hub_root().join(format!("models--{}", repo.replace('/', "--")))
 }
 
 fn home_dir() -> PathBuf {
@@ -96,9 +95,8 @@ struct RemoteFile {
 }
 
 fn list_files(repo: &str, rev: &str) -> Result<Vec<RemoteFile>> {
-    let url = format!(
-        "https://huggingface.co/api/models/{repo}/tree/{rev}?recursive=true&expand=true"
-    );
+    let url =
+        format!("https://huggingface.co/api/models/{repo}/tree/{rev}?recursive=true&expand=true");
     let tree = get_json(&url)?;
     let arr = tree
         .as_array()
@@ -116,10 +114,7 @@ fn list_files(repo: &str, rev: &str) -> Result<Vec<RemoteFile>> {
                 l.get("size").and_then(|s| s.as_u64()).unwrap_or(0),
                 l.get("oid").and_then(|o| o.as_str()).map(str::to_string),
             ),
-            None => (
-                e.get("size").and_then(|s| s.as_u64()).unwrap_or(0),
-                None,
-            ),
+            None => (e.get("size").and_then(|s| s.as_u64()).unwrap_or(0), None),
         };
         let hash = hash.or_else(|| e.get("oid").and_then(|o| o.as_str()).map(str::to_string));
         let Some(hash) = hash else {
@@ -194,9 +189,7 @@ pub fn download_repo(repo: &str) -> Result<PathBuf> {
             let incomplete = blobs.join(format!("{}.incomplete", file.hash));
             download_file(repo, &rev, file, &incomplete)?;
             if file.size > 0 {
-                let got = std::fs::metadata(&incomplete)
-                    .map(|m| m.len())
-                    .unwrap_or(0);
+                let got = std::fs::metadata(&incomplete).map(|m| m.len()).unwrap_or(0);
                 if got != file.size {
                     bail!(
                         "{}: expected {} bytes, got {got} — retry the download",

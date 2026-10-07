@@ -6,16 +6,16 @@ use std::sync::Arc;
 
 use half::bf16;
 use lisa_mlx::ops::indexing::{Ellipsis, IndexOp};
-use lisa_mlx::{ops, Array, Dtype};
+use lisa_mlx::{Array, Dtype, ops};
 use memmap2::Mmap;
 
 use crate::core::loader::TensorSource;
 use crate::core::norm::RmsNorm;
-use crate::core::quant::{QuantizedLinear, GROUP_SIZE, BITS};
+use crate::core::quant::{BITS, GROUP_SIZE, QuantizedLinear};
 
 // ---------------------------------------------------------------------------
-// Host-side hash constants (rebuilt from configuration, exactly as the
-// reference does — the checkpoint copies are never used).
+// Host-side hash constants (rebuilt from configuration — the checkpoint
+// copies are never used).
 // ---------------------------------------------------------------------------
 
 pub struct NgramConstants {
@@ -138,16 +138,14 @@ impl NgramTable {
     ) -> anyhow::Result<Self> {
         // Locate the three tensors per shard. Names in the raw checkpoint
         // carry a `language_model.` prefix; match either form.
-        let mut shard_files: Vec<Option<(String, String, String, String)>> = vec![None; shard_count];
+        let mut shard_files: Vec<Option<(String, String, String, String)>> =
+            vec![None; shard_count];
         let prefixes = [
             format!("{tensor_prefix}.shard_"),
             format!("language_model.{tensor_prefix}.shard_"),
         ];
         for (name, file) in weight_map {
-            let Some(rest) = prefixes
-                .iter()
-                .find_map(|p| name.strip_prefix(p.as_str()))
-            else {
+            let Some(rest) = prefixes.iter().find_map(|p| name.strip_prefix(p.as_str())) else {
                 continue;
             };
             let Some((idx, tensor)) = rest.split_once('.') else {
@@ -157,7 +155,9 @@ impl NgramTable {
             match tensor {
                 "weight" | "scales" | "biases" => {
                     let entry = &mut shard_files[idx];
-                    let e = entry.get_or_insert_with(|| (file.clone(), String::new(), String::new(), String::new()));
+                    let e = entry.get_or_insert_with(|| {
+                        (file.clone(), String::new(), String::new(), String::new())
+                    });
                     match tensor {
                         "weight" => e.1 = name.clone(),
                         "scales" => e.2 = name.clone(),
@@ -171,7 +171,8 @@ impl NgramTable {
 
         let mut maps = Vec::with_capacity(shard_count);
         for (idx, entry) in shard_files.into_iter().enumerate() {
-            let (file, w, s, b) = entry.ok_or_else(|| anyhow::anyhow!("ngram shard {idx} incomplete"))?;
+            let (file, w, s, b) =
+                entry.ok_or_else(|| anyhow::anyhow!("ngram shard {idx} incomplete"))?;
             let path = dir.join(&file);
             let f = std::fs::File::open(&path)?;
             let mmap = unsafe { Mmap::map(&f)? };
@@ -182,9 +183,15 @@ impl NgramTable {
             let w_info = &header[w];
             let s_info = &header[s];
             let b_info = &header[b];
-            let weight_off = abs(w_info["data_offsets"].as_array().unwrap()[0].as_u64().unwrap());
-            let scales_off = abs(s_info["data_offsets"].as_array().unwrap()[0].as_u64().unwrap());
-            let biases_off = abs(b_info["data_offsets"].as_array().unwrap()[0].as_u64().unwrap());
+            let weight_off = abs(w_info["data_offsets"].as_array().unwrap()[0]
+                .as_u64()
+                .unwrap());
+            let scales_off = abs(s_info["data_offsets"].as_array().unwrap()[0]
+                .as_u64()
+                .unwrap());
+            let biases_off = abs(b_info["data_offsets"].as_array().unwrap()[0]
+                .as_u64()
+                .unwrap());
             maps.push(Some(ShardMap {
                 map: Arc::new(mmap),
                 weight_off,
@@ -199,7 +206,7 @@ impl NgramTable {
         })
     }
 
-    /// Open a single merged `ngram.safetensors` (the mlx-serve pack:
+    /// Open a single merged `ngram.safetensors` (the merged pack:
     /// `ngram.weight/scales/biases`). The file is the concatenation of
     /// `shard_count` equal row-runs, so it is exposed as `shard_count` windows
     /// into one mmap — `gather` then addresses it exactly like the sharded form.
@@ -344,7 +351,11 @@ impl NgramEmbedding {
     }
 
     /// Forward: ids [B, S], previous_context [B, ctx] -> [B, S, 2560].
-    pub fn forward(&self, ids: &[Vec<i64>], previous_context: &[Vec<i64>]) -> anyhow::Result<Array> {
+    pub fn forward(
+        &self,
+        ids: &[Vec<i64>],
+        previous_context: &[Vec<i64>],
+    ) -> anyhow::Result<Array> {
         let b = ids.len();
         let s = ids[0].len();
         let ctx = previous_context[0].len();
@@ -356,16 +367,13 @@ impl NgramEmbedding {
             all_ids.append(&mut row);
         }
         let _ = ctx;
-        if std::env::var("LISA_DEBUG_ROWS").is_ok() {
-            println!("RS mults: {:?} sizes[:4]: {:?} half: {}", self.constants.multipliers, &self.constants.sizes[..4], ((i64::MAX as u64) / 248320) / 2);
-            println!("RS row ids[:32]: {:?}", &all_ids[..all_ids.len().min(32)]);
-        }
         let (packed, scales, biases) = {
             let table = self.table.read().unwrap();
             table.gather(&all_ids)?
         };
         let rows = ops::dequantize(&packed, &scales, &biases, GROUP_SIZE, BITS)?;
-        rows.reshape(&[b as i32, s as i32, -1]).map_err(|e| anyhow::anyhow!("{e}"))
+        rows.reshape(&[b as i32, s as i32, -1])
+            .map_err(|e| anyhow::anyhow!("{e}"))
     }
 }
 
@@ -420,7 +428,10 @@ impl PleLayer {
             seed,
             ple_layer_index,
         );
-        table.write().unwrap().set_rows_per_shard(constants.rows_per_shard);
+        table
+            .write()
+            .unwrap()
+            .set_rows_per_shard(constants.rows_per_shard);
 
         let mut conv1d_weight = src.get_bf16(&format!("{prefix}.conv1d.weight"))?;
         let cs = conv1d_weight.shape();
@@ -440,7 +451,12 @@ impl PleLayer {
             key_proj: QuantizedLinear::load(src, prefix, "key_proj")?,
             value_proj: QuantizedLinear::load(src, prefix, "value_proj")?,
             norm_key: RmsNorm::load(src, &format!("{prefix}.norm_key"), eps, Some(hidden_size))?,
-            norm_query: RmsNorm::load(src, &format!("{prefix}.norm_query"), eps, Some(hidden_size))?,
+            norm_query: RmsNorm::load(
+                src,
+                &format!("{prefix}.norm_query"),
+                eps,
+                Some(hidden_size),
+            )?,
             norm_conv: RmsNorm::load(src, &format!("{prefix}.norm_conv"), eps, Some(hidden_size))?,
             conv1d_weight,
             hidden_size,
@@ -456,16 +472,16 @@ impl PleLayer {
         self.embedding.eos_token_id = eos;
     }
 
-    fn short_conv(&mut self, x: &Array, conv_state: &mut Option<Array>) -> lisa_mlx::error::Result<Array> {
+    fn short_conv(
+        &mut self,
+        x: &Array,
+        conv_state: &mut Option<Array>,
+    ) -> lisa_mlx::error::Result<Array> {
         let s = x.dim(1) as usize;
         let n = self.short_conv_state_length;
         let state = match conv_state {
             Some(st) => st.clone(),
-            None => ops::zeros::<half::bf16>(&[
-                x.dim(0),
-                n as i32,
-                x.dim(-1),
-            ])?,
+            None => ops::zeros::<half::bf16>(&[x.dim(0), n as i32, x.dim(-1)])?,
         };
         let full = ops::concatenate(&[&state, x], 1)?;
         // keep the last n rows as the new state
@@ -485,14 +501,6 @@ impl PleLayer {
             Some(window.dim(-1)),
         )?;
         let conv = lisa_mlx::nn::silu(&conv)?;
-        if let Ok(dir) = std::env::var("LISA_DUMP_DIR") {
-            let f = conv.as_dtype(Dtype::Float32).unwrap();
-            let a = f.as_slice::<f32>();
-            let _ = std::fs::write(
-                format!("{dir}/rs_ple_conv.bin"),
-                unsafe { std::slice::from_raw_parts(a.as_ptr() as *const u8, a.len() * 4) },
-            );
-        }
         Ok(conv)
     }
 
@@ -511,15 +519,10 @@ impl PleLayer {
         let h = self.hidden_size as i32;
 
         let embedded = self.embedding.forward(ids, previous_context)?;
-        let embedded = embedded.as_dtype(hidden.dtype()).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let embedded = embedded
+            .as_dtype(hidden.dtype())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         self.last_embed = Some(embedded.clone());
-        if let Ok(dir) = std::env::var("LISA_DUMP_DIR") {
-            let f = embedded.as_dtype(Dtype::Float32).map_err(|e| anyhow::anyhow!("{e}"))?;
-            let a = f.as_slice::<f32>();
-            let _ = std::fs::write(format!("{dir}/rs_ple_embed.bin"), unsafe {
-                std::slice::from_raw_parts(a.as_ptr() as *const u8, a.len() * 4)
-            });
-        }
 
         // Three fused kernels replace the ~22-launch op chain (see the engine's
         // `TrackFastPLE.swift`); the reduction between prod and gated stays MLX.
@@ -612,9 +615,16 @@ impl PleLayer {
                 };
                 let stream = lisa_mlx::Stream::thread_local_or_default();
                 if let Some((full, out)) = lisa_mlx::kernels::ple_fuse2(
-                    &key, hidden, &value,
-                    &self.norm_key.weight, &self.norm_query.weight, &self.norm_conv.weight,
-                    &state, &self.conv1d_weight, self.norm_key.eps, &stream,
+                    &key,
+                    hidden,
+                    &value,
+                    &self.norm_key.weight,
+                    &self.norm_query.weight,
+                    &self.norm_conv.weight,
+                    &state,
+                    &self.conv1d_weight,
+                    self.norm_key.eps,
+                    &stream,
                 ) {
                     *conv_state = Some(full.index((.., 1..10, ..)).contiguous()?);
                     self.last_gated = None;
@@ -631,40 +641,17 @@ impl PleLayer {
 
         let mut gate = key.multiply(&query)?.sum_axis(-1, Some(true))?;
         gate = gate / crate::core::norm::bf16_scalar((self.hidden_size as f32).sqrt());
-        if let Ok(dir) = std::env::var("LISA_DUMP_DIR") {
-            let f = gate.as_dtype(Dtype::Float32).map_err(|e| anyhow::anyhow!("{e}"))?;
-            let a = f.as_slice::<f32>();
-            let _ = std::fs::write(
-                format!("{dir}/rs_ple_gate_raw.bin"),
-                unsafe { std::slice::from_raw_parts(a.as_ptr() as *const u8, a.len() * 4) },
-            );
-        }
         // Floor scalar built IN THE GATE'S DTYPE (bf16) — an f32 scalar here
         // would silently promote the whole stream to f32.
-        let floor = Array::from_f32(1e-6).as_dtype(gate.dtype()).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let floor = Array::from_f32(1e-6)
+            .as_dtype(gate.dtype())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         gate = ops::sqrt(&ops::maximum(ops::abs(&gate)?, &floor)?)?.multiply(&ops::sign(&gate)?)?;
 
         let sg = ops::sigmoid(&gate)?;
-        if let Ok(dir) = std::env::var("LISA_DUMP_DIR") {
-            for (nm, arr) in [("rs_ple_sigmoid", &sg), ("rs_ple_value", &value)] {
-                let f = arr.as_dtype(Dtype::Float32).map_err(|e| anyhow::anyhow!("{e}"))?;
-                let a = f.as_slice::<f32>();
-                let _ = std::fs::write(
-                    format!("{dir}/{nm}.bin"),
-                    unsafe { std::slice::from_raw_parts(a.as_ptr() as *const u8, a.len() * 4) },
-                );
-            }
-        }
         let gated = sg.multiply(&value.expand_dims(-2)?)?;
         let gated = gated.reshape(&[b, s, -1])?;
         self.last_gated = Some(gated.clone());
-        if let Ok(dir) = std::env::var("LISA_DUMP_DIR") {
-            let f = gated.as_dtype(Dtype::Float32).map_err(|e| anyhow::anyhow!("{e}"))?;
-            let a = f.as_slice::<f32>();
-            let _ = std::fs::write(format!("{dir}/rs_ple_gated.bin"), unsafe {
-                std::slice::from_raw_parts(a.as_ptr() as *const u8, a.len() * 4)
-            });
-        }
         let conv = self.short_conv(&self.norm_conv.forward(&gated)?, conv_state)?;
         gated.add(&conv).map_err(|e| anyhow::anyhow!("{e}"))
     }

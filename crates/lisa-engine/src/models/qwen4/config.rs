@@ -186,10 +186,9 @@ impl ModelConfig {
         };
         let eos_token_id = match &m.eos_token_id {
             Some(serde_json::Value::Number(n)) => n.as_i64().unwrap_or(248_044),
-            Some(serde_json::Value::Array(a)) => a
-                .first()
-                .and_then(|v| v.as_i64())
-                .unwrap_or(248_044),
+            Some(serde_json::Value::Array(a)) => {
+                a.first().and_then(|v| v.as_i64()).unwrap_or(248_044)
+            }
             _ => 248_044,
         };
         // rope_parameters wins over the top level for both fields.

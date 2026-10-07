@@ -66,7 +66,14 @@ impl Laya {
         tensor_names.sort();
         verify_encoder_tensors(&weights, &config)?;
 
-        Ok(Self { dir: dir.to_path_buf(), config, tokenizer, weights, tensor_names, device })
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            config,
+            tokenizer,
+            weights,
+            tensor_names,
+            device,
+        })
     }
 
     /// The device this instance runs on.
@@ -193,7 +200,10 @@ fn verify_encoder_tensors(shard: &Shard, cfg: &LayaConfig) -> anyhow::Result<()>
         cfg.hidden_size
     );
     anyhow::ensure!(
-        matches!(dtype, lisa_mlx::Dtype::Float16 | lisa_mlx::Dtype::Float32 | lisa_mlx::Dtype::Bfloat16),
+        matches!(
+            dtype,
+            lisa_mlx::Dtype::Float16 | lisa_mlx::Dtype::Float32 | lisa_mlx::Dtype::Bfloat16
+        ),
         "laya: {emb} has unsupported dtype {dtype:?}"
     );
 
@@ -216,7 +226,14 @@ fn verify_encoder_tensors(shard: &Shard, cfg: &LayaConfig) -> anyhow::Result<()>
         }
     }
     for i in 0..cfg.head_layers {
-        for t in ["norm1.weight", "norm2.weight", "self_attn.in_proj_weight", "self_attn.out_proj.weight", "linear1.weight", "linear2.weight"] {
+        for t in [
+            "norm1.weight",
+            "norm2.weight",
+            "self_attn.in_proj_weight",
+            "self_attn.out_proj.weight",
+            "linear1.weight",
+            "linear2.weight",
+        ] {
             required.push(format!("head.layers.{i}.{t}"));
         }
     }

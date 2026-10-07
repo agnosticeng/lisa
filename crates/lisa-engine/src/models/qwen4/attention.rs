@@ -2,15 +2,13 @@
 //! partial rope, and a contiguous KV cache.
 
 use lisa_mlx::ops::indexing::{Ellipsis, IndexOp};
-use lisa_mlx::{fast, ops, Array, Dtype};
+use lisa_mlx::{Array, Dtype, fast, ops};
 
 use crate::core::cache::FullAttentionCache;
-use crate::models::qwen4::indexer::{QsaIndexer, QsaSelection};
 use crate::core::loader::TensorSource;
-use crate::core::norm::{rope_partial, RmsNorm, Rotary};
+use crate::core::norm::{RmsNorm, Rotary, rope_partial};
 use crate::core::quant::QuantizedLinear;
-
-
+use crate::models::qwen4::indexer::{QsaIndexer, QsaSelection};
 
 /// Full attention layer.
 pub struct Attention {
@@ -43,8 +41,16 @@ impl Attention {
             let d = head_dim as i32;
             let hq = heads as i32;
             let mut order: Vec<u32> = Vec::with_capacity((hq * d * 2) as usize);
-            for h in 0..hq { for i in 0..d { order.push((h * 2 * d + i) as u32); } }
-            for h in 0..hq { for i in 0..d { order.push((h * 2 * d + d + i) as u32); } }
+            for h in 0..hq {
+                for i in 0..d {
+                    order.push((h * 2 * d + i) as u32);
+                }
+            }
+            for h in 0..hq {
+                for i in 0..d {
+                    order.push((h * 2 * d + d + i) as u32);
+                }
+            }
             let idx = Array::from_slice(&order, &[(hq * d * 2) as i32]);
             q_proj.weight = q_proj.weight.take_axis(&idx, 0)?;
             q_proj.scales = q_proj.scales.take_axis(&idx, 0)?;
@@ -100,18 +106,11 @@ impl Attention {
             )
             .map_err(|e| lisa_mlx::error::Exception::custom(e.to_string()))?;
 
-        if sparse.is_some() && std::env::var("LISA_INDEXER_DEBUG").is_ok() {
-            eprintln!("[indexer] sparse keep mask active (offset={offset}, s={s_usize})");
-        }
-
         // q_proj carries [all q of every head | all gate of every head] after
         // the load-time row reorder.
         let projected = self.q_proj.forward(x)?;
         let qw = (self.heads * self.head_dim) as i32;
         let q_part = projected.index((.., .., 0..qw)).contiguous()?;
-        if std::env::var("LISA_ATTN_DEBUG").is_ok() {
-            eprintln!("[attn] x={:?} projected={:?} q_part={:?} qw={qw}", x.shape(), projected.shape(), q_part.shape());
-        }
         let gate = projected
             .index((.., .., qw..(2 * qw)))
             .contiguous()?
@@ -122,18 +121,27 @@ impl Attention {
         // (S <= 8 uses the fused qkv form, wide prefill the split form); the
         // split kernel is the same body, so use it at every width.
         let (queries, keys, values) = if let Some(t) = {
-                let k_raw = self.k_proj.forward(x)?;
-                let v_raw = self.v_proj.forward(x)?;
-                let stream = lisa_mlx::Stream::thread_local_or_default();
-                let cosb = cos.as_dtype(Dtype::Bfloat16)?;
-                let sinb = sin.as_dtype(Dtype::Bfloat16)?;
-                lisa_mlx::kernels::attn_prep_split(
-                    &q_part, &k_raw, &v_raw, &self.q_norm.weight, &self.k_norm.weight,
-                    &cosb, &sinb, self.heads as i32, self.kv_heads as i32,
-                    self.head_dim as i32, rope.dimensions as i32, self.q_norm.eps, &stream,
-                )
-            }
-        {
+            let k_raw = self.k_proj.forward(x)?;
+            let v_raw = self.v_proj.forward(x)?;
+            let stream = lisa_mlx::Stream::thread_local_or_default();
+            let cosb = cos.as_dtype(Dtype::Bfloat16)?;
+            let sinb = sin.as_dtype(Dtype::Bfloat16)?;
+            lisa_mlx::kernels::attn_prep_split(
+                &q_part,
+                &k_raw,
+                &v_raw,
+                &self.q_norm.weight,
+                &self.k_norm.weight,
+                &cosb,
+                &sinb,
+                self.heads as i32,
+                self.kv_heads as i32,
+                self.head_dim as i32,
+                rope.dimensions as i32,
+                self.q_norm.eps,
+                &stream,
+            )
+        } {
             t
         } else {
             let queries = q_part.reshape(&[b, s, self.heads as i32, self.head_dim as i32])?;
@@ -143,42 +151,16 @@ impl Attention {
             let keys = self.k_norm.forward(&keys)?;
             let values = self.v_proj.forward(x)?;
             let values = values.reshape(&[b, s, self.kv_heads as i32, self.head_dim as i32])?;
-            if std::env::var("LISA_ATTN_DEBUG").is_ok() {
-                eprintln!("[attn] pre-transpose queries={:?} keys={:?} values={:?}", queries.shape(), keys.shape(), values.shape());
-            }
             let queries = queries.transpose_axes(&[0, 2, 1, 3])?;
             let keys = keys.transpose_axes(&[0, 2, 1, 3])?;
             let values = values.transpose_axes(&[0, 2, 1, 3])?;
             let cos = cos.expand_dims(1)?;
             let sin = sin.expand_dims(1)?;
-            if std::env::var("LISA_ATTN_DEBUG").is_ok() {
-                eprintln!("[attn] cos={:?} sin={:?} queries={:?}", cos.shape(), sin.shape(), queries.shape());
-            }
             let queries = rope_partial(&queries, &cos, &sin)?;
             let keys = rope_partial(&keys, &cos, &sin)?;
             (queries, keys, values)
         };
 
-        if std::env::var("LISA_DUMP_DRAFT").is_ok() {
-            static ACALL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let r = ACALL.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let d3 = |name: &str, a: &lisa_mlx::Array, r: usize| {
-                if r < 200 { return; }
-                if let Ok(f) = a.as_dtype(lisa_mlx::Dtype::Float32) {
-                    {
-                                let v = f.as_slice::<f32>();
-                        let v: &[f32] = v;
-                        let sum: f32 = v.iter().sum();
-                        eprintln!("[attn] #{r} {name} n={} sum={:.6e} h={:?}", v.len(), sum, &v[..4.min(v.len())]);
-                    }
-                }
-            };
-            let kk = keys.as_dtype(lisa_mlx::Dtype::Bfloat16).unwrap_or_else(|_| keys.clone());
-            let vv = values.as_dtype(lisa_mlx::Dtype::Bfloat16).unwrap_or_else(|_| values.clone());
-            d3("queries", &queries, r);
-            d3("keys", &kk, r);
-            d3("values", &vv, r);
-        }
         let attn_mask = cache.as_deref().and_then(|c| c.attn_mask.clone());
         let (live_keys, live_values) = match cache {
             Some(c) => c.update(&keys, &values)?,
@@ -198,7 +180,13 @@ impl Attention {
             let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, s, -1])?;
             let gated = {
                 let stream = lisa_mlx::Stream::thread_local_or_default();
-                match lisa_mlx::kernels::attn_gate(&out, &gate, self.heads as i32, self.head_dim as i32, &stream) {
+                match lisa_mlx::kernels::attn_gate(
+                    &out,
+                    &gate,
+                    self.heads as i32,
+                    self.head_dim as i32,
+                    &stream,
+                ) {
                     Some(g) => g,
                     None => out.multiply(&ops::sigmoid(&gate)?)?,
                 }
@@ -245,8 +233,13 @@ impl Attention {
                         let rinds = Array::from_slice(&rinds, &[kv_len]);
                         let linds: Vec<f32> = ((kv_len - s)..kv_len).map(|x| x as f32).collect();
                         let linds = Array::from_slice(&linds, &[s as i32, 1]);
-                        let l = lisa_mlx::ops::broadcast_to(&linds, &[s as i32, kv_len])?.contiguous()?;
-                        let r = lisa_mlx::ops::broadcast_to(&rinds.expand_dims(0)?, &[s as i32, kv_len])?.contiguous()?;
+                        let l = lisa_mlx::ops::broadcast_to(&linds, &[s as i32, kv_len])?
+                            .contiguous()?;
+                        let r = lisa_mlx::ops::broadcast_to(
+                            &rinds.expand_dims(0)?,
+                            &[s as i32, kv_len],
+                        )?
+                        .contiguous()?;
                         let causal = l.ge(&r)?;
                         let mask = causal.expand_dims(0)?.logical_and(&keep)?;
                         fast::scaled_dot_product_attention(
@@ -260,91 +253,34 @@ impl Attention {
                     }
                 }
             }
-            None => {
-                if std::env::var("LISA_DUMP_DRAFT").is_ok() {
-                    static LCALL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-                    let r = LCALL.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    if r >= 200 {
-                        for (nm, a) in [("lk", &live_keys), ("lv", &live_values)] {
-                            if let Ok(f) = a.as_dtype(lisa_mlx::Dtype::Float32) {
-                                {
-                                let v = f.as_slice::<f32>();
-                                    let v: &[f32] = v;
-                                    let sum: f32 = v.iter().sum();
-                                    eprintln!("[live] #{r} {nm} n={} sum={:.6e} h={:?}", v.len(), sum, &v[..4.min(v.len())]);
-                                }
-                            }
-                        }
-                    }
-                }
-                fast::scaled_dot_product_attention(
-                    &queries,
-                    &live_keys,
-                    &live_values,
-                    self.scale,
-                    fast::ScaledDotProductAttentionMask::Causal,
-                    None,
-                )?
-            }
+            None => fast::scaled_dot_product_attention(
+                &queries,
+                &live_keys,
+                &live_values,
+                self.scale,
+                fast::ScaledDotProductAttentionMask::Causal,
+                None,
+            )?,
         };
         // [B, S, H*D]
         let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, s, -1])?;
-        if std::env::var("LISA_DUMP_DRAFT").is_ok() {
-            static OCALL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let r = OCALL.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if r >= 200 {
-                if let Ok(f) = out.as_dtype(lisa_mlx::Dtype::Float32) {
-                    {
-                                let v = f.as_slice::<f32>();
-                        let v: &[f32] = v;
-                        let sum: f32 = v.iter().sum();
-                        eprintln!("[attn-out] #{r} n={} sum={:.6e} h={:?}", v.len(), sum, &v[..4.min(v.len())]);
-                    }
-                }
-            }
-        }
-        if std::env::var("LISA_ATTN_DEBUG").is_ok() {
-            eprintln!("[attn] q={:?} k={:?} v={:?} out={:?} gate={:?} b={b} s={s} offset={offset}",
-                queries.shape(), live_keys.shape(), live_values.shape(), out.shape(), gate.shape());
-        }
         let gated = {
             let stream = lisa_mlx::Stream::thread_local_or_default();
-            match lisa_mlx::kernels::attn_gate(&out, &gate, self.heads as i32, self.head_dim as i32, &stream) {
+            match lisa_mlx::kernels::attn_gate(
+                &out,
+                &gate,
+                self.heads as i32,
+                self.head_dim as i32,
+                &stream,
+            ) {
                 Some(g) => g,
                 None => out.multiply(&ops::sigmoid(&gate)?)?,
             }
         };
-        if let Ok(dir) = std::env::var("LISA_DUMP_DIR") {
-            static AC2: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let ac = AC2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let want = std::env::var("LISA_ATTN_CALL").ok().and_then(|v| v.parse::<usize>().ok());
-            if want == Some(ac) {
-                for (nm, arr) in [("q", &queries), ("lk", &live_keys), ("lv", &live_values), ("out", &out), ("gate", &gate), ("gated", &gated)] {
-                    let a = arr.as_dtype(Dtype::Float32)?;
-                    let a = a.as_slice::<f32>();
-                    let _ = std::fs::write(format!("{dir}/aout_{nm}.bin"), unsafe {
-                        std::slice::from_raw_parts(a.as_ptr() as *const u8, a.len() * 4)
-                    });
-                }
-            }
-        }
         let ret = self.o_proj.forward(&gated)?;
-        if let Ok(dir) = std::env::var("LISA_DUMP_DIR") {
-            static AC9: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let ac = AC9.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let want = std::env::var("LISA_ATTN_CALL").ok().and_then(|v| v.parse::<usize>().ok());
-            if want == Some(ac) {
-                let a = ret.as_dtype(Dtype::Float32)?;
-                let a = a.as_slice::<f32>();
-                let _ = std::fs::write(format!("{dir}/aout_ret.bin"), unsafe {
-                    std::slice::from_raw_parts(a.as_ptr() as *const u8, a.len() * 4)
-                });
-            }
-        }
         Ok(ret)
     }
 }
-
 
 /// Expand a sparse selection into the dense boolean keep mask `[1, S, kv_len]`
 /// (the fallback for when the block-sparse kernel is unavailable).
@@ -355,7 +291,8 @@ fn dense_keep_from_selection(sel: &QsaSelection) -> lisa_mlx::error::Result<Arra
     let blocks = kv / cr;
     // `where_cond` has no I32 output, so do the select in f32
     // (block ids are < 2^24) and cast back.
-    let sentinel = lisa_mlx::ops::broadcast_to(&Array::from_f32(blocks as f32), sel.block_ids.shape())?;
+    let sentinel =
+        lisa_mlx::ops::broadcast_to(&Array::from_f32(blocks as f32), sel.block_ids.shape())?;
     let ids_f = sel.block_ids.as_dtype(Dtype::Float32)?;
     let picked_f = lisa_mlx::ops::r#where(&sel.block_valid, &ids_f, &sentinel)?;
     let picked_safe = picked_f.as_dtype(Dtype::Int32)?;
@@ -372,8 +309,14 @@ fn dense_keep_from_selection(sel: &QsaSelection) -> lisa_mlx::error::Result<Arra
     }
     // `complete` is f32 (no i32 Metal arithmetic); compare in f32.
     let own_start = sel.complete.multiply(Array::from_f32(cr as f32))?;
-    let tokens = Array::from_slice(&(0..kv).map(|x| x as f32).collect::<Vec<f32>>(), &[1, 1, kv]);
-    let kv_pos = Array::from_slice(&((kv - s)..kv).map(|x| x as f32).collect::<Vec<f32>>(), &[1, s]);
+    let tokens = Array::from_slice(
+        &(0..kv).map(|x| x as f32).collect::<Vec<f32>>(),
+        &[1, 1, kv],
+    );
+    let kv_pos = Array::from_slice(
+        &((kv - s)..kv).map(|x| x as f32).collect::<Vec<f32>>(),
+        &[1, s],
+    );
     let tok_b = lisa_mlx::ops::broadcast_to(&tokens, &[1, s, kv])?;
     // `cmp` does not broadcast; expand both bounds to the full shape.
     let own_start_b = lisa_mlx::ops::broadcast_to(&own_start.expand_dims(-1)?, &[1, s, kv])?;

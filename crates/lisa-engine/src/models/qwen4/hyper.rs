@@ -1,11 +1,11 @@
 //! Hyper-connections: the 4-stream gated residual mixer.
 
-use lisa_mlx::{ops, Array, Dtype};
+use lisa_mlx::{Array, ops};
 
-use crate::core::norm::RmsNorm;
 use crate::core::loader::TensorSource;
-use lisa_mlx::ops::indexing::IndexOp;
+use crate::core::norm::RmsNorm;
 use crate::core::quant::QuantizedLinear;
+use lisa_mlx::ops::indexing::IndexOp;
 
 /// Gated residual mixer for the hyper-connection stream.
 ///
@@ -28,13 +28,20 @@ pub struct GatedResidual {
 }
 
 impl GatedResidual {
-    pub fn load<S: TensorSource>(src: &mut S, prefix: &str, hidden: usize, hc_count: usize, use_inject: bool) -> anyhow::Result<Self> {
+    pub fn load<S: TensorSource>(
+        src: &mut S,
+        prefix: &str,
+        hidden: usize,
+        hc_count: usize,
+        use_inject: bool,
+    ) -> anyhow::Result<Self> {
         let wide = hidden * hc_count;
         let mix_up = QuantizedLinear::load(src, prefix, "input_mix_weight_up")?;
         // OPT-PACKEDUP: reorder the up rows so each decode tile's eight rows
         // are contiguous (for each hidden pair, the four HC streams), letting
         // the mixer walk `qmv_reg` instead of the strided `qmv_reg_rows`.
-        let decode_up = if hc_count == 4 && hidden % 2 == 0 && mix_up.weight.dim(0) as usize == wide {
+        let decode_up = if hc_count == 4 && hidden % 2 == 0 && mix_up.weight.dim(0) as usize == wide
+        {
             let base = hidden as i32;
             let mut order: Vec<i32> = Vec::with_capacity(wide);
             let mut d = 0i32;
@@ -49,7 +56,13 @@ impl GatedResidual {
             let w = mix_up.weight.take_axis(&idx, 0)?;
             let sc = mix_up.scales.take_axis(&idx, 0)?;
             let bi = mix_up.biases.take_axis(&idx, 0)?;
-            Some(QuantizedLinear { weight: w, scales: sc, biases: bi, group_size: mix_up.group_size, bits: mix_up.bits })
+            Some(QuantizedLinear {
+                weight: w,
+                scales: sc,
+                biases: bi,
+                group_size: mix_up.group_size,
+                bits: mix_up.bits,
+            })
         } else {
             None
         };
@@ -69,48 +82,35 @@ impl GatedResidual {
     }
 
     pub fn mixed_from_normed(&self, normed: &Array) -> lisa_mlx::error::Result<Array> {
-        self.mixed(normed, false)
+        self.mixed(normed)
     }
 
     /// hc_norm with the 1/hc_count pre-multiplied into the scale (the fast
-    /// path's exact trick: the mix sum then equals the reference mean).
+    /// path's exact trick: the mix sum then equals the plain mean).
     pub fn hc_norm_quarter(&self, hyper: &Array) -> lisa_mlx::error::Result<Array> {
-        let scaled = &self.hc_norm.weight * crate::core::norm::bf16_scalar(1.0 / self.hc_count as f32);
-        let h = self.hc_norm.group_size.unwrap_or_else(|| self.hidden / self.hc_count);
+        let scaled =
+            &self.hc_norm.weight * crate::core::norm::bf16_scalar(1.0 / self.hc_count as f32);
+        let h = self
+            .hc_norm
+            .group_size
+            .unwrap_or_else(|| self.hidden / self.hc_count);
         crate::core::norm::rms_row_exact(hyper, Some(&scaled), self.hc_norm.eps, h)
     }
 
     /// The fast-kernel mix (upMix): the normed arrives PRE-QUARTERED (the
     /// /hc_count baked into the norm scale), silu is bf16-stepped, and the
     /// stream fold is a SEQUENTIAL BF16 accumulation of bf16 products.
-    fn mixed(&self, normed: &Array, mix_dump: bool) -> lisa_mlx::error::Result<Array> {
+    fn mixed(&self, normed: &Array) -> lisa_mlx::error::Result<Array> {
         let mean_form = true;
-        let dump = |name: &str, arr: &Array| {
-            if mix_dump {
-                if let Ok(dir) = std::env::var("LISA_DUMP_DIR") {
-                    let f = arr.as_dtype(Dtype::Float32).unwrap();
-                    let a = f.as_slice::<f32>();
-                    let _ = std::fs::write(
-                        format!("{dir}/rs_{name}.bin"),
-                        unsafe { std::slice::from_raw_parts(a.as_ptr() as *const u8, a.len() * 4) },
-                    );
-                }
-            }
-        };
-        dump("mix_normed", normed);
         let lo = self.mix_down.forward(normed)?;
-        dump("mix_down", &lo);
         let w = if mean_form {
             let lo = lo / crate::core::norm::bf16_scalar(self.hc_count as f32);
             lisa_mlx::nn::silu(&lo)?
         } else {
             crate::core::norm::bf16_silu(&lo)?
         };
-        dump("mix_act", &w);
         let w = self.mix_up.forward(&w)?;
-        dump("mix_up", &w);
         let w = ops::sigmoid(&w)?;
-        dump("mix_w", &w);
         let mut lead = w.shape().to_vec();
         lead.pop();
         let hc = self.hc_count as i32;
@@ -123,12 +123,10 @@ impl GatedResidual {
             return (w4 * n4).mean_axis(-2, None);
         }
         let prod = w4.multiply(&n4)?;
-        dump("mix_prod", &prod);
         let mut acc = prod.index((.., .., 0, ..)).contiguous().unwrap();
         for s in 1..self.hc_count {
             acc = acc.add(&prod.index((.., .., s as i32, ..)))?;
         }
-        dump("mix_acc", &acc);
         Ok(acc)
     }
 
@@ -157,22 +155,53 @@ impl GatedResidual {
                 .as_ref()
                 .map(|i| (&i.weight, &i.scales, &i.biases));
             let nd = self.mix_down.weight.dim(0);
-            let (wi, si, bi) = inj_q.unwrap_or((&self.mix_down.weight, &self.mix_down.scales, &self.mix_down.biases));
+            let (wi, si, bi) = inj_q.unwrap_or((
+                &self.mix_down.weight,
+                &self.mix_down.scales,
+                &self.mix_down.biases,
+            ));
             if let Some((_lo, act, injw)) = lisa_mlx::moe_decode::down_inject(
                 normed,
-                &self.mix_down.weight, &self.mix_down.scales, &self.mix_down.biases,
-                wi, si, bi,
-                self.hidden as i32, nd, hc, s, has_inject, &stream,
+                &self.mix_down.weight,
+                &self.mix_down.scales,
+                &self.mix_down.biases,
+                wi,
+                si,
+                bi,
+                self.hidden as i32,
+                nd,
+                hc,
+                s,
+                has_inject,
+                &stream,
             ) {
                 if let Some((input, inject_w)) = {
-                    let packed = if s == 1 { self.decode_up.as_ref() } else { None };
+                    let packed = if s == 1 {
+                        self.decode_up.as_ref()
+                    } else {
+                        None
+                    };
                     let (wu, su, bu) = match packed {
                         Some(p) => (&p.weight, &p.scales, &p.biases),
-                        None => (&self.mix_up.weight, &self.mix_up.scales, &self.mix_up.biases),
+                        None => (
+                            &self.mix_up.weight,
+                            &self.mix_up.scales,
+                            &self.mix_up.biases,
+                        ),
                     };
                     lisa_mlx::moe_decode::up_mix(
-                        &act, normed, wu, su, bu, &injw,
-                        h, hc, s, has_inject, packed.is_some(), &stream,
+                        &act,
+                        normed,
+                        wu,
+                        su,
+                        bu,
+                        &injw,
+                        h,
+                        hc,
+                        s,
+                        has_inject,
+                        packed.is_some(),
+                        &stream,
                     )
                 } {
                     return Ok((input.reshape(&[b, s, h])?, inject_w.reshape(&[b, s, hc])?));
@@ -184,33 +213,11 @@ impl GatedResidual {
             None => normed.clone(),
         };
         let lo = self.mix_down.forward(normed)?;
-        if let Ok(dir) = std::env::var("LISA_DUMP_DIR") {
-            static H0: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-            if normed.dim(1) == 1024 && H0.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                for (nm, arr) in [("hx_inj", &inj), ("hx_lo", &lo)] {
-                    let f = arr.as_dtype(lisa_mlx::Dtype::Float32)?;
-                    let a = f.as_slice::<f32>();
-                    let _ = std::fs::write(format!("{dir}/{nm}.bin"),
-                        unsafe { std::slice::from_raw_parts(a.as_ptr() as *const u8, a.len() * 4) });
-                }
-            }
-        }
         let act = match lisa_mlx::kernels::silu_head(&lo, lo.dim(-1), &stream) {
             Some(r) => r.reshape(lo.shape())?,
             None => crate::core::norm::bf16_silu(&lo)?,
         };
         let w = self.mix_up.forward(&act)?;
-        if let Ok(dir) = std::env::var("LISA_DUMP_DIR") {
-            static H1: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-            if normed.dim(1) == 1024 && H1.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                for (nm, arr) in [("hx_act", &act), ("hx_w", &w)] {
-                    let f = arr.as_dtype(lisa_mlx::Dtype::Float32)?;
-                    let a = f.as_slice::<f32>();
-                    let _ = std::fs::write(format!("{dir}/{nm}.bin"),
-                        unsafe { std::slice::from_raw_parts(a.as_ptr() as *const u8, a.len() * 4) });
-                }
-            }
-        }
         if let Some((input, inject_w)) =
             lisa_mlx::kernels::hc_mix(&w, normed, &inj, hc, h, b * s, has_inject, &stream)
         {
@@ -225,20 +232,6 @@ impl GatedResidual {
 
     /// Returns `(block_input, residual, inject_weights)`.
     pub fn mix_with_inject(&self, hyper: &Array) -> lisa_mlx::error::Result<(Array, Array, Array)> {
-        static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-        let dump_dir = std::env::var("LISA_DUMP_DIR").ok();
-        let first = FIRST.swap(false, std::sync::atomic::Ordering::SeqCst) && dump_dir.is_some();
-        let dump = |name: &str, arr: &Array| {
-            if first {
-                let dir = dump_dir.as_ref().unwrap();
-                let f = arr.as_dtype(Dtype::Float32).unwrap();
-                let a = f.as_slice::<f32>();
-                let _ = std::fs::write(
-                    format!("{dir}/rsx_{name}.bin"),
-                    unsafe { std::slice::from_raw_parts(a.as_ptr() as *const u8, a.len() * 4) },
-                );
-            }
-        };
         let inject = self
             .block_inject
             .as_ref()
@@ -264,8 +257,6 @@ impl GatedResidual {
             {
                 let block_input = input.reshape(&[b, s, h])?;
                 let inject_w = inject_w.reshape(&[b, s, hc])?;
-                dump("inject_w", &inject_w);
-                dump("block_input", &block_input);
                 return Ok((block_input, hyper.clone(), inject_w));
             }
         }
@@ -281,9 +272,7 @@ impl GatedResidual {
             x
         };
         let inject_w = ops::sigmoid(&x)? * crate::core::norm::bf16_scalar(2.0);
-        dump("inject_w", &inject_w);
-        let block_input = self.mixed(&normed, first)?;
-        dump("block_input", &block_input);
+        let block_input = self.mixed(&normed)?;
         Ok((block_input, hyper.clone(), inject_w))
     }
 }
@@ -291,11 +280,7 @@ impl GatedResidual {
 /// Inject a block output back into the hyper-connection stream.
 ///
 /// output: [B, S, hidden]; inject: [B, S, hc]; returns residual + spread.
-pub fn inject(
-    residual: &Array,
-    output: &Array,
-    inject: &Array,
-) -> lisa_mlx::error::Result<Array> {
+pub fn inject(residual: &Array, output: &Array, inject: &Array) -> lisa_mlx::error::Result<Array> {
     let spread = output.expand_dims(-2)?.multiply(&inject.expand_dims(-1)?)?;
     // [B, S, hc, hidden] -> [B, S, hc * hidden] (stream-major, like the ref)
     let mut shape = spread.shape().to_vec();

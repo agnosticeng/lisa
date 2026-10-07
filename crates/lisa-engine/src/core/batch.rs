@@ -4,7 +4,7 @@
 //! (together for equal lengths, or alone then packed when ragged) and then
 //! advanced in lockstep. [`ContinuousBatch`] is the serving case: streams are
 //! admitted and retired as they arrive and finish, and the packed caches are
-//! compacted on every membership change (the reference engine's CBv2 idea).
+//! compacted on every membership change (the continuous-batch v2 idea).
 //!
 //! The model is written with `B` as a batch dimension throughout (attention,
 //! GDN state, PLE history), so a batched forward is a single `Tower::forward`
@@ -12,12 +12,108 @@
 //! because the engine's fused decode/prefill kernels are single-batch.
 
 use lisa_mlx::ops::indexing::{IndexMutOp, IndexOp};
-use lisa_mlx::{ops, Array};
+use lisa_mlx::{Array, ops};
 
+use crate::core::cache::{FullAttentionCache, GdnCache, IndexerTape, LayerCache};
 use crate::core::generate::is_eos;
 use crate::core::sampler::Sampler;
-use crate::core::cache::{FullAttentionCache, GdnCache, IndexerTape, LayerCache};
 use crate::models::LanguageModel;
+
+/// Prompt prefill window (`Tower::prefill_multi` chunks at the same size).
+pub const PREFILL_CHUNK: usize = 2048;
+
+/// The padded tensor may be at most this multiple of the bytes the group
+/// actually needs. Must stay
+/// BELOW 2.0 or a two-slot group is never vetoable: one 1-token slot beside
+/// one huge slot pads to exactly 2x — the pathological pair this cap exists
+/// for.
+pub const MAX_PAD_WASTE: f64 = 1.5;
+
+/// Per-slot batched attention floor: past the longest
+/// slot's live window the attention reads are per-slot (nothing padded), so
+/// the pad-waste cap is void for the group. Must match
+/// `Qwen35Attention::per_slot_attention`.
+pub const BATCHED_PER_SLOT_ATTN_MIN_KV: usize = 1024;
+
+/// Largest ascending-sorted prefix of `kv_lens_asc` whose padded tensor stays
+/// within [`MAX_PAD_WASTE`] of its useful bytes. The slots that fall out are the LONGEST ones — the ones
+/// dominating the pad. 0 or 1 = nobody batches.
+pub fn batched_kv_keep_count(kv_lens_asc: &[usize]) -> usize {
+    if kv_lens_asc.len() < 2 {
+        return 0;
+    }
+    let mut k = kv_lens_asc.len();
+    while k >= 2 {
+        let sum: usize = kv_lens_asc[..k].iter().sum();
+        if sum == 0 {
+            return k; // nothing prefilled yet: no padding to waste
+        }
+        let padded = (k * kv_lens_asc[k - 1]) as f64;
+        if padded <= MAX_PAD_WASTE * sum as f64 {
+            return k;
+        }
+        k -= 1;
+    }
+    0
+}
+
+/// [`batched_kv_keep_count`] for a group whose attention may go per-slot: past
+/// the per-slot floor nothing is padded, so every slot batches.
+pub fn group_keep_count(kv_lens_asc: &[usize], per_slot_capable: bool) -> usize {
+    if per_slot_capable
+        && kv_lens_asc.len() >= 2
+        && kv_lens_asc[kv_lens_asc.len() - 1] >= BATCHED_PER_SLOT_ATTN_MIN_KV
+    {
+        return kv_lens_asc.len();
+    }
+    batched_kv_keep_count(kv_lens_asc)
+}
+
+/// A prefill narrows to at most [`PREFILL_CHUNK`] while anyone decodes, so an
+/// admission prefill cannot monopolize the GPU against live decode ticks. At
+/// our default chunk the narrow is a no-op — kept as the policy's safety net.
+pub fn company_prefill_chunk(chunk: usize, decoding: usize) -> usize {
+    if decoding == 0 {
+        return chunk;
+    }
+    chunk.min(PREFILL_CHUNK)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Expected keep-count vectors.
+    #[test]
+    fn keep_count_caps_pad_waste() {
+        // 10 beside 900 pads to exactly 1.98x useful — the pathological pair.
+        assert_eq!(batched_kv_keep_count(&[10, 900]), 0);
+        assert!(1.5 < (2.0 * 900.0) / (10.0 + 900.0));
+        // Equal lengths pad nothing.
+        assert_eq!(batched_kv_keep_count(&[64, 64, 64]), 3);
+        // A mild skew keeps the pair, a hard one splits it.
+        assert_eq!(batched_kv_keep_count(&[100, 200]), 2); // 1.33x
+        assert_eq!(batched_kv_keep_count(&[100, 400]), 0); // 1.6x > 1.5x
+    }
+
+    #[test]
+    fn per_slot_floor_voids_the_cap() {
+        let skew = [100usize, 850, 900, 1300];
+        // Without the per-slot arm the cap trims to the 3 shortest.
+        assert_eq!(group_keep_count(&skew, false), 3);
+        // With it (max >= 1024) every slot batches.
+        assert_eq!(group_keep_count(&skew, true), 4);
+        // Below the floor the stacked cap applies even when capable.
+        assert_eq!(group_keep_count(&[10, 900], true), 0);
+    }
+
+    #[test]
+    fn company_chunk_narrows_only_while_decoding() {
+        assert_eq!(company_prefill_chunk(8192, 0), 8192);
+        assert_eq!(company_prefill_chunk(8192, 1), 2048);
+        assert_eq!(company_prefill_chunk(1024, 3), 1024);
+    }
+}
 
 pub struct Batch {
     pub caches: Vec<LayerCache>,
@@ -72,7 +168,6 @@ impl Batch {
             toks,
         ))
     }
-
 
     /// Prefill each stream on its own (any length), then pack the per-stream
     /// caches into one batched cache for lockstep decode.
@@ -133,7 +228,12 @@ impl Batch {
     /// One batched decode step: feed `tokens` (one per stream), return the next
     /// token per stream. Finished streams are fed their own last token again and
     /// their output is ignored by the caller.
-    pub fn step(&mut self, tower: &mut dyn LanguageModel, tokens: &[u32], sampler: &mut Sampler) -> anyhow::Result<Vec<u32>> {
+    pub fn step(
+        &mut self,
+        tower: &mut dyn LanguageModel,
+        tokens: &[u32],
+        sampler: &mut Sampler,
+    ) -> anyhow::Result<Vec<u32>> {
         let n = self.fed.len();
         anyhow::ensure!(tokens.len() == n, "step needs one token per stream");
 
@@ -412,6 +512,34 @@ impl ContinuousBatch {
         self.fed.is_empty()
     }
 
+    /// Live KV lens per stream (committed tokens — each full-attention layer's
+    /// live window length at decode time).
+    pub fn kv_lens(&self) -> Vec<usize> {
+        self.fed.iter().map(|f| f.len()).collect()
+    }
+
+    /// May a new stream of `new_len` prompt tokens join without pushing the
+    /// group's padded attention past [`MAX_PAD_WASTE`]?
+    ///
+    /// The keep-count cap is normally applied when forming each tick's decode
+    /// group, decoding the longest rejects serially that tick. Our packed
+    /// cache makes per-tick re-formation a copy storm (specs/13 §3b), and —
+    /// because every stream advances one token per tick — the KV skew is
+    /// FIXED at pack time, so the same cap applied at ADMISSION gives the
+    /// same protection: a would-be reject waits instead of joining. Past the
+    /// per-slot attention floor nothing is padded, so the cap is void —
+    /// mirroring the per-slot-capable arm.
+    pub fn admits_within_pad_waste(&self, new_len: usize) -> bool {
+        if self.len() == 0 {
+            return true;
+        }
+        let mut lens = self.kv_lens();
+        lens.push(new_len);
+        lens.sort_unstable();
+        let per_slot = *lens.last().unwrap() >= BATCHED_PER_SLOT_ATTN_MIN_KV;
+        group_keep_count(&lens, per_slot) == lens.len()
+    }
+
     /// Prefill `prompt` alone (any length) and merge it into the batch; returns
     /// the first sampled token.
     pub fn admit(
@@ -422,6 +550,53 @@ impl ContinuousBatch {
     ) -> anyhow::Result<u32> {
         anyhow::ensure!(!prompt.is_empty(), "empty prompt");
         let per = prefill_one(tower, prompt)?;
+        self.admit_prefilled(tower, per, prompt, sampler)
+    }
+
+    /// Prefill `prompt` alone in [`PREFILL_CHUNK`] windows, yielding to the
+    /// caller between chunks via `on_chunk` (the prefill/decode interleave:
+    /// a long prefill must not stall streams that are already decoding).
+    /// Returns the first sampled
+    /// token.
+    ///
+    /// The chunk loop mirrors `Tower::prefill_multi` exactly (same windows,
+    /// same per-chunk forward), so the admission result is identical to
+    /// [`Self::admit`] — only the wall-clock interleaving differs.
+    pub fn admit_chunked(
+        &mut self,
+        tower: &mut dyn LanguageModel,
+        prompt: &[u32],
+        sampler: &mut Sampler,
+        on_chunk: &mut dyn FnMut(&mut Self, &mut dyn LanguageModel) -> anyhow::Result<()>,
+    ) -> anyhow::Result<u32> {
+        anyhow::ensure!(!prompt.is_empty(), "empty prompt");
+        tower.clear_context();
+        let mut caches = tower.new_caches();
+        let mut last = None;
+        for chunk in prompt.chunks(PREFILL_CHUNK) {
+            let ids: Vec<i32> = chunk.iter().map(|&t| t as i32).collect();
+            let arr = Array::from_slice(&ids, &[1i32, chunk.len() as i32]);
+            let (h, _) = tower.forward(&arr, Some(&mut caches))?;
+            last = Some(h.index((.., h.dim(1) - 1, ..)));
+            lisa_mlx::memory::trim_cache();
+            on_chunk(self, tower)?;
+        }
+        let per = Prefilled {
+            caches,
+            last_hidden: last.expect("non-empty prompt"),
+        };
+        self.admit_prefilled(tower, per, prompt, sampler)
+    }
+
+    /// Merge an already-prefilled stream into the batch (the shared tail of
+    /// [`Self::admit`] / [`Self::admit_chunked`]).
+    fn admit_prefilled(
+        &mut self,
+        tower: &mut dyn LanguageModel,
+        per: Prefilled,
+        prompt: &[u32],
+        sampler: &mut Sampler,
+    ) -> anyhow::Result<u32> {
         let logits = tower.head(&per.last_hidden)?;
         let tok = sampler.draw(&logits, prompt)?;
         let ctx = tower.context_window();
@@ -462,7 +637,10 @@ impl ContinuousBatch {
         // Ragged packing: stream i's keys occupy `[lmax - lens[i], offset + 1)`;
         // the mask hides the padding prefix. Collapsed (single-stream) batches
         // carry no `next_pos`, so they take the plain causal path.
-        let ragged = self.caches.iter().any(|c| matches!(c, LayerCache::Full(f) if f.next_pos.is_some()));
+        let ragged = self
+            .caches
+            .iter()
+            .any(|c| matches!(c, LayerCache::Full(f) if f.next_pos.is_some()));
         if ragged {
             let l_after = self
                 .caches
@@ -535,7 +713,8 @@ impl ContinuousBatch {
         let mut done: Vec<bool> = Vec::new();
 
         if !self.caches.is_empty() {
-            let mut extracted = extract_streams(&self.caches, &survivors, &self.lens, self.lmax)?.into_iter();
+            let mut extracted =
+                extract_streams(&self.caches, &survivors, &self.lens, self.lmax)?.into_iter();
             for &i in survivors.iter() {
                 per.push(extracted.next().expect("one per survivor"));
                 lens.push(self.fed[i].len());
@@ -598,11 +777,17 @@ pub(crate) struct Prefilled {
 }
 /// Prefill `prompt` alone (B=1, fresh caches) and return the caches plus the
 /// last-position hidden state.
-pub(crate) fn prefill_one(tower: &mut dyn LanguageModel, prompt: &[u32]) -> anyhow::Result<Prefilled> {
+pub(crate) fn prefill_one(
+    tower: &mut dyn LanguageModel,
+    prompt: &[u32],
+) -> anyhow::Result<Prefilled> {
     tower.clear_context();
     let mut caches = tower.new_caches();
     let last = tower.prefill(prompt, &mut caches)?;
-    Ok(Prefilled { caches, last_hidden: last })
+    Ok(Prefilled {
+        caches,
+        last_hidden: last,
+    })
 }
 
 /// Slice the packed caches back into per-stream (B=1) caches for `survivors`,
@@ -629,8 +814,18 @@ fn extract_streams(
         for c in packed {
             match c {
                 LayerCache::Full(f) => {
-                    let k = f.keys.as_ref().unwrap().index((row.clone(), .., range.clone(), ..)).contiguous()?;
-                    let v = f.values.as_ref().unwrap().index((row.clone(), .., range.clone(), ..)).contiguous()?;
+                    let k = f
+                        .keys
+                        .as_ref()
+                        .unwrap()
+                        .index((row.clone(), .., range.clone(), ..))
+                        .contiguous()?;
+                    let v = f
+                        .values
+                        .as_ref()
+                        .unwrap()
+                        .index((row.clone(), .., range.clone(), ..))
+                        .contiguous()?;
                     layers.push(LayerCache::Full(FullAttentionCache {
                         keys: Some(k),
                         values: Some(v),
@@ -659,7 +854,7 @@ fn extract_streams(
                         ple_conv: one(&g.ple_conv)?,
                         capture_ssm: None,
                         capture_conv_input: None,
-                rec_y_buf: None,
+                        rec_y_buf: None,
                         capture_ple_full: None,
                     }));
                 }

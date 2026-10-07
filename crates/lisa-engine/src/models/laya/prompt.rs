@@ -7,7 +7,7 @@
 //! different view of it.
 
 use anyhow::{Context, Result};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::Laya;
 
@@ -25,7 +25,9 @@ impl QType {
             "choice" => Ok(QType::Choice),
             "score" => Ok(QType::Score),
             "noul" => Ok(QType::Noul),
-            other => anyhow::bail!("unknown question type {other:?}; expected choice, score, or noul"),
+            other => {
+                anyhow::bail!("unknown question type {other:?}; expected choice, score, or noul")
+            }
         }
     }
     pub fn name(self) -> &'static str {
@@ -50,9 +52,17 @@ pub struct Question {
 impl Question {
     /// Validate and normalize a question definition (upstream `_to_internal`).
     pub fn parse(v: &Value) -> Result<Self> {
-        let obj = v.as_object().context("each question must be a dictionary")?;
-        let t = QType::parse(obj.get("type").and_then(|v| v.as_str()).context("question is missing type")?)?;
-        let ins = obj.get("instructions").context("question is missing instructions")?;
+        let obj = v
+            .as_object()
+            .context("each question must be a dictionary")?;
+        let t = QType::parse(
+            obj.get("type")
+                .and_then(|v| v.as_str())
+                .context("question is missing type")?,
+        )?;
+        let ins = obj
+            .get("instructions")
+            .context("question is missing instructions")?;
         let ins = match ins {
             Value::String(s) => s.clone(),
             other => serde_json::to_string(other)?,
@@ -84,7 +94,10 @@ impl Question {
     pub fn render_options(&self) -> Result<Vec<String>> {
         match self.t {
             QType::Choice => {
-                let obj = self.crit.as_object().context("choice criteria must be a dictionary")?;
+                let obj = self
+                    .crit
+                    .as_object()
+                    .context("choice criteria must be a dictionary")?;
                 let mut out = Vec::with_capacity(obj.len());
                 for (k, v) in obj {
                     out.push(if v.is_null() || v.as_str() == Some("") {
@@ -96,7 +109,10 @@ impl Question {
                 Ok(out)
             }
             QType::Score => {
-                let arr = self.crit.as_array().context("score criteria must be a list")?;
+                let arr = self
+                    .crit
+                    .as_array()
+                    .context("score criteria must be a list")?;
                 Ok(arr
                     .iter()
                     .enumerate()
@@ -109,7 +125,10 @@ impl Question {
                 let false_c = get("false");
                 let true_c = get("true");
                 Ok(vec![
-                    format!("false: {}", noul_text(false_c, "no, the statement does not hold")),
+                    format!(
+                        "false: {}",
+                        noul_text(false_c, "no, the statement does not hold")
+                    ),
                     format!("true: {}", noul_text(true_c, "yes, the statement holds")),
                 ])
             }
@@ -131,7 +150,10 @@ fn normalize_choice(crit: &Value) -> Result<Value> {
         Value::Object(o) => Value::Object(o.clone()),
         _ => anyhow::bail!("choice criteria must be a nonempty dictionary or list"),
     };
-    anyhow::ensure!(obj.as_object().is_some_and(|o| !o.is_empty()), "choice criteria must be nonempty");
+    anyhow::ensure!(
+        obj.as_object().is_some_and(|o| !o.is_empty()),
+        "choice criteria must be nonempty"
+    );
     Ok(obj)
 }
 
@@ -252,7 +274,8 @@ impl Laya {
             id.extend(self.encode_text(&format!(" {body}"))?.into_iter().take(48));
             opt_ids.push(id);
         }
-        let mut opt_budget = head_max_len as i64 - opt_ids.iter().map(|o| o.len() as i64).sum::<i64>();
+        let mut opt_budget =
+            head_max_len as i64 - opt_ids.iter().map(|o| o.len() as i64).sum::<i64>();
         if opt_budget < 16 {
             let per = (4).max((head_max_len.saturating_sub(16)) / opt_ids.len().max(1));
             for o in &mut opt_ids {
@@ -284,7 +307,9 @@ impl Laya {
 
     /// Run one state + questions and produce the upstream answer JSON.
     pub fn system_one(&self, state: &Value, questions: &Value) -> Result<Value> {
-        let qmap = questions.as_object().context("questions must be a dictionary")?;
+        let qmap = questions
+            .as_object()
+            .context("questions must be a dictionary")?;
         let mut answers = serde_json::Map::new();
         let mut input_tokens = 0usize;
         for (qid, qdef) in qmap {
@@ -333,7 +358,12 @@ impl Laya {
                     let legend: serde_json::Map<String, Value> = q
                         .crit
                         .as_array()
-                        .map(|a| a.iter().enumerate().map(|(i, c)| (i.to_string(), c.clone())).collect())
+                        .map(|a| {
+                            a.iter()
+                                .enumerate()
+                                .map(|(i, c)| (i.to_string(), c.clone()))
+                                .collect()
+                        })
                         .unwrap_or_default();
                     let probs: serde_json::Map<String, Value> = p
                         .iter()

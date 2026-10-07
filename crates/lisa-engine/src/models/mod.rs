@@ -14,10 +14,12 @@
 //! Device backends are a separate axis (see `lisa_mlx`): the runtime talks to
 //! an `Array`/`Stream` surface, and a backend supplies it.
 
+pub mod gdn;
 pub mod hf;
 pub mod laya;
 pub mod qwen3_5;
 pub mod qwen4;
+pub mod speculate;
 
 use std::path::{Path, PathBuf};
 
@@ -60,6 +62,20 @@ pub trait LanguageModel {
     fn warmup(&mut self, seed: &[u32]) -> anyhow::Result<()>;
 
     // --- optional host-side rolling context (e.g. the PLE n-gram window) ---
+    /// Whether B>1 batched decode is safe on this tower. `false` clamps the
+    /// scheduler to lone streams (the exact single-stream path).
+    fn batch_decode_ok(&self) -> bool {
+        true
+    }
+    /// O3: bytes of KV a single token occupies for one stream (0 = unknown, in
+    /// which case admission is skipped rather than guessed).
+    fn kv_bytes_per_token(&self) -> usize {
+        0
+    }
+    /// O3: fixed per-stream non-KV state bytes (GDN conv/SSM, indexer tape).
+    fn stream_state_bytes(&self) -> usize {
+        0
+    }
     /// Rolling context window size (0 = the model carries none).
     fn context_window(&self) -> usize {
         0
@@ -94,6 +110,23 @@ pub trait LanguageModel {
     fn draft_step(&mut self, _tokens: &Array, _multi: &Array) -> anyhow::Result<(Array, Array)> {
         anyhow::bail!("this model has no drafter")
     }
+    /// Take the most recent `draft_step`'s head confidence: log p_head of the
+    /// token it proposed, as an UNEVALUATED `[1]` array (the chunk-A sync
+    /// evals these — port spec §2.3; reads the exact re-score row the step
+    /// already produced, no new buffer). `None` = the drafter does not expose
+    /// one; the two-chunk machinery stays off for that model.
+    fn take_draft_confidence(&mut self) -> Option<Array> {
+        None
+    }
+    /// Arm/disarm the per-step confidence capture (an enqueue-time cost: only
+    /// the two-chunk rounds need it, so capture stays off otherwise and the
+    /// certified paths stay byte-identical in dispatch shape).
+    fn set_conf_capture(&mut self, _on: bool) {}
+    /// Stable per-architecture row key for the round-cost table (shape, never
+    /// a repo id or snapshot hash), e.g. `qwen3_5-64L-5120h`.
+    fn mtp_cost_key(&self) -> String {
+        String::new()
+    }
 }
 
 /// A model kind the runtime can load.
@@ -124,7 +157,11 @@ pub trait DecisionModel {
         marker_pos: &[i32],
     ) -> anyhow::Result<(Vec<f32>, Vec<f32>)>;
     /// Run a `state` + typed `questions` request and return the answer JSON.
-    fn system_one(&self, _state: &serde_json::Value, _questions: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    fn system_one(
+        &self,
+        _state: &serde_json::Value,
+        _questions: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
         anyhow::bail!("this decision model has no typed-question interface")
     }
 }
@@ -167,7 +204,9 @@ pub fn load_dir_with(dir: &Path, backend: lisa_mlx::backend::Backend) -> anyhow:
                 backend.name()
             );
             let config = qwen3_5::Qwen35Config::from_json(&dir.join("config.json"))?;
-            Ok(Loaded::Language(Box::new(qwen3_5::Qwen35Tower::load(dir, config)?)))
+            Ok(Loaded::Language(Box::new(qwen3_5::Qwen35Tower::load(
+                dir, config,
+            )?)))
         }
         // Laya (ModernBERT encoder + typed-decision head; non-generative).
         "laya" => {
@@ -175,7 +214,9 @@ pub fn load_dir_with(dir: &Path, backend: lisa_mlx::backend::Backend) -> anyhow:
                 lisa_mlx::backend::Backend::Metal => laya::LayaDevice::Metal,
                 lisa_mlx::backend::Backend::Cpu => laya::LayaDevice::Cpu,
             };
-            Ok(Loaded::Decision(Box::new(laya::Laya::load_device(dir, device)?)))
+            Ok(Loaded::Decision(Box::new(laya::Laya::load_device(
+                dir, device,
+            )?)))
         }
         other => anyhow::bail!(
             "unsupported model_type {other:?} in {}; supported: qwen4_exp, qwen3_5, laya",
@@ -188,7 +229,8 @@ pub fn load_dir_with(dir: &Path, backend: lisa_mlx::backend::Backend) -> anyhow:
 ///
 /// A path that exists is used as-is. Otherwise `target` is treated as a
 /// Hugging Face repo id and resolved against the Hugging Face hub cache; if it
-/// is not cached, it is fetched with `hf download` into the same cache.
+/// is not cached, it is fetched with `hf download` into the same cache. These
+/// are the only two sources — there is no legacy fallback.
 pub fn resolve_model_dir(target: &str) -> anyhow::Result<PathBuf> {
     let direct = Path::new(target);
     if direct.is_dir() {
@@ -197,6 +239,12 @@ pub fn resolve_model_dir(target: &str) -> anyhow::Result<PathBuf> {
     if direct.exists() {
         anyhow::bail!("{} exists but is not a directory", direct.display());
     }
+
+    anyhow::ensure!(
+        target.contains('/') && !target.starts_with('~') && !target.starts_with('/'),
+        "unknown model {target}: pass a local path or a Hugging Face repo id \
+         (models are cached in the HF hub cache)"
+    );
 
     if let Some(dir) = hf_snapshot_dir(target) {
         return Ok(dir);
@@ -270,4 +318,3 @@ fn hf_snapshot_dir(repo: &str) -> Option<PathBuf> {
     entries.sort();
     entries.pop()
 }
-

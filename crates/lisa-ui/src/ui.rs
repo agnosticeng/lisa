@@ -1,6 +1,6 @@
+use objc2::MainThreadMarker;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Sel};
-use objc2::MainThreadMarker;
 use objc2_app_kit::{
     NSBezelStyle, NSBorderType, NSButton, NSButtonType, NSColor, NSFocusRingType, NSFont,
     NSLayoutAttribute, NSScrollView, NSStackView, NSTextField, NSUserInterfaceLayoutOrientation,
@@ -106,7 +106,9 @@ pub fn scroll(mtm: MainThreadMarker, document: &NSView) -> Retained<NSScrollView
 pub fn rule(mtm: MainThreadMarker) -> Retained<NSView> {
     let rule = NSView::new(mtm);
     rule.setTranslatesAutoresizingMaskIntoConstraints(false);
-    rule.heightAnchor().constraintEqualToConstant(1.0).setActive(true);
+    rule.heightAnchor()
+        .constraintEqualToConstant(1.0)
+        .setActive(true);
     rule
 }
 
@@ -120,12 +122,18 @@ pub fn backdrop(mtm: MainThreadMarker) -> Retained<NSVisualEffectView> {
 }
 
 pub fn height(view: &NSView, value: CGFloat) {
-    view.heightAnchor().constraintEqualToConstant(value).setActive(true);
+    view.heightAnchor()
+        .constraintEqualToConstant(value)
+        .setActive(true);
 }
 
 #[allow(dead_code)]
 pub fn size(view: &NSView, width: CGFloat, height: CGFloat) {
     view.setTranslatesAutoresizingMaskIntoConstraints(false);
-    view.widthAnchor().constraintEqualToConstant(width).setActive(true);
-    view.heightAnchor().constraintEqualToConstant(height).setActive(true);
+    view.widthAnchor()
+        .constraintEqualToConstant(width)
+        .setActive(true);
+    view.heightAnchor()
+        .constraintEqualToConstant(height)
+        .setActive(true);
 }

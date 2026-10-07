@@ -118,10 +118,7 @@ impl Qwen35Config {
                     .collect()
             });
         let eos = match g(|x| x.eos_token_id.clone().map(|_| 0)) {
-            _ => t
-                .eos_token_id
-                .clone()
-                .or_else(|| root.eos_token_id.clone()),
+            _ => t.eos_token_id.clone().or_else(|| root.eos_token_id.clone()),
         };
         let eos_token_id = match eos {
             Some(serde_json::Value::Number(n)) => n.as_i64().unwrap_or(248046),
@@ -130,11 +127,11 @@ impl Qwen35Config {
             }
             _ => 248046,
         };
-        let rp = t.rope_parameters.clone().or_else(|| root.rope_parameters.clone());
-        let mut rope_theta = t
-            .rope_theta
-            .or(root.rope_theta)
-            .unwrap_or(10_000_000.0);
+        let rp = t
+            .rope_parameters
+            .clone()
+            .or_else(|| root.rope_parameters.clone());
+        let mut rope_theta = t.rope_theta.or(root.rope_theta).unwrap_or(10_000_000.0);
         let mut partial_rotary_factor = t
             .partial_rotary_factor
             .or(root.partial_rotary_factor)

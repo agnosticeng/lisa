@@ -1,14 +1,14 @@
 use std::cell::{Cell, OnceCell, RefCell};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Bool, ProtocolObject, Sel};
 use objc2::{
-    define_class, msg_send, sel, AnyThread, ClassType, DefinedClass, MainThreadMarker,
-    MainThreadOnly,
+    AnyThread, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
+    sel,
 };
 use objc2_app_kit::*;
 use objc2_foundation::*;
@@ -169,7 +169,8 @@ fn hf_blobs_size(repo: &str) -> u64 {
 
 /// Byte size of a Hub repo (sum of its files), 0 when unknown.
 fn remote_size(id: &str) -> u64 {
-    let url = format!("https://huggingface.co/api/models/{id}/tree/main?recursive=true&expand=true");
+    let url =
+        format!("https://huggingface.co/api/models/{id}/tree/main?recursive=true&expand=true");
     let Some(v) = curl_json(&url) else {
         return 0;
     };
@@ -185,7 +186,8 @@ fn remote_size(id: &str) -> u64 {
 /// Fetch the agnosticeng models (id, size) from the Hugging Face Hub (`curl`,
 /// no HTTP dependency). Runs on a background thread; empty on failure.
 fn fetch_remote_models() -> Vec<(String, u64)> {
-    let Some(v) = curl_json("https://huggingface.co/api/models?author=agnosticeng&limit=200") else {
+    let Some(v) = curl_json("https://huggingface.co/api/models?author=agnosticeng&limit=200")
+    else {
         return Vec::new();
     };
     let Some(arr) = v.as_array() else {
@@ -210,7 +212,10 @@ enum Command {
     Download(String),
     /// Reset the conversation (drop the session state; keep the model loaded).
     Clear,
-    Chat { text: String, system: String },
+    Chat {
+        text: String,
+        system: String,
+    },
     /// Start the OpenAI-compatible server on the loaded model; runs until the
     /// shared `stop` flag is set, then the engine resumes handling commands.
     StartServe {
@@ -329,7 +334,11 @@ fn append_plain(
 /// Row title for the "/" command menu: the command name in the label colour,
 /// its description after a gap in the secondary colour. `selected` brightens
 /// both runs so the keyboard-highlighted row stands out.
-fn command_row_title(name: &str, desc: &str, selected: bool) -> Retained<NSMutableAttributedString> {
+fn command_row_title(
+    name: &str,
+    desc: &str,
+    selected: bool,
+) -> Retained<NSMutableAttributedString> {
     let font_key = NSString::from_str("NSFont");
     let color_key = NSString::from_str("NSColor");
     let name_font = NSFont::boldSystemFontOfSize(13.0);
@@ -345,8 +354,10 @@ fn command_row_title(name: &str, desc: &str, selected: bool) -> Retained<NSMutab
         NSColor::secondaryLabelColor()
     };
 
-    let out =
-        NSMutableAttributedString::initWithString(NSMutableAttributedString::alloc(), ns_string!(""));
+    let out = NSMutableAttributedString::initWithString(
+        NSMutableAttributedString::alloc(),
+        ns_string!(""),
+    );
     // Keep the leading slash off the command word so it reads as a marker.
     let display = match name.strip_prefix('/') {
         Some(rest) => format!("/ {rest}"),
@@ -805,26 +816,21 @@ fn math_attributed(
     color: &NSColor,
 ) {
     let small = size * 0.72;
-    let italic = NSFont::fontWithName_size(
-        &NSString::from_str("TimesNewRomanPS-ItalicMT"),
-        size,
-    )
-    .unwrap_or_else(|| {
-        NSFontManager::sharedFontManager(mtm).convertFont_toHaveTrait(
-            &NSFont::systemFontOfSize(size),
-            NSFontTraitMask::ItalicFontMask,
-        )
-    });
-    let italic_small = NSFont::fontWithName_size(
-        &NSString::from_str("TimesNewRomanPS-ItalicMT"),
-        small,
-    )
-    .unwrap_or_else(|| {
-        NSFontManager::sharedFontManager(mtm).convertFont_toHaveTrait(
-            &NSFont::systemFontOfSize(small),
-            NSFontTraitMask::ItalicFontMask,
-        )
-    });
+    let italic = NSFont::fontWithName_size(&NSString::from_str("TimesNewRomanPS-ItalicMT"), size)
+        .unwrap_or_else(|| {
+            NSFontManager::sharedFontManager(mtm).convertFont_toHaveTrait(
+                &NSFont::systemFontOfSize(size),
+                NSFontTraitMask::ItalicFontMask,
+            )
+        });
+    let italic_small =
+        NSFont::fontWithName_size(&NSString::from_str("TimesNewRomanPS-ItalicMT"), small)
+            .unwrap_or_else(|| {
+                NSFontManager::sharedFontManager(mtm).convertFont_toHaveTrait(
+                    &NSFont::systemFontOfSize(small),
+                    NSFontTraitMask::ItalicFontMask,
+                )
+            });
     let upright = NSFont::fontWithName_size(&NSString::from_str("TimesNewRomanPSMT"), size)
         .unwrap_or_else(|| NSFont::systemFontOfSize(size));
     let upright_small = NSFont::fontWithName_size(&NSString::from_str("TimesNewRomanPSMT"), small)
@@ -898,7 +904,10 @@ fn parse_cells(line: &str) -> Vec<String> {
 
 /// Drop math delimiters and inline markers from a table cell.
 fn sanitize_cell(c: &str) -> String {
-    c.replace("**", "").chars().filter(|ch| *ch != '`').collect()
+    c.replace("**", "")
+        .chars()
+        .filter(|ch| *ch != '`')
+        .collect()
 }
 
 /// True for a `|---|---|` alignment-specifier row.
@@ -984,7 +993,10 @@ fn parse_blocks(text: &str) -> Vec<Block> {
             let mut items = Vec::new();
             while i < lines.len() && is_bullet_line(lines[i]) {
                 let s = lines[i].trim_start();
-                let rest = s.strip_prefix("- ").or_else(|| s.strip_prefix("* ")).unwrap();
+                let rest = s
+                    .strip_prefix("- ")
+                    .or_else(|| s.strip_prefix("* "))
+                    .unwrap();
                 items.push(rest.to_string());
                 i += 1;
             }
@@ -1068,7 +1080,13 @@ fn paragraph_label(
     label.setPreferredMaxLayoutWidth(BUBBLE_MAX_WIDTH - 30.0);
     label.setAlignment(NSTextAlignment::Left);
     label.setFont(Some(&NSFont::systemFontOfSize(BUBBLE_FONT_SIZE)));
-    label.setAttributedStringValue(&styled_attributed(mtm, text, color, base_style, BUBBLE_FONT_SIZE));
+    label.setAttributedStringValue(&styled_attributed(
+        mtm,
+        text,
+        color,
+        base_style,
+        BUBBLE_FONT_SIZE,
+    ));
     ui::make_static(&label);
     label
 }
@@ -1087,11 +1105,7 @@ fn code_label(mtm: MainThreadMarker, text: &str, color: &NSColor) -> Retained<NS
     label
 }
 
-fn bullets_view(
-    mtm: MainThreadMarker,
-    items: &[String],
-    color: &NSColor,
-) -> Retained<NSStackView> {
+fn bullets_view(mtm: MainThreadMarker, items: &[String], color: &NSColor) -> Retained<NSStackView> {
     let stack = NSStackView::new(mtm);
     stack.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
     stack.setAlignment(NSLayoutAttribute::Leading);
@@ -1267,6 +1281,11 @@ fn table_view(
 /// Clean a raw model reply for display: drop `<|…|>` special-token markers and
 /// any ` thinking…</think>` reasoning, leaving just the answer. The prompt
 /// pre-fills ` thinking`, so the reply often has only the closing tag.
+/// The unstripped decode — what a reasoning-only reply still shows.
+fn raw_display(ids: &[u32], tok: &lisa_engine::core::tokenizer::Tokenizer) -> String {
+    tok.decode_clean(ids).unwrap_or_default().trim().to_string()
+}
+
 fn clean_reply(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
@@ -1486,256 +1505,388 @@ fn tilde(path: &str) -> String {
 /// Owns the loaded model on a dedicated thread (the model is not `Send`) and
 /// funnels log/chat events back to the main thread through `events`.
 fn spawn_engine(rx: mpsc::Receiver<Command>, events: Arc<Mutex<Vec<UiEvent>>>) {
-    let _ = thread::Builder::new().name("lisa-engine".into()).spawn(move || {
-        let push = |e: UiEvent| events.lock().unwrap().push(e);
-        let mut model: Option<Box<dyn lisa_engine::models::LanguageModel>> = None;
-        let mut tokenizer: Option<lisa_engine::core::tokenizer::Tokenizer> = None;
-        let mut sampler = lisa_engine::core::sampler::Sampler::default();
-        let mut model_dir: Option<PathBuf> = None;
-        // Multi-turn conversation state; kept in lockstep with the loaded model.
-        let mut session: Option<lisa_engine::core::session::Session> = None;
-        let mut turn = 0usize;
-        // Whether the checkpoint's template closes assistant turns with
-        // `` (MiMo-style) rather than Qwen's bare newline.
-        let mut assistant_im_end = false;
+    let _ = thread::Builder::new()
+        .name("lisa-engine".into())
+        .spawn(move || {
+            let push = |e: UiEvent| events.lock().unwrap().push(e);
+            let mut model: Option<Box<dyn lisa_engine::models::LanguageModel>> = None;
+            let mut tokenizer: Option<lisa_engine::core::tokenizer::Tokenizer> = None;
+            let mut sampler = lisa_engine::core::sampler::Sampler::default();
+            let mut model_dir: Option<PathBuf> = None;
+            // Multi-turn conversation state; kept in lockstep with the loaded model.
+            let mut session: Option<lisa_engine::core::session::Session> = None;
+            let mut turn = 0usize;
+            // The conversation as the engine saw it — user turns, assistant
+            // replies, and the first-turn system — kept so a model swap can
+            // replay the history into the new model's session and the chat
+            // keeps its context across the switch.
+            let mut history: Vec<(String, String)> = Vec::new();
+            let mut history_system = String::new();
+            // Whether the checkpoint's template closes assistant turns with
+            // `` (MiMo-style) rather than Qwen's bare newline.
+            let mut assistant_im_end = false;
 
-        // One engine thread serves both UI chat and (optionally) the
-        // in-process HTTP server. Commands are preferred; between them the
-        // server advances one wave at a time. The model is not `Send` and a
-        // forward pass is not preemptible, so requests are serialized — a chat
-        // turn waits at most for an in-flight HTTP request, and vice versa.
-        let mut server: Option<lisa_serve::Server> = None;
-        let mut serve_stop: Option<Arc<AtomicBool>> = None;
-        loop {
-            let cmd = match rx.try_recv() {
-                Ok(c) => c,
-                Err(mpsc::TryRecvError::Disconnected) => break,
-                Err(mpsc::TryRecvError::Empty) => {
-                    if let Some(stop) = serve_stop.as_ref() {
-                        if stop.load(Ordering::Relaxed) {
-                            if let Some(mut srv) = server.take() {
-                                srv.shutdown();
+            // One engine thread serves both UI chat and (optionally) the
+            // in-process HTTP server. Commands are preferred; between them the
+            // server advances one wave at a time. The model is not `Send` and a
+            // forward pass is not preemptible, so requests are serialized — a chat
+            // turn waits at most for an in-flight HTTP request, and vice versa.
+            let mut server: Option<lisa_serve::Server> = None;
+            let mut serve_stop: Option<Arc<AtomicBool>> = None;
+            loop {
+                let cmd = match rx.try_recv() {
+                    Ok(c) => c,
+                    Err(mpsc::TryRecvError::Disconnected) => break,
+                    Err(mpsc::TryRecvError::Empty) => {
+                        if let Some(stop) = serve_stop.as_ref() {
+                            if stop.load(Ordering::Relaxed) {
+                                if let Some(mut srv) = server.take() {
+                                    srv.shutdown();
+                                }
+                                serve_stop = None;
+                                push(UiEvent::ServeStopped);
+                                continue;
                             }
+                        }
+                        if let (Some(srv), Some(m), Some(t)) =
+                            (server.as_mut(), model.as_mut(), tokenizer.as_ref())
+                        {
+                            if srv.step(&mut **m, t) {
+                                continue;
+                            }
+                        }
+                        match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                            Ok(c) => c,
+                            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        }
+                    }
+                };
+                match cmd {
+                    Command::Load(path) => {
+                        // Swapping the model requires stopping any running server.
+                        if let Some(mut srv) = server.take() {
+                            srv.shutdown();
                             serve_stop = None;
                             push(UiEvent::ServeStopped);
-                            continue;
                         }
-                    }
-                    if let (Some(srv), Some(m), Some(t)) =
-                        (server.as_mut(), model.as_mut(), tokenizer.as_ref())
-                    {
-                        if srv.step(&mut **m, t) {
-                            continue;
-                        }
-                    }
-                    match rx.recv_timeout(std::time::Duration::from_millis(50)) {
-                        Ok(c) => c,
-                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                    }
-                }
-            };
-            match cmd {
-                Command::Load(path) => {
-                    // Swapping the model requires stopping any running server.
-                    if let Some(mut srv) = server.take() {
-                        srv.shutdown();
-                        serve_stop = None;
-                        push(UiEvent::ServeStopped);
-                    }
-                    model = None;
-                    tokenizer = None;
-                    push(UiEvent::Log(format!(
-                        "loading {} …",
-                        tilde(&path.to_string_lossy())
-                    )));
-                    match lisa_engine::models::load_dir(&path) {
-                        Ok(lisa_engine::models::Loaded::Language(m)) => {
-                            match lisa_engine::core::tokenizer::Tokenizer::load(&path) {
-                                Ok(t) => {
-                                    lisa_engine::core::generate::set_eos_ids(t.im_end_ids.clone());
-                                    tokenizer = Some(t);
-                                    model = Some(m);
-                                    model_dir = Some(path.clone());
-                                    assistant_im_end = std::fs::read_to_string(
-                                        path.join("chat_template.jinja"),
-                                    )
-                                    .map(|t| t.contains("render_assistant_message"))
-                                    .unwrap_or(false);
-                                    if let Some(m) = model.as_mut() {
-                                        session = Some(lisa_engine::core::session::Session::new(
-                                            &mut **m,
-                                        ));
-                                        turn = 0;
+                        model = None;
+                        tokenizer = None;
+                        push(UiEvent::Log(format!(
+                            "loading {} …",
+                            tilde(&path.to_string_lossy())
+                        )));
+                        match lisa_engine::models::load_dir(&path) {
+                            Ok(lisa_engine::models::Loaded::Language(m)) => {
+                                match lisa_engine::core::tokenizer::Tokenizer::load(&path) {
+                                    Ok(t) => {
+                                        lisa_engine::core::generate::set_eos_ids(
+                                            t.im_end_ids.clone(),
+                                        );
+                                        tokenizer = Some(t);
+                                        model = Some(m);
+                                        model_dir = Some(path.clone());
+                                        assistant_im_end = std::fs::read_to_string(
+                                            path.join("chat_template.jinja"),
+                                        )
+                                        .map(|t| t.contains("render_assistant_message"))
+                                        .unwrap_or(false);
+                                        if let Some(m) = model.as_mut() {
+                                            session = Some(
+                                                lisa_engine::core::session::Session::new(&mut **m),
+                                            );
+                                            // Model swap: replay the recorded
+                                            // history into the new session so
+                                            // the chat keeps its context. A
+                                            // generate() with max_tokens = 0
+                                            // prefills the turns and samples
+                                            // nothing; a replay failure falls
+                                            // back to a fresh session.
+                                            let tokenizer = tokenizer.as_ref().expect("tokenizer");
+                                            let mut sampler =
+                                                lisa_engine::core::sampler::Sampler::default();
+                                            if !history.is_empty() {
+                                                let mut sess =
+                                                    lisa_engine::core::session::Session::new(
+                                                        &mut **m,
+                                                    );
+                                                let mut replayed = true;
+                                                for (i, (user, reply)) in history.iter().enumerate()
+                                                {
+                                                    let prompt = if i == 0 {
+                                                        lisa_engine::core::tokenizer::chat_prompt_special_with_system(
+                                                            user,
+                                                            if history_system.is_empty() { None } else { Some(history_system.as_str()) },
+                                                            false,
+                                                        )
+                                                    } else {
+                                                        lisa_engine::core::tokenizer::chat_turn_suffix_special(
+                                                            user,
+                                                            false,
+                                                            false,
+                                                            assistant_im_end,
+                                                        )
+                                                    };
+                                                    match tokenizer.encode(&prompt, false) {
+                                                        Ok(ids) => {
+                                                            let _ = sess.generate(
+                                                                &mut **m,
+                                                                &ids,
+                                                                0,
+                                                                &mut sampler,
+                                                                0,
+                                                                None,
+                                                                &mut |_| Ok(()),
+                                                            );
+                                                            if !reply.is_empty() {
+                                                                match tokenizer.encode(reply, false) {
+                                                                    Ok(rids) => {
+                                                                        let _ = sess.generate(
+                                                                            &mut **m,
+                                                                            &rids,
+                                                                            0,
+                                                                            &mut sampler,
+                                                                            0,
+                                                                            None,
+                                                                            &mut |_| Ok(()),
+                                                                        );
+                                                                    }
+                                                                    Err(_) => {
+                                                                        replayed = false;
+                                                                        break;
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                        Err(_) => {
+                                                            replayed = false;
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                                if replayed {
+                                                    session = Some(sess);
+                                                    turn = history.len();
+                                                    push(UiEvent::Log(format!(
+                                                        "history replayed ({} turns)",
+                                                        history.len()
+                                                    )));
+                                                } else {
+                                                    session = Some(
+                                                        lisa_engine::core::session::Session::new(
+                                                            &mut **m,
+                                                        ),
+                                                    );
+                                                    turn = 0;
+                                                }
+                                            }
+                                            turn = if session.is_some() && turn > 0 {
+                                                turn
+                                            } else {
+                                                0
+                                            };
+                                        }
+                                        push(UiEvent::Log("model loaded".into()));
+                                        push(UiEvent::Loaded(true));
                                     }
-                                    push(UiEvent::Log("model loaded".into()));
-                                    push(UiEvent::Loaded(true));
-                                }
-                                Err(e) => {
-                                    push(UiEvent::Log(format!("tokenizer error: {e}")));
-                                    push(UiEvent::Loaded(false));
+                                    Err(e) => {
+                                        push(UiEvent::Log(format!("tokenizer error: {e}")));
+                                        push(UiEvent::Loaded(false));
+                                    }
                                 }
                             }
-                        }
-                        Ok(lisa_engine::models::Loaded::Decision(_)) => {
-                            push(UiEvent::Log("decision models are not chattable".into()));
-                            push(UiEvent::Loaded(false));
-                        }
-                        Err(e) => {
-                            push(UiEvent::Log(format!("load error: {e}")));
-                            push(UiEvent::Loaded(false));
-                        }
-                    }
-                }
-                Command::Download(repo) => {
-                    // Download on a side thread so the active model keeps
-                    // serving chat, and don't swap models when it finishes.
-                    push(UiEvent::Log(format!("downloading {repo} …")));
-                    let events = events.clone();
-                    let repo2 = repo.clone();
-                    let _ = thread::Builder::new()
-                        .name("lisa-download".into())
-                        .spawn(move || {
-                            let push = |e: UiEvent| events.lock().unwrap().push(e);
-                            match lisa_engine::models::resolve_model_dir(&repo2) {
-                                Ok(_) => {
-                                    push(UiEvent::Log(format!("downloaded {repo2}")));
-                                    push(UiEvent::ModelsChanged);
-                                }
-                                Err(e) => {
-                                    push(UiEvent::Log(format!("download error: {e}")));
-                                    push(UiEvent::ModelsChanged);
-                                }
+                            Ok(lisa_engine::models::Loaded::Decision(_)) => {
+                                push(UiEvent::Log("decision models are not chattable".into()));
+                                push(UiEvent::Loaded(false));
                             }
-                        });
-                }
-                Command::Clear => {
-                    if let Some(m) = model.as_mut() {
-                        session = Some(lisa_engine::core::session::Session::new(&mut **m));
-                        turn = 0;
+                            Err(e) => {
+                                push(UiEvent::Log(format!("load error: {e}")));
+                                push(UiEvent::Loaded(false));
+                            }
+                        }
                     }
-                    push(UiEvent::Log("conversation cleared".into()));
-                }
-                Command::Chat { text, system } => {
-                    let (Some(model), Some(tokenizer)) = (model.as_mut(), tokenizer.as_ref())
-                    else {
-                        push(UiEvent::Log("no model loaded".into()));
-                        continue;
-                    };
-                    if session.is_none() {
-                        session =
-                            Some(lisa_engine::core::session::Session::new(&mut **model));
-                        turn = 0;
+                    Command::Download(repo) => {
+                        // Download on a side thread so the active model keeps
+                        // serving chat, and don't swap models when it finishes.
+                        push(UiEvent::Log(format!("downloading {repo} …")));
+                        let events = events.clone();
+                        let repo2 = repo.clone();
+                        let _ =
+                            thread::Builder::new()
+                                .name("lisa-download".into())
+                                .spawn(move || {
+                                    let push = |e: UiEvent| events.lock().unwrap().push(e);
+                                    match lisa_engine::models::resolve_model_dir(&repo2) {
+                                        Ok(_) => {
+                                            push(UiEvent::Log(format!("downloaded {repo2}")));
+                                            push(UiEvent::ModelsChanged);
+                                        }
+                                        Err(e) => {
+                                            push(UiEvent::Log(format!("download error: {e}")));
+                                            push(UiEvent::ModelsChanged);
+                                        }
+                                    }
+                                });
                     }
-                    let sys = if system.trim().is_empty() {
-                        None
-                    } else {
-                        Some(system.as_str())
-                    };
-                    // First turn renders the whole (system + user) prompt; later
-                    // turns append just the new user turn to the session.
-                    let prompt = if turn == 0 {
-                        lisa_engine::core::tokenizer::chat_prompt_special_with_system(
-                            &text, sys, false,
-                        )
-                    } else {
-                        lisa_engine::core::tokenizer::chat_turn_suffix_special(
-                            &text,
-                            false,
-                            false,
-                            assistant_im_end,
-                        )
-                    };
-                    let ids = match tokenizer.encode(&prompt, false) {
-                        Ok(ids) => ids,
-                        Err(e) => {
-                            push(UiEvent::Log(format!("encode error: {e}")));
+                    Command::Clear => {
+                        history.clear();
+                        history_system.clear();
+                        if let Some(m) = model.as_mut() {
+                            session = Some(lisa_engine::core::session::Session::new(&mut **m));
+                            turn = 0;
+                        }
+                        push(UiEvent::Log("conversation cleared".into()));
+                    }
+                    Command::Chat { text, system } => {
+                        let (Some(model), Some(tokenizer)) = (model.as_mut(), tokenizer.as_ref())
+                        else {
+                            push(UiEvent::Log("no model loaded".into()));
                             continue;
+                        };
+                        if session.is_none() {
+                            session = Some(lisa_engine::core::session::Session::new(&mut **model));
+                            turn = 0;
                         }
-                    };
-                    push(UiEvent::UserMessage(text.clone()));
-                    let mut all = Vec::new();
-                    let mut emitted = String::new();
-                    let sess = session.as_mut().expect("session");
-                    let result = sess.generate(
-                        &mut **model,
-                        &ids,
-                        CHAT_MAX_TOKENS,
-                        &mut sampler,
-                        &mut |id| {
-                            all.push(id);
+                        if turn == 0 {
+                            history.clear();
+                            history_system = system.clone();
+                        }
+                        let sys = if system.trim().is_empty() {
+                            None
+                        } else {
+                            Some(system.as_str())
+                        };
+                        // First turn renders the whole (system + user) prompt; later
+                        // turns append just the new user turn to the session.
+                        let prompt = if turn == 0 {
+                            lisa_engine::core::tokenizer::chat_prompt_special_with_system(
+                                &text, sys, false,
+                            )
+                        } else {
+                            lisa_engine::core::tokenizer::chat_turn_suffix_special(
+                                &text,
+                                false,
+                                false,
+                                assistant_im_end,
+                            )
+                        };
+                        let ids = match tokenizer.encode(&prompt, false) {
+                            Ok(ids) => ids,
+                            Err(e) => {
+                                push(UiEvent::Log(format!("encode error: {e}")));
+                                continue;
+                            }
+                        };
+                        push(UiEvent::UserMessage(text.clone()));
+                        let mut all = Vec::new();
+                        let mut emitted = String::new();
+                        let sess = session.as_mut().expect("session");
+                        let result = sess.generate(
+                            &mut **model,
+                            &ids,
+                            CHAT_MAX_TOKENS,
+                            &mut sampler,
+                            0,
+                            None,
+                            &mut |id| {
+                                all.push(id);
+                                let full = tokenizer.decode_clean(&all).unwrap_or_default();
+                                let display = clean_reply(&full);
+                                if display.len() >= emitted.len() && display.starts_with(&emitted) {
+                                    let delta = display[emitted.len()..].to_string();
+                                    if !delta.is_empty() && !delta.ends_with('\u{FFFD}') {
+                                        emitted = display;
+                                        push(UiEvent::AssistantDelta(delta));
+                                    }
+                                } else if display.len() > emitted.len() {
+                                    // Non-monotonic (a stripped think/special span):
+                                    // only grow the bubble, never clear it mid-stream.
+                                    emitted = display.clone();
+                                    push(UiEvent::AssistantReset(display));
+                                }
+                                Ok(())
+                            },
+                        );
+                        if let Err(e) = result {
+                            push(UiEvent::AssistantDelta(format!("\n[error: {e}]")));
+                        } else {
+                            // Settle on the authoritative final text (the streaming
+                            // pass may have skipped transient truncations).
                             let full = tokenizer.decode_clean(&all).unwrap_or_default();
                             let display = clean_reply(&full);
-                            if display.len() >= emitted.len() && display.starts_with(&emitted) {
-                                let delta = display[emitted.len()..].to_string();
-                                if !delta.is_empty() && !delta.ends_with('\u{FFFD}') {
-                                    emitted = display;
-                                    push(UiEvent::AssistantDelta(delta));
-                                }
-                            } else if display.len() > emitted.len() {
-                                // Non-monotonic (a stripped think/special span):
-                                // only grow the bubble, never clear it mid-stream.
+                            if display != emitted {
                                 emitted = display.clone();
                                 push(UiEvent::AssistantReset(display));
                             }
-                            Ok(())
-                        },
-                    );
-                    if let Err(e) = result {
-                        push(UiEvent::AssistantDelta(format!("\n[error: {e}]")));
-                    } else {
-                        // Settle on the authoritative final text (the streaming
-                        // pass may have skipped transient truncations).
-                        let full = tokenizer.decode_clean(&all).unwrap_or_default();
-                        let display = clean_reply(&full);
-                        if display != emitted {
-                            emitted = display.clone();
-                            push(UiEvent::AssistantReset(display));
+                            if emitted.is_empty() {
+                                // Reasoning checkpoints spend their whole
+                                // budget inside ` presence think` and emit
+                                // nothing after it. The bubble still shows the
+                                // thinking: re-decode without the strip.
+                                let raw = tokenizer.decode_clean(&all).unwrap_or_default();
+                                let raw = raw.trim().to_string();
+                                if raw.is_empty() {
+                                    push(UiEvent::AssistantDelta(
+                                        "(no response)".to_string(),
+                                    ));
+                                } else {
+                                    push(UiEvent::AssistantReset(raw));
+                                }
+                            }
+                            // Record the turn so a later model swap replays it.
+                            let reply = if emitted.is_empty() { raw_display(&all, tokenizer) } else { emitted.clone() };
+                            history.push((text.clone(), reply));
                         }
-                        if emitted.is_empty() {
-                            push(UiEvent::AssistantDelta("(no response)".to_string()));
-                        }
+                        turn += 1;
+                        push(UiEvent::AssistantDone);
                     }
-                    turn += 1;
-                    push(UiEvent::AssistantDone);
-                }
-                Command::StartServe { addr, stop } => {
-                    if model.is_none() || tokenizer.is_none() {
-                        push(UiEvent::Log("serve: no model loaded".into()));
-                        push(UiEvent::ServeStopped);
-                        continue;
-                    }
-                    let chat_template = model_dir
-                        .as_ref()
-                        .and_then(|d| std::fs::read_to_string(d.join("chat_template.jinja")).ok());
-                    let cfg = lisa_serve::ServerConfig {
-                        addr: addr.clone(),
-                        max_tokens: 2048,
-                        temperature: 0.0,
-                        top_p: 1.0,
-                        top_k: 0,
-                        min_p: 0.0,
-                        rep_penalty: 1.0,
-                        depth: 0,
-                        max_batch: 4,
-                        chat_template,
-                    };
-                    match lisa_serve::Server::start(cfg, stop.clone()) {
-                        Ok(srv) => {
-                            let local = srv.local_addr();
-                            server = Some(srv);
-                            serve_stop = Some(stop);
-                            push(UiEvent::ServeStarted(format!("http://{local}")));
-                        }
-                        Err(e) => {
-                            push(UiEvent::Log(format!("serve error: {e}")));
+                    Command::StartServe { addr, stop } => {
+                        if model.is_none() || tokenizer.is_none() {
+                            push(UiEvent::Log("serve: no model loaded".into()));
                             push(UiEvent::ServeStopped);
+                            continue;
+                        }
+                        let chat_template = model_dir.as_ref().and_then(|d| {
+                            std::fs::read_to_string(d.join("chat_template.jinja")).ok()
+                        });
+                        let cfg = lisa_serve::ServerConfig {
+                            addr: addr.clone(),
+                            max_tokens: 2048,
+                            temperature: Some(0.0),
+                            top_p: Some(1.0),
+                            top_k: Some(0),
+                            min_p: Some(0.0),
+                            rep_penalty: Some(1.0),
+                            gen_defaults: model_dir
+                                .as_deref()
+                                .map(lisa_serve::GenDefaults::from_model_dir)
+                                .unwrap_or_default(),
+                            depth: 0,
+                            pld: 0,
+                            prefix_cache: 2,
+                            max_batch: 4,
+                            chat_template,
+                            model_id: model_dir
+                                .as_deref()
+                                .map(lisa_serve::model_id_of)
+                                .unwrap_or_else(|| "unknown".to_string()),
+                        };
+                        match lisa_serve::Server::start(cfg, stop.clone()) {
+                            Ok(srv) => {
+                                let local = srv.local_addr();
+                                server = Some(srv);
+                                serve_stop = Some(stop);
+                                push(UiEvent::ServeStarted(format!("http://{local}")));
+                            }
+                            Err(e) => {
+                                push(UiEvent::Log(format!("serve error: {e}")));
+                                push(UiEvent::ServeStopped);
+                            }
                         }
                     }
                 }
             }
-        }
-    });
+        });
 }
 
 #[derive(Debug)]
@@ -2408,7 +2559,10 @@ impl AppDelegate {
         let model = models.get(row as usize)?;
 
         let cell = NSView::new(mtm);
-        cell.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(150.0, 30.0)));
+        cell.setFrame(NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(150.0, 30.0),
+        ));
 
         // Custom highlight for the selected model (clear even when the table
         // isn't focused).
@@ -2520,10 +2674,12 @@ impl AppDelegate {
                 spinner.setTranslatesAutoresizingMaskIntoConstraints(false);
                 unsafe { spinner.startAnimation(None) };
                 cell.addSubview(&spinner);
-                spinner.trailingAnchor()
+                spinner
+                    .trailingAnchor()
                     .constraintEqualToAnchor_constant(&cell.trailingAnchor(), -10.0)
                     .setActive(true);
-                spinner.centerYAnchor()
+                spinner
+                    .centerYAnchor()
                     .constraintEqualToAnchor(&cell.centerYAnchor())
                     .setActive(true);
                 ui::size(&spinner, 16.0, 16.0);
@@ -2627,7 +2783,8 @@ impl AppDelegate {
     /// while the text starts with "/" and matches at least one command. The
     /// first match is selected so Enter runs it straight away.
     fn update_command_menu(&self) {
-        let (Some(input), Some(menu)) = (self.ivars().chat_input.get(), self.ivars().cmd_menu.get())
+        let (Some(input), Some(menu)) =
+            (self.ivars().chat_input.get(), self.ivars().cmd_menu.get())
         else {
             return;
         };
@@ -2702,10 +2859,7 @@ impl AppDelegate {
             return false;
         }
         let cur = self.ivars().cmd_sel.get();
-        let pos = visible
-            .iter()
-            .position(|&i| i as isize == cur)
-            .unwrap_or(0);
+        let pos = visible.iter().position(|&i| i as isize == cur).unwrap_or(0);
         let next = (pos as isize + delta).rem_euclid(visible.len() as isize) as usize;
         self.ivars().cmd_sel.set(visible[next] as isize);
         self.apply_command_selection();
@@ -2980,9 +3134,13 @@ impl AppDelegate {
         *self.ivars().models.borrow_mut() = merged;
         // Re-anchor the highlight to the active model after the re-sort.
         let active = self.ivars().active_repo.borrow().clone();
-        let index = active
-            .as_ref()
-            .and_then(|r| self.ivars().models.borrow().iter().position(|m| &m.repo_id == r));
+        let index = active.as_ref().and_then(|r| {
+            self.ivars()
+                .models
+                .borrow()
+                .iter()
+                .position(|m| &m.repo_id == r)
+        });
         *self.ivars().selected_row.borrow_mut() = index;
         self.reload_models_table();
     }
@@ -3045,7 +3203,9 @@ impl AppDelegate {
                     &NSString::from_str(key),
                 )
             };
-            item.setKeyEquivalentModifierMask(NSEventModifierFlags::Control | NSEventModifierFlags::Command);
+            item.setKeyEquivalentModifierMask(
+                NSEventModifierFlags::Control | NSEventModifierFlags::Command,
+            );
             unsafe { item.setTarget(Some(self.target())) };
             view_menu.addItem(&item);
         }
@@ -3233,19 +3393,23 @@ impl AppDelegate {
         self.ivars().chat_input.set(input.clone()).ok();
         input_bg.addSubview(&input);
 
-        let send = ui::button(mtm, "Send", Some(self.target()), Some(sel!(sendMessage:)), true);
+        let send = ui::button(
+            mtm,
+            "Send",
+            Some(self.target()),
+            Some(sel!(sendMessage:)),
+            true,
+        );
         send.setControlSize(NSControlSize::Large);
         send.setFont(Some(&NSFont::systemFontOfSize(13.0)));
         send.setEnabled(false);
         send.setBordered(false);
         self.ivars().chat_send.set(send.clone()).ok();
         send.setTranslatesAutoresizingMaskIntoConstraints(false);
-        send
-            .widthAnchor()
+        send.widthAnchor()
             .constraintGreaterThanOrEqualToConstant(80.0)
             .setActive(true);
-        send
-            .heightAnchor()
+        send.heightAnchor()
             .constraintEqualToConstant(32.0)
             .setActive(true);
 
@@ -3324,14 +3488,20 @@ impl AppDelegate {
             row.addSubview(&btn);
 
             for constraint in [
-                bg.leadingAnchor().constraintEqualToAnchor(&row.leadingAnchor()),
-                bg.trailingAnchor().constraintEqualToAnchor(&row.trailingAnchor()),
+                bg.leadingAnchor()
+                    .constraintEqualToAnchor(&row.leadingAnchor()),
+                bg.trailingAnchor()
+                    .constraintEqualToAnchor(&row.trailingAnchor()),
                 bg.topAnchor().constraintEqualToAnchor(&row.topAnchor()),
-                bg.bottomAnchor().constraintEqualToAnchor(&row.bottomAnchor()),
-                btn.leadingAnchor().constraintEqualToAnchor_constant(&row.leadingAnchor(), 10.0),
-                btn.trailingAnchor().constraintEqualToAnchor_constant(&row.trailingAnchor(), -10.0),
+                bg.bottomAnchor()
+                    .constraintEqualToAnchor(&row.bottomAnchor()),
+                btn.leadingAnchor()
+                    .constraintEqualToAnchor_constant(&row.leadingAnchor(), 10.0),
+                btn.trailingAnchor()
+                    .constraintEqualToAnchor_constant(&row.trailingAnchor(), -10.0),
                 btn.topAnchor().constraintEqualToAnchor(&row.topAnchor()),
-                btn.bottomAnchor().constraintEqualToAnchor(&row.bottomAnchor()),
+                btn.bottomAnchor()
+                    .constraintEqualToAnchor(&row.bottomAnchor()),
             ] {
                 constraint.setActive(true);
             }
@@ -3416,12 +3586,10 @@ impl AppDelegate {
             .constraintEqualToAnchor(&input_bg.centerYAnchor())
             .setActive(true);
 
-        send
-            .trailingAnchor()
+        send.trailingAnchor()
             .constraintEqualToAnchor_constant(&root.trailingAnchor(), -18.0)
             .setActive(true);
-        send
-            .bottomAnchor()
+        send.bottomAnchor()
             .constraintEqualToAnchor(&input_bg.bottomAnchor())
             .setActive(true);
 
@@ -3569,8 +3737,12 @@ impl AppDelegate {
         icon.topAnchor()
             .constraintEqualToAnchor(&row1.topAnchor())
             .setActive(true);
-        icon.widthAnchor().constraintEqualToConstant(28.0).setActive(true);
-        icon.heightAnchor().constraintEqualToConstant(28.0).setActive(true);
+        icon.widthAnchor()
+            .constraintEqualToConstant(28.0)
+            .setActive(true);
+        icon.heightAnchor()
+            .constraintEqualToConstant(28.0)
+            .setActive(true);
         glyph
             .centerXAnchor()
             .constraintEqualToAnchor(&icon.centerXAnchor())
@@ -3579,8 +3751,14 @@ impl AppDelegate {
             .centerYAnchor()
             .constraintEqualToAnchor(&icon.centerYAnchor())
             .setActive(true);
-        glyph.widthAnchor().constraintEqualToConstant(16.0).setActive(true);
-        glyph.heightAnchor().constraintEqualToConstant(16.0).setActive(true);
+        glyph
+            .widthAnchor()
+            .constraintEqualToConstant(16.0)
+            .setActive(true);
+        glyph
+            .heightAnchor()
+            .constraintEqualToConstant(16.0)
+            .setActive(true);
         switch
             .trailingAnchor()
             .constraintEqualToAnchor(&row1.trailingAnchor())
@@ -3647,7 +3825,13 @@ impl AppDelegate {
         dot.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
         dot.setTranslatesAutoresizingMaskIntoConstraints(false);
         status_row.addSubview(&dot);
-        let state = ui::label(mtm, "Unavailable", 12.0, false, &NSColor::secondaryLabelColor());
+        let state = ui::label(
+            mtm,
+            "Unavailable",
+            12.0,
+            false,
+            &NSColor::secondaryLabelColor(),
+        );
         state.setTranslatesAutoresizingMaskIntoConstraints(false);
         status_row.addSubview(&state);
         self.ivars().serve_dot.set(dot.clone()).ok();
@@ -3658,8 +3842,12 @@ impl AppDelegate {
         dot.topAnchor()
             .constraintEqualToAnchor(&status_row.topAnchor())
             .setActive(true);
-        dot.widthAnchor().constraintEqualToConstant(9.0).setActive(true);
-        dot.heightAnchor().constraintEqualToConstant(9.0).setActive(true);
+        dot.widthAnchor()
+            .constraintEqualToConstant(9.0)
+            .setActive(true);
+        dot.heightAnchor()
+            .constraintEqualToConstant(9.0)
+            .setActive(true);
         state
             .leadingAnchor()
             .constraintEqualToAnchor_constant(&dot.trailingAnchor(), 6.0)
@@ -3718,19 +3906,18 @@ impl AppDelegate {
             .centerYAnchor()
             .constraintEqualToAnchor(&port_card.centerYAnchor())
             .setActive(true);
-        port
-            .trailingAnchor()
+        port.trailingAnchor()
             .constraintEqualToAnchor_constant(&port_card.trailingAnchor(), -12.0)
             .setActive(true);
-        port
-            .centerYAnchor()
+        port.centerYAnchor()
             .constraintEqualToAnchor(&port_card.centerYAnchor())
             .setActive(true);
-        port
-            .leadingAnchor()
+        port.leadingAnchor()
             .constraintGreaterThanOrEqualToAnchor_constant(&port_label.trailingAnchor(), 8.0)
             .setActive(true);
-        port.widthAnchor().constraintEqualToConstant(120.0).setActive(true);
+        port.widthAnchor()
+            .constraintEqualToConstant(120.0)
+            .setActive(true);
 
         let sys_card = RoundedView::new(mtm, &NSColor::quaternaryLabelColor(), 10.0);
         sys_card.setTranslatesAutoresizingMaskIntoConstraints(false);
@@ -3757,7 +3944,10 @@ impl AppDelegate {
         sys_text.setVerticallyResizable(true);
         sys_text.setHorizontallyResizable(false);
         sys_text.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
-        sys_text.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(220.0, 72.0)));
+        sys_text.setFrame(NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(220.0, 72.0),
+        ));
         sys_text.setString(&NSString::from_str(DEFAULT_SYSTEM_PROMPT));
         self.ivars().system_view.set(sys_text.clone()).ok();
         let sys_scroll = ui::scroll(mtm, &sys_text);
@@ -3789,17 +3979,13 @@ impl AppDelegate {
             .setActive(true);
         ui::height(&sys_scroll, 72.0);
 
-
-        body
-            .leadingAnchor()
+        body.leadingAnchor()
             .constraintEqualToAnchor_constant(&root.leadingAnchor(), 18.0)
             .setActive(true);
-        body
-            .trailingAnchor()
+        body.trailingAnchor()
             .constraintEqualToAnchor_constant(&root.trailingAnchor(), -18.0)
             .setActive(true);
-        body
-            .topAnchor()
+        body.topAnchor()
             .constraintEqualToAnchor_constant(&root.topAnchor(), 20.0)
             .setActive(true);
 
@@ -3831,7 +4017,10 @@ impl AppDelegate {
         text.setVerticallyResizable(true);
         text.setHorizontallyResizable(false);
         text.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
-        text.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(420.0, 600.0)));
+        text.setFrame(NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(420.0, 600.0),
+        ));
         text.setString(&NSString::from_str(""));
         self.ivars().engine_log.set(text.clone()).ok();
 

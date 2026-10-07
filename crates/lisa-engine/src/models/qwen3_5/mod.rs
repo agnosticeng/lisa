@@ -4,6 +4,7 @@
 
 pub mod attention;
 pub mod config;
+pub mod mtp;
 pub mod tower;
 
 pub use config::Qwen35Config;

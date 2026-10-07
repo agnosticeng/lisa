@@ -4,9 +4,9 @@
 use lisa_mlx::Array;
 
 use crate::core::cache::FullAttentionCache;
-use crate::models::qwen4::hyper::GatedResidual;
 use crate::core::norm::{RmsNorm, Rotary};
-use crate::core::quant::{QuantizedLinear, QuantizedEmbedding};
+use crate::core::quant::{QuantizedEmbedding, QuantizedLinear};
+use crate::models::qwen4::hyper::GatedResidual;
 use std::collections::HashMap;
 
 use crate::core::cache::LayerCache;
@@ -26,7 +26,10 @@ pub struct MtpHead {
 }
 
 impl MtpHead {
-    pub fn load(w: &mut HashMap<String, lisa_mlx::Array>, config: &crate::models::qwen4::config::ModelConfig) -> anyhow::Result<Self> {
+    pub fn load(
+        w: &mut HashMap<String, lisa_mlx::Array>,
+        config: &crate::models::qwen4::config::ModelConfig,
+    ) -> anyhow::Result<Self> {
         let eps = config.rms_norm_eps;
         let hidden = config.hidden_size;
         let hc = config.hc_count;
@@ -47,9 +50,25 @@ impl MtpHead {
             config.num_key_value_heads,
             config.head_dim,
         )?);
-        let mlp = crate::models::qwen4::moe::SparseMoeBlock::load(w, &format!("{prefix}.mlp"), config.num_experts_per_tok)?;
-        let attn_hc = GatedResidual::load(w, &format!("{prefix}.attn_hyper_connection"), hidden, hc, true)?;
-        let mlp_hc = GatedResidual::load(w, &format!("{prefix}.mlp_hyper_connection"), hidden, hc, true)?;
+        let mlp = crate::models::qwen4::moe::SparseMoeBlock::load(
+            w,
+            &format!("{prefix}.mlp"),
+            config.num_experts_per_tok,
+        )?;
+        let attn_hc = GatedResidual::load(
+            w,
+            &format!("{prefix}.attn_hyper_connection"),
+            hidden,
+            hc,
+            true,
+        )?;
+        let mlp_hc = GatedResidual::load(
+            w,
+            &format!("{prefix}.mlp_hyper_connection"),
+            hidden,
+            hc,
+            true,
+        )?;
         let layer = DecoderLayer {
             block,
             mlp,
@@ -90,7 +109,9 @@ impl MtpHead {
         let b = next_token_ids.dim(0);
         let s = next_token_ids.dim(1);
 
-        let embedded = self.pre_fc_norm_embedding.forward(&embed_tokens.forward(next_token_ids)?)?;
+        let embedded = self
+            .pre_fc_norm_embedding
+            .forward(&embed_tokens.forward(next_token_ids)?)?;
         let e = self.fc_embedding.forward(&embedded)?;
         let h_in = self.pre_fc_norm_hidden.forward(multi_stream)?;
         let h_in = h_in.reshape(&[b, s, self.hc_count as i32, self.hidden_size as i32])?;
@@ -98,40 +119,21 @@ impl MtpHead {
         let x = e.expand_dims(-2)?.add(&h)?;
         let hyper = x.reshape(&[b, s, -1])?;
 
-
-        if std::env::var("LISA_DUMP_DRAFT").is_ok() {
-            static FCALL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let r = FCALL.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if r >= 200 {
-                let d = |name: &str, a: &lisa_mlx::Array| {
-                    if let Ok(f) = a.as_dtype(lisa_mlx::Dtype::Float32) {
-                        {
-                                let v = f.as_slice::<f32>();
-                            let v: &[f32] = v;
-                            let sum: f32 = v.iter().sum();
-                            eprintln!("[head] step#{r} {name} n={} sum={:.6e} h={:?}", v.len(), sum, &v[..4.min(v.len())]);
-                        }
-                    }
-                };
-                let _ = &r;
-                d("embedded", &embedded);
-                d("fc_e", &e);
-                d("fc_h", &h);
-                d("hyper", &hyper);
-            }
-        }
-
         let cache: Option<&mut LayerCache> = match self.caches.first_mut() {
             Some(c @ LayerCache::Full(_)) => Some(c),
             _ => None,
         };
         let positions = crate::core::norm::positions(offset, s as usize)?;
-        let (st, moe_out, inject_w) =
-            self.layer.forward(&hyper, None, None, cache, &self.rope, offset, &positions, None, false)?;
+        let (st, moe_out, inject_w) = self.layer.forward(
+            &hyper, None, None, cache, &self.rope, offset, &positions, None, false,
+        )?;
 
         // Final mixer: injectNorm then the inject-less hcMix (the engine's
         // `TrackFastHead` tail). `multi_next` is the new stream for the chain.
-        let final_scale = self.mixer.norm_scale_q().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let final_scale = self
+            .mixer
+            .norm_scale_q()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         let hc = self.hc_count as i32;
         let hidden_i = self.hidden_size as i32;
         let rows = (b * s) as i32;
@@ -151,7 +153,10 @@ impl MtpHead {
         .ok_or_else(|| anyhow::anyhow!("inject_norm kernel unavailable"))?;
         let multi_next = multi_next.reshape(&[b as i32, s as i32, hc * hidden_i])?;
         let final_normed = final_normed.reshape(&[b as i32, s as i32, hc * hidden_i])?;
-        let (sample, _) = self.mixer.mix_from_normed(&final_normed, false).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let (sample, _) = self
+            .mixer
+            .mix_from_normed(&final_normed, false)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         Ok((sample, multi_next))
     }
 
