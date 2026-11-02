@@ -1,18 +1,23 @@
 [package]
 name = "lisa-engine"
-version = "0.1.0"
-edition = "2024"
-description = "Qwen 3.8 Flash-Next engine library"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Model loading and inference for Qwen, GLM and Laya"
+
+[features]
+# Enable only when the local GLM-5.3 DS4 capture archive is available.
+glm53-fixtures = []
 
 [dependencies]
-anyhow = "1.0.104"
-clap = { version = "4.6.6", features = ["derive"] }
-half = "2.7.1"
-libm = "0.2.15"
-rayon = "1.11.0"
-memmap2 = "0.9.11"
-lisa-mlx = { path = "../lisa-mlx" }
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
-thiserror = "2.0.20"
-tokenizers = "0.23.2"
+anyhow.workspace = true
+half.workspace = true
+libm.workspace = true
+libc.workspace = true
+rayon.workspace = true
+memmap2.workspace = true
+lisa-mlx.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokenizers.workspace = true

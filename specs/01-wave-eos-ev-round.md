@@ -1,8 +1,14 @@
-# specs/01 §7 wave — ignore_eos fix, EV re-pricing, round decomposition
+# specs/01 §4 wave — ignore_eos fix, EV re-pricing, round decomposition
+
+Historical Qwen campaign. Results and implementation descriptions below refer
+to their recorded source versions; later sections may supersede earlier
+findings. Current contracts are in [00](00-contracts.md) and
+[AGENTS.md](../AGENTS.md). These measurements do not certify current GLM paths.
 
 HEAD base 045f28f → wave commits 7eed729 (ignore_eos), c503bf1 (EV chain pricing).
 
 ## 1. ignore_eos root-cause + fix (7eed729)
+
 - `set_eos_ids` was `OnceLock::set`: first write wins. `lisa run` arms `im_end`
  ids then clears them for `--ignore-eos`; the clear was a SILENT NO-OP, so the
  decode loop kept `is_eos` armed and stopped at EOS (199/204 of 256 in 2/3
@@ -13,6 +19,7 @@ HEAD base 045f28f → wave commits 7eed729 (ignore_eos), c503bf1 (EV chain prici
  (rounds+accepted = 257/256/258), decode 30.9/37.5/33.6 tok/s.
 
 ## 2. EV table re-pricing (c503bf1)
+
 - Old draft cell = ONE synchronous `draft_step` (1.73-1.79 ms) × depth. New
  `chain_ms` cell times the depth-d chain AS SERVED (device-fed proposals, lazy
  enqueue, one tail eval). Measured (27B, 24 iters, median):
@@ -24,26 +31,26 @@ HEAD base 045f28f → wave commits 7eed729 (ignore_eos), c503bf1 (EV chain prici
  (median 33.6 → 30.8, within drift). The controller was NOT buying
  under-priced deep rounds — ledger hypothesis falsified by measurement.
 
-## 3. Round decomposition (xctrace Metal System Trace, attach, forced-256
-## @15.6k, the run)
+## 3. Round decomposition (Metal System Trace, forced 256 outputs at 15.6K)
+
 - lisa-serve (23.0 tok/s, 1.42 tok/round → round ≈ 62 ms): steady 5 s window =
  10040 intervals; small (≤50 µs) intervals are ~0.5 µs — the "75 µs slot" is
  per-KERNEL GPU time (our LISA_TRACE attribution), visible to Instruments only
  inside the big encoders. Big-encoder exec ≈ 880 ms/s → ~55 ms GPU per round,
- GPU ~88-100% busy (matches specs/19).
+ GPU ~88-100% busy (consistent with the command-buffer trace campaign).
 - CONCLUSION: the 40-50 ms/round advance is GPU CONTENT per round, not round
  structure, not cadence, not acceptance (our accepted 1.42-2.0/round). Our S=3
  verify attributes 65.4 ms of GPU (splitk qmm 23.7, copies 12.7, fused_add_rms
- 8.4, GDN 8.0, swiglu2 4.5, sdpa 3.1 — specs/01 §5) while we run GPU-busy
+ 8.4, GDN 8.0, swiglu2 4.5, sdpa 3.1 — specs/02 §4) while we run GPU-busy
  88-100% — the residual is the per-launch GPU slot price inside our kernels,
  not idle structure. Micro-ports (copies/rms) are measured washes because slots
  overlap the splitk qmm tail. Remaining named lever: batched decode kernels
  (specs/07 item 2) + serial-step floor.
-- Artifacts: bench/data/spec26/{xc.mlx,xc.lisa}.{trace,req.json,server.log},
- round-anatomy.{json,err} (LISA_TRACE_JSON d4 round: 84.5 ms = 1.6 host +
- chain ~6.9 GPU hidden in the verify window + readback drain 34 ms).
+- The recorded d4 Chrome trace measured 84.5 ms: 1.6 ms host work, about
+ 6.9 ms draft-chain GPU work hidden in the verify window and 34 ms readback drain.
 
 ## 4. Certified verdict AFTER the fixes (4316f5f, verdict-24 protocol)
+
 3 interleaved pairs, forced 256, ignore_eos HONORED (this run's entries are the
 LAST per cert.*.json — the files also hold the morning's §6 reps):
 
@@ -58,11 +65,11 @@ LAST per cert.*.json — the files also hold the morning's §6 reps):
 pricing, not speed — the §3 decomposition shows why: the residual is GPU CONTENT
 per round (~55 ms at 16k), attributable to splitk qmm + rms + copies bulk. The
 only named lever left is batched decode kernels (specs/07 item 2); micro-ports
-in the copies/rms class are measured washes (specs/01 §5-§6, PORT A) because
+in the copies/rms class are measured washes (specs/02 §5, PORT A) because
 their slots overlap the splitk qmm tail.
 Correctness wins this wave: 3/3 lisa reps complete 256 forced (was 1/3), the
 EV table now bills the chain as served, goldens 310/310, engine lib 22/22.
-## 5. Measured additions from theserving campaign
+## 5. Measured additions from the serving campaign
 
 - **Speculation at temperature > 0 — the hole the probe cannot see.**
  Everything speculative was greedy-only (four CLI guards + the scheduler's

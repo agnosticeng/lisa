@@ -9,8 +9,11 @@ pub const EXACT_HEADER: &str = include_str!("../../../shaders/common/exact_heade
 /// row offset `off`, touching only the `s` appended rows. Replaces the
 /// `slice_assign` (O(cap)) in the KV cache and the indexer tape.
 const COPY_ROWS_SOURCE: &str = include_str!("../../../shaders/common/data/copy_rows.metal");
+const COPY_ROWS_CONCAT_SOURCE: &str =
+    include_str!("../../../shaders/common/data/copy_rows_concat.metal");
 
 static COPY_ROWS: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
+static COPY_ROWS_CONCAT: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 
 fn copy_rows_kernel() -> &'static Option<MetalKernel> {
     COPY_ROWS.get_or_init(|| {
@@ -27,22 +30,78 @@ fn copy_rows_kernel() -> &'static Option<MetalKernel> {
     })
 }
 
+fn copy_rows_concat_kernel() -> &'static Option<MetalKernel> {
+    COPY_ROWS_CONCAT.get_or_init(|| {
+        MetalKernel::new(
+            "track_copy_concat_rows_into",
+            &["first", "second", "dst", "off"],
+            &["out"],
+            COPY_ROWS_CONCAT_SOURCE,
+            "",
+            true,
+            false,
+        )
+        .ok()
+    })
+}
+
 /// Append `src` `[.., s, D]` into the caller's `dst` `[.., cap, D]` buffer at
 /// row offset `off`. `dst` is bound as both a shape-carrying input and the
 /// preallocated output so the encoder sees the dependency on the cache buffer.
 pub fn copy_rows_into(src: &Array, dst: &Array, off: i32, stream: &Stream) -> Option<Array> {
     let kernel = copy_rows_kernel().as_ref()?;
+    if src.dtype() != dst.dtype() {
+        return None;
+    }
     let off_a = Array::from_int(off);
     let inputs: [&Array; 3] = [src, dst, &off_a];
     let outputs = [OutputArg {
         shape: dst.shape().to_vec(),
-        dtype: Dtype::Bfloat16,
+        dtype: src.dtype(),
     }];
     let grid = (src.size() as i32, 1, 1);
     let out = kernel
         .apply_into(&inputs, &[], grid, (256, 1, 1), &outputs, &[dst], stream)
         .ok()?;
     out.into_iter().next()
+}
+
+/// Append two `[B,S,D]` tensors side-by-side into `[B,cap,D1+D2]` at row `off`.
+/// This avoids first materializing their last-axis concatenation.
+pub fn copy_rows_concat_into(
+    first: &Array,
+    second: &Array,
+    dst: &Array,
+    off: i32,
+    stream: &Stream,
+) -> Option<Array> {
+    let kernel = copy_rows_concat_kernel().as_ref()?;
+    if first.rank() != 3
+        || second.rank() != 3
+        || dst.rank() != 3
+        || first.dtype() != second.dtype()
+        || first.dtype() != dst.dtype()
+        || first.dim(0) != second.dim(0)
+        || first.dim(1) != second.dim(1)
+        || dst.dim(0) != first.dim(0)
+        || dst.dim(2) != first.dim(2) + second.dim(2)
+        || off < 0
+        || off as i64 + i64::from(first.dim(1)) > i64::from(dst.dim(1))
+    {
+        return None;
+    }
+    let off = Array::from_int(off);
+    let inputs: [&Array; 4] = [first, second, dst, &off];
+    let output = [OutputArg {
+        shape: dst.shape().to_vec(),
+        dtype: dst.dtype(),
+    }];
+    let grid = (first.dim(0) * first.dim(1) * dst.dim(2), 1, 1);
+    kernel
+        .apply_into(&inputs, &[], grid, (256, 1, 1), &output, &[dst], stream)
+        .ok()?
+        .into_iter()
+        .next()
 }
 /// Diagnostic: time the NAX indirect expert GEMMs against a dense quantized
 /// matmul of the same FLOPs (`lisa indirect-bench`).
@@ -196,11 +255,45 @@ pub fn indirect_bench() {
 /// `crate::models::qwen4::warm_kernels`).
 pub fn warm() {
     let _ = copy_rows_kernel();
+    let _ = copy_rows_concat_kernel();
 }
 
 #[cfg(test)]
 mod copy_rows_tests {
     use crate::{Array, Stream};
+
+    #[test]
+    fn copy_rows_concat_into_matches_materialized_append() {
+        let stream = Stream::thread_local_or_default();
+        let (b, steps, left, right, cap, off) = (2usize, 3usize, 5usize, 7usize, 11usize, 4usize);
+        let a_values: Vec<f32> = (0..b * steps * left)
+            .map(|i| i as f32 * 0.25 - 2.0)
+            .collect();
+        let b_values: Vec<f32> = (0..b * steps * right)
+            .map(|i| i as f32 * -0.125 + 1.0)
+            .collect();
+        let a = Array::from_slice(&a_values, &[b as i32, steps as i32, left as i32]);
+        let b_arr = Array::from_slice(&b_values, &[b as i32, steps as i32, right as i32]);
+        let packed = Array::concatenate(&[&a, &b_arr], 2).expect("materialized concat");
+        let make_dst = || {
+            Array::from_slice(
+                &vec![f32::NAN; b * cap * (left + right)],
+                &[b as i32, cap as i32, (left + right) as i32],
+            )
+        };
+        let expected = make_dst();
+        let actual = make_dst();
+        assert!(super::copy_rows_into(&packed, &expected, off as i32, &stream).is_some());
+        assert!(super::copy_rows_concat_into(&a, &b_arr, &actual, off as i32, &stream).is_some());
+        expected.eval().expect("evaluate expected");
+        actual.eval().expect("evaluate actual");
+        let expected = expected.to_vec1::<f32>().expect("read expected");
+        let actual = actual.to_vec1::<f32>().expect("read actual");
+        assert_eq!(
+            expected.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            actual.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+        );
+    }
 
     /// The KV cache hands `copy_rows_into` a transposed v view; the kernel must
     /// read it through its declared strides and produce EXACTLY the bytes the
@@ -214,7 +307,9 @@ mod copy_rows_tests {
         let mut x = 0u32;
         for _ in 0..b * hk * s * d {
             x = x.wrapping_mul(1664525).wrapping_add(1013904223);
-            src_v.push(half::bf16::from_f32(((x >> 16) as f32 / 65536.0) * 2.0 - 1.0));
+            src_v.push(half::bf16::from_f32(
+                ((x >> 16) as f32 / 65536.0) * 2.0 - 1.0,
+            ));
         }
         // Contiguous src [b, hk, s, d].
         let dense = Array::from_slice(&src_v, &[b as _, hk as _, s as _, d as _]);
@@ -242,10 +337,14 @@ mod copy_rows_tests {
         dst_b.eval().expect("eval b");
         let va = dst_a.to_vec1::<half::bf16>().expect("read a");
         let vb = dst_b.to_vec1::<half::bf16>().expect("read b");
-        let mism = va.iter().zip(vb.iter()).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+        let mism = va
+            .iter()
+            .zip(vb.iter())
+            .filter(|(x, y)| x.to_bits() != y.to_bits())
+            .count();
         assert_eq!(mism, 0, "strided-src copy differs from contiguous-src copy");
         // And the rows actually landed at `off` (dst [b, hk, cap, d]).
         let base = (0 * cap * d + off * d) as usize;
-        assert!(va[base].to_f32() != f32::NAN);
+        assert!(!va[base].to_f32().is_nan());
     }
 }

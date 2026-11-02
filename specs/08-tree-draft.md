@@ -1,5 +1,10 @@
 # Spec 08 — Tree drafting: the top-k oracle says the signal is real, the M4 verify row price says it does not pay
 
+Historical Qwen campaign. Results and implementation descriptions below refer
+to their recorded source versions; later sections may supersede earlier
+findings. Current contracts are in [00](00-contracts.md) and
+[AGENTS.md](../AGENTS.md). These measurements do not certify current GLM paths.
+
 ## Verdict
 
 **NO-GO — closed.** Two independent measurements, one on each side of the
@@ -21,7 +26,7 @@ question:
  (`S≤8`: fused GDN, `track_qk_norm_rope_rows`, MoE wide, mixer) is left
  behind. 2.6× round cost for ≤+16% tokens projects to **−40…−70% tok/s**.
 
-The brief's cost assumption — "verify S>1 inchangé (même batch)" — is the one
+The brief's cost assumption — "verify cost stays unchanged at S>1 in the same batch" — is the one
 thing this spec falsifies: verify is *not* flat in rows, and the rows are
 exactly what a tree adds. Do not build the beam; the A/B outcome is already
 bounded by the width curve below, and the gap (2.6× cost vs ≤16% tokens) is
@@ -66,11 +71,10 @@ not assumed):
 
 ## Constraints (user directive)
 
-- HARD CAP 120 GB RAM (detected 128 − 8); sequential runs, one model at a
+- Budget = detected physical RAM minus 8 GiB; sequential runs, one model at a
  time, `memory_pressure` before every run (91–94% free throughout).
 - max-tokens ≤ 128; flaky tests → isolated; English in `specs/`.
-- Zero invention: every number below is a tool output in
- `bench/data/tree/`.
+- Numbers below are the campaign's recorded instrument outputs.
 
 ## Phase 1 — The oracle (instrumentation, `--oracle`)
 
@@ -113,7 +117,7 @@ rollback all untouched).
 ## Phase 1 measurements — where was the true token?
 
 All runs: 128 tok, `--depth 4` forced, kv 2 343 (`router_prose` / `router_mixed`
-/ `router_echo`, `--raw`), 27B-4bit unless noted. Logs: `bench/data/tree/oracle_*.txt`.
+/ `router_echo`, `--raw`), 27B-4bit unless noted.
 
 | run | rounds | accepted (mean) | first failures → chain-fail / copy | rank ≤2 of chain-fail | ≤4 | ≤8 | floor tok/round |
 |---|---|---|---|---|---|---|---|
@@ -151,8 +155,8 @@ because it ranks a 98k-row set with no coarse truncation.
 ## Phase 1 — the price side (the measurement the design assumed away)
 
 `lisa-bench round-cost --kv 1024 --widths 3,5,6,7,8,9,10,12,15,20,25 --steps 48`
-→ `bench/data/tree/round_cost_tree{,2}.json` (written to the tree dir on
-purpose — the tracked `~/.lisa/round_cost.json` EV table is untouched, no
+→ a separate campaign cost table (written separately on
+purpose — the persisted `~/.lisa/round_cost.json` EV table is untouched, no
 verify kernel changed):
 
 | S | 3 | 5 | 6 | 7 | 8 | 9 | 10 | 12 | 15 | 20 | 25 |
@@ -173,7 +177,7 @@ independent sessions):
  top-2 tree is 31 nodes.
 
 Cross-check that a *real* batched tree is not cheaper than this single-sequence
-proxy: specs/13's B=4 batched decode costs 57.5 ms/step at M=4 while a
+proxy: the earlier B=4 batched decode measurement costs 57.5 ms/step at M=4 while a
 single-sequence S=4 verify measures 44.4 ms — batched is **dearer** at equal
 M, so the proxy is optimistic for the tree.
 
@@ -207,7 +211,7 @@ Caveats stated, not hidden: (a) rows are counted ragged/summed, but our engine
 has no tree-mask attention and no ragged batch — a real tree pays the padded
 figure (path lengths rounded up to the longest sibling) or several forwards;
 (b) the `[1,S]` curve above is the measurement; a `[B,S]` tree forward at equal
-row count is *dearer*, directionally, from specs/13 (B=4, M=4: 57.5 ms/step vs
+row count is *dearer*, directionally, from the earlier batch measurement (B=4, M=4: 57.5 ms/step vs
 44.4 ms for a single-sequence S=4 verify). Every structure loses either way.
 
 The `K=2` beam of the brief is worse than the leaf-sibling tree: two full
@@ -230,12 +234,12 @@ where the chain is right) — so it pays 2× rows for
 1. **The EV controller picks serial-only at 2–4k KV.** `~/.lisa/round_cost.json`
  has no serial cell for bucket `2-4k` (all-zero), so the controller probes
  in-run and measured **84.77 ms** on a warm box → every depth loses EV →
- `picks []`, no MTP rounds at all (`bench/data/tree/oracle_prose_auto.txt` is
+ `picks []`, no MTP rounds at all (the recorded auto-prose run is
  therefore empty). Auto runs at ~2.3k are void until the cell exists:
  `lisa-bench round-cost --kv 2343 --docs`.
 2. **`--depth 6` on the prose prompt stops after 6 tokens (EOS)**, identically
  with and without `--oracle` — deterministic, so it is the S=7 verify path
- disagreeing with S=5 on something (§9.6 near-tie class), not drift. It
+ disagreeing with S=5 on something (the documented wide-verify near-tie class), not drift. It
  voids the d6 sample (n=5); d4 is the measured depth.
 
 ## Artifacts
@@ -243,9 +247,9 @@ where the chain is right) — so it pays 2× rows for
 - Instrument: `crates/lisa-engine/src/core/oracle.rs`, hooks in
  `models/qwen3_5/tower.rs`, `models/qwen4/tower.rs`, `core/session.rs`,
  flag in `crates/lisa-cli/src/main.rs` (`lisa run --oracle`).
-- Logs: `bench/data/tree/oracle_{prose_d4,prose_d4b,prose_d6,prose_auto,mixed_d4,echo_d4,flashnext_prose_d4}.txt`
-- Width curve: `bench/data/tree/round_cost_tree.json`, `round_cost_tree2.json`.
-## Dispositions recorded herecampaign)
+- Recorded cases: repeated prose d4, prose d6/auto, mixed d4, echo d4 and
+ Flash-Next prose d4; the separate width sweep supplies the cost curve.
+## Other dispositions from this campaign
 
 - **Tree verify via a beam over tensor units (the DFlash2 prototype)** —
  FALSIFIED for our hardware: **0.94× vs MTP**; the prototype's premise ran
@@ -300,7 +304,7 @@ traffic. Measured here; verdict below.
 **Instrument (trace-only, no scored-path change):** the `mtp.copy` span now
 carries the round's copy-hit length as its trace detail
 (`core/session.rs`, one `span` → `span_detail` line). A sweep
-(`bench/data/tree/copyfreq/sweep.sh`) runs 21 sequential requests
+runs 21 sequential requests
 (`lisa run --raw --temperature 0 --max-tokens 256 --ignore-eos`, depth auto,
 27B-4bit, one model at a time, memory ≥ 92 % free throughout), parses the
 `LISA_TRACE_JSON` chrome events per request, and tallies the per-round
@@ -360,7 +364,7 @@ the FIXED-depth clamp so `--depth 12` runs chain-only wide rounds. The
 controller's own picks stay capped at 6.
 
 Round-cost re-check in the current tree (`lisa-bench round-cost
---kv 1024,16384 --steps 24 --widths 7,13`, `bench/data/tree/round_cost_wide.json`):
+--kv 1024,16384 --steps 24 --widths 7,13`):
 kv 1024 S7 48.84 ms / S13 119.08 ms; kv 16384 S7 61.91 / S13 258.54. The wide
 end still prices ~2.4× S7 per row-count but ~9 ms/token vs 8.4 — parity, no
 cliff. At 16k the wide lane dears badly; wide rounds are a short-KV tool.
@@ -454,8 +458,9 @@ always streams the fixed [16, K] tile) at 394.6-438.0 us across two runs —
 vs the stock path's 282.4-398.3 us at M 9..=12 and qmm_nax's 222.8-241.6 us.
 It never wins: worse than stock at every M (incl. M=12, the best case for
 it), ~1.7x qmm_nax everywhere. NO-LAND: the lane stays
-kernel-level opt-in, unwired; M 9..=12 keep `qmv_wide`. Nothing to re-measure
-in situ — a slower per-dispatch kernel cannot win round-cost.
+kernel-level opt-in, unwired; M 9..=12 keep `qmv_wide`. The campaign did not advance it to a production trial. This isolated result
+rejected the candidate for that investigation; it is not a general proof about
+in-situ scheduling.
 
 The diagnosis above ("additive-binary linkage") is retired; the m16 follow-up
 is closed as measured-out, not blocked.
@@ -464,7 +469,7 @@ Footprint: unchanged — t4-draft-head / t5-map-cleared at 15038 MB exactly.
 
 Verdict: the wide lane now pays at S=8 in situ. Widths 9..=16 are closed —
 the m16 lane executes (step 3, below) and measured LOSES to stock, so no
-fast lane exists for M 9..=12 at these trunk shapes; S=8 alone makes an
+admitted fast lane was established for M 9..=12 at these trunk shapes; S=8 alone makes an
 8-wide default viable pending the long-copy frequency bar (above) holding on
 a novel-prose corpus.
 
@@ -474,7 +479,7 @@ The reopen question, re-priced on the current tree: is S=9 within ~15 % of
 S=8 per-token? `lisa-bench round-cost --widths 8,9,10,13 --steps 24`, two
 passes per kv in reversed width order (order-drift control; in-pair = 8 and
 9 measured adjacently within a pass; cooldowns between passes). Table
-written to `bench/data/s9/` (scratch, NOT merged into the EV table).
+kept separately and not merged into the EV table.
 
 | kv | pass (order) | S8 | S9 | S10 | S13 | S9/S8 | per-row S9 vs S8 |
 |----|--------------|----|----|----|-----|-------|------------------|
@@ -489,3 +494,7 @@ verify. **COPY_LEN_MAX stays 7; the depth ladder stays S ≤ 8 on the split-K
 lane.** The S=9/S=10 step is nearly free (~1 ms) — the cliff is the S=8→9
 boundary (the fast lanes end at 8 rows), consistent with the earlier
 S≥9 curve; this does not change the verdict.
+
+The seven-token limit above belongs to MTP copy proposals. The public plain-PLD
+control remains clamped to six; kernel S=8 availability does not change that
+separate interface contract.

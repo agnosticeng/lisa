@@ -281,54 +281,47 @@ impl GatedDeltaNet {
             };
             let neg_exp_alog = self.neg_exp_alog.clone();
             let stream = lisa_mlx::Stream::thread_local_or_default();
-            let r: Option<(
-                Array,
-                Array,
-                Array,
-                Array,
-                Array,
-                Array,
-                Option<Array>,
-            )> = match &fused_proj {
-                Some(proj) => lisa_mlx::kernels::gdn_prep_fused(
-                    proj,
-                    &conv_state,
-                    &self.conv1d_weight,
-                    &neg_exp_alog,
-                    &self.dt_bias,
-                    self.b_offset,
-                    self.a_offset,
-                    s,
-                    self.key_heads as i32,
-                    self.value_heads as i32,
-                    self.key_head_dim as i32,
-                    self.value_head_dim as i32,
-                    kc,
-                    self.proj_width,
-                    conv_dim,
-                    &stream,
-                )
-                .map(|(qn, kn, vv, gg, bb, co, ci)| (qn, kn, vv, gg, bb, co, Some(ci))),
-                None => lisa_mlx::kernels::gdn_prep(
-                    &mixed_qkv,
-                    &conv_state,
-                    &self.conv1d_weight,
-                    &neg_exp_alog,
-                    &self.dt_bias,
-                    &b_proj,
-                    &a_proj,
-                    s,
-                    self.key_heads as i32,
-                    self.value_heads as i32,
-                    self.key_head_dim as i32,
-                    self.value_head_dim as i32,
-                    kc,
-                    conv_dim,
-                    &stream,
-                )
-                .map(|(qn, kn, vv, gg, bb, co)| (qn, kn, vv, gg, bb, co, None)),
-                // (the split-proj arm is wide prefill only — never a capture)
-            };
+            let r: Option<(Array, Array, Array, Array, Array, Array, Option<Array>)> =
+                match &fused_proj {
+                    Some(proj) => lisa_mlx::kernels::gdn_prep_fused(
+                        proj,
+                        &conv_state,
+                        &self.conv1d_weight,
+                        &neg_exp_alog,
+                        &self.dt_bias,
+                        self.b_offset,
+                        self.a_offset,
+                        s,
+                        self.key_heads as i32,
+                        self.value_heads as i32,
+                        self.key_head_dim as i32,
+                        self.value_head_dim as i32,
+                        kc,
+                        self.proj_width,
+                        conv_dim,
+                        &stream,
+                    )
+                    .map(|(qn, kn, vv, gg, bb, co, ci)| (qn, kn, vv, gg, bb, co, Some(ci))),
+                    None => lisa_mlx::kernels::gdn_prep(
+                        &mixed_qkv,
+                        &conv_state,
+                        &self.conv1d_weight,
+                        &neg_exp_alog,
+                        &self.dt_bias,
+                        &b_proj,
+                        &a_proj,
+                        s,
+                        self.key_heads as i32,
+                        self.value_heads as i32,
+                        self.key_head_dim as i32,
+                        self.value_head_dim as i32,
+                        kc,
+                        conv_dim,
+                        &stream,
+                    )
+                    .map(|(qn, kn, vv, gg, bb, co)| (qn, kn, vv, gg, bb, co, None)),
+                    // (the split-proj arm is wide prefill only — never a capture)
+                };
             let (qn, kn, vv, gg, bb, conv_out, conv_in) = r.ok_or_else(|| {
                 lisa_mlx::error::Exception::custom("gdn_prep kernel unavailable".to_string())
             })?;
@@ -521,7 +514,8 @@ impl GatedDeltaNet {
                 Some(r) => r,
                 None => {
                     let z4 = z.copied()?.reshape(&[b, s, hv, dv])?;
-                    let rms = lisa_mlx::fast::rms_norm(&out, Some(&self.norm.weight), self.norm.eps)?;
+                    let rms =
+                        lisa_mlx::fast::rms_norm(&out, Some(&self.norm.weight), self.norm.eps)?;
                     crate::core::norm::bf16_silu(&z4)?.multiply(&rms)?
                 }
             }

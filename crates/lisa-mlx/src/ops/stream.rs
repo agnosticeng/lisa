@@ -60,7 +60,17 @@ impl Stream {
                 // the per-buffer GPUStartTime/GPUEndTime measure single
                 // kernels (diagnostic; commits per dispatch are slow).
                 let probe = std::env::var_os("LISA_GPU_PROBE").is_some();
-                let per_buffer = if probe { 1 } else { 16 };
+                let per_buffer = if probe {
+                    1
+                } else {
+                    // Large batches collapse the ~4700 tiny command buffers of a
+                    // decode forward into a few big ones — commit overhead was
+                    // ~3ms per buffer (~15s CPU vs 23ms GPU per decode step).
+                    std::env::var("LISA_PER_BUFFER")
+                        .ok()
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(65536)
+                };
                 std::sync::Arc::new(
                     crate::runtime::MetalRuntime::new(per_buffer).expect("metal runtime"),
                 )

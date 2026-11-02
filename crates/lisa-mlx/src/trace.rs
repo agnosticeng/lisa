@@ -1,10 +1,9 @@
 //! Lightweight hierarchical tracing for performance work.
 //!
 //! Off by default and near-zero cost (one relaxed atomic load per `span()`).
-//! Enabled with `LISA_TRACE=1`; `LISA_TRACE_JSON=<path>` additionally writes a
-//! Chrome Trace Event file (`chrome://tracing`, or `perfetto.dev`) with every
-//! span as an `X` event, so per-layer / per-kernel timelines can be inspected
-//! visually.
+//! Enabled with `LISA_TRACE=1`; `LISA_TRACE=filter:<prefixes>` records only
+//! comma-separated span-name prefixes. `LISA_TRACE_JSON=<path>` additionally
+//! writes a Chrome Trace Event file (`chrome://tracing`, or `perfetto.dev`).
 //!
 //! Usage:
 //! ```ignore
@@ -16,12 +15,37 @@
 //! when `LISA_TRACE` is set and writes the JSON when `LISA_TRACE_JSON` is set.
 
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static INIT: AtomicBool = AtomicBool::new(false);
 static T0: Mutex<Option<Instant>> = Mutex::new(None);
+static SPAN_FILTER: OnceLock<Option<Vec<String>>> = OnceLock::new();
+
+fn span_matches_filter(name: &str) -> bool {
+    let filters = SPAN_FILTER.get_or_init(|| {
+        std::env::var("LISA_TRACE")
+            .ok()
+            .and_then(|value| value.strip_prefix("filter:").map(str::to_owned))
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|part| !part.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+    });
+    filters
+        .as_ref()
+        .is_none_or(|filters| trace_name_matches_filters(name, filters))
+}
+
+fn trace_name_matches_filters(name: &str, filters: &[String]) -> bool {
+    filters.is_empty() || filters.iter().any(|prefix| name.starts_with(prefix))
+}
 
 /// One closed span. `parent` indexes [`RECORDS`]; `detail` carries an optional
 /// numeric discriminator (layer index, token count, …) for the Chrome view.
@@ -67,6 +91,12 @@ pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
+/// Whether tracing is enabled and the named prefix passes the active filter.
+/// Use this for diagnostic side logs that should respect `LISA_TRACE=filter:`.
+pub fn enabled_for(prefix: &str) -> bool {
+    enabled() && span_matches_filter(prefix)
+}
+
 /// A tracing span. Drop closes it. Cheap no-op when tracing is off.
 pub struct Span {
     inner: Option<(&'static str, u64, u64, usize, u64)>, // (name, detail, start_us, record slot, tid)
@@ -86,7 +116,7 @@ pub fn span(name: &'static str) -> Span {
 
 /// Open a span with a numeric detail (e.g. layer index) for the Chrome view.
 pub fn span_detail(name: &'static str, detail: u64) -> Span {
-    if !enabled() {
+    if !enabled() || !span_matches_filter(name) {
         return Span { inner: None };
     }
     let tid = TID.with(|t| *t);
@@ -111,6 +141,28 @@ pub fn span_detail(name: &'static str, detail: u64) -> Span {
     Span {
         inner: Some((name, detail, start_us, slot, tid)),
     }
+}
+
+/// Record a completed span from an elapsed duration without changing the
+/// current thread's nesting stack. Use this for intervals owned by Metal
+/// callbacks or command encoders whose start and finish occur in different
+/// scopes.
+pub fn record_elapsed(name: &'static str, detail: u64, elapsed: std::time::Duration) {
+    if !enabled() || !span_matches_filter(name) {
+        return;
+    }
+    let tid = TID.with(|t| *t);
+    let end_us = now_us();
+    let dur_us = elapsed.as_micros().min(u64::MAX as u128) as u64;
+    RECORDS.lock().unwrap().push(Record {
+        name,
+        detail,
+        start_us: end_us.saturating_sub(dur_us),
+        dur_us,
+        depth: 0,
+        parent: None,
+        tid,
+    });
 }
 
 impl Drop for Span {
@@ -246,13 +298,11 @@ pub fn report() {
     probe_report();
 }
 
-/// GPU-probe analysis (`LISA_GPU_PROBE=1`): per-kernel real execution
-/// distributions plus the inter-kernel gap total on the GPU timeline.
+/// GPU-probe analysis (`LISA_GPU_PROBE=1`): per-command-buffer GPU interval
+/// distributions attributed to the single dispatched kernel, plus timeline
+/// gaps. These intervals are not hardware-counter shader occupancy readings.
 fn probe_report() {
-    let recs = crate::runtime::GPU_PROBE_RECORDS
-        .lock()
-        .unwrap()
-        .clone();
+    let recs = crate::runtime::GPU_PROBE_RECORDS.lock().unwrap().clone();
     if recs.is_empty() {
         return;
     }
@@ -375,6 +425,17 @@ pub fn write_chrome(path: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trace_prefix_filter_excludes_unrelated_diagnostic_names() {
+        let filters = [
+            "glm53.forward".to_owned(),
+            "glm53.layer".to_owned(),
+            "glm53.mlp".to_owned(),
+        ];
+        assert!(trace_name_matches_filters("glm53.layer", &filters));
+        assert!(!trace_name_matches_filters("glm53-loader", &filters));
+    }
 
     #[test]
     fn disabled_spans_are_noops() {

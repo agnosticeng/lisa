@@ -92,7 +92,8 @@ impl Array {
 
         let out = Self::wrap(
             Arc::clone(&self.rt),
-            self.rt.buffer(size * self.dtype.size_of(), "unary_out")?,
+            self.rt
+                .buffer_for_full_gpu_write(size * self.dtype.size_of(), "unary_out")?,
             Layout::contiguous(&x.layout.shape),
             self.dtype,
         );
@@ -162,7 +163,7 @@ impl Array {
         let out = Self::wrap(
             Arc::clone(&self.rt),
             self.rt
-                .buffer(x.size() * self.dtype.size_of(), "softmax_out")?,
+                .buffer_for_full_gpu_write(x.size() * self.dtype.size_of(), "softmax_out")?,
             Layout::contiguous(&shape),
             self.dtype,
         );
@@ -326,7 +327,7 @@ impl Array {
         let out = Self::wrap(
             Arc::clone(&self.rt),
             self.rt
-                .buffer(out_count * self.dtype.size_of(), "reduce_out")?,
+                .buffer_for_full_gpu_write(out_count * self.dtype.size_of(), "reduce_out")?,
             Layout::contiguous(&out_dims),
             self.dtype,
         );
@@ -490,7 +491,8 @@ impl Array {
         let n: usize = shape.iter().product();
         let out = Self::wrap(
             Arc::clone(&self.rt),
-            self.rt.buffer(n * self.dtype.size_of(), "binary_out")?,
+            self.rt
+                .buffer_for_full_gpu_write(n * self.dtype.size_of(), "binary_out")?,
             Layout::contiguous(&shape),
             self.dtype,
         );
@@ -542,6 +544,7 @@ impl Array {
             Dtype::F16 => "f16",
             Dtype::BF16 => "bf16",
             Dtype::I64 => "i64",
+            Dtype::I32 => "i32",
             Dtype::U32 => "u32",
             Dtype::U8 | Dtype::Bool => "u8",
             _ => return None,
@@ -618,7 +621,7 @@ impl Array {
         let out = Self::wrap(
             Arc::clone(&self.rt),
             self.rt
-                .buffer(dst_el * x.dtype.size_of(), "index_select_out")?,
+                .buffer_for_gpu_write(dst_el * x.dtype.size_of(), "index_select_out")?,
             Layout::contiguous(&out_shape),
             x.dtype,
         );
@@ -729,7 +732,7 @@ impl Array {
         let n: usize = shape.iter().product();
         let out = Self::wrap(
             Arc::clone(&self.rt),
-            self.rt.buffer(n, "cmp_out")?,
+            self.rt.buffer_for_full_gpu_write(n, "cmp_out")?,
             Layout::contiguous(&shape),
             Dtype::U8,
         );
@@ -967,7 +970,8 @@ impl Array {
         let out_count: usize = out_dims.iter().product::<usize>().max(1);
         let out = Self::wrap(
             Arc::clone(&self.rt),
-            self.rt.buffer(out_count * 4, "arg_out")?,
+            self.rt
+                .buffer_for_full_gpu_write(out_count * 4, "arg_out")?,
             Layout::contiguous(&out_dims),
             Dtype::U32,
         );
@@ -1205,7 +1209,8 @@ impl Array {
         let dst_el = ids_size * left_size * right_size;
         let out = Self::wrap(
             Arc::clone(&self.rt),
-            self.rt.buffer(dst_el * x.dtype.size_of(), "gather_out")?,
+            self.rt
+                .buffer_for_gpu_write(dst_el * x.dtype.size_of(), "gather_out")?,
             Layout::contiguous(ids.shape()),
             x.dtype,
         );
@@ -1289,7 +1294,8 @@ impl Array {
         let size = cond.size();
         let out = Self::wrap(
             Arc::clone(&self.rt),
-            self.rt.buffer(size * t.dtype.size_of(), "where_out")?,
+            self.rt
+                .buffer_for_full_gpu_write(size * t.dtype.size_of(), "where_out")?,
             Layout::contiguous(cond.shape()),
             t.dtype,
         );
@@ -1354,6 +1360,7 @@ impl Array {
                 Dtype::F16 => "f16",
                 Dtype::BF16 => "bf16",
                 Dtype::I64 => "i64",
+                Dtype::I32 => "i32",
                 Dtype::U32 => "u32",
                 Dtype::U8 | Dtype::Bool => "u8",
                 _ => return None,
@@ -1380,7 +1387,8 @@ impl Array {
         let n = x.size();
         let out = Self::wrap(
             Arc::clone(&self.rt),
-            self.rt.buffer(n * dtype.size_of(), "cast_out")?,
+            self.rt
+                .buffer_for_full_gpu_write(n * dtype.size_of(), "cast_out")?,
             Layout::contiguous(x.shape()),
             dtype,
         );

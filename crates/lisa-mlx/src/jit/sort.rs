@@ -72,11 +72,12 @@ fn argsort_multi_block(
     // contiguous input) and the per-row block partitions.
     let nbytes_v = n_rows * size_sorted_axis * in_dt.size_of();
     let nbytes_i = n_rows * size_sorted_axis * idx_dt.size_of();
-    let vals0 = mdev.buffer(nbytes_v, "mbsort_vals0")?;
-    let vals1 = mdev.buffer(nbytes_v, "mbsort_vals1")?;
-    let idxs0 = mdev.buffer(nbytes_i, "mbsort_idxs0")?;
-    let idxs1 = mdev.buffer(nbytes_i, "mbsort_idxs1")?;
-    let parts = mdev.buffer(n_rows * (n_blocks + 1) * idx_dt.size_of(), "mbsort_parts")?;
+    let vals0 = mdev.buffer_for_gpu_write(nbytes_v, "mbsort_vals0")?;
+    let vals1 = mdev.buffer_for_gpu_write(nbytes_v, "mbsort_vals1")?;
+    let idxs0 = mdev.buffer_for_gpu_write(nbytes_i, "mbsort_idxs0")?;
+    let idxs1 = mdev.buffer_for_gpu_write(nbytes_i, "mbsort_idxs1")?;
+    let parts =
+        mdev.buffer_for_gpu_write(n_rows * (n_blocks + 1) * idx_dt.size_of(), "mbsort_parts")?;
 
     // Non-sorted-axis shape/strides for the block-sort kernel. The input is
     // contiguous and the sorted axis is last, so the non-sorted axes are
@@ -293,7 +294,7 @@ fn argsort_axis(device: &Device, x: &Tensor, argsort: bool) -> Result<Tensor> {
     let pipeline = compile_builtin(device, &source, &kernel_name)?;
 
     let count = x.elem_count();
-    let obuf = mdev.buffer((count) as usize * (DType::U32).size_of(), "sort_out")?;
+    let obuf = mdev.buffer_for_gpu_write((count) as usize * (DType::U32).size_of(), "sort_out")?;
     let out = Array::from_parts(mdev, obuf.clone(), &dims.clone(), DType::U32);
 
     let guard = mdev.commands.encoder()?;

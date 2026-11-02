@@ -9,7 +9,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
-    MTLComputeCommandEncoder, MTLDevice, MTLDispatchType, MTLSize,
+    MTLComputeCommandEncoder, MTLDevice, MTLDispatchType, MTLResource, MTLResourceUsage, MTLSize,
 };
 
 use crate::error::Result;
@@ -19,16 +19,14 @@ use super::buffer::Buffer;
 use super::env::{DISPATCH_COUNT, ENCODER_COUNT, WAIT_NS, add_gpu_ns_split, err};
 use super::fence::Fence;
 use super::pipeline::ComputePipeline;
+use super::residency::ResidencySet;
 
 // ──────────────────────────── command encoder ────────────────────────────
 
 /// Per-encoder state: the buffers this session wrote, registered globally on
 /// `end` (cross-encoder fence map). The former per-dispatch hazard sets
-/// (prev/next inputs/outputs) are gone: the encoder is opened with
-/// `MTLDispatchType::Serial`, so Metal guarantees dispatch order and memory
-/// visibility across dispatches — tracking them cost a Mutex lock + several
-/// HashSet ops per binding and per dispatch for a barrier that was never
-/// inserted.
+/// (prev/next inputs/outputs) are gone: the encoder uses serial dispatch, and
+/// command-buffer submission establishes ordering for later consumers.
 #[derive(Default)]
 struct EncoderState {
     /// Every buffer this session wrote, registered globally on `end`.
@@ -44,31 +42,44 @@ unsafe impl Sync for ComputeEncoder {}
 #[derive(Clone)]
 pub struct ComputeEncoder {
     raw: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
+    command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
     fence: Arc<Fence>,
     state: Arc<Mutex<EncoderState>>,
     /// Id of `command_buffer`, recorded on every bound buffer so the pool can
     /// reuse it once this command buffer completes.
     cb_id: u64,
+    /// Host time from the first encoder creation until its command buffer is
+    /// submitted. This separates CPU encoding gaps from GPU execution time.
+    encode_started: std::time::Instant,
+    /// Resources reached through GPU virtual addresses are invisible to Metal's
+    /// ordinary buffer binding tracker; retain them through command completion.
+    cb_keepalive: Arc<Mutex<HashMap<u64, HashMap<usize, Arc<Buffer>>>>>,
     /// Interned kernel label of the last `set_pipeline` (u32::MAX = none), so
     /// each dispatch is attributed. Atomics only: no lock, no String clone on
     /// the hot path.
     current_label: Arc<AtomicU32>,
     /// Dispatch count per interned kernel label encoded into this encoder's
-    /// session. Only touched when tracing is on (`LISA_TRACE`).
+    /// session. Captured when tracing, GPU probing, or command-buffer recording
+    /// is enabled.
     kernel_counts: Arc<Mutex<Vec<(u32, u64)>>>,
 }
 
 impl ComputeEncoder {
     fn new(
         raw: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
+        command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
         fence: Arc<Fence>,
         cb_id: u64,
+        cb_keepalive: Arc<Mutex<HashMap<u64, HashMap<usize, Arc<Buffer>>>>>,
     ) -> Self {
         Self {
             raw,
+            command_buffer,
             fence,
             state: Arc::new(Mutex::new(EncoderState::default())),
             cb_id,
+            encode_started: std::time::Instant::now(),
+            cb_keepalive,
             current_label: Arc::new(AtomicU32::new(u32::MAX)),
             kernel_counts: Arc::new(Mutex::new(Vec::new())),
         }
@@ -80,10 +91,23 @@ impl ComputeEncoder {
         self.raw.setComputePipelineState(pipeline.raw());
     }
 
-    /// Attribute this dispatch to the current kernel label. Counts are only
-    /// kept when tracing is on — off-trace this is free.
+    /// Attach an indirect-resource set to the command buffer that owns this
+    /// encoder. Metal makes those allocations resident for its execution.
+    pub fn use_residency_set(&self, set: &ResidencySet) {
+        self.command_buffer.useResidencySet(set.raw());
+    }
+
+    /// Bind dynamic threadgroup scratch declared with `[[threadgroup(0)]]`.
+    pub fn set_threadgroup_memory_length(&self, index: usize, length: usize) {
+        unsafe {
+            self.raw.setThreadgroupMemoryLength_atIndex(length, index);
+        }
+    }
+
+    /// Attribute this dispatch to the current kernel label. When diagnostics
+    /// are disabled, return before the label lookup and lock.
     fn note_dispatch(&self) {
-        if !trace::enabled() {
+        if !trace::enabled() && !super::env::kernel_label_capture_enabled() {
             return;
         }
         let label = self.current_label.load(Ordering::Relaxed);
@@ -110,6 +134,37 @@ impl ComputeEncoder {
             unsafe {
                 self.raw.setBuffer_offset_atIndex(None, offset, index);
             }
+        }
+    }
+
+    /// Retain a buffer referenced indirectly through a GPU address until the
+    /// command buffer that contains the dispatch has completed, and declare
+    /// its read residency to Metal before the indirect dispatch.
+    pub fn retain_until_completion(&self, buffer: &Arc<Buffer>) {
+        self.retain_until_completion_with_usage(buffer, true);
+    }
+
+    /// Retain an indirectly-addressed buffer for the command buffer when it is
+    /// already covered by a queue-wide residency set.
+    pub fn retain_resident_until_completion(&self, buffer: &Arc<Buffer>) {
+        self.retain_until_completion_with_usage(buffer, false);
+    }
+
+    fn retain_until_completion_with_usage(&self, buffer: &Arc<Buffer>, declare_usage: bool) {
+        let first_use = {
+            let mut keepalive = self.cb_keepalive.lock().unwrap();
+            let resources = keepalive.entry(self.cb_id).or_default();
+            if resources.contains_key(&buffer.id()) {
+                false
+            } else {
+                resources.insert(buffer.id(), Arc::clone(buffer));
+                true
+            }
+        };
+        buffer.mark_used_cb(self.cb_id);
+        if first_use && declare_usage {
+            let resource: &ProtocolObject<dyn MTLResource> = buffer.mtlbuffer().as_ref();
+            self.raw.useResource_usage(resource, MTLResourceUsage::Read);
         }
     }
 
@@ -209,6 +264,11 @@ impl ComputeEncoder {
         prev_outputs: &Arc<Mutex<HashMap<usize, Arc<Fence>>>>,
         cb_labels: &Arc<Mutex<HashMap<u64, Vec<(String, u64)>>>>,
     ) -> Option<(Vec<usize>, Arc<Fence>)> {
+        trace::record_elapsed(
+            "mlx.commands.encoder_lifetime",
+            self.cb_id,
+            self.encode_started.elapsed(),
+        );
         // Hand the per-label dispatch counts to the command buffer's completion
         // handler, which splits its GPU duration across them.
         {
@@ -258,7 +318,7 @@ impl ComputeEncoder {
         // its `waitForFence`, and kernels/readbacks read buffers whose
         // producer command buffer was still in flight — the specs/04 §6
         // readback-race flake family. Returning the (outputs, fence) to
-        // `rotate` here hands the cleanup to a block that provably outlives
+        // `end_encoder` here hands the cleanup to a block that provably outlives
         // the buffer.
         Some((outs, Arc::clone(&self.fence)))
     }
@@ -270,6 +330,9 @@ struct EntryState {
     current_id: u64,
     in_flight: Vec<(u64, Retained<ProtocolObject<dyn MTLCommandBuffer>>)>,
     encoder: Option<ComputeEncoder>,
+    /// Each encoder in the current command buffer owns a distinct fence.
+    /// Keep all cleanup records until that command buffer completes.
+    fence_cleanups: Vec<(Vec<usize>, Arc<Fence>)>,
 }
 
 unsafe impl Send for EntryState {}
@@ -318,6 +381,9 @@ pub struct Commands {
     /// Per-command-buffer kernel dispatch counts, consumed by the completion
     /// handler to split the buffer's GPU time across labels.
     cb_labels: Arc<Mutex<HashMap<u64, Vec<(String, u64)>>>>,
+    /// Buffers indirectly accessed by GPU virtual address, keyed by command
+    /// buffer and buffer identity to avoid duplicate retains.
+    cb_keepalive: Arc<Mutex<HashMap<u64, HashMap<usize, Arc<Buffer>>>>>,
 }
 
 unsafe impl Send for Commands {}
@@ -346,6 +412,7 @@ impl Commands {
                 current_id: 1,
                 in_flight: Vec::new(),
                 encoder: None,
+                fence_cleanups: Vec::new(),
             }),
             queue,
             device,
@@ -357,6 +424,7 @@ impl Commands {
             completed: Arc::new(Mutex::new(CompletionState::default())),
             epoch: AtomicU64::new(1),
             cb_labels: Arc::new(Mutex::new(HashMap::new())),
+            cb_keepalive: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -377,8 +445,9 @@ impl Commands {
         &self,
         cb: &ProtocolObject<dyn MTLCommandBuffer>,
         id: u64,
-        fence_cleanup: Option<(Vec<usize>, Arc<Fence>)>,
+        fence_cleanups: Vec<(Vec<usize>, Arc<Fence>)>,
     ) {
+        let submitted_at = std::time::Instant::now();
         let tracker = Arc::clone(&self.completed);
         // Cross-encoder fence-map cleanup for THIS command buffer's outputs:
         // on completion, drop the map entries so the map only holds in-flight
@@ -389,7 +458,9 @@ impl Commands {
         // block in `ComputeEncoder::end` was dropped while still registered —
         // a use-after-free at completion time (specs/04 §6).
         let map_for_cleanup = Arc::clone(&self.prev_outputs);
-        let fence_cleanup = fence_cleanup.map(|(outs, fence)| (Arc::new(outs), fence));
+        // The completion block itself is kept alive below. Release these
+        // per-encoder vectors and fences when it fires, not at process exit.
+        let fence_cleanups = Arc::new(Mutex::new(Some(fence_cleanups)));
         // Take this buffer's kernel dispatch counts; the handler splits the
         // buffer's GPU duration (GPUStartTime..GPUEndTime) across them.
         let labels = self
@@ -398,14 +469,30 @@ impl Commands {
             .unwrap()
             .remove(&id)
             .unwrap_or_default();
+        let keepalive = Arc::new(Mutex::new(Some(
+            self.cb_keepalive
+                .lock()
+                .unwrap()
+                .remove(&id)
+                .unwrap_or_default(),
+        )));
+        let keepalive_for_callback = Arc::clone(&keepalive);
         let block = RcBlock::new(move |_cb: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+            trace::record_elapsed(
+                "mlx.commands.submit_to_completion",
+                id,
+                submitted_at.elapsed(),
+            );
+            drop(keepalive_for_callback.lock().unwrap().take());
             tracker.lock().unwrap().note(id);
-            if let Some((outs, fence)) = &fence_cleanup {
+            if let Some(fence_cleanups) = fence_cleanups.lock().unwrap().take() {
                 let mut map = map_for_cleanup.lock().unwrap();
-                for &buf in outs.iter() {
-                    if let Some(f) = map.get(&buf) {
-                        if Arc::ptr_eq(f, fence) {
-                            map.remove(&buf);
+                for (outs, fence) in &fence_cleanups {
+                    for &buf in outs {
+                        if let Some(f) = map.get(&buf) {
+                            if Arc::ptr_eq(f, fence) {
+                                map.remove(&buf);
+                            }
                         }
                     }
                 }
@@ -438,7 +525,8 @@ impl Commands {
                             .map(|(n, c)| format!("[\"{}\",{}]", esc(n), c))
                             .collect::<Vec<_>>()
                             .join(",");
-                        let json = format!("{{\"d\":{},\"l\":[{}]}}\n", dur_ns, pairs);
+                        let json =
+                            format!("{{\"id\":{},\"d\":{},\"l\":[{}]}}\n", id, dur_ns, pairs);
                         let _ = f.write_all(json.as_bytes());
                     }
                 }
@@ -481,6 +569,16 @@ impl Commands {
         self.per_buffer.load(Ordering::Acquire)
     }
 
+    /// Make a model residency set visible to the whole queue once at setup.
+    pub fn add_residency_set_to_queue(&self, set: &ResidencySet) -> bool {
+        set.add_to_queue(&self.queue)
+    }
+
+    /// Register a model residency set without prewarming all of its allocations.
+    pub fn add_residency_set_to_queue_without_request(&self, set: &ResidencySet) -> bool {
+        set.add_to_queue_without_request(&self.queue)
+    }
+
     /// Open (or reuse) the current session's encoder.
     pub fn encoder(&self) -> Result<EncoderGuard<'_>> {
         ENCODER_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -499,12 +597,9 @@ impl Commands {
                 .current
                 .computeCommandEncoderWithDispatchType(MTLDispatchType::Serial)
                 .ok_or_else(|| err("computeCommandEncoder"))?;
-            // Every buffer written by a previous session must be visible before
-            // the first dispatch here. Skipped in GPU-probe mode: the fence
-            // wait would sit INSIDE the measured GPUStartTime..GPUEndTime
-            // window and inflate every duration by the host submission
-            // latency. Probe results are garbage numerically (benign data
-            // races); buffer reuse stays gated on the completion watermark.
+            // Every buffer written by a previous encoder must be visible before
+            // this encoder's first dispatch. Skipped in GPU-probe mode because the
+            // wait would contaminate the measured GPU execution window.
             if !super::env::gpu_probe_enabled() {
                 let prev = self.prev_outputs.lock().unwrap();
                 let mut seen = HashSet::new();
@@ -514,22 +609,46 @@ impl Commands {
                     }
                 }
             }
-            st.encoder = Some(ComputeEncoder::new(raw, fence, st.current_id));
+            st.encoder = Some(ComputeEncoder::new(
+                raw,
+                st.current.clone(),
+                fence,
+                st.current_id,
+                Arc::clone(&self.cb_keepalive),
+            ));
         }
         Ok(EncoderGuard { guard: st })
     }
 
+    fn end_encoder(&self, st: &mut EntryState) {
+        if let Some(cleanup) = st
+            .encoder
+            .take()
+            .and_then(|enc| enc.end(&self.prev_outputs, &self.cb_labels))
+        {
+            st.fence_cleanups.push(cleanup);
+        }
+    }
+
+    /// End only the compute encoder, keeping the current command buffer open.
+    /// The next dispatch opens another encoder in that same buffer, with the
+    /// usual cross-encoder fences. This never commits, waits, advances the
+    /// completion watermark, or makes its temporary buffers reusable.
+    pub fn flush_encoder(&self) {
+        let mut st = self.state.lock().unwrap();
+        let _span = trace::span_detail("mlx.commands.flush_encoder", st.current_id);
+        self.end_encoder(&mut st);
+    }
+
     fn rotate(&self, st: &mut EntryState) -> Result<()> {
-        let fence_cleanup = if let Some(enc) = st.encoder.take() {
-            enc.end(&self.prev_outputs, &self.cb_labels)
-        } else {
-            None
-        };
+        let _span = trace::span_detail("mlx.commands.rotate", st.current_id);
+        self.end_encoder(st);
+        let fence_cleanups = std::mem::take(&mut st.fence_cleanups);
         match st.current.status() {
             MTLCommandBufferStatus::NotEnqueued | MTLCommandBufferStatus::Enqueued => {
                 // Arm before commit so a completion that races the caller is not
                 // missed; the watermark only moves on this id's completion.
-                self.arm_completion(&st.current, st.current_id, fence_cleanup);
+                self.arm_completion(&st.current, st.current_id, fence_cleanups);
                 st.current.commit()
             }
             _ => {}
@@ -568,6 +687,7 @@ impl Commands {
     /// (the other thread had "checked out" the entries) and return while the
     /// GPU was still writing the very buffer the caller was about to read.
     pub fn flush_wait_through(&self, id: u64) -> Result<()> {
+        let _span = trace::span_detail("mlx.commands.flush_wait_through", id);
         let target = {
             let mut st = self.state.lock().unwrap();
             if st.encoder.is_some() || self.compute_count.load(Ordering::Acquire) > 0 {
@@ -584,7 +704,9 @@ impl Commands {
         };
         if let Some((wait_id, cb)) = target {
             let t0 = std::time::Instant::now();
+            let _wait_span = trace::span_detail("mlx.commands.wait_completed", wait_id);
             wait(&cb)?;
+            drop(_wait_span);
             WAIT_NS.fetch_add(
                 t0.elapsed().as_nanos() as u64,
                 std::sync::atomic::Ordering::Relaxed,
@@ -611,8 +733,22 @@ impl Commands {
         Ok(())
     }
 
+    /// Commit everything queued so far **without waiting** (ds4/MLX parity:
+    /// a kernel-input materialization enqueues the producer into the serial
+    /// queue; the queue's FIFO order makes the buffer readable by any later
+    /// dispatch — no `waitUntilCompleted`). Buffer reuse stays sound via the
+    /// pool's `reusable_after(completed_watermark)` gate.
+    pub fn flush(&self) -> Result<()> {
+        let mut st = self.state.lock().unwrap();
+        if st.encoder.is_some() || self.compute_count.load(Ordering::Acquire) > 0 {
+            self.rotate(&mut st)?;
+        }
+        Ok(())
+    }
+
     /// Commit and wait for everything queued so far; drops the fence map.
     pub fn flush_and_wait(&self) -> Result<()> {
+        let _span = trace::span("mlx.commands.flush_and_wait");
         let to_wait = {
             let mut st = self.state.lock().unwrap();
             if st.encoder.is_some() || self.compute_count.load(Ordering::Acquire) > 0 {
@@ -624,7 +760,9 @@ impl Commands {
         };
         if let Some((last_id, last)) = to_wait {
             let t0 = std::time::Instant::now();
+            let _wait_span = trace::span_detail("mlx.commands.wait_completed", last_id);
             wait(&last)?;
+            drop(_wait_span);
             WAIT_NS.fetch_add(
                 t0.elapsed().as_nanos() as u64,
                 std::sync::atomic::Ordering::Relaxed,
@@ -686,4 +824,51 @@ fn wait(cb: &ProtocolObject<dyn MTLCommandBuffer>) -> Result<()> {
         _ => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encoder_only_boundaries_preserve_command_buffer_and_clean_all_fences() -> Result<()> {
+        if !crate::device::metal_available() {
+            return Ok(());
+        }
+        let rt = crate::runtime::MetalRuntime::new(64)?;
+        let commands = &rt.commands;
+        let cb_id = commands.current_cb_id();
+        let epoch = commands.epoch();
+        for output_id in [11, 22, 33] {
+            {
+                let guard = commands.encoder()?;
+                // Distinct output identities exercise cleanup of every closed
+                // encoder, including outputs the final encoder never writes.
+                guard
+                    .encoder()
+                    .state
+                    .lock()
+                    .unwrap()
+                    .all_outputs
+                    .push(output_id);
+            }
+            commands.flush_encoder();
+            assert_eq!(commands.current_cb_id(), cb_id);
+            assert_eq!(commands.epoch(), epoch);
+            assert_eq!(commands.completed_watermark(), 0);
+            let state = commands.state.lock().unwrap();
+            assert!(state.encoder.is_none());
+            assert!(state.in_flight.is_empty());
+            assert_eq!(state.current.status(), MTLCommandBufferStatus::NotEnqueued);
+        }
+        assert_eq!(commands.state.lock().unwrap().fence_cleanups.len(), 3);
+        assert_eq!(commands.prev_outputs.lock().unwrap().len(), 3);
+        commands.flush_wait_through(cb_id)?;
+        // Unlike flush_and_wait, this does not clear the fence map itself:
+        // all three entries must be retired by the completion callback.
+        assert!(commands.prev_outputs.lock().unwrap().is_empty());
+        assert!(commands.state.lock().unwrap().fence_cleanups.is_empty());
+        assert!(commands.completed_watermark() >= cb_id);
+        Ok(())
+    }
 }

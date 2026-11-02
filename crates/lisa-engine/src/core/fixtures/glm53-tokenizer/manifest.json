@@ -1,0 +1,22 @@
+{
+  "format": "lisa-glm53-tokenizer-fixtures-v1",
+  "ds4_revision": "c97964b8aa77034a8e17afb10ca7a686c40ab511",
+  "tokenizer_json_sha256": "19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d",
+  "files": [
+    {
+      "name": "prompt-row-1.u32",
+      "bytes": 32772,
+      "sha256": "70f513a08ab1120738a25a2edd32638b65c9c8a517feae4815f1b61195a34cec"
+    },
+    {
+      "name": "prompt-row-1.ds4.u32",
+      "bytes": 32780,
+      "sha256": "765e84f0e87953e5351a65c35519628568b82766bc712e9d43da4bede63e5b20"
+    },
+    {
+      "name": "tokenizer-ds4-merge-cases-20261101.json",
+      "bytes": 3437,
+      "sha256": "3240652b382a5f70e7fd65fb4332f9012e7dab7fac7619d16fb14034ca21a608"
+    }
+  ]
+}

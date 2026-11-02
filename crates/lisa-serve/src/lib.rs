@@ -23,7 +23,7 @@ use lisa_engine::DecisionModel;
 use lisa_engine::core::generate::is_eos;
 use lisa_engine::core::prefix_cache::PrefixCache;
 use lisa_engine::core::sampler::Sampler;
-use lisa_engine::core::session::{MtpDepth, Session};
+use lisa_engine::core::session::{MtpDepth, Session, TargetMtpEosPolicy, TargetMtpSamplingMode};
 use lisa_engine::core::tokenizer::{self, Tokenizer};
 use lisa_engine::models::LanguageModel;
 
@@ -38,6 +38,8 @@ pub struct ServerConfig {
     pub top_k: Option<usize>,
     pub min_p: Option<f32>,
     pub rep_penalty: Option<f32>,
+    /// Enable DS4's exact stochastic acceptance/residual sampling for GLM MTP.
+    pub mtp_exact_sampling: bool,
     /// The checkpoint's own sampling/thinking recommendations
     /// (`generation_config.json`): `temperature`, `top_p`, `top_k`,
     /// `repetition_penalty`, and `default_chat_template_kwargs
@@ -108,11 +110,7 @@ impl GenDefaults {
             eprintln!("[serve] generation_config.json: unparseable, ignoring");
             return Self::default();
         };
-        let f = |k: &str| {
-            v.get(k)
-                .and_then(|x| x.as_f64())
-                .map(|x| x as f32)
-        };
+        let f = |k: &str| v.get(k).and_then(|x| x.as_f64()).map(|x| x as f32);
         let mut out = Self {
             temperature: f("temperature"),
             top_p: f("top_p"),
@@ -165,9 +163,10 @@ enum Reply {
     Start {
         prompt_tokens: usize,
     },
-    /// A streamed text delta, optionally carrying a per-token logprob entry.
+    /// A streamed content or reasoning delta, optionally carrying a per-token logprob entry.
     Delta {
         text: String,
+        reasoning: Option<String>,
         logprobs: Option<Value>,
     },
     Done {
@@ -314,6 +313,17 @@ impl Server {
     /// Process one ready wave of jobs, if any. Returns `true` when it did work
     /// (so a host loop can prefer its own commands between waves).
     pub fn step(&mut self, tower: &mut dyn LanguageModel, tok: &Tokenizer) -> bool {
+        self.step_with_context(tower, tok, |_| {})
+    }
+
+    /// Restore a host's model context immediately before a ready wave runs.
+    /// An idle poll leaves model-owned context and draft caches untouched.
+    pub fn step_with_context(
+        &mut self,
+        tower: &mut dyn LanguageModel,
+        tok: &Tokenizer,
+        before_wave: impl FnOnce(&mut dyn LanguageModel),
+    ) -> bool {
         let Ok(first) = self.jobs.try_recv() else {
             return false;
         };
@@ -362,6 +372,10 @@ impl Server {
             }
         }
 
+        if !wave.is_empty() {
+            before_wave(tower);
+        }
+
         // Stateful (session) requests are serial; stateless ones batch.
         let mut sess_jobs = Vec::new();
         let mut batch_jobs = Vec::new();
@@ -389,13 +403,14 @@ impl Server {
             }
         }
         if !batch_jobs.is_empty() {
-            // Wave-level batching policy. Speculative requests are serialized one
-            // stream at a time (`maximumSpeculativeBatch == 1`), so N concurrent
-            // streams pay N sequential prefill+decode passes. Batching them
-            // trades per-stream speculation for shared work: measured at equal
-            // steps (4 streams x 64 engine steps, 3 interleaved pairs,
-            // `tools/4stream.py`) batched 3.44 s vs serialized MTP 4.71 s =
-            // **1.37x**, and ~3x on the worst TTFT (2183 vs 6569 ms).
+            // Qwen chain-MTP requests are serialized one stream at a time
+            // (`maximumSpeculativeBatch == 1`), so N concurrent streams pay N
+            // sequential prefill+decode passes. Batching them trades per-stream
+            // speculation for shared work: measured at equal steps (4 streams
+            // x 64 engine steps, 3 interleaved pairs, `tools/4stream.py`)
+            // batched 3.44 s vs serialized MTP 4.71 s = **1.37x**, and ~3x on
+            // the worst TTFT (2183 vs 6569 ms). GLM target-MTP uses its own
+            // one-cycle-per-session wave path below.
             //
             // The decision is PER WAVE, not per job: a lone request keeps its
             // speculation (which is where MTP wins). Requests that need the
@@ -409,17 +424,24 @@ impl Server {
             // interpolation. The batched path emits different tokens than the
             // speculative one (near-tie class, AGENTS.md §9.6).
             const BATCH_WAVE_MIN: usize = 4;
-            let (spec, plain): (Vec<Job>, Vec<Job>) =
-                if batch_jobs.len() >= BATCH_WAVE_MIN {
-                    eprintln!(
-                        "[batched] wave of {} jobs -> continuous batch \
+            let target_mtp_model = tower.has_target_mtp();
+            let (spec, wave_jobs): (Vec<Job>, Vec<Job>) = if target_mtp_model {
+                // GLM target-MTP has a one-step drafter. Preserve it for
+                // eligible multi-request waves and let the scheduler
+                // interleave one verified target-MTP round per stream.
+                batch_jobs
+                    .into_iter()
+                    .partition(|job| !is_target_mtp_wave_eligible(job, depth_for(job, &cfg)))
+            } else if batch_jobs.len() >= BATCH_WAVE_MIN {
+                eprintln!(
+                    "[batched] wave of {} jobs -> continuous batch \
                          (per-stream speculation dropped, maximumSpeculativeBatch == 1)",
-                        batch_jobs.len()
-                    );
-                    batch_jobs.into_iter().partition(|j| !is_wave_eligible(j))
-                } else {
-                    batch_jobs.into_iter().partition(|j| !is_plain_job(j, &cfg))
-                };
+                    batch_jobs.len()
+                );
+                batch_jobs.into_iter().partition(|j| !is_wave_eligible(j))
+            } else {
+                batch_jobs.into_iter().partition(|j| !is_plain_job(j, &cfg))
+            };
             for job in &spec {
                 let why = if depth_for(job, &cfg) > 0 {
                     format!("mtp depth={}", depth_for(job, &cfg))
@@ -445,6 +467,13 @@ impl Server {
                     let _ = job.reply.send(Reply::Error(e.to_string()));
                 }
             }
+            let (mtp_wave, plain) = if target_mtp_model {
+                wave_jobs
+                    .into_iter()
+                    .partition(|job| depth_for(job, &cfg) > 0)
+            } else {
+                (Vec::new(), wave_jobs)
+            };
             if !plain.is_empty() {
                 // Late arrivals are polled mid-wave so they join the live
                 // batch; anything non-plain comes back and runs serial here.
@@ -455,6 +484,7 @@ impl Server {
                     plain,
                     &cfg,
                     chat_tmpl,
+                    0,
                     Some(&self.jobs),
                     &mut leftover,
                 ) {
@@ -469,6 +499,36 @@ impl Server {
                         complete(tower, tok, &job, &cfg, &mut self.prefix, chat_tmpl)
                     };
                     if let Err(e) = r {
+                        let _ = job.reply.send(Reply::Error(e.to_string()));
+                    }
+                }
+            }
+            if mtp_wave.len() == 1 {
+                let job = mtp_wave.into_iter().next().expect("one MTP request");
+                if let Err(e) = complete(tower, tok, &job, &cfg, &mut self.prefix, chat_tmpl) {
+                    let _ = job.reply.send(Reply::Error(e.to_string()));
+                }
+            } else if !mtp_wave.is_empty() {
+                // GLM's target-conditioned MTP depth is a single verify
+                // opportunity; the requested numeric depth does not alter its
+                // model path. A fixed supported depth keeps this wave on the
+                // speculative scheduler while each request retains its own
+                // sampler and output budget.
+                let mut leftover = Vec::new();
+                if let Err(e) = run_wave(
+                    tower,
+                    tok,
+                    mtp_wave,
+                    &cfg,
+                    chat_tmpl,
+                    2,
+                    None,
+                    &mut leftover,
+                ) {
+                    eprintln!("[serve] GLM MTP wave error: {e}");
+                }
+                for job in leftover {
+                    if let Err(e) = complete(tower, tok, &job, &cfg, &mut self.prefix, chat_tmpl) {
                         let _ = job.reply.send(Reply::Error(e.to_string()));
                     }
                 }
@@ -499,6 +559,7 @@ pub fn run_with_stop(
     cfg: ServerConfig,
     stop: std::sync::Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
+    lisa_engine::core::generate::set_eos_ids_for_model(tok.im_end_ids.clone(), tower);
     let mut server = Server::start(cfg, stop.clone())?;
     println!("lisa serve listening on http://{}", server.local_addr());
     println!("  POST /v1/chat/completions   GET /v1/models   GET /health");
@@ -575,11 +636,24 @@ fn build_request(
     })
 }
 
-/// Whether a job takes the continuous-batch wave path: a stateless plain chat
-/// completion that needs none of the features only the serial paths implement
-/// (stop sequences, per-token logprobs — the scheduler streams bare tokens).
+/// Whether a job can use a stateless scheduler wave: a plain chat completion
+/// that needs none of the features only the serial paths implement (stop
+/// sequences, per-token logprobs, and tool calls).
 fn is_plain_job(job: &Job, cfg: &ServerConfig) -> bool {
     depth_for(job, cfg) == 0 && is_wave_eligible(job)
+}
+
+/// GLM target-MTP can join the speculative scheduler wave unless request
+/// semantics require the serial completion path.
+fn is_target_mtp_wave_eligible(job: &Job, depth: usize) -> bool {
+    is_wave_eligible(job)
+        && depth != 1
+        && !(depth > 0
+            && job
+                .body
+                .get("ignore_eos")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false))
 }
 
 /// Everything [`is_plain_job`] requires EXCEPT the depth clause: the features
@@ -596,7 +670,9 @@ fn is_wave_eligible(job: &Job) -> bool {
 
 /// Whether a request asked for per-token logprobs.
 fn wants_logprobs(body: &Value) -> bool {
-    body.get("logprobs").and_then(|v| v.as_bool()).unwrap_or(false)
+    body.get("logprobs")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
         || body
             .get("top_logprobs")
             .and_then(|v| v.as_u64())
@@ -604,18 +680,18 @@ fn wants_logprobs(body: &Value) -> bool {
             > 0
 }
 
-/// Serve a wave of stateless requests through the continuous-batch scheduler,
-/// streaming each request's tokens back to its own connection. `late`, when
-/// given, is polled between decode rounds: a plain request that arrives while
-/// the wave is decoding joins the live batch (continuous admission) instead of
-/// waiting for the wave to drain. Non-plain late jobs are returned to the
-/// caller for the serial paths.
+/// Serve a wave of stateless requests through the generation scheduler,
+/// streaming each request's tokens back to its own connection. `depth == 0`
+/// uses continuous batching; a positive depth uses per-request speculation.
+/// `late`, when given, is polled between plain decode rounds so eligible
+/// arrivals can join the live batch. Other late jobs return to the caller.
 fn run_wave(
     tower: &mut dyn LanguageModel,
     tok: &Tokenizer,
     jobs: Vec<Job>,
     cfg: &ServerConfig,
     tmpl: Option<&ChatTemplate>,
+    depth: usize,
     late: Option<&Receiver<Job>>,
     leftover: &mut Vec<Job>,
 ) -> anyhow::Result<()> {
@@ -645,6 +721,8 @@ fn run_wave(
     let acc: std::cell::RefCell<Vec<Vec<u32>>> = std::cell::RefCell::new(vec![Vec::new(); n]);
     let stopped: std::cell::RefCell<Vec<bool>> = std::cell::RefCell::new(vec![false; n]);
     let last: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(vec![String::new(); n]);
+    let last_reasoning: std::cell::RefCell<Vec<String>> =
+        std::cell::RefCell::new(vec![String::new(); n]);
     let stream_flags: std::cell::RefCell<Vec<bool>> =
         std::cell::RefCell::new(jobs.iter().map(|j| j.stream).collect());
     // `ignore_eos` must reach the wave's token callback: testing `is_eos` there
@@ -684,6 +762,7 @@ fn run_wave(
                         acc.borrow_mut().push(Vec::new());
                         stopped.borrow_mut().push(false);
                         last.borrow_mut().push(String::new());
+                        last_reasoning.borrow_mut().push(String::new());
                         dead.borrow_mut().push(false);
                         stream_flags.borrow_mut().push(job.stream);
                         ignore_eos_flags.borrow_mut().push(
@@ -706,42 +785,43 @@ fn run_wave(
         }
     };
 
-    lisa_engine::core::sched::run_streaming(
-        tower,
-        reqs,
-        cfg.max_batch,
-        &mut |id, t| {
-            if is_eos(t) {
-                // `ignore_eos`: EOS never ends the reply (the engine's
-                // decode_round agrees after the same fix). Skip the token — it
-                // is not part of the answer — and keep collecting.
-                if ignore_eos_flags.borrow()[id] {
-                    return Ok(());
-                }
-                stopped.borrow_mut()[id] = true;
+    let mut emit = |id: usize, t: u32| -> anyhow::Result<()> {
+        if is_eos(t) {
+            // `ignore_eos`: EOS never ends the reply (the engine's
+            // decode_round agrees after the same fix). Skip the token — it
+            // is not part of the answer — and keep collecting.
+            if ignore_eos_flags.borrow()[id] {
                 return Ok(());
             }
-            acc.borrow_mut()[id].push(t);
-            if stream_flags.borrow()[id] {
-                // Shape the streamed text the same way the serial paths do:
-                // nothing while a `<think>` block is open, the answer once it
-                // closes — never the raw scratchpad.
-                let text = tok.decode(&acc.borrow()[id])?;
-                let shown = streaming_answer(&text).to_string();
-                let mut last = last.borrow_mut();
-                if shown.len() > last[id].len() {
-                    let delta = shown[last[id].len()..].to_string();
-                    let _ = replies.borrow()[id].send(Reply::Delta {
-                        text: delta,
-                        logprobs: None,
-                    });
-                }
-                last[id] = shown;
+            stopped.borrow_mut()[id] = true;
+            return Ok(());
+        }
+        acc.borrow_mut()[id].push(t);
+        if stream_flags.borrow()[id] {
+            let text = tok.decode(&acc.borrow()[id])?;
+            let thinking = request_thinking(&jobs.borrow()[id].body, cfg);
+            let (reasoning, content) = streaming_sections(&text, thinking);
+            let reasoning = reasoning.to_string();
+            let content = content.to_string();
+            let content_delta = stream_delta(&last.borrow()[id], &content);
+            let reasoning_delta = stream_delta(&last_reasoning.borrow()[id], &reasoning);
+            if content_delta.is_some() || reasoning_delta.is_some() {
+                let _ = replies.borrow()[id].send(Reply::Delta {
+                    text: content_delta.unwrap_or_default(),
+                    reasoning: reasoning_delta,
+                    logprobs: None,
+                });
             }
-            Ok(())
-        },
-        &mut next,
-    )?;
+            last.borrow_mut()[id] = content;
+            last_reasoning.borrow_mut()[id] = reasoning;
+        }
+        Ok(())
+    };
+    if depth == 0 {
+        lisa_engine::core::sched::run_streaming(tower, reqs, cfg.max_batch, &mut emit, &mut next)?;
+    } else {
+        lisa_engine::core::sched::run(tower, reqs, cfg.max_batch, depth, &mut emit)?;
+    }
 
     let n = jobs.borrow().len();
     for id in 0..n {
@@ -754,7 +834,24 @@ fn run_wave(
         // streamed reply and a non-streamed one carry identical content and
         // reasoning.
         let full = tok.decode(&acc.borrow()[id])?;
-        let (reasoning, content) = split_reasoning(&full);
+        let thinking = request_thinking(&jobs.borrow()[id].body, cfg);
+        let (reasoning, content) = split_reasoning_for_request(&full, thinking);
+        if stream_flags.borrow()[id] {
+            // Reconcile against the same request-mode parser used while
+            // streaming. Completed-response shaping may classify a late
+            // `</think>` marker differently; a stream cannot retract text
+            // already sent in DS4's text mode.
+            let (stream_reasoning, stream_content) = streaming_reply_sections(&full, thinking, &[]);
+            let content_delta = stream_delta(&last.borrow()[id], &stream_content);
+            let reasoning_delta = stream_delta(&last_reasoning.borrow()[id], &stream_reasoning);
+            if content_delta.is_some() || reasoning_delta.is_some() {
+                let _ = replies.borrow()[id].send(Reply::Delta {
+                    text: content_delta.unwrap_or_default(),
+                    reasoning: reasoning_delta,
+                    logprobs: None,
+                });
+            }
+        }
         let _ = replies.borrow()[id].send(Reply::Done {
             content,
             reasoning,
@@ -798,11 +895,15 @@ fn run_session(
     let thinking = request_thinking(&job.body, cfg);
     let new_str = render_prompt(tmpl, &messages, true, &tools, thinking)?;
 
-    let (mut sess, mut conversation) = sessions.remove(&sid).unwrap_or_else(|| {
-        let mut s = Session::new(tower);
-        s.enable_snapshots();
-        (s, Vec::new())
-    });
+    let (mut sess, mut conversation) = sessions
+        .remove(&sid)
+        .filter(|(session, _)| session.is_valid())
+        .unwrap_or_else(|| {
+            let mut s = Session::new(tower);
+            s.enable_snapshots();
+            (s, Vec::new())
+        });
+    sess.ensure_valid()?;
     // Cross-request prefix cache: a brand-new session whose prompt extends a
     // cached prompt token-exactly resumes at the split point.
     let ids_full = tok.encode(&new_str, false)?;
@@ -837,9 +938,15 @@ fn run_session(
             .ok()
             .and_then(|prefix| new_str.strip_prefix(&prefix).map(|r| r.to_string()))
             .filter(|r| !r.is_empty())
-            // The assistant turn's closing newline lives in the stripped
-            // prefix but not in the cached tokens; carry it over.
-            .map(|rest| tok.encode(&format!("\n{rest}"), false))
+            // The canonical GLM template has no newline between turns, and
+            // DS4's rendered prompt reuses that exact boundary. Other model
+            // templates can leave a closing assistant newline outside the
+            // cached token prefix, so preserve the historical separator for
+            // those formats only.
+            .map(|rest| {
+                let suffix = session_suffix_text(&new_str, &rest);
+                tok.encode(&suffix, false)
+            })
             .transpose()?
     } else {
         None
@@ -874,10 +981,12 @@ fn run_session(
         }
     };
     anyhow::ensure!(!suffix.is_empty(), "session request has no new tokens");
+    sess.set_target_mtp_eos_policy(TargetMtpEosPolicy::StopBeforeVerified);
 
     let max_tokens = request_max_tokens(job, cfg);
     let mut sampler = sampler_from(&job.body, cfg);
-    let greedy = sampler.greedy();
+    let greedy = !tower.has_target_mtp() && sampler.greedy() && !sampler.mtp_exact_sampling;
+    let dsml_tools = !tools.is_empty() && tower.has_target_mtp();
     let streaming = job.stream;
     if streaming {
         let _ = job.reply.send(Reply::Start {
@@ -897,12 +1006,10 @@ fn run_session(
         .get("ignore_eos")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let im_end = tok.im_end_ids.clone();
-    if ignore_eos {
-        lisa_engine::core::generate::set_eos_ids(Vec::new());
-    }
+    let _eos_scope = ignore_eos.then(lisa_engine::core::generate::ignore_eos_scope);
     let mut acc: Vec<u32> = Vec::new();
     let mut last = String::new();
+    let mut last_reasoning = String::new();
     let hit_stop = std::cell::Cell::new(false);
     let mut emit = |t: u32| -> anyhow::Result<()> {
         if is_eos(t) {
@@ -916,41 +1023,104 @@ fn run_session(
                 .any(|s| !s.is_empty() && text.contains(s.as_str()))
             {
                 hit_stop.set(true);
+                if streaming {
+                    // DS4 emits the safe prefix before ending the stream when
+                    // a text stop is found. The normal holdback path runs
+                    // after this check, so flush the trimmed prefix here.
+                    let (reasoning, content) = streaming_reply_sections(&text, thinking, &stops);
+                    let content_delta = stream_delta(&last, &content);
+                    let reasoning_delta = stream_delta(&last_reasoning, &reasoning);
+                    if content_delta.is_some() || reasoning_delta.is_some() {
+                        let _ = reply.send(Reply::Delta {
+                            text: content_delta.unwrap_or_default(),
+                            reasoning: reasoning_delta,
+                            logprobs: None,
+                        });
+                    }
+                    last = content;
+                    last_reasoning = reasoning;
+                }
                 return Err(anyhow::anyhow!("stop sequence"));
             }
         }
         if streaming {
             let text = tok.decode(&acc)?;
-            let ans = streaming_answer(&text);
-            let shown = match tool_call_start(ans) {
-                Some(i) => ans[..i].to_string(),
-                None => ans.to_string(),
+            let safe_len = streaming_stop_safe_len(&text, &stops);
+            let (reasoning, answer) = streaming_sections(&text[..safe_len], thinking);
+            let shown = match tool_call_start(answer) {
+                Some(i) => answer[..i].to_string(),
+                None => answer.to_string(),
             };
-            if let Some(delta) = stream_delta(&last, &shown) {
+            let content_delta = stream_delta(&last, &shown);
+            let reasoning_delta = stream_delta(&last_reasoning, reasoning);
+            if content_delta.is_some() || reasoning_delta.is_some() {
                 let _ = reply.send(Reply::Delta {
-                    text: delta,
+                    text: content_delta.unwrap_or_default(),
+                    reasoning: reasoning_delta,
                     logprobs: None,
                 });
             }
             last = shown;
+            last_reasoning = reasoning.to_string();
+        }
+        if dsml_tools && dsml_decode_state(&tok.decode(&acc)?, thinking) == DsmlDecodeState::Done {
+            hit_stop.set(true);
+            return Err(anyhow::anyhow!("tool call complete"));
         }
         Ok(())
     };
     // Snapshot the full prompt at the clean boundary (prompt fed, nothing
     // decoded) so later requests sharing it resume there.
+    let explicit_cache_law = tower.cache_numerical_law();
     let mut after_prefill = |caches: &[lisa_engine::core::cache::LayerCache]| {
-        prefix.insert(&ids_full, caches);
+        let cache_law = explicit_cache_law.unwrap_or_else(lisa_mlx::runtime::kernel_law);
+        prefix.insert_with_law(cache_law, &ids_full, caches);
     };
     let generated = if depth > 0 {
         let md = mtp_depth(depth, tower);
-        sess.generate_mtp_depth(
+        if dsml_tools {
+            let mut sampling_tokens = Vec::new();
+            let mut on_token_with_mode = |token| {
+                emit(token)?;
+                sampling_tokens.push(token);
+                let output = tok.decode(&sampling_tokens)?;
+                Ok(dsml_sampling_mode(&output, thinking))
+            };
+            sess.generate_mtp_depth_with_sampling_mode(
+                tower,
+                &suffix,
+                max_tokens,
+                md,
+                Some(&mut after_prefill),
+                if greedy { None } else { Some(&mut sampler) },
+                &mut on_token_with_mode,
+            )
+        } else {
+            sess.generate_mtp_depth(
+                tower,
+                &suffix,
+                max_tokens,
+                md,
+                Some(&mut after_prefill),
+                if greedy { None } else { Some(&mut sampler) },
+                &mut emit,
+            )
+        }
+    } else if dsml_tools {
+        let mut sampling_tokens = Vec::new();
+        let mut on_token_with_mode = |token| {
+            emit(token)?;
+            sampling_tokens.push(token);
+            let output = tok.decode(&sampling_tokens)?;
+            Ok(dsml_sampling_mode(&output, thinking))
+        };
+        sess.generate_with_sampling_mode(
             tower,
             &suffix,
             max_tokens,
-            md,
+            &mut sampler,
             Some(&mut after_prefill),
-            if greedy { None } else { Some(&mut sampler) },
-            &mut emit,
+            &mut on_token_with_mode,
         )
     } else {
         sess.generate(
@@ -965,15 +1135,32 @@ fn run_session(
     };
     let generated = match generated {
         Ok(g) => g,
-        Err(_) if hit_stop.get() => Vec::new(),
+        Err(_) if hit_stop.get() => {
+            // A callback stop can leave the last visible token unfed or a
+            // verified suffix discarded. Rebuild from the next full prompt.
+            sess.invalidate();
+            Vec::new()
+        }
         Err(e) => return Err(e),
     };
-    if ignore_eos {
-        lisa_engine::core::generate::set_eos_ids(im_end);
-    }
     let stopped = generated.last().map(|&t| is_eos(t)).unwrap_or(false);
     let full = tok.decode(&acc)?;
-    let (content, reasoning, tool_calls) = shape_reply(&full, &tools, parallel, &stops);
+    let (content, reasoning, tool_calls) = shape_reply(&full, &tools, parallel, &stops, thinking);
+    if streaming {
+        // Completed-response shaping can reinterpret a late `</think>`
+        // marker, but an SSE stream cannot retract its earlier text-mode
+        // deltas. Reconcile with the incremental parser's final state.
+        let (stream_reasoning, stream_content) = streaming_reply_sections(&full, thinking, &stops);
+        let content_delta = stream_delta(&last, &stream_content);
+        let reasoning_delta = stream_delta(&last_reasoning, &stream_reasoning);
+        if content_delta.is_some() || reasoning_delta.is_some() {
+            let _ = reply.send(Reply::Delta {
+                text: content_delta.unwrap_or_default(),
+                reasoning: reasoning_delta,
+                logprobs: None,
+            });
+        }
+    }
 
     // Track the conversation including this assistant turn.
     conversation = messages.clone();
@@ -985,7 +1172,9 @@ fn run_session(
         tool_call_id: None,
         parts: None,
     });
-    sessions.insert(sid, (sess, conversation));
+    if sess.is_valid() {
+        sessions.insert(sid, (sess, conversation));
+    }
     let finish = if !tool_calls.is_empty() {
         "tool_calls"
     } else if stopped || hit_stop.get() {
@@ -1029,6 +1218,21 @@ fn common_prefix(a: &[u32], b: &[u32]) -> usize {
     i
 }
 
+fn models_payload(id: &str) -> Value {
+    json!({
+        "object": "list",
+        "data": [{
+            "id": id,
+            "object": "model",
+            "owned_by": "lisa",
+            "architecture": {
+                "input_modalities": ["text"],
+                "output_modalities": ["text"]
+            }
+        }]
+    })
+}
+
 fn handle_conn(mut stream: TcpStream, tx: Sender<Job>, cfg: &ServerConfig) -> anyhow::Result<()> {
     let req = match read_request(&mut stream) {
         Ok(Some(r)) => r,
@@ -1058,10 +1262,7 @@ fn handle_conn(mut stream: TcpStream, tx: Sender<Job>, cfg: &ServerConfig) -> an
         );
     }
     if method == "GET" && path.starts_with("/v1/models") {
-        let payload = json!({
-            "object": "list",
-            "data": [{ "id": model_id(), "object": "model", "owned_by": "lisa" }]
-        });
+        let payload = models_payload(model_id());
         return write_response(
             &mut stream,
             "200 OK",
@@ -1338,14 +1539,21 @@ fn drain_reply(rx: Receiver<Reply>) -> anyhow::Result<ReplyData> {
 /// lisa-engine's sampler so this crate doesn't depend on the tensor runtime.
 use lisa_engine::sampler::token_logprob;
 
+fn prompt_tokens_details_json(prompt_tokens: usize, cached_tokens: usize) -> Value {
+    let cached_tokens = cached_tokens.min(prompt_tokens);
+    let cache_write_tokens = prompt_tokens.saturating_sub(cached_tokens);
+    json!({
+        "cached_tokens": cached_tokens,
+        "cache_write_tokens": cache_write_tokens,
+    })
+}
+
 fn usage_json(prompt_tokens: usize, completion_tokens: usize, cached_tokens: usize) -> Value {
     json!({
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
-        // OpenAI-standard detail: the only way a client can SEE that a
-        // cross-request prefix cache engaged (llmprobe's benchmark reads it —
-        // without it the cache reads as "not detected" however well it works).
-        "prompt_tokens_details": { "cached_tokens": cached_tokens },
+        // Match DS4's cache accounting and expose prefix-cache hits to clients.
+        "prompt_tokens_details": prompt_tokens_details_json(prompt_tokens, cached_tokens),
         "total_tokens": prompt_tokens + completion_tokens,
     })
 }
@@ -1412,7 +1620,8 @@ fn collect_surface(
     let d = match drain_reply(rx) {
         Ok(d) => d,
         Err(e) => {
-            let payload = json!({"error": {"message": error_message_for(&e), "type": "engine_error"}});
+            let payload =
+                json!({"error": {"message": error_message_for(&e), "type": "engine_error"}});
             return write_response(
                 stream,
                 http_status_for(&e),
@@ -1590,7 +1799,7 @@ fn responses_payload_with_id(d: &ReplyData, id: &str) -> Value {
         "input_tokens": d.prompt_tokens,
         "output_tokens": d.completion_tokens,
         "total_tokens": d.prompt_tokens + d.completion_tokens,
-        "input_tokens_details": { "cached_tokens": 0 },
+        "input_tokens_details": prompt_tokens_details_json(d.prompt_tokens, d.cached_tokens),
         "output_tokens_details": { "reasoning_tokens": 0 },
     });
     if incomplete {
@@ -1632,7 +1841,8 @@ fn collect_choices(
         let d = match drain_reply(rrx) {
             Ok(d) => d,
             Err(e) => {
-                let payload = json!({"error": {"message": error_message_for(&e), "type": "engine_error"}});
+                let payload =
+                    json!({"error": {"message": error_message_for(&e), "type": "engine_error"}});
                 return write_response(
                     stream,
                     http_status_for(&e),
@@ -1725,10 +1935,22 @@ fn stream_chat(
     for reply in rx {
         match reply {
             Reply::Start { .. } => {}
-            Reply::Delta { text, logprobs } => write_sse(
-                stream,
-                &chunk(json!({"content": text}), Value::Null, logprobs),
-            )?,
+            Reply::Delta {
+                text,
+                reasoning,
+                logprobs,
+            } => {
+                let mut delta = json!({});
+                if !text.is_empty() || logprobs.is_some() {
+                    delta["content"] = json!(text);
+                }
+                if let Some(reasoning) = reasoning {
+                    delta["reasoning_content"] = json!(reasoning);
+                }
+                if !delta.as_object().map_or(true, |object| object.is_empty()) {
+                    write_sse(stream, &chunk(delta, Value::Null, logprobs))?;
+                }
+            }
             Reply::Done {
                 finish,
                 tool_calls,
@@ -1883,6 +2105,7 @@ fn stream_messages(stream: &mut TcpStream, rx: Receiver<Reply>) -> anyhow::Resul
     let mut started = false;
     let mut block_index = 0usize;
     let mut text_started = false;
+    let mut thinking_started = false;
     for reply in rx {
         match reply {
             Reply::Start { prompt_tokens } => {
@@ -1907,31 +2130,73 @@ fn stream_messages(stream: &mut TcpStream, rx: Receiver<Reply>) -> anyhow::Resul
                     )?;
                 }
             }
-            Reply::Delta { text, .. } => {
-                if text.is_empty() {
-                    continue;
-                }
-                if !text_started {
+            Reply::Delta {
+                text, reasoning, ..
+            } => {
+                if let Some(reasoning) = reasoning.filter(|r| !r.is_empty()) {
+                    if text_started {
+                        sse_event(
+                            stream,
+                            Some("content_block_stop"),
+                            &json!({ "type": "content_block_stop", "index": block_index }),
+                        )?;
+                        block_index += 1;
+                        text_started = false;
+                    }
+                    if !thinking_started {
+                        sse_event(
+                            stream,
+                            Some("content_block_start"),
+                            &json!({
+                                "type": "content_block_start",
+                                "index": block_index,
+                                "content_block": { "type": "thinking", "thinking": "" },
+                            }),
+                        )?;
+                        thinking_started = true;
+                    }
                     sse_event(
                         stream,
-                        Some("content_block_start"),
+                        Some("content_block_delta"),
                         &json!({
-                            "type": "content_block_start",
+                            "type": "content_block_delta",
                             "index": block_index,
-                            "content_block": { "type": "text", "text": "" },
+                            "delta": { "type": "thinking_delta", "thinking": reasoning },
                         }),
                     )?;
-                    text_started = true;
                 }
-                sse_event(
-                    stream,
-                    Some("content_block_delta"),
-                    &json!({
-                        "type": "content_block_delta",
-                        "index": block_index,
-                        "delta": { "type": "text_delta", "text": text },
-                    }),
-                )?;
+                if !text.is_empty() {
+                    if thinking_started {
+                        sse_event(
+                            stream,
+                            Some("content_block_stop"),
+                            &json!({ "type": "content_block_stop", "index": block_index }),
+                        )?;
+                        block_index += 1;
+                        thinking_started = false;
+                    }
+                    if !text_started {
+                        sse_event(
+                            stream,
+                            Some("content_block_start"),
+                            &json!({
+                                "type": "content_block_start",
+                                "index": block_index,
+                                "content_block": { "type": "text", "text": "" },
+                            }),
+                        )?;
+                        text_started = true;
+                    }
+                    sse_event(
+                        stream,
+                        Some("content_block_delta"),
+                        &json!({
+                            "type": "content_block_delta",
+                            "index": block_index,
+                            "delta": { "type": "text_delta", "text": text },
+                        }),
+                    )?;
+                }
             }
             Reply::Done {
                 finish,
@@ -1939,7 +2204,7 @@ fn stream_messages(stream: &mut TcpStream, rx: Receiver<Reply>) -> anyhow::Resul
                 completion_tokens,
                 ..
             } => {
-                if text_started {
+                if text_started || thinking_started {
                     sse_event(
                         stream,
                         Some("content_block_stop"),
@@ -2058,11 +2323,54 @@ fn stream_responses(
         }),
     )?;
     let item_id = format!("msg_{:x}", now());
+    let reasoning_item_id = format!("rs_{:x}", now());
+    let mut reasoning_started = false;
     let mut text_started = false;
     for reply in rx {
         match reply {
             Reply::Start { .. } => {}
-            Reply::Delta { text, .. } => {
+            Reply::Delta {
+                text, reasoning, ..
+            } => {
+                if let Some(reasoning) = reasoning.filter(|r| !r.is_empty()) {
+                    if !reasoning_started {
+                        reasoning_started = true;
+                        sse_event(
+                            stream,
+                            None,
+                            &json!({
+                                "type": "response.output_item.added",
+                                "sequence_number": next_seq(),
+                                "output_index": 0,
+                                "item": {
+                                    "type": "reasoning", "id": reasoning_item_id,
+                                    "status": "in_progress", "summary": []
+                                }
+                            }),
+                        )?;
+                        sse_event(
+                            stream,
+                            None,
+                            &json!({
+                                "type": "response.reasoning_summary_part.added",
+                                "sequence_number": next_seq(),
+                                "item_id": reasoning_item_id, "output_index": 0,
+                                "summary_index": 0,
+                                "part": { "type": "summary_text", "text": "" }
+                            }),
+                        )?;
+                    }
+                    sse_event(
+                        stream,
+                        None,
+                        &json!({
+                            "type": "response.reasoning_summary_text.delta",
+                            "sequence_number": next_seq(),
+                            "item_id": reasoning_item_id, "output_index": 0,
+                            "summary_index": 0, "delta": reasoning
+                        }),
+                    )?;
+                }
                 if text.is_empty() {
                     continue;
                 }
@@ -2074,7 +2382,7 @@ fn stream_responses(
                         &json!({
                             "type": "response.output_item.added",
                             "sequence_number": next_seq(),
-                            "output_index": 0,
+                            "output_index": usize::from(reasoning_started),
                             "item": {
                                 "type": "message", "id": item_id, "status": "in_progress",
                                 "role": "assistant", "content": []
@@ -2087,7 +2395,7 @@ fn stream_responses(
                         &json!({
                             "type": "response.content_part.added",
                             "sequence_number": next_seq(),
-                            "item_id": item_id, "output_index": 0, "content_index": 0,
+                            "item_id": item_id, "output_index": usize::from(reasoning_started), "content_index": 0,
                             "part": { "type": "output_text", "text": "", "annotations": [] }
                         }),
                     )?;
@@ -2098,7 +2406,7 @@ fn stream_responses(
                     &json!({
                         "type": "response.output_text.delta",
                         "sequence_number": next_seq(),
-                        "item_id": item_id, "output_index": 0, "content_index": 0,
+                        "item_id": item_id, "output_index": usize::from(reasoning_started), "content_index": 0,
                         "delta": text
                     }),
                 )?;
@@ -2116,7 +2424,7 @@ fn stream_responses(
             } => {
                 let d = ReplyData {
                     content: content.clone(),
-                    reasoning,
+                    reasoning: reasoning.clone(),
                     tool_calls: tool_calls.clone(),
                     prompt_tokens,
                     completion_tokens,
@@ -2125,25 +2433,27 @@ fn stream_responses(
                     logprobs,
                     stop_sequence,
                 };
-                if text_started {
+                if reasoning_started {
+                    let text = reasoning.as_deref().unwrap_or("");
                     sse_event(
                         stream,
                         None,
                         &json!({
-                            "type": "response.output_text.done",
+                            "type": "response.reasoning_summary_text.done",
                             "sequence_number": next_seq(),
-                            "item_id": item_id, "output_index": 0, "content_index": 0,
-                            "text": content
+                            "item_id": reasoning_item_id, "output_index": 0,
+                            "summary_index": 0, "text": text
                         }),
                     )?;
                     sse_event(
                         stream,
                         None,
                         &json!({
-                            "type": "response.content_part.done",
+                            "type": "response.reasoning_summary_part.done",
                             "sequence_number": next_seq(),
-                            "item_id": item_id, "output_index": 0, "content_index": 0,
-                            "part": { "type": "output_text", "text": content, "annotations": [] }
+                            "item_id": reasoning_item_id, "output_index": 0,
+                            "summary_index": 0,
+                            "part": { "type": "summary_text", "text": text }
                         }),
                     )?;
                     sse_event(
@@ -2154,6 +2464,42 @@ fn stream_responses(
                             "sequence_number": next_seq(),
                             "output_index": 0,
                             "item": {
+                                "type": "reasoning", "id": reasoning_item_id,
+                                "status": "completed",
+                                "summary": [{ "type": "summary_text", "text": text }]
+                            }
+                        }),
+                    )?;
+                }
+                if text_started {
+                    sse_event(
+                        stream,
+                        None,
+                        &json!({
+                            "type": "response.output_text.done",
+                            "sequence_number": next_seq(),
+                            "item_id": item_id, "output_index": usize::from(reasoning_started), "content_index": 0,
+                            "text": content
+                        }),
+                    )?;
+                    sse_event(
+                        stream,
+                        None,
+                        &json!({
+                            "type": "response.content_part.done",
+                            "sequence_number": next_seq(),
+                            "item_id": item_id, "output_index": usize::from(reasoning_started), "content_index": 0,
+                            "part": { "type": "output_text", "text": content, "annotations": [] }
+                        }),
+                    )?;
+                    sse_event(
+                        stream,
+                        None,
+                        &json!({
+                            "type": "response.output_item.done",
+                            "sequence_number": next_seq(),
+                            "output_index": usize::from(reasoning_started),
+                            "item": {
                                 "type": "message", "id": item_id, "status": "completed",
                                 "role": "assistant",
                                 "content": [{ "type": "output_text", "text": content, "annotations": [] }]
@@ -2161,7 +2507,7 @@ fn stream_responses(
                         }),
                     )?;
                 }
-                let base = if text_started { 1 } else { 0 };
+                let base = usize::from(reasoning_started) + usize::from(text_started);
                 for (i, c) in tool_calls.iter().enumerate() {
                     let idx = base + i;
                     let call_id = c.get("id").cloned().unwrap_or(json!(""));
@@ -2654,7 +3000,8 @@ fn collect_count_tokens(stream: &mut TcpStream, rx: Receiver<Reply>) -> anyhow::
     let d = match drain_reply(rx) {
         Ok(d) => d,
         Err(e) => {
-            let payload = json!({"error": {"message": error_message_for(&e), "type": "engine_error"}});
+            let payload =
+                json!({"error": {"message": error_message_for(&e), "type": "engine_error"}});
             return write_response(
                 stream,
                 http_status_for(&e),
@@ -2721,10 +3068,7 @@ fn complete(
         .get("ignore_eos")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let im_end = tok.im_end_ids.clone();
-    if ignore_eos {
-        lisa_engine::core::generate::set_eos_ids(Vec::new());
-    }
+    let _eos_scope = ignore_eos.then(lisa_engine::core::generate::ignore_eos_scope);
     // Raw completions never get a think-prompt (parity with the old
     // surface-gated resolution); explicit enable_thinking there is ignored.
     let thinking = job.surface != Surface::Completions && request_thinking(&job.body, cfg);
@@ -2757,7 +3101,8 @@ fn complete(
         }
     };
     let mut sampler = sampler_from(&job.body, cfg);
-    let greedy = sampler.greedy();
+    let greedy = !tower.has_target_mtp() && sampler.greedy() && !sampler.mtp_exact_sampling;
+    let dsml_tools = !tools.is_empty() && tower.has_target_mtp();
     let streaming = job.stream;
     if streaming {
         let _ = job.reply.send(Reply::Start {
@@ -2778,6 +3123,7 @@ fn complete(
             > 0;
     let mut collected: Vec<u32> = Vec::new();
     let mut last_text = String::new();
+    let mut last_reasoning = String::new();
     let reply = job.reply.clone();
     let hit_stop = std::cell::Cell::new(false);
     let mut lp_entries: Vec<Value> = Vec::new();
@@ -2798,6 +3144,8 @@ fn complete(
     } else {
         Session::new(tower)
     };
+    session.ensure_valid()?;
+    session.set_target_mtp_eos_policy(TargetMtpEosPolicy::StopBeforeVerified);
     let mut prefeed: Option<Vec<u32>> = None;
     // Populate the cache BEFORE generation, with the boundary one token short
     // of the prompt end. `PrefixCache::lookup` serves only STRICT extensions
@@ -2820,13 +3168,23 @@ fn complete(
                 let b = (ids.len() / 2048) * 2048;
                 if b > pos && b <= split {
                     session.feed(tower, &ids[pos..b])?;
-                    prefix.insert(&ids[..b], &session.caches);
+                    session.ensure_valid()?;
+                    prefix.insert_with_law(
+                        lisa_engine::core::prefix_cache::model_numerical_law(tower),
+                        &ids[..b],
+                        &session.caches,
+                    );
                     prefeed = Some(ids[..b].to_vec());
                 }
             }
             let start = prefeed.as_ref().map_or(pos, |p| p.len());
             session.feed(tower, &ids[start..split])?;
-            prefix.insert(&ids[..split], &session.caches);
+            session.ensure_valid()?;
+            prefix.insert_with_law(
+                lisa_engine::core::prefix_cache::model_numerical_law(tower),
+                &ids[..split],
+                &session.caches,
+            );
             prefeed = Some(ids[..split].to_vec());
         }
     }
@@ -2845,28 +3203,57 @@ fn complete(
                         .any(|s| !s.is_empty() && text.contains(s.as_str()))
                     {
                         hit_stop.set(true);
+                        if streaming && json_schema.is_none() {
+                            let visible = strip_stops(&text, &stops);
+                            let (reasoning, answer) = streaming_sections(visible, thinking);
+                            let shown = match tool_call_start(answer) {
+                                Some(i) => answer[..i].to_string(),
+                                None => answer.to_string(),
+                            };
+                            let delta = stream_delta(&last_text, &shown);
+                            let reasoning_delta = stream_delta(&last_reasoning, reasoning);
+                            last_text = shown;
+                            last_reasoning = reasoning.to_string();
+                            if delta.is_some() || reasoning_delta.is_some() || lp.is_some() {
+                                let _ = reply.send(Reply::Delta {
+                                    text: delta.unwrap_or_default(),
+                                    reasoning: reasoning_delta,
+                                    logprobs: lp.map(|e| json!({ "content": [e] })),
+                                });
+                            }
+                        }
                         return Err(anyhow::anyhow!("stop sequence"));
                     }
                 }
             }
             if streaming && json_schema.is_none() {
                 let text = tok.decode(&collected)?;
-                let ans = streaming_answer(&text);
+                let safe_len = streaming_stop_safe_len(&text, &stops);
+                let (reasoning, answer) = streaming_sections(&text[..safe_len], thinking);
                 // Past a `<tool_call>` the text is not assistant content; don't stream it.
-                let shown = match tool_call_start(ans) {
-                    Some(i) => ans[..i].to_string(),
-                    None => ans.to_string(),
+                let shown = match tool_call_start(answer) {
+                    Some(i) => answer[..i].to_string(),
+                    None => answer.to_string(),
                 };
                 let delta = stream_delta(&last_text, &shown);
+                let reasoning_delta = stream_delta(&last_reasoning, reasoning);
                 last_text = shown;
+                last_reasoning = reasoning.to_string();
                 // An EOS token contributes a logprob entry but no text; stream it
                 // so the streamed logprob list matches the non-streamed one.
-                if delta.is_some() || lp.is_some() {
+                if delta.is_some() || reasoning_delta.is_some() || lp.is_some() {
                     let _ = reply.send(Reply::Delta {
                         text: delta.unwrap_or_default(),
+                        reasoning: reasoning_delta,
                         logprobs: lp.map(|e| json!({ "content": [e] })),
                     });
                 }
+            }
+            if dsml_tools
+                && dsml_decode_state(&tok.decode(&collected)?, thinking) == DsmlDecodeState::Done
+            {
+                hit_stop.set(true);
+                return Err(anyhow::anyhow!("tool call complete"));
             }
             Ok(())
         };
@@ -2876,8 +3263,15 @@ fn complete(
             let mut out: Vec<u32> = Vec::new();
             let gen_ids = unfed_prefix(&ids, resumed.as_ref(), &prefeed);
             let mut logits = session.feed(tower, &gen_ids)?;
-            loop {
-                let t = sampler.draw(&logits, &session.fed)?;
+            let mut sampling_mode = TargetMtpSamplingMode::Configured;
+            while out.len() < max_tokens {
+                let t = if dsml_tools && sampling_mode == TargetMtpSamplingMode::Greedy {
+                    Sampler::default().draw_ds4(&logits, &[])?
+                } else if tower.has_target_mtp() {
+                    sampler.draw_ds4(&logits, &session.fed)?
+                } else {
+                    sampler.draw(&logits, &session.fed)?
+                };
                 let entry = json!({
                     "token": tok.decode(&[t]).unwrap_or_default(),
                     "logprob": token_logprob(&logits, t)?,
@@ -2890,37 +3284,73 @@ fn complete(
                     Err(e) => return Err(e),
                 }
                 out.push(t);
+                if dsml_tools {
+                    sampling_mode = dsml_sampling_mode(&tok.decode(&out)?, thinking);
+                }
                 if out.len() >= max_tokens || is_eos(t) {
                     break;
                 }
-                logits = session.feed(tower, &[t])?;
+                logits = session.decode_token(tower, t)?;
             }
             Ok(out)
         } else if depth > 0 {
             let gen_ids = unfed_prefix(&ids, resumed.as_ref(), &prefeed);
             anyhow::ensure!(!gen_ids.is_empty(), "request has no new tokens");
             let md = mtp_depth(depth, tower);
-            session.generate_mtp_depth(
-                tower,
-                &gen_ids,
-                max_tokens,
-                md,
-                None,
-                if greedy { None } else { Some(&mut sampler) },
-                &mut |t| emit(t, None),
-            )
+            if dsml_tools {
+                let mut sampling_tokens = Vec::new();
+                session.generate_mtp_depth_with_sampling_mode(
+                    tower,
+                    &gen_ids,
+                    max_tokens,
+                    md,
+                    None,
+                    Some(&mut sampler),
+                    &mut |token| {
+                        emit(token, None)?;
+                        sampling_tokens.push(token);
+                        Ok(dsml_sampling_mode(&tok.decode(&sampling_tokens)?, thinking))
+                    },
+                )
+            } else {
+                session.generate_mtp_depth(
+                    tower,
+                    &gen_ids,
+                    max_tokens,
+                    md,
+                    None,
+                    if greedy { None } else { Some(&mut sampler) },
+                    &mut |t| emit(t, None),
+                )
+            }
         } else {
             let gen_ids = unfed_prefix(&ids, resumed.as_ref(), &prefeed);
             anyhow::ensure!(!gen_ids.is_empty(), "request has no new tokens");
-            session.generate(
-                tower,
-                &gen_ids,
-                max_tokens,
-                &mut sampler,
-                cfg.pld,
-                None,
-                &mut |t| emit(t, None),
-            )
+            if dsml_tools {
+                let mut sampling_tokens = Vec::new();
+                session.generate_with_sampling_mode(
+                    tower,
+                    &gen_ids,
+                    max_tokens,
+                    &mut sampler,
+                    None,
+                    &mut |token| {
+                        emit(token, None)?;
+                        sampling_tokens.push(token);
+                        Ok(dsml_sampling_mode(&tok.decode(&sampling_tokens)?, thinking))
+                    },
+                )
+            } else {
+                session.generate(
+                    tower,
+                    &gen_ids,
+                    max_tokens,
+                    &mut sampler,
+                    cfg.pld,
+                    None,
+                    &mut |t| emit(t, None),
+                )
+            }
         }
     };
     let generated = match generated {
@@ -2994,18 +3424,31 @@ fn complete(
             }
         }
         if !errors.is_empty() {
-            eprintln!("[serve] json-schema still invalid after retry: {}", errors.join("; "));
+            eprintln!(
+                "[serve] json-schema still invalid after retry: {}",
+                errors.join("; ")
+            );
         }
         (content, None, Vec::new())
     } else {
-        shape_reply(&full, &tools, parallel, &stops)
+        shape_reply(&full, &tools, parallel, &stops, thinking)
     };
-    if ignore_eos {
-        lisa_engine::core::generate::set_eos_ids(im_end);
+    if streaming && json_schema.is_none() {
+        let (stream_reasoning, stream_content) = streaming_reply_sections(&full, thinking, &stops);
+        let content_delta = stream_delta(&last_text, &stream_content);
+        let reasoning_delta = stream_delta(&last_reasoning, &stream_reasoning);
+        if content_delta.is_some() || reasoning_delta.is_some() {
+            let _ = job.reply.send(Reply::Delta {
+                text: content_delta.unwrap_or_default(),
+                reasoning: reasoning_delta,
+                logprobs: None,
+            });
+        }
     }
     if streaming && json_schema.is_some() {
         let _ = job.reply.send(Reply::Delta {
             text: content.clone(),
+            reasoning: None,
             logprobs: None,
         });
     }
@@ -3044,11 +3487,7 @@ fn complete(
 /// trunk, mean-pool the last hidden states over the sequence, L2-normalize.
 /// The OpenAI payload is serialized into `Reply::Done.content` (the surface
 /// writer hands it straight through).
-fn run_embeddings(
-    tower: &mut dyn LanguageModel,
-    tok: &Tokenizer,
-    job: &Job,
-) -> anyhow::Result<()> {
+fn run_embeddings(tower: &mut dyn LanguageModel, tok: &Tokenizer, job: &Job) -> anyhow::Result<()> {
     use lisa_mlx::Array as MlxArray;
     let inputs: Vec<String> = match job.body.get("input") {
         Some(Value::String(s)) => vec![s.clone()],
@@ -3070,10 +3509,7 @@ fn run_embeddings(
     let mut total_tokens = 0usize;
     for text in &inputs {
         let ids = tok.encode(text, false)?;
-        anyhow::ensure!(
-            !ids.is_empty(),
-            "input encoded to zero tokens: {text:?}"
-        );
+        anyhow::ensure!(!ids.is_empty(), "input encoded to zero tokens: {text:?}");
         total_tokens += ids.len();
         let arr = MlxArray::from_slice(
             &ids.iter().map(|&t| t as i32).collect::<Vec<_>>(),
@@ -3082,7 +3518,9 @@ fn run_embeddings(
         let mut caches = tower.new_caches();
         let (mixed, _multi) = tower.forward(&arr, Some(&mut caches))?;
         // mixed: [1, S, H] -> mean over S -> [1, H]
-        let pooled = mixed.mean_axis(1, false)?.as_dtype(lisa_mlx::Dtype::Float32)?;
+        let pooled = mixed
+            .mean_axis(1, false)?
+            .as_dtype(lisa_mlx::Dtype::Float32)?;
         let _ = pooled.eval();
         let host = pooled.as_slice::<f32>();
         // L2 normalization in host order (H is small).
@@ -3176,8 +3614,8 @@ impl ChatTemplate {
                 for c in &mut calls {
                     if let Some(f) = c.get_mut("function") {
                         if let Some(a) = f.get("arguments").and_then(|v| v.as_str()) {
-                            let parsed: Value = serde_json::from_str(a)
-                                .unwrap_or_else(|_| json!({}));
+                            let parsed: Value =
+                                serde_json::from_str(a).unwrap_or_else(|_| json!({}));
                             f["arguments"] = parsed;
                         }
                     }
@@ -3195,10 +3633,94 @@ impl ChatTemplate {
         input
             .extra
             .insert("preserve_thinking".to_string(), json!(true));
-        self.inner
+        let mut rendered = self
+            .inner
             .render(&input)
-            .map_err(|e| anyhow::anyhow!("chat template render: {e}"))
+            .map_err(|e| anyhow::anyhow!("chat template render: {e}"))?;
+
+        // The GLM checkpoint template defaults an absent or unsupported
+        // reasoning_effort to "Max" and emits that system instruction even
+        // when enable_thinking=false. DS4 omits the reasoning-effort system
+        // message entirely for a no-thinking request; leaving it here changes
+        // the prompt tokens and can make the model emit private reasoning as
+        // visible content. Match DS4's GLM prompt contract while preserving
+        // the checkpoint template for thinking requests and every other model.
+        const GLM_PREFIX: &str = "[gMASK]<sop>";
+        const GLM_MAX_EFFORT: &str = "<|system|>Reasoning Effort: Max";
+        if rendered.starts_with(GLM_PREFIX) {
+            normalize_glm_tool_prompt(&mut rendered, tools);
+            if !thinking {
+                let effort_start = GLM_PREFIX.len();
+                let effort_end = effort_start + GLM_MAX_EFFORT.len();
+                if rendered
+                    .get(effort_start..effort_end)
+                    .is_some_and(|text| text == GLM_MAX_EFFORT)
+                {
+                    rendered.replace_range(effort_start..effort_end, "");
+                }
+                if add_generation_prompt && rendered.ends_with("<|assistant|><think>") {
+                    rendered.push_str("</think>");
+                }
+            }
+        }
+
+        Ok(rendered)
     }
+}
+
+/// Match DS4's GLM tool-schema serialization. The checkpoint Jinja template
+/// uses Python-style `tojson` spacing inside nested values, while DS4 emits
+/// compact nested JSON and preserves only the spaces between top-level fields.
+fn ds4_glm_tool_schema_json(tool: &Value) -> Option<String> {
+    let schema = tool.get("function").unwrap_or(tool);
+    let fields = schema.as_object()?;
+    if fields
+        .get("defer_loading")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
+    let mut out = String::from("{");
+    let mut wrote = false;
+    for (key, value) in fields {
+        if key == "defer_loading" || key == "strict" {
+            continue;
+        }
+        if wrote {
+            out.push_str(", ");
+        }
+        out.push_str(&serde_json::to_string(key).ok()?);
+        out.push_str(": ");
+        out.push_str(&serde_json::to_string(value).ok()?);
+        wrote = true;
+    }
+    out.push('}');
+    Some(out)
+}
+
+fn normalize_glm_tool_prompt(rendered: &mut String, tools: &[Value]) {
+    if tools.is_empty() {
+        return;
+    }
+    // The fixed instruction text also contains the literal `<tools></tools>`;
+    // match the rendered opening tag followed by its schema newline instead.
+    let Some(start) = rendered.find("<tools>\n") else {
+        return;
+    };
+    let Some(relative_end) = rendered[start..].find("</tools>") else {
+        return;
+    };
+    let end = start + relative_end + "</tools>".len();
+
+    let schemas: Vec<String> = tools.iter().filter_map(ds4_glm_tool_schema_json).collect();
+    let replacement = if schemas.is_empty() {
+        "<tools>\n\n\n</tools>".to_string()
+    } else {
+        format!("<tools>\n\n{}\n\n\n</tools>", schemas.join("\n\n\n"))
+    };
+    rendered.replace_range(start..end, &replacement);
 }
 
 /// Render the prompt with the checkpoint template when available, else fall
@@ -3220,6 +3742,14 @@ fn render_prompt(
     Ok(tokenizer::generation_prompt(&pairs))
 }
 
+fn session_suffix_text(full_prompt: &str, rest: &str) -> String {
+    if full_prompt.starts_with("[gMASK]<sop>") {
+        rest.to_string()
+    } else {
+        format!("\n{rest}")
+    }
+}
+
 /// Close the ` thinking` block a generation prompt opened, splitting the model's
 /// raw output into (reasoning, answer). Falls back to all-content.
 fn split_reasoning(text: &str) -> (Option<String>, String) {
@@ -3227,7 +3757,9 @@ fn split_reasoning(text: &str) -> (Option<String>, String) {
     const OPEN: &str = "\u{3c}think\u{3e}";
     const CLOSE: &str = "\u{3c}/think\u{3e}";
     if let Some(idx) = text.find(CLOSE) {
-        let reasoning = text[..idx].trim().to_string();
+        let raw = &text[..idx];
+        let raw = raw.strip_prefix(OPEN).unwrap_or(raw);
+        let reasoning = raw.trim().to_string();
         let answer = text[idx + CLOSE.len()..].trim_start().to_string();
         (Some(reasoning), answer)
     } else if let Some(idx) = text.find(OPEN) {
@@ -3241,20 +3773,54 @@ fn split_reasoning(text: &str) -> (Option<String>, String) {
     }
 }
 
-/// The visible answer inside the text generated so far, for streaming. Mirrors
-/// [`split_reasoning`] so a streamed reply reassembles to the non-streamed
-/// `content`: nothing while a ` thinking` block is open, the answer once it
-/// closes, the whole text when the model never thinks.
-fn streaming_answer(text: &str) -> &str {
+/// Incremental response sections for SSE, following DS4's request-selected
+/// parser mode. With thinking disabled, raw generated text stays in content;
+/// with thinking enabled, text inside the think block goes to reasoning.
+fn streaming_sections(text: &str, thinking_enabled: bool) -> (&str, &str) {
     const OPEN: &str = "\u{3c}think\u{3e}";
     const CLOSE: &str = "\u{3c}/think\u{3e}";
+    // DS4 selects the streaming parser mode from the request's thinking
+    // setting. In text mode, an incidental closing marker does not switch
+    // already-streamed content into reasoning after the fact.
+    if !thinking_enabled {
+        return ("", text);
+    }
     if let Some(idx) = text.find(CLOSE) {
-        return &text[idx + CLOSE.len()..];
+        let raw = &text[..idx];
+        let reasoning = raw.strip_prefix(OPEN).unwrap_or(raw);
+        return (reasoning, &text[idx + CLOSE.len()..]);
     }
     if let Some(idx) = text.find(OPEN) {
-        return &text[..idx];
+        return (&text[idx + OPEN.len()..], &text[..idx]);
     }
-    text
+    (text, "")
+}
+
+/// Final visible sections for an SSE stream. Keep this aligned with the
+/// incremental parser: once text mode emitted a prefix, completed-response
+/// shaping cannot retroactively move it into `reasoning_content`.
+fn streaming_reply_sections(
+    full: &str,
+    thinking_enabled: bool,
+    stops: &[String],
+) -> (String, String) {
+    let text = strip_stops(full, stops);
+    let (reasoning, answer) = streaming_sections(text, thinking_enabled);
+    let content = match tool_call_start(answer) {
+        Some(i) => &answer[..i],
+        None => answer,
+    };
+    (reasoning.to_string(), content.to_string())
+}
+
+/// Split a completed response according to the requested thinking mode.
+/// An unclosed thinking block is reasoning, never user-visible answer text.
+fn split_reasoning_for_request(text: &str, thinking_enabled: bool) -> (Option<String>, String) {
+    if thinking_enabled && !text.contains("</think>") {
+        let reasoning = text.strip_prefix("<think>").unwrap_or(text);
+        return (Some(reasoning.trim().to_string()), String::new());
+    }
+    split_reasoning(text)
 }
 
 /// Delta to append so a partially-streamed reply grows to `cur`. Decoding a
@@ -3273,6 +3839,25 @@ fn stream_delta(prev: &str, cur: &str) -> Option<String> {
         n += a.len_utf8();
     }
     Some(cur[n..].to_string())
+}
+
+/// Keep a suffix large enough that a stop string cannot begin in already-sent
+/// text and finish in a later token. This mirrors DS4's byte-based streaming
+/// holdback while ensuring the returned Rust string slice ends on a UTF-8
+/// boundary.
+fn streaming_stop_safe_len(text: &str, stops: &[String]) -> usize {
+    let hold = stops
+        .iter()
+        .filter(|stop| !stop.is_empty())
+        .map(String::len)
+        .max()
+        .unwrap_or(0)
+        .saturating_sub(1);
+    let mut safe_len = text.len().saturating_sub(hold);
+    while !text.is_char_boundary(safe_len) {
+        safe_len -= 1;
+    }
+    safe_len
 }
 
 /// Split a generated reply into visible content and OpenAI-style `tool_calls`,
@@ -3350,6 +3935,44 @@ fn parse_tool_call(
     body: &str,
     types: &std::collections::HashMap<String, std::collections::HashMap<String, String>>,
 ) -> Value {
+    if body.contains("<arg_key>") {
+        let Some((raw_name, _)) = body.split_once("<arg_key>") else {
+            unreachable!();
+        };
+        let name = raw_name.trim();
+        let mut qwen_form = format!("<function={name}>");
+        let mut rest = body;
+        loop {
+            let Some(start) = rest.find("<arg_key>") else {
+                break;
+            };
+            rest = &rest[start + "<arg_key>".len()..];
+            let Some((key, after_key)) = rest.split_once("</arg_key>") else {
+                break;
+            };
+            let Some(value_start) = after_key.find("<arg_value>") else {
+                break;
+            };
+            let value_start = value_start + "<arg_value>".len();
+            let after_value_start = &after_key[value_start..];
+            let (value, after_value) = match after_value_start.split_once("</arg_value>") {
+                Some((value, after)) => (value, Some(after)),
+                None => (after_value_start, None),
+            };
+            qwen_form.push_str("<parameter=");
+            qwen_form.push_str(key.trim());
+            qwen_form.push('>');
+            qwen_form.push_str(value.trim());
+            qwen_form.push_str("</parameter>");
+            match after_value {
+                Some(after) => rest = after,
+                None => break,
+            }
+        }
+        qwen_form.push_str("</function>");
+        return parse_tool_call(&qwen_form, types);
+    }
+
     // Name comes from `<function=NAME>` or, for JSON-form calls, `"name"`.
     let mut name = body
         .split_once("<function=")
@@ -3661,6 +4284,105 @@ fn tool_call_start(text: &str) -> Option<usize> {
     text.find("<tool_call>")
 }
 
+/// Match ds4's live GLM/Qwen DSML sampling boundary. Structural tool syntax is
+/// sampled greedily; parameter bodies use the request's configured sampler.
+fn dsml_sampling_mode(output: &str, thinking_enabled: bool) -> TargetMtpSamplingMode {
+    match dsml_decode_state(output, thinking_enabled) {
+        DsmlDecodeState::Greedy => TargetMtpSamplingMode::Greedy,
+        DsmlDecodeState::Configured | DsmlDecodeState::Done => TargetMtpSamplingMode::Configured,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DsmlDecodeState {
+    Configured,
+    Greedy,
+    Done,
+}
+
+fn dsml_decode_state(output: &str, thinking_enabled: bool) -> DsmlDecodeState {
+    const THINK_END: &str = "</think>";
+    const TOOL_OPEN: &str = "<tool_call>";
+    const TOOL_CLOSE: &str = "</tool_call>";
+    const GLM_VALUE_OPEN: &str = "<arg_value>";
+    const GLM_VALUE_CLOSE: &str = "</arg_value>";
+    const QWEN_VALUE_OPEN: &str = "<parameter=";
+    const QWEN_VALUE_CLOSE: &str = "</parameter>";
+    const QWEN_VALUE_OPEN_ALT: &str = "<parameter ";
+
+    fn partial_suffix_len(text: &str, literal: &str) -> usize {
+        let max = text.len().min(literal.len().saturating_sub(1));
+        (1..=max)
+            .rev()
+            .find(|&len| text.ends_with(&literal[..len]))
+            .unwrap_or(0)
+    }
+
+    let mut pos = 0usize;
+    if thinking_enabled {
+        let Some(end) = output.find(THINK_END) else {
+            return DsmlDecodeState::Configured;
+        };
+        pos = end + THINK_END.len();
+    }
+
+    let mut structural = false;
+    let mut payload_close: Option<&str> = None;
+    while pos < output.len() {
+        if let Some(close) = payload_close {
+            if let Some(relative) = output[pos..].find(close) {
+                pos += relative + close.len();
+                payload_close = None;
+                structural = true;
+                continue;
+            }
+            return if partial_suffix_len(&output[pos..], close) >= 2 {
+                DsmlDecodeState::Greedy
+            } else {
+                DsmlDecodeState::Configured
+            };
+        }
+
+        if !structural {
+            if let Some(relative) = output[pos..].find(TOOL_OPEN) {
+                pos += relative + TOOL_OPEN.len();
+                structural = true;
+                continue;
+            }
+            return DsmlDecodeState::Configured;
+        }
+
+        let tail = &output[pos..];
+        if tail.starts_with(TOOL_CLOSE) {
+            return DsmlDecodeState::Done;
+        }
+        if tail.starts_with(GLM_VALUE_OPEN) {
+            pos += GLM_VALUE_OPEN.len();
+            payload_close = Some(GLM_VALUE_CLOSE);
+            continue;
+        }
+        if tail.starts_with(QWEN_VALUE_OPEN) || tail.starts_with(QWEN_VALUE_OPEN_ALT) {
+            let Some(end) = tail.find('>') else {
+                return DsmlDecodeState::Greedy;
+            };
+            pos += end + 1;
+            payload_close = Some(QWEN_VALUE_CLOSE);
+            continue;
+        }
+
+        let ch = tail.chars().next().expect("non-empty structural tail");
+        pos += ch.len_utf8();
+    }
+
+    if payload_close.is_some() {
+        DsmlDecodeState::Configured
+    } else if structural {
+        DsmlDecodeState::Greedy
+    } else {
+        DsmlDecodeState::Configured
+    }
+}
+
 fn parse_messages(body: &Value) -> anyhow::Result<Vec<ChatMessage>> {
     let mut out: Vec<ChatMessage> = Vec::new();
     let as_content = |m: &Value| -> String {
@@ -3804,9 +4526,10 @@ fn shape_reply(
     tools: &[Value],
     parallel: bool,
     stops: &[String],
+    thinking_enabled: bool,
 ) -> (String, Option<String>, Vec<Value>) {
     let text = strip_stops(full, stops);
-    let (reasoning, answer) = split_reasoning(text);
+    let (reasoning, answer) = split_reasoning_for_request(text, thinking_enabled);
     if tools.is_empty() {
         (answer, reasoning, Vec::new())
     } else {
@@ -4120,9 +4843,17 @@ fn sampler_from(body: &Value, cfg: &ServerConfig) -> Sampler {
             .or(generation)
             .unwrap_or(d)
     };
-    let seed = body.get("seed").and_then(|v| v.as_u64()).unwrap_or(0x9E37_79B9_7F4A_7C15);
+    let seed = body
+        .get("seed")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0x9E37_79B9_7F4A_7C15);
     Sampler {
-        temperature: f("temperature", cfg.temperature, cfg.gen_defaults.temperature, 0.0),
+        temperature: f(
+            "temperature",
+            cfg.temperature,
+            cfg.gen_defaults.temperature,
+            0.0,
+        ),
         top_k: u("top_k", cfg.top_k, cfg.gen_defaults.top_k, 0),
         top_p: f("top_p", cfg.top_p, cfg.gen_defaults.top_p, 1.0),
         min_p: f("min_p", cfg.min_p, None, 0.0),
@@ -4132,6 +4863,7 @@ fn sampler_from(body: &Value, cfg: &ServerConfig) -> Sampler {
             cfg.gen_defaults.rep_penalty,
             1.0,
         ),
+        mtp_exact_sampling: cfg.mtp_exact_sampling,
         seed,
         ..Default::default()
     }
@@ -4338,8 +5070,30 @@ fn bad_request(stream: &mut TcpStream, msg: String) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod render_test {
-    use super::{ChatMessage, ChatTemplate, extract_tool_calls};
+    use super::{
+        ChatMessage, ChatTemplate, Job, ReplyData, Surface, dsml_sampling_mode, extract_tool_calls,
+        is_target_mtp_wave_eligible, models_payload, normalize_glm_tool_prompt,
+        prompt_tokens_details_json, responses_payload_with_id, session_suffix_text,
+        split_reasoning_for_request, stream_delta, streaming_reply_sections, streaming_sections,
+        streaming_stop_safe_len, usage_json,
+    };
+    use lisa_engine::core::session::TargetMtpSamplingMode;
     use serde_json::json;
+
+    #[test]
+    fn model_list_reports_text_only_modalities_for_loaded_model() {
+        let payload = models_payload("org/glm53-flash");
+        assert_eq!(payload["object"], "list");
+        assert_eq!(payload["data"][0]["id"], "org/glm53-flash");
+        assert_eq!(
+            payload["data"][0]["architecture"]["input_modalities"],
+            json!(["text"])
+        );
+        assert_eq!(
+            payload["data"][0]["architecture"]["output_modalities"],
+            json!(["text"])
+        );
+    }
 
     #[test]
     fn parses_tool_calls() {
@@ -4353,6 +5107,212 @@ mod render_test {
             serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
         assert_eq!(args["city"], "Paris");
         assert_eq!(args["units"], "metric");
+    }
+
+    #[test]
+    fn parses_ds4_glm_arg_key_value_tool_calls() {
+        let text = "Before.\n<tool_call>bash<arg_key>command</arg_key><arg_value>pwd</arg_value></tool_call>";
+        let (content, calls) = extract_tool_calls(text, &[]);
+        assert_eq!(content, "Before.");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "bash");
+        let args: serde_json::Value =
+            serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["command"], "pwd");
+    }
+
+    #[test]
+    fn dsml_sampling_switches_at_glm_and_qwen_payload_boundaries() {
+        use TargetMtpSamplingMode::{Configured, Greedy};
+
+        assert_eq!(dsml_sampling_mode("ordinary answer", false), Configured);
+        assert_eq!(
+            dsml_sampling_mode("<tool_call>bash<arg_key>command</arg_key>", false),
+            Greedy
+        );
+        assert_eq!(
+            dsml_sampling_mode(
+                "<tool_call>bash<arg_key>command</arg_key><arg_value>printf ok",
+                false
+            ),
+            Configured
+        );
+        assert_eq!(
+            dsml_sampling_mode(
+                "<tool_call>bash<arg_key>command</arg_key><arg_value>printf ok</ar",
+                false
+            ),
+            Greedy
+        );
+        assert_eq!(
+            dsml_sampling_mode(
+                "<tool_call>bash<arg_key>command</arg_key><arg_value>printf ok</arg_value></tool_call>",
+                false
+            ),
+            Configured
+        );
+        assert_eq!(
+            dsml_sampling_mode("<tool_call><function=search><parameter=query>hello", false),
+            Configured
+        );
+        assert_eq!(
+            dsml_sampling_mode("<tool_call><function=search><parameter=query", false),
+            Greedy
+        );
+        assert_eq!(
+            dsml_sampling_mode("<think>drafting <tool_call>ignored", true),
+            Configured
+        );
+        assert_eq!(
+            dsml_sampling_mode(
+                "<think>drafting <tool_call>ignored</think><tool_call>bash<arg_key>command",
+                true
+            ),
+            Greedy
+        );
+    }
+
+    #[test]
+    fn glm_target_mtp_wave_preserves_serial_only_request_modes() {
+        let make_job = |body: serde_json::Value| {
+            let (reply, _receiver) = std::sync::mpsc::channel();
+            Job {
+                body,
+                stream: false,
+                session_id: None,
+                surface: Surface::Chat,
+                reply,
+            }
+        };
+
+        assert!(is_target_mtp_wave_eligible(&make_job(json!({})), 2));
+        assert!(!is_target_mtp_wave_eligible(
+            &make_job(json!({"depth": 1})),
+            1
+        ));
+        assert!(!is_target_mtp_wave_eligible(
+            &make_job(json!({"ignore_eos": true})),
+            2
+        ));
+        assert!(!is_target_mtp_wave_eligible(
+            &make_job(json!({"tools": [{"type": "function"}]})),
+            2
+        ));
+    }
+
+    #[test]
+    fn streaming_thinking_matches_open_prompt_and_unclosed_final_state() {
+        assert_eq!(
+            streaming_sections("private scratchpad", true),
+            ("private scratchpad", "")
+        );
+        assert_eq!(
+            streaming_sections("private scratchpad</think><tool_call>x", true),
+            ("private scratchpad", "<tool_call>x")
+        );
+        assert_eq!(
+            streaming_sections("direct response", false),
+            ("", "direct response")
+        );
+        assert_eq!(
+            streaming_sections("private scratchpad</think>tool call", false),
+            ("", "private scratchpad</think>tool call")
+        );
+        assert_eq!(
+            streaming_reply_sections(
+                "private scratchpad</think><tool_call>bash</tool_call>",
+                false,
+                &[],
+            ),
+            (String::new(), "private scratchpad</think>".into())
+        );
+        assert_eq!(
+            streaming_reply_sections(
+                "<think>private scratchpad</think><tool_call>bash</tool_call>",
+                true,
+                &[],
+            ),
+            ("private scratchpad".into(), String::new())
+        );
+        assert_eq!(
+            split_reasoning_for_request("unfinished private scratchpad", true),
+            (Some("unfinished private scratchpad".into()), String::new())
+        );
+        assert_eq!(
+            split_reasoning_for_request("private scratchpad</think>visible answer", true),
+            (Some("private scratchpad".into()), "visible answer".into())
+        );
+    }
+
+    #[test]
+    fn streaming_stop_tail_holds_cross_token_prefix_and_flushes_only_safe_text() {
+        let stops = vec![" gamma delta".to_string()];
+        let partial = "alpha beta gamma";
+        let safe_len = streaming_stop_safe_len(partial, &stops);
+        assert_eq!(&partial[..safe_len], "alpha");
+
+        // The next token completes the stop string. Final response shaping
+        // flushes the safe prefix that was held back but never exposes the
+        // stop sequence itself.
+        let complete = "alpha beta gamma delta epsilon";
+        let (_, final_content) = streaming_reply_sections(complete, false, &stops);
+        assert_eq!(final_content, "alpha beta");
+        assert_eq!(
+            stream_delta(&partial[..safe_len], &final_content).as_deref(),
+            Some(" beta")
+        );
+
+        // Holdback is measured in UTF-8 bytes but may only slice at a valid
+        // character boundary.
+        let unicode_stop = vec!["☃".to_string()];
+        let unicode_text = "A☃";
+        let unicode_safe_len = streaming_stop_safe_len(unicode_text, &unicode_stop);
+        assert_eq!(&unicode_text[..unicode_safe_len], "A");
+        assert_eq!(streaming_stop_safe_len("complete", &[]), "complete".len());
+    }
+
+    #[test]
+    fn openai_usage_reports_ds4_cache_read_and_write_counts() {
+        assert_eq!(
+            usage_json(19, 4, 0),
+            json!({
+                "prompt_tokens": 19,
+                "completion_tokens": 4,
+                "prompt_tokens_details": {
+                    "cached_tokens": 0,
+                    "cache_write_tokens": 19
+                },
+                "total_tokens": 23
+            })
+        );
+        assert_eq!(
+            usage_json(19, 4, 7)["prompt_tokens_details"],
+            json!({"cached_tokens": 7, "cache_write_tokens": 12})
+        );
+        assert_eq!(
+            prompt_tokens_details_json(19, 25),
+            json!({"cached_tokens": 19, "cache_write_tokens": 0})
+        );
+    }
+
+    #[test]
+    fn responses_usage_reports_ds4_cache_read_and_write_counts() {
+        let data = ReplyData {
+            content: String::new(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            prompt_tokens: 19,
+            completion_tokens: 4,
+            cached_tokens: 7,
+            finish: "stop".to_string(),
+            logprobs: None,
+            stop_sequence: None,
+        };
+        let payload = responses_payload_with_id(&data, "resp_test");
+        assert_eq!(
+            payload["usage"]["input_tokens_details"],
+            json!({"cached_tokens": 7, "cache_write_tokens": 12})
+        );
     }
 
     #[test]
@@ -4425,6 +5385,89 @@ mod render_test {
         let t = ChatTemplate::new(src).expect("template parse");
         let out = t.render(&[], false, &[], true).expect("render");
         assert!(out.contains("hello 1"), "got {out:?}");
+    }
+
+    #[test]
+    fn glm_no_thinking_prompt_omits_default_max_effort_message() {
+        let src = "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>hello<|assistant|><think>";
+        let t = ChatTemplate::new(src).expect("template parse");
+
+        let direct = t
+            .render(&[], true, &[], false)
+            .expect("render direct prompt");
+        assert_eq!(
+            direct,
+            "[gMASK]<sop><|user|>hello<|assistant|><think></think>"
+        );
+
+        let thinking = t
+            .render(&[], true, &[], true)
+            .expect("render thinking prompt");
+        assert_eq!(thinking, src);
+
+        let partial = t
+            .render(&[], false, &[], false)
+            .expect("render partial prompt");
+        assert_eq!(partial, "[gMASK]<sop><|user|>hello<|assistant|><think>");
+    }
+
+    #[test]
+    fn glm_session_suffix_preserves_ds4_turn_boundary() {
+        let full = "[gMASK]<sop><|user|>first<|assistant|><think></think>BLUE<|user|>second";
+        let rest = "<|user|>second";
+        assert_eq!(session_suffix_text(full, rest), rest);
+        assert_eq!(
+            session_suffix_text("<|im_start|>assistant", rest),
+            "\n<|user|>second"
+        );
+    }
+
+    #[test]
+    fn glm_tool_prompt_matches_ds4_json_and_whitespace() {
+        let tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Run a shell command.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                    "additionalProperties": false
+                },
+                "strict": true,
+                "defer_loading": false
+            }
+        })];
+        let mut rendered = "You are provided with signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"bash\", \"parameters\": { \"type\": \"object\" }}\n</tools>\n\nFor each function call".to_string();
+        normalize_glm_tool_prompt(&mut rendered, &tools);
+        assert_eq!(
+            rendered,
+            "You are provided with signatures within <tools></tools> XML tags:\n<tools>\n\n{\"name\": \"bash\", \"description\": \"Run a shell command.\", \"parameters\": {\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}},\"required\":[\"command\"],\"additionalProperties\":false}}\n\n\n</tools>\n\nFor each function call"
+        );
+    }
+
+    #[test]
+    fn glm_tool_prompt_matches_ds4_multiple_and_deferred_tools() {
+        let tools = vec![
+            json!({"type":"function", "function":{"name":"first", "parameters":{"type":"object"}}}),
+            json!({"type":"function", "function":{"name":"hidden", "defer_loading":true}}),
+            json!({"type":"function", "function":{"name":"last", "parameters":{"type":"array"}}}),
+        ];
+        let mut rendered = "<tools>\nfirst and last\n</tools>".to_string();
+        normalize_glm_tool_prompt(&mut rendered, &tools);
+        assert_eq!(
+            rendered,
+            "<tools>\n\n{\"name\": \"first\", \"parameters\": {\"type\":\"object\"}}\n\n\n{\"name\": \"last\", \"parameters\": {\"type\":\"array\"}}\n\n\n</tools>"
+        );
+
+        let deferred_only = vec![json!({
+            "type": "function",
+            "function": {"name": "hidden", "defer_loading": true}
+        })];
+        let mut rendered = "<tools>\n</tools>".to_string();
+        normalize_glm_tool_prompt(&mut rendered, &deferred_only);
+        assert_eq!(rendered, "<tools>\n\n\n</tools>");
     }
 
     #[test]

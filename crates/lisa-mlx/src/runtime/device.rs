@@ -1,8 +1,10 @@
 use std::collections::HashMap;
+use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
+use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
@@ -13,10 +15,41 @@ use objc2_metal::{
 
 use crate::error::Result;
 
-use super::buffer::{Buffer, BufferPool, bucket_size};
+use super::buffer::{Buffer, BufferPool};
 use super::commands::Commands;
 use super::env::{ALLOC_COUNT, LABEL_COUNTS, POOLHIT_COUNT, err, ns};
 use super::pipeline::ComputePipeline;
+
+thread_local! {
+    static ORDERED_GPU_REUSE_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Enables reuse only at explicitly marked GPU-output allocation sites.
+/// The guard is thread-bound; normal and host-written allocations never use
+/// this policy. Dropping it restores the previous nested scope without a wait:
+/// each GPU bind updates the buffer's completion fence for later CPU leases.
+pub struct OrderedGpuReuseScope {
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+pub fn enter_ordered_gpu_reuse_scope() -> OrderedGpuReuseScope {
+    ORDERED_GPU_REUSE_DEPTH.with(|depth| depth.set(depth.get() + 1));
+    OrderedGpuReuseScope {
+        _thread_bound: std::marker::PhantomData,
+    }
+}
+
+impl Drop for OrderedGpuReuseScope {
+    fn drop(&mut self) {
+        ORDERED_GPU_REUSE_DEPTH.with(|depth| depth.set(depth.get() - 1));
+    }
+}
+
+fn ordered_gpu_reuse_enabled() -> bool {
+    ORDERED_GPU_REUSE_DEPTH.with(|depth| depth.get() != 0)
+}
+
+const ORDERED_GPU_ZERO_SOURCE: &str = include_str!("../shaders/common/data/ordered_zero.metal");
 
 // ───────────────────────────── runtime ─────────────────────────────
 
@@ -159,6 +192,12 @@ pub struct MetalRuntime {
 ///   multiply).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Math {
+    /// Leave Metal's compile options at their platform defaults. ds4 creates
+    /// one library with a fresh `MTLCompileOptions` and does not override its
+    /// math or language settings on the normal path; this mode lets a ported
+    /// kernel match that compiler contract instead of approximating it with
+    /// `Fast`.
+    CompilerDefault,
     /// mlx_rt's JIT `MetalKernel` path: Safe + an explicit language version,
     /// but **no** `Precise` floating-point functions (its own `compile_options`).
     Jit,
@@ -183,6 +222,7 @@ fn compile_options(math: Math, nax: bool) -> Retained<MTLCompileOptions> {
     use objc2_metal::MTLLanguageVersion;
     let opts = MTLCompileOptions::new();
     match math {
+        Math::CompilerDefault => {}
         Math::SafeNoLang => {
             opts.setMathMode(MTLMathMode::Safe);
             opts.setMathFloatingPointFunctions(MTLMathFloatingPointFunctions::Precise);
@@ -221,17 +261,9 @@ impl MetalRuntime {
             .newCommandQueue()
             .ok_or_else(|| err("newCommandQueue"))?;
         let pool = Arc::new(BufferPool::new());
-        // Mirror the reference engine: their pool is capped (`MLX buffer-pool cap
-        // 8192 MB`) and their effective non-weight footprint is < 1 GB. Ours was
-        // UNCAPPED (`limit = 0`), so every buffer released by a dropped Array
-        // stayed allocated inside the pool and MLX counted it as `active` — the
-        // ~5.7 GB of row-join originals that never came back. 512 MiB is what
-        // makes the two footprints coincide; a release therefore frees for real
-        // instead of parking in the pool.
-        // The pool cap — specs/00 §3 Rule 1. Default 512 MiB; `LISA_POOL_CAP_MB`
-        // overrides (0 = uncapped, for the footprint-vs-latency A/B). It must
-        // ALWAYS be set deliberately: an uncapped pool parks every released
-        // buffer and MLX counts it as `active`.
+        // Bound retained native buffers to 512 MiB by default. LISA_POOL_CAP_MB
+        // overrides this pool-only budget; zero leaves it uncapped. Resident
+        // model reservations and admission are accounted separately.
         let cap_mb = std::env::var("LISA_POOL_CAP_MB")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
@@ -283,6 +315,120 @@ impl MetalRuntime {
 
     /// Allocate (or reuse) a shared-storage buffer of at least `bytes`.
     pub fn buffer(&self, bytes: usize, label: &str) -> Result<Arc<Buffer>> {
+        self.buffer_inner(bytes, label, true, false)
+    }
+
+    /// Allocate shared storage for a caller that will overwrite every logical
+    /// byte before exposing the resulting array. This avoids clearing large
+    /// imported weight tensors immediately before copying their full payload.
+    pub fn buffer_for_full_write(&self, bytes: usize, label: &str) -> Result<Arc<Buffer>> {
+        self.buffer_inner(bytes, label, false, false)
+    }
+
+    /// Allocate an output that a GPU kernel overwrites completely. Within an
+    /// explicit ordered-reuse scope, unleased storage may still have earlier
+    /// GPU readers; the new write is encoded after them on our one serial queue.
+    /// Never expose the returned storage to a CPU writer before synchronization.
+    pub fn buffer_for_full_gpu_write(&self, bytes: usize, label: &str) -> Result<Arc<Buffer>> {
+        if !ordered_gpu_reuse_enabled() {
+            return self.buffer(bytes, label);
+        }
+        self.buffer_inner(bytes, label, false, true)
+    }
+
+    /// Allocate a GPU output with the same zero-initialized contract as
+    /// `buffer`. In the ordered scope its clear is a GPU command, so partial
+    /// writes and atomic accumulations cannot race an earlier GPU reader.
+    pub fn buffer_for_gpu_write(&self, bytes: usize, label: &str) -> Result<Arc<Buffer>> {
+        if !ordered_gpu_reuse_enabled() {
+            return self.buffer(bytes, label);
+        }
+        let buffer = self.buffer_inner(bytes, label, false, true)?;
+        // Only the requested output is published. A best-fit lease may be
+        // much larger; clearing its unused tail would waste GPU bandwidth.
+        let words = bytes.div_ceil(std::mem::size_of::<u32>());
+        if words == 0 {
+            return Ok(buffer);
+        }
+        let pipeline = self.compile(ORDERED_GPU_ZERO_SOURCE, "lisa_ordered_zero_u32")?;
+        let width = words.min(1 << 20);
+        let guard = self.commands.encoder()?;
+        let enc = guard.encoder();
+        enc.set_pipeline(&pipeline);
+        enc.set_output(0, Some(&buffer), 0);
+        enc.set_bytes(1, &(words as u64));
+        enc.set_bytes(2, &(width as u32));
+        enc.dispatch_threads((width, words.div_ceil(width), 1), (256.min(width), 1, 1));
+        Ok(buffer)
+    }
+
+    /// Arm a lifetime-scoped RAM budget for an immutable mapped model.
+    pub fn reserve_model_memory(
+        &self,
+        bytes: usize,
+        budget: usize,
+    ) -> Result<super::buffer::ResidentMemoryReservation> {
+        self.pool
+            .reserve_model_memory(bytes, budget, self.commands.clone())
+    }
+
+    /// Wrap a page-aligned, externally owned read-only region in a Metal
+    /// buffer without copying it. The deallocator retains `owner` until Metal
+    /// releases the buffer, including while a command buffer is in flight.
+    pub fn buffer_from_external(
+        &self,
+        pointer: NonNull<c_void>,
+        length: usize,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+        label: &str,
+    ) -> Result<Arc<Buffer>> {
+        if length == 0 || length > self.device.maxBufferLength() {
+            return Err(err(format!(
+                "external Metal buffer length {length} is invalid"
+            )));
+        }
+        let page_size = unsafe { getpagesize() };
+        if page_size <= 0
+            || pointer.as_ptr() as usize % page_size as usize != 0
+            || length % page_size as usize != 0
+        {
+            return Err(err("external Metal buffer must be page-aligned"));
+        }
+        let deallocator = RcBlock::new(move |_pointer: NonNull<c_void>, _length: usize| {
+            // Capturing the owner retains the mapping until Metal releases this block.
+            let _ = &owner;
+        });
+        let raw = unsafe {
+            self.device
+                .newBufferWithBytesNoCopy_length_options_deallocator(
+                    pointer,
+                    length,
+                    MTLResourceOptions::StorageModeShared,
+                    Some(&deallocator),
+                )
+        }
+        .ok_or_else(|| err(format!("newBufferWithBytesNoCopy({length})")))?;
+        let buf = Arc::new(Buffer::wrap(raw));
+        buf.set_label(label);
+        Ok(buf)
+    }
+
+    fn buffer_inner(
+        &self,
+        bytes: usize,
+        label: &str,
+        clear: bool,
+        ordered_gpu_write: bool,
+    ) -> Result<Arc<Buffer>> {
+        debug_assert!(
+            !clear || !ordered_gpu_write,
+            "in-flight GPU storage must not be cleared on the CPU"
+        );
+        let allocation_bytes = bytes
+            .max(1)
+            .checked_add(1023)
+            .map(|rounded| rounded / 1024 * 1024)
+            .ok_or_else(|| err("Metal allocation size overflow"))?;
         ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
         {
             let mut c = LABEL_COUNTS.lock().unwrap();
@@ -291,22 +437,47 @@ impl MetalRuntime {
                 None => c.push((label.to_string(), 1)),
             }
         }
-        self.pool.sweep_if_over();
-        if let Some(b) = self.pool.take(bytes, self.commands.completed_watermark()) {
+        let completed = self.commands.completed_watermark();
+        if self.pool.reserved_model_bytes() > 0 {
+            self.pool.sweep_if_over_completed(completed);
+        } else {
+            self.pool.sweep_if_over();
+        }
+        let reusable = if ordered_gpu_write {
+            self.pool.take_for_ordered_gpu_write(bytes)
+        } else {
+            self.pool.take(bytes, completed)
+        };
+        if let Some(b) = reusable {
             POOLHIT_COUNT.fetch_add(1, Ordering::Relaxed);
+            b.set_label(label);
+            if clear {
+                // `take` only returns buffers whose last command buffer has
+                // completed, so clearing shared storage here cannot race a GPU
+                // reader. Fresh buffers receive the same initial contents below.
+                unsafe { std::ptr::write_bytes(b.contents(), 0, b.length()) };
+            }
             return Ok(b);
         }
-        let raw = self
-            .device
-            .newBufferWithLength_options(bucket_size(bytes), MTLResourceOptions::StorageModeShared)
-            .ok_or_else(|| err(format!("newBuffer({bytes})")))?;
-        let buf = Arc::new(Buffer::wrap(raw));
-        buf.set_label(label);
-        // Metal buffer contents are undefined at allocation; a kernel that reads
-        // a region its producer never wrote would see recycled garbage.
-        unsafe { std::ptr::write_bytes(buf.contents(), 0, buf.length()) };
-        self.pool.put(Arc::clone(&buf));
-        Ok(buf)
+        self.pool.allocate_new(allocation_bytes, completed, || {
+            let raw = self
+                .device
+                .newBufferWithLength_options(
+                    allocation_bytes,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .ok_or_else(|| err(format!("newBuffer({bytes})")))?;
+            let buf = Arc::new(Buffer::wrap(raw));
+            buf.set_label(label);
+            // General-purpose buffers start at zero so a kernel that reads a region
+            // its producer never wrote cannot observe uninitialized storage. Full
+            // host-write imports skip this; their caller overwrites the logical
+            // tensor payload before making the Array visible.
+            if clear {
+                unsafe { std::ptr::write_bytes(buf.contents(), 0, buf.length()) };
+            }
+            Ok(buf)
+        })
     }
 
     /// Compile `source`'s kernel `name` with the MLX (`Safe`) options, cached.
@@ -395,5 +566,33 @@ impl MetalRuntime {
         // Twin-check on the SLOW path only (one source hash per real compile).
         record_pipeline(name, fnv1a(source.as_bytes()));
         Ok(p)
+    }
+}
+
+unsafe extern "C" {
+    fn getpagesize() -> i32;
+}
+
+#[cfg(test)]
+mod ordered_gpu_reuse_scope_tests {
+    use super::*;
+
+    #[test]
+    fn ordered_gpu_reuse_scope_is_nested_and_thread_local() {
+        assert!(!ordered_gpu_reuse_enabled());
+        let outer = enter_ordered_gpu_reuse_scope();
+        assert!(ordered_gpu_reuse_enabled());
+        {
+            let _inner = enter_ordered_gpu_reuse_scope();
+            assert!(ordered_gpu_reuse_enabled());
+            assert!(
+                !std::thread::spawn(ordered_gpu_reuse_enabled)
+                    .join()
+                    .unwrap()
+            );
+        }
+        assert!(ordered_gpu_reuse_enabled());
+        drop(outer);
+        assert!(!ordered_gpu_reuse_enabled());
     }
 }

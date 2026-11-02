@@ -33,18 +33,18 @@ impl std::str::FromStr for ModelDir {
     }
 }
 
-/// MTP draft depth: 0 = serial, 2..=6 = speculative. A single draft is never
-/// worth a round, so depth 1 is rejected rather than silently routed.
+/// MTP draft depth: zero selects serial, two or more requests speculation.
+/// The model/session limits the effective width; one is not supported.
 pub fn parse_depth(s: &str) -> Result<usize, String> {
     let v: usize = s.parse().map_err(|e| format!("{e}"))?;
     if v == 1 {
-        return Err("depth 1 is not supported; use 0 (serial) or 2..=6 (MTP)".to_string());
+        return Err("depth 1 is not supported; use 0 (serial) or at least 2 (MTP)".to_string());
     }
     Ok(v)
 }
 
 /// `--depth` on the generation commands: `auto` (the EV controller; the
-/// default when the model ships a drafter) or a fixed `0` (serial) / `2..=6`.
+/// default when the model ships a drafter) or a fixed depth (zero or at least two).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum DepthArg {
     Auto,
@@ -60,7 +60,7 @@ impl std::str::FromStr for DepthArg {
         let v: usize = s.parse().map_err(|e| format!("{e}"))?;
         if v == 1 {
             return Err(
-                "depth 1 is not supported; use 0 (serial), 2..=6 (MTP), or auto".to_string(),
+                "depth 1 is not supported; use 0 (serial), at least 2 (MTP), or auto".to_string(),
             );
         }
         Ok(DepthArg::Fixed(v))
@@ -110,25 +110,44 @@ pub fn pld_enable(pld: bool, pld_depth: usize) -> usize {
 
 /// Resolve a `--depth` argument against the sampler/model: `Some(policy)` runs
 /// the speculative path, `None` runs serial (PLD still applies there). `auto`
-/// means the EV controller, but only when the model ships a drafter and sampling
-/// is greedy — otherwise it silently degrades to serial (logged by the
-/// controller when it runs).
+/// means the EV controller when the caller explicitly enables automatic MTP;
+/// CLIs do this for greedy sampling and GLM's target-MTP sampler.
 pub fn resolve_mtp_depth(
     depth: DepthArg,
-    greedy: bool,
+    auto_enabled: bool,
     has_drafter: bool,
 ) -> anyhow::Result<Option<crate::session::MtpDepth>> {
     use crate::session::MtpDepth;
     match depth {
         DepthArg::Fixed(0) => Ok(None),
-        DepthArg::Fixed(d) => {
-            Ok(Some(MtpDepth::Fixed(d)))
-        }
-        DepthArg::Auto => Ok(if greedy && has_drafter {
+        DepthArg::Fixed(d) => Ok(Some(MtpDepth::Fixed(d))),
+        DepthArg::Auto => Ok(if auto_enabled && has_drafter {
             Some(MtpDepth::Auto)
         } else {
             None
         }),
+    }
+}
+
+#[cfg(test)]
+mod depth_tests {
+    use super::{DepthArg, resolve_mtp_depth};
+    use crate::session::MtpDepth;
+
+    #[test]
+    fn auto_depth_requires_enabled_policy_and_model_mtp() {
+        assert_eq!(
+            resolve_mtp_depth(DepthArg::Auto, true, true).unwrap(),
+            Some(MtpDepth::Auto)
+        );
+        assert_eq!(
+            resolve_mtp_depth(DepthArg::Auto, false, true).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_mtp_depth(DepthArg::Auto, true, false).unwrap(),
+            None
+        );
     }
 }
 

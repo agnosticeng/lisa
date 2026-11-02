@@ -36,6 +36,14 @@ const SPILL_MAGIC: [u8; 4] = *b"LPS1";
 /// Spill-file header: magic(4) law(8) ntok(4).
 const SPILL_HEADER: usize = 16;
 
+/// Resolve the cache law before prefill; GLM supplies a versioned identity
+/// independent of which lazy Metal pipelines have happened to compile.
+pub fn model_numerical_law(tower: &dyn LanguageModel) -> u64 {
+    tower
+        .cache_numerical_law()
+        .unwrap_or_else(lisa_mlx::runtime::kernel_law)
+}
+
 pub struct PrefixCache {
     max_entries: usize,
     /// Front = most recently used.
@@ -55,7 +63,11 @@ struct PrefixEntry {
 /// FNV-1a 64 over the law + token ids (LE): the spill file's content hash.
 fn entry_hash(law: u64, tokens: &[u32]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in law.to_le_bytes().into_iter().chain(tokens.iter().flat_map(|t| t.to_le_bytes())) {
+    for b in law
+        .to_le_bytes()
+        .into_iter()
+        .chain(tokens.iter().flat_map(|t| t.to_le_bytes()))
+    {
         h ^= b as u64;
         h = h.wrapping_mul(0x100_0000_01b3);
     }
@@ -90,11 +102,19 @@ impl PrefixCache {
         if !self.enabled() || tokens.len() < MIN_PREFIX_TOKENS {
             return;
         }
+        self.insert_with_law(lisa_mlx::runtime::kernel_law(), tokens, caches);
+    }
+
+    /// Snapshot under the model's law captured before the prefill callback.
+    /// This same identity is written into persisted spill headers.
+    pub fn insert_with_law(&mut self, law: u64, tokens: &[u32], caches: &[LayerCache]) {
+        if !self.enabled() || tokens.len() < MIN_PREFIX_TOKENS {
+            return;
+        }
         // O2: states are only comparable within one numerical law. Drop any
         // entry recorded under a different kernel fingerprint (a recompiled or
         // re-targeted kernel invalidates its rows), alongside the same-prefix
         // dedupe. The invalidation propagates to the spill tier.
-        let law = lisa_mlx::runtime::kernel_law();
         self.entries.retain(|e| e.tokens != tokens && e.law == law);
         prune_spill_foreign(law);
         let layers = caches.iter().map(|c| c.snapshot_prefix()).collect();
@@ -140,7 +160,7 @@ impl PrefixCache {
         tower: &mut dyn LanguageModel,
         prompt: &[u32],
     ) -> Option<(usize, Session)> {
-        let law = lisa_mlx::runtime::kernel_law();
+        let law = model_numerical_law(tower);
         let ram_len = self.lookup_ram(prompt, law);
         if let Some((n, path)) = best_disk_match(prompt, law, ram_len) {
             if n > ram_len.unwrap_or(0) {
@@ -164,7 +184,11 @@ impl PrefixCache {
     /// Re-warm a restored disk entry: admit only if no identical-token entry
     /// is resident (the restored state is the same content hash).
     fn rewarm(&mut self, e: PrefixEntry) {
-        if self.entries.iter().any(|r| r.tokens == e.tokens) {
+        if self
+            .entries
+            .iter()
+            .any(|r| r.tokens == e.tokens && r.law == e.law)
+        {
             return;
         }
         self.admit(e);
@@ -205,11 +229,7 @@ fn spill_header(path: &std::path::Path) -> Option<(u64, usize)> {
 /// The best disk prefix match that strictly beats `at_least`. Unlinks
 /// foreign-law files it encounters (RAM invalidation propagates) and
 /// truncated junk. Returns `(match_len, path)`.
-fn best_disk_match(
-    prompt: &[u32],
-    law: u64,
-    at_least: Option<usize>,
-) -> Option<(usize, PathBuf)> {
+fn best_disk_match(prompt: &[u32], law: u64, at_least: Option<usize>) -> Option<(usize, PathBuf)> {
     let dir = spill_dir()?;
     let rd = std::fs::read_dir(&dir).ok()?;
     let floor = at_least.unwrap_or(0);
@@ -410,6 +430,19 @@ mod tests {
         assert_eq!(entry_hash(law, &[1, 2, 3]), entry_hash(law, &[1, 2, 3]));
         assert_ne!(entry_hash(law, &[1, 2, 3]), entry_hash(law, &[1, 2, 4]));
         assert_ne!(entry_hash(law, &[1, 2, 3]), entry_hash(law + 1, &[1, 2, 3]));
+    }
+
+    #[test]
+    fn explicit_law_rewarm_cannot_restore_same_tokens_from_foreign_arithmetic() {
+        let mut cache = PrefixCache::new(4);
+        let tokens = vec![17; MIN_PREFIX_TOKENS];
+        let mut prompt = tokens.clone();
+        prompt.push(18);
+        cache.entries.push(entry(tokens.clone(), 7));
+        assert_eq!(cache.lookup_ram(&prompt, 8), None);
+        cache.rewarm(entry(tokens, 8));
+        assert_eq!(cache.entries[0].law, 8);
+        assert_eq!(cache.lookup_ram(&prompt, 8), Some(MIN_PREFIX_TOKENS));
     }
 
     /// Spill on eviction, restore on lookup, RAM LRU re-warm — the tier

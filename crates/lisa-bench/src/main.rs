@@ -1,12 +1,15 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use lisa_engine::cli::{parse_depth, pld_enable, DepthArg, ModelDir};
+use lisa_engine::cli::{DepthArg, ModelDir, parse_depth, pld_enable};
 use lisa_engine::core::prefix_cache;
 use lisa_engine::models::qwen4::tower as model;
 use lisa_engine::models::qwen4::{config, layerdiff, smoke};
+use lisa_engine::models::{self, Loaded};
 use lisa_engine::{generate, sampler, sched, session, tokenizer};
 use lisa_mlx::ops::indexing::IndexOp;
+
+mod glm53_run;
 
 #[derive(Parser)]
 #[command(
@@ -20,6 +23,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Time one production GLM serial/MTP generation and save token IDs as JSON.
+    Glm53Run(glm53_run::Args),
     /// Verify the compute stack: quantized matmul, fast ops, custom kernels.
     Smoke,
     /// Run the public golden correctness check.
@@ -56,7 +61,7 @@ enum Command {
         #[arg(long)]
         model: ModelDir,
     },
-    /// Print top-8 first-token logits for a prompt.
+    /// Print top-8 first-token logits for a prompt; optionally dump the full vector as JSON.
     Logits {
         #[arg(long)]
         model: ModelDir,
@@ -64,6 +69,9 @@ enum Command {
         prompt: String,
         #[arg(long, default_value_t = false)]
         raw: bool,
+        /// Write prompt IDs and the full first-token logit vector as JSON.
+        #[arg(long)]
+        dump_logits: Option<PathBuf>,
     },
     /// KV cache write/read unit test.
     CacheTest,
@@ -178,20 +186,60 @@ enum Command {
         golden: PathBuf,
         #[arg(long, default_value_t = 9)]
         iters: usize,
+        /// Select the GLM Q8 prefill route or run an interleaved DS4/stock A/B.
+        #[arg(long, default_value = "ds4-mpp", value_parser = ["ds4-mpp", "stock", "abba"])]
+        q8_prefill: String,
+        /// Select the default, grouped, or per-slot routed-MoE prefill schedule.
+        #[arg(long, default_value = "auto", value_parser = ["auto", "grouped", "stock", "abba"])]
+        moe_grouped: String,
+        /// Select the fused or DS4-split grouped gate/up schedule, or interleave both.
+        #[arg(long, default_value = "auto", value_parser = ["auto", "fused", "split", "abba"])]
+        moe_pair: String,
+        /// Select scalar or four-byte-vector affine-Q2 unpacking for grouped MoE.
+        #[arg(long, default_value = "scalar", value_parser = ["vector", "scalar", "abba"])]
+        moe_q2_load: String,
+        /// Select the grouped affine-Q2 down output tile or interleave 64/128.
+        #[arg(long, default_value = "auto", value_parser = ["auto", "64", "128", "abba"])]
+        moe_down_tile: String,
+        /// Write both warmup logit vectors as JSON when --moe-grouped abba is selected.
+        #[arg(long)]
+        dump_schedule_logits_prefix: Option<PathBuf>,
     },
     /// Serial-step GPU audit: wall ms/step, dispatches/step and per-label GPU
-    /// ms/step over N serial decode steps (specs/16). Pair with
-    /// LISA_GPU_PROBE=1 for exact per-kernel GPU times and a normal run for
-    /// the wall/step (probe mode commits per dispatch and inflates wall).
+    /// intervals over N serial decode steps (specs/16). Pair with
+    /// LISA_GPU_PROBE=1 for per-command-buffer GPU intervals attributed to
+    /// one kernel per buffer; use a normal run for wall/step because probe
+    /// mode changes command-buffer submission cadence.
     SerialAudit {
         #[arg(long)]
         model: ModelDir,
         /// Synthetic prompt length (KV bucket context).
         #[arg(long, default_value_t = 1024)]
         kv: usize,
+        /// Optional prefill window for long-context diagnostics. Zero keeps the
+        /// single-forward prefill used by the default serial audit.
+        #[arg(long, default_value_t = 0)]
+        prefill_chunk: usize,
         /// Counted steps after 8 warmup steps.
         #[arg(long, default_value_t = 32)]
         steps: usize,
+        /// Compare the DS4 KDA projection schedule, a 4/16-simdgroup
+        /// candidate, or interleave them in ABBA order.
+        #[arg(
+            long,
+            default_value = "ds4",
+            value_parser = ["ds4", "4", "16", "abba", "abba4", "abba16"]
+        )]
+        kda_nsg: String,
+        /// Compare DS4's one-pool indexer scorer with its four-pool SIMD-group schedule.
+        #[arg(long, default_value = "rows4", value_parser = ["legacy", "rows4", "abba"])]
+        dsa_score: String,
+        /// Select the DS4 threadgroup or SIMD-shuffle top-k network, or interleave both.
+        #[arg(long, default_value = "shuffle", value_parser = ["legacy", "shuffle", "abba"])]
+        dsa_topk: String,
+        /// Compare the reference 4-row output-head QMV tile with the 8-row candidate.
+        #[arg(long, default_value = "4", value_parser = ["4", "8", "abba"])]
+        lm_head_qmv: String,
     },
 }
 
@@ -226,11 +274,21 @@ fn run() -> anyhow::Result<()> {
     // overlap the CPU graph build. Committing at ~16 recovers ~2 ms of the
     // draft (d5 round 69.6 -> 67.4 ms); the boundary does not change results.
     match cli.command {
+        Command::Glm53Run(args) => glm53_run::run(args),
         Command::Smoke => smoke::run_all(),
         Command::LayerDiff { model } => layerdiff::run(&model),
-        Command::Logits { model, prompt, raw } => {
-            let config = config::ModelConfig::from_json(&model.join("config.json"))?;
-            let mut tower = model::Tower::load(&model, config)?;
+        Command::Logits {
+            model,
+            prompt,
+            raw,
+            dump_logits,
+        } => {
+            let mut tower = match models::load_dir(&model)? {
+                Loaded::Language(tower) => tower,
+                Loaded::Decision(model) => {
+                    anyhow::bail!("logits are unavailable for decision model {}", model.name())
+                }
+            };
             let tok = tokenizer::Tokenizer::load(&model)?;
             let text = if raw {
                 prompt.clone()
@@ -239,6 +297,7 @@ fn run() -> anyhow::Result<()> {
             };
             let ids = tok.encode(&text, false)?;
             println!("{} tokens", ids.len());
+            println!("input_ids: {ids:?}");
             let mut caches = tower.new_caches();
             let i32s: Vec<i32> = ids.iter().map(|&t| t as i32).collect();
             let arr = lisa_mlx::Array::from_slice(&i32s, &[1i32, i32s.len() as i32]);
@@ -259,6 +318,30 @@ fn run() -> anyhow::Result<()> {
             for (t, v) in toks.iter().zip(vf.iter()) {
                 let piece = tok.decode(&[*t]).unwrap_or_default();
                 println!("  {:>7} {:>8.3} {:?}", t, v, piece);
+            }
+            if let Some(path) = dump_logits {
+                let values = logits
+                    .as_dtype(lisa_mlx::Dtype::Float32)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+                    .as_slice::<f32>()
+                    .to_vec();
+                let (argmax_id, argmax_logit) = values
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.total_cmp(b.1))
+                    .map(|(id, value)| (id, *value))
+                    .ok_or_else(|| anyhow::anyhow!("logit vector is empty"))?;
+                let payload = serde_json::json!({
+                    "source": "lisa",
+                    "model": model.to_string_lossy(),
+                    "prompt": prompt,
+                    "raw": raw,
+                    "input_ids": ids,
+                    "vocab": values.len(),
+                    "argmax_token": {"id": argmax_id, "logit": argmax_logit},
+                    "logits": values,
+                });
+                std::fs::write(path, serde_json::to_vec(&payload)?)?;
             }
             Ok(())
         }
@@ -318,7 +401,11 @@ fn run() -> anyhow::Result<()> {
                 {
                     let mut s = session::Session::new(&mut *tower);
                     s.feed(&mut *tower, &prompt[..split])?;
-                    cache.insert(&prompt[..split], &s.caches);
+                    cache.insert_with_law(
+                        prefix_cache::model_numerical_law(&*tower),
+                        &prompt[..split],
+                        &s.caches,
+                    );
                 }
                 let (matched, mut s) = cache
                     .restore_session(&mut *tower, &prompt)
@@ -404,7 +491,7 @@ fn run() -> anyhow::Result<()> {
             };
             let tower = tower.as_mut();
             let tok = tokenizer::Tokenizer::load(&model)?;
-            generate::set_eos_ids(tok.im_end_ids.clone());
+            generate::set_eos_ids_for_model(tok.im_end_ids.clone(), tower);
             let requests: Vec<sched::Request> = prompts
                 .iter()
                 .enumerate()
@@ -416,7 +503,12 @@ fn run() -> anyhow::Result<()> {
                         raw,
                         max_tokens,
                         lisa_engine::cli::build_sampler(
-                            temperature, top_k, top_p, min_p, rep_penalty, seed,
+                            temperature,
+                            top_k,
+                            top_p,
+                            min_p,
+                            rep_penalty,
+                            seed,
                         ),
                     )
                 })
@@ -449,9 +541,42 @@ fn run() -> anyhow::Result<()> {
         Command::SerialAudit {
             model,
             kv,
+            prefill_chunk,
             steps,
+            kda_nsg,
+            dsa_score,
+            dsa_topk,
+            lm_head_qmv,
         } => {
-            use lisa_mlx::{runtime_dispatch_count, runtime_label_counts, runtime_label_gpu_ms};
+            anyhow::ensure!(
+                dsa_score != "abba" || kda_nsg == "ds4",
+                "--dsa-score abba requires the default DS4 KDA schedule"
+            );
+            anyhow::ensure!(
+                dsa_score != "abba" || !kda_nsg.starts_with("abba"),
+                "run one ABBA schedule experiment at a time"
+            );
+            anyhow::ensure!(
+                dsa_topk != "abba" || kda_nsg == "ds4",
+                "--dsa-topk abba requires the default DS4 KDA schedule"
+            );
+            anyhow::ensure!(
+                dsa_topk != "abba" || dsa_score != "abba",
+                "run one ABBA schedule experiment at a time"
+            );
+            anyhow::ensure!(
+                dsa_topk != "abba" || !kda_nsg.starts_with("abba"),
+                "run one ABBA schedule experiment at a time"
+            );
+            anyhow::ensure!(
+                lm_head_qmv != "abba"
+                    || (kda_nsg == "ds4" && dsa_score != "abba" && dsa_topk != "abba"),
+                "--lm-head-qmv abba requires all other schedules to use one fixed path"
+            );
+            use lisa_mlx::{
+                runtime_dispatch_count, runtime_label_counts, runtime_label_dispatches,
+                runtime_label_gpu_ms,
+            };
             let mut tower = match lisa_engine::models::load_dir(&model)? {
                 lisa_engine::models::Loaded::Language(m) => m,
                 lisa_engine::models::Loaded::Decision(_) => {
@@ -467,37 +592,134 @@ fn run() -> anyhow::Result<()> {
             ids.truncate(kv);
             tower.warmup(&ids[..ids.len().min(64)])?;
             let mut sess = lisa_engine::core::session::Session::new(&mut *tower);
-            let (logits, _) = sess.feed_multi(&mut *tower, &ids)?;
+            let logits = if prefill_chunk == 0 {
+                sess.feed_multi(&mut *tower, &ids)?.0
+            } else {
+                let mut logits = None;
+                for chunk in ids.chunks(prefill_chunk) {
+                    let next = sess.feed(&mut *tower, chunk)?;
+                    next.eval()?;
+                    logits = Some(next);
+                    lisa_mlx::memory::trim_cache();
+                }
+                logits.expect("non-empty serial-audit prompt")
+            };
             let argmax_id = |a: &lisa_mlx::Array| -> anyhow::Result<u32> {
-                let out = lisa_mlx::ops::indexing::argmax(a, None)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                let out =
+                    lisa_mlx::ops::indexing::argmax(a, None).map_err(|e| anyhow::anyhow!("{e}"))?;
                 out.eval().map_err(|e| anyhow::anyhow!("{e}"))?;
                 Ok(out.item_cast::<i32>() as u32)
             };
             let mut tok_id = argmax_id(&logits)?;
             let warm = 8usize;
             for _ in 0..warm {
-                let logits = sess.feed(&mut *tower, &[tok_id])?;
+                let logits = sess.decode_token(&mut *tower, tok_id)?;
                 tok_id = argmax_id(&logits)?;
             }
             // Snapshot BEFORE the counted steps (counters are cumulative since
             // process start, prefill included) so deltas cover exactly them.
             let pre_d = runtime_dispatch_count();
             let pre_lc = runtime_label_counts();
+            let pre_ld = runtime_label_dispatches();
             let pre_lg = runtime_label_gpu_ms();
             std::thread::sleep(std::time::Duration::from_millis(300));
             let pre_lg2 = runtime_label_gpu_ms();
-            println!("pre GPU cumulative: {:.1} ms / after settle {:.1} ms (labels={})",
+            println!(
+                "pre GPU cumulative: {:.1} ms / after settle {:.1} ms (labels={})",
                 pre_lg.iter().map(|(_, g)| g).sum::<u64>() as f64 / 1e6,
                 pre_lg2.iter().map(|(_, g)| g).sum::<u64>() as f64 / 1e6,
-                pre_lg.len());
+                pre_lg.len()
+            );
             let mut walls: Vec<f64> = Vec::new();
-            for _ in 0..steps {
+            let mut ds4_walls: Vec<f64> = Vec::new();
+            let mut candidate_walls: Vec<f64> = Vec::new();
+            let mut dsa_baseline_walls: Vec<f64> = Vec::new();
+            let mut dsa_rows4_walls: Vec<f64> = Vec::new();
+            let mut dsa_topk_legacy_walls: Vec<f64> = Vec::new();
+            let mut dsa_topk_shuffle_walls: Vec<f64> = Vec::new();
+            let mut lm_head_qmv_reference_walls: Vec<f64> = Vec::new();
+            let mut lm_head_qmv_wide_walls: Vec<f64> = Vec::new();
+            let mut sampled_tokens = Vec::with_capacity(steps);
+            for step in 0..steps {
+                let use_candidate = match kda_nsg.as_str() {
+                    "ds4" => false,
+                    "4" | "16" => true,
+                    "abba" | "abba16" | "abba4" => matches!(step % 4, 1 | 2),
+                    _ => unreachable!("clap validates kda-nsg"),
+                };
+                let use_rows4 = match dsa_score.as_str() {
+                    "legacy" => false,
+                    "rows4" => true,
+                    "abba" => matches!(step % 4, 1 | 2),
+                    _ => unreachable!("clap validates dsa-score"),
+                };
+                let use_shuffle = match dsa_topk.as_str() {
+                    "legacy" => false,
+                    "shuffle" => true,
+                    "abba" => matches!(step % 4, 1 | 2),
+                    _ => unreachable!("clap validates dsa-topk"),
+                };
+                let use_wide_lm_head = match lm_head_qmv.as_str() {
+                    "4" => false,
+                    "8" => true,
+                    "abba" => matches!(step % 4, 1 | 2),
+                    _ => unreachable!("clap validates lm-head-qmv"),
+                };
                 let t0 = std::time::Instant::now();
-                let logits = sess.feed(&mut *tower, &[tok_id])?;
+                let _dsa_score_scope = (dsa_score != "rows4").then(|| {
+                    lisa_engine::core::quant::Glm53IndexerDecodeRows4Scope::new(use_rows4)
+                });
+                let _dsa_topk_scope = (dsa_topk != "shuffle").then(|| {
+                    lisa_engine::core::quant::Glm53IndexerTopkShuffleScope::new(use_shuffle)
+                });
+                let _lm_head_qmv_scope = (lm_head_qmv != "4").then(|| {
+                    lisa_mlx::ops::Glm53LmHeadQmvTileScope::new(if use_wide_lm_head {
+                        8
+                    } else {
+                        4
+                    })
+                });
+                let logits = if use_candidate {
+                    let nsg = if kda_nsg == "4" || kda_nsg == "abba4" {
+                        4
+                    } else {
+                        16
+                    };
+                    let _scope = lisa_engine::core::quant::Glm53KdaNsgScope::new(nsg);
+                    sess.decode_token(&mut *tower, tok_id)?
+                } else {
+                    sess.decode_token(&mut *tower, tok_id)?
+                };
                 let id = argmax_id(&logits)?;
                 let dt = t0.elapsed().as_secs_f64() * 1e3;
                 walls.push(dt);
+                if use_candidate {
+                    candidate_walls.push(dt);
+                } else {
+                    ds4_walls.push(dt);
+                }
+                if dsa_score != "ds4" {
+                    if use_rows4 {
+                        dsa_rows4_walls.push(dt);
+                    } else {
+                        dsa_baseline_walls.push(dt);
+                    }
+                }
+                if dsa_topk != "legacy" {
+                    if use_shuffle {
+                        dsa_topk_shuffle_walls.push(dt);
+                    } else {
+                        dsa_topk_legacy_walls.push(dt);
+                    }
+                }
+                if lm_head_qmv != "4" {
+                    if use_wide_lm_head {
+                        lm_head_qmv_wide_walls.push(dt);
+                    } else {
+                        lm_head_qmv_reference_walls.push(dt);
+                    }
+                }
+                sampled_tokens.push(id);
                 tok_id = id;
             }
             let d = runtime_dispatch_count();
@@ -505,6 +727,7 @@ fn run() -> anyhow::Result<()> {
             // beat to drain the counted buffers before the post snapshot.
             std::thread::sleep(std::time::Duration::from_millis(500));
             let lc = runtime_label_counts();
+            let ld = runtime_label_dispatches();
             let lg = runtime_label_gpu_ms();
             let pre = (pre_d, &pre_lc, &pre_lg2);
             let _ = &pre_lg;
@@ -512,33 +735,118 @@ fn run() -> anyhow::Result<()> {
             let mut steps_v: Vec<f64> = walls.clone();
             steps_v.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let wall_med = steps_v[steps_v.len() / 2];
-            println!("serial-audit: {steps} steps @ kv {kv} (probe={:?})",
-                std::env::var_os("LISA_GPU_PROBE").is_some());
-            println!("wall ms/step: median {:.2}  mean {:.2}", wall_med,
-                walls.iter().sum::<f64>() / n);
+            println!("greedy tokens: {sampled_tokens:?}");
+            println!(
+                "serial-audit: {steps} steps @ kv {kv} (prefill_chunk={prefill_chunk}, kda_nsg={kda_nsg}, dsa_score={dsa_score}, dsa_topk={dsa_topk}, lm_head_qmv={lm_head_qmv}, probe={:?})",
+                std::env::var_os("LISA_GPU_PROBE").is_some(),
+            );
+            println!(
+                "wall ms/step: median {:.2}  mean {:.2}",
+                wall_med,
+                walls.iter().sum::<f64>() / n
+            );
+            if kda_nsg.starts_with("abba") {
+                let median = |values: &mut Vec<f64>| -> f64 {
+                    values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    values[values.len() / 2]
+                };
+                let candidate_nsg = if kda_nsg == "abba4" { 4 } else { 16 };
+                println!(
+                    "ABBA wall ms/step: DS4 median {:.2} ({} steps), nsg{candidate_nsg} median {:.2} ({} steps)",
+                    median(&mut ds4_walls),
+                    ds4_walls.len(),
+                    median(&mut candidate_walls),
+                    candidate_walls.len(),
+                );
+            }
+            if dsa_score == "abba" {
+                let median = |values: &mut Vec<f64>| -> f64 {
+                    values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    values[values.len() / 2]
+                };
+                println!(
+                    "DSA score ABBA wall ms/step: legacy median {:.2} ({} steps), rows4 median {:.2} ({} steps)",
+                    median(&mut dsa_baseline_walls),
+                    dsa_baseline_walls.len(),
+                    median(&mut dsa_rows4_walls),
+                    dsa_rows4_walls.len(),
+                );
+            }
+            if dsa_topk == "abba" {
+                let median = |values: &mut Vec<f64>| -> f64 {
+                    values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    values[values.len() / 2]
+                };
+                println!(
+                    "DSA top-k ABBA wall ms/step: legacy median {:.2} ({} steps), shuffle median {:.2} ({} steps)",
+                    median(&mut dsa_topk_legacy_walls),
+                    dsa_topk_legacy_walls.len(),
+                    median(&mut dsa_topk_shuffle_walls),
+                    dsa_topk_shuffle_walls.len(),
+                );
+            }
+            if lm_head_qmv == "abba" {
+                let median = |values: &mut Vec<f64>| -> f64 {
+                    values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    values[values.len() / 2]
+                };
+                println!(
+                    "LM-head QMV ABBA wall ms/step: 4-row median {:.2} ({} steps), 8-row median {:.2} ({} steps)",
+                    median(&mut lm_head_qmv_reference_walls),
+                    lm_head_qmv_reference_walls.len(),
+                    median(&mut lm_head_qmv_wide_walls),
+                    lm_head_qmv_wide_walls.len(),
+                );
+            }
             println!("dispatches/step: {:.1}", (d - pre.0) as f64 / n);
-            let count: std::collections::HashMap<String, u64> = pre.1.iter().cloned().collect();
             let gpu: std::collections::HashMap<String, u64> = pre.2.iter().cloned().collect();
-            // NOTE: the two label universes differ — LABEL_COUNTS keys are OP
-            // names (device.rs set_pipeline), LABEL_GPU_NS keys are METAL
-            // KERNEL names (encoder kernel_counts). Report them side by side.
-            let mut dl: Vec<(&String, i64)> = lg.iter()
+            // Buffer-allocation labels and kernel labels are separate
+            // universes; GPU timing and dispatch counts use the latter.
+            let mut dl: Vec<(&String, i64)> = lg
+                .iter()
                 .map(|(k, g)| (k, *g as i64 - gpu.get(k).copied().unwrap_or(0) as i64))
                 .collect();
             dl.sort_by(|a, b| b.1.cmp(&a.1));
             let gpu_sum: f64 = dl.iter().map(|(_, g)| *g).sum::<i64>() as f64 / 1e6;
-            println!("GPU ms/step (sum over kernels): {:.2}  -> un-attributed (idle/gaps) {:.2} ms/step",
-                gpu_sum / n, (wall_med - gpu_sum / n).max(0.0));
-            println!("--- kernels by GPU ms/step ---");
+            println!(
+                "attributed GPU interval ms/step: {:.2}  wall-minus-interval: {:+.2} ms/step",
+                gpu_sum / n,
+                wall_med - gpu_sum / n
+            );
+            println!("--- kernels by attributed GPU interval/step ---");
             for (k, g) in dl.iter().filter(|(_, g)| *g > 10_000) {
                 println!("{:>8.3} ms  {}", *g as f64 / 1e6 / n, k);
             }
-            let mut cl: Vec<(&String, i64)> = lc.iter()
-                .map(|(k, v)| (k, *v as i64 - count.get(k).copied().unwrap_or(0) as i64))
+            let dispatches: std::collections::HashMap<String, u64> =
+                pre_ld.iter().cloned().collect();
+            let mut dlc: Vec<(&String, i64)> = ld
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k,
+                        *v as i64 - dispatches.get(k).copied().unwrap_or(0) as i64,
+                    )
+                })
                 .collect();
-            cl.sort_by(|a, b| b.1.cmp(&a.1));
-            println!("--- ops by dispatch count/step ---");
-            for (k, c) in cl.iter().filter(|(_, c)| *c > 0) {
+            dlc.sort_by(|a, b| b.1.cmp(&a.1));
+            println!("--- kernels by dispatch count/step ---");
+            for (k, c) in dlc.iter().filter(|(_, c)| *c > 0) {
+                println!("{:>7.1}/step  {}", *c as f64 / n, k);
+            }
+            let allocations: std::collections::HashMap<String, u64> =
+                pre.1.iter().cloned().collect();
+            let mut alc: Vec<(&String, i64)> = lc
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k,
+                        *v as i64 - allocations.get(k).copied().unwrap_or(0) as i64,
+                    )
+                })
+                .collect();
+            alc.sort_by(|a, b| b.1.cmp(&a.1));
+            println!("--- output allocations/step ---");
+            for (k, c) in alc.iter().filter(|(_, c)| *c > 0) {
                 println!("{:>7.1}/step  {}", *c as f64 / n, k);
             }
             Ok(())
@@ -569,8 +877,7 @@ fn run() -> anyhow::Result<()> {
             let (logits, _) = sess.feed_multi(&mut *tower, &ids)?;
             let _ = logits;
             let s = s.max(2);
-            let verify_ids: Vec<i32> =
-                std::iter::repeat(1i32).take(s as usize).collect();
+            let verify_ids: Vec<i32> = std::iter::repeat(1i32).take(s as usize).collect();
             // One S-row verify forward with snapshot/rollback (round-cost's
             // verify pass); wall ms includes head+argmax, splitk scope armed.
             let verify_once = |sess: &mut lisa_engine::core::session::Session,
@@ -586,11 +893,12 @@ fn run() -> anyhow::Result<()> {
                         }
                     })
                     .collect();
-                tower.set_context_tails(vec![sess.fed
-                    [sess.fed.len().saturating_sub(ctx_len)..]
-                    .iter()
-                    .map(|&t| t as i64)
-                    .collect()]);
+                tower.set_context_tails(vec![
+                    sess.fed[sess.fed.len().saturating_sub(ctx_len)..]
+                        .iter()
+                        .map(|&t| t as i64)
+                        .collect(),
+                ]);
                 let arr = lisa_mlx::Array::from_slice(&verify_ids, &[1i32, s as i32]);
                 let _splitk = lisa_mlx::ops::enter_verify_splitk_scope();
                 let t0 = std::time::Instant::now();
@@ -620,7 +928,6 @@ fn run() -> anyhow::Result<()> {
             }
             let pre_d = runtime_dispatch_count();
             let pre_lc = runtime_label_counts();
-            let pre_lg = runtime_label_gpu_ms();
             std::thread::sleep(std::time::Duration::from_millis(300));
             let pre_lg2 = runtime_label_gpu_ms();
             let mut walls: Vec<f64> = Vec::new();
@@ -637,23 +944,31 @@ fn run() -> anyhow::Result<()> {
             walls_v.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let wall_med = walls_v[walls_v.len() / 2];
             println!("verify-audit: {steps} x S{s} @ kv {kv}");
-            println!("wall ms/verify: median {:.2}  mean {:.2}", wall_med,
-                walls.iter().sum::<f64>() / n);
+            println!(
+                "wall ms/verify: median {:.2}  mean {:.2}",
+                wall_med,
+                walls.iter().sum::<f64>() / n
+            );
             println!("dispatches/verify: {:.1}", (d - pre.0) as f64 / n);
             let count: std::collections::HashMap<String, u64> = pre.1.iter().cloned().collect();
             let gpu: std::collections::HashMap<String, u64> = pre.2.iter().cloned().collect();
-            let mut dl: Vec<(&String, i64)> = lg.iter()
+            let mut dl: Vec<(&String, i64)> = lg
+                .iter()
                 .map(|(k, g)| (k, *g as i64 - gpu.get(k).copied().unwrap_or(0) as i64))
                 .collect();
             dl.sort_by(|a, b| b.1.cmp(&a.1));
             let gpu_sum: f64 = dl.iter().map(|(_, g)| *g).sum::<i64>() as f64 / 1e6;
-            println!("GPU ms/verify (sum over kernels): {:.2}  -> un-attributed {:.2} ms/verify",
-                gpu_sum / n, (wall_med - gpu_sum / n).max(0.0));
+            println!(
+                "GPU ms/verify (sum over kernels): {:.2}  -> un-attributed {:.2} ms/verify",
+                gpu_sum / n,
+                (wall_med - gpu_sum / n).max(0.0)
+            );
             println!("--- kernels by GPU ms/verify ---");
             for (k, g) in dl.iter().filter(|(_, g)| *g > 10_000) {
                 println!("{:>8.3} ms  {}", *g as f64 / 1e6 / n, k);
             }
-            let mut cl: Vec<(&String, i64)> = lc.iter()
+            let mut cl: Vec<(&String, i64)> = lc
+                .iter()
                 .map(|(k, v)| (k, *v as i64 - count.get(k).copied().unwrap_or(0) as i64))
                 .collect();
             cl.sort_by(|a, b| b.1.cmp(&a.1));
@@ -679,6 +994,16 @@ fn run() -> anyhow::Result<()> {
                 lisa_engine::models::Loaded::Decision(_) => {
                     anyhow::bail!("round-cost expects a language model")
                 }
+            };
+            let widths = if tower.has_target_mtp() {
+                anyhow::ensure!(
+                    widths == [3, 4, 5, 6, 7] || widths.iter().all(|&width| width == 2),
+                    "GLM target-MTP supports only verify width S=2; pass --widths 2"
+                );
+                eprintln!("round-cost: target-conditioned MTP supports only verify width S=2");
+                vec![2]
+            } else {
+                widths
             };
             let tok = tokenizer::Tokenizer::load(&model)?;
             let key = tower.mtp_cost_key();
@@ -756,47 +1081,478 @@ fn run() -> anyhow::Result<()> {
             model,
             golden,
             iters,
+            q8_prefill,
+            moe_grouped,
+            moe_pair,
+            moe_q2_load,
+            moe_down_tile,
+            dump_schedule_logits_prefix,
         } => {
+            anyhow::ensure!(
+                [
+                    q8_prefill == "abba",
+                    moe_grouped == "abba",
+                    moe_pair == "abba",
+                    moe_q2_load == "abba",
+                    moe_down_tile == "abba"
+                ]
+                .into_iter()
+                .filter(|active| *active)
+                .count()
+                    <= 1,
+                "select ABBA for only one prefill schedule at a time"
+            );
+            anyhow::ensure!(
+                moe_pair != "abba" || moe_grouped == "grouped",
+                "--moe-pair abba requires --moe-grouped grouped"
+            );
+            anyhow::ensure!(
+                moe_q2_load != "abba"
+                    || (moe_grouped == "grouped" && q8_prefill != "abba" && moe_pair != "abba"),
+                "--moe-q2-load abba requires grouped MoE and fixed Q8/pair schedules"
+            );
+            anyhow::ensure!(
+                moe_down_tile != "abba"
+                    || (moe_grouped == "grouped"
+                        && q8_prefill != "abba"
+                        && moe_pair != "abba"
+                        && moe_q2_load != "abba"),
+                "--moe-down-tile abba requires grouped MoE and fixed Q8/pair/load schedules"
+            );
+            anyhow::ensure!(
+                dump_schedule_logits_prefix.is_none()
+                    || (q8_prefill != "abba" && moe_grouped == "abba" && moe_pair != "abba"),
+                "schedule logit dumps require --moe-grouped abba with a fixed Q8 prefill route"
+            );
             let data = std::fs::read_to_string(&golden)?;
             let g: serde_json::Value = serde_json::from_str(&data)?;
-            let prompt: Vec<i32> = g["cases"][0]["prompt_tokens"]
+            let prompt: Vec<u32> = g["cases"][0]["prompt_tokens"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .filter_map(|v| v.as_u64().map(|x| x as i32))
+                .filter_map(|v| v.as_u64().map(|x| x as u32))
                 .collect();
             let n = prompt.len();
-            let config = config::ModelConfig::from_json(&model.join("config.json"))?;
             let t0 = std::time::Instant::now();
-            let mut tower = model::Tower::load(&model, config)?;
+            let mut tower = match models::load_dir(&model)? {
+                Loaded::Language(tower) => tower,
+                Loaded::Decision(model) => {
+                    anyhow::bail!(
+                        "prefill-bench requires a language model, got {}",
+                        model.name()
+                    )
+                }
+            };
             eprintln!("loaded in {:.1}s", t0.elapsed().as_secs_f64());
-            generate::set_eos_ids(vec![248_046, 248_044]);
-            let arr = lisa_mlx::Array::from_slice(&prompt, &[1i32, n as i32]);
+            // Both schedules can compile first-use Metal pipelines during
+            // prefill. Warm each path before collecting the interleaved
+            // samples so one route does not pay that one-time cost in the
+            // measured ABBA window.
+            let warm_moe_modes: &[Option<bool>] = match moe_grouped.as_str() {
+                "auto" => &[None],
+                "grouped" => &[Some(true)],
+                "stock" => &[Some(false)],
+                "abba" => &[Some(true), Some(false)],
+                _ => unreachable!("clap validates moe-grouped"),
+            };
+            let warm_pair_modes: &[Option<bool>] = match moe_pair.as_str() {
+                "auto" => &[None],
+                "fused" => &[Some(false)],
+                "split" => &[Some(true)],
+                "abba" => &[Some(false), Some(true)],
+                _ => unreachable!("clap validates moe-pair"),
+            };
+            let warm_q2_load_modes: &[Option<bool>] = match moe_q2_load.as_str() {
+                "vector" => &[Some(true)],
+                "scalar" => &[Some(false)],
+                "abba" => &[Some(false), Some(true)],
+                _ => unreachable!("clap validates moe-q2-load"),
+            };
+            let warm_down_tile_modes: &[Option<usize>] = match moe_down_tile.as_str() {
+                "auto" => &[None],
+                "64" => &[Some(64)],
+                "128" => &[Some(128)],
+                "abba" => &[Some(64), Some(128)],
+                _ => unreachable!("clap validates moe-down-tile"),
+            };
+            let mut grouped_warm_logits: Option<(Vec<f32>, u32)> = None;
+            let mut stock_warm_logits: Option<(Vec<f32>, u32)> = None;
+            let mut vector_load_warm_logits: Option<(Vec<f32>, u32)> = None;
+            let mut scalar_load_warm_logits: Option<(Vec<f32>, u32)> = None;
+            let mut tile64_warm_logits: Option<(Vec<f32>, u32)> = None;
+            let mut tile128_warm_logits: Option<(Vec<f32>, u32)> = None;
+            for use_ds4_mpp in [true, false] {
+                for &grouped_override in warm_moe_modes {
+                    for &pair_override in warm_pair_modes {
+                        for &q2_load_override in warm_q2_load_modes {
+                            for &down_tile_override in warm_down_tile_modes {
+                                let q8_name = if use_ds4_mpp { "ds4-mpp" } else { "stock" };
+                                let moe_name = match grouped_override {
+                                    Some(true) => "grouped",
+                                    Some(false) => "stock",
+                                    None => "auto",
+                                };
+                                let pair_split = pair_override.unwrap_or(true);
+                                let pair_name = if pair_split { "split" } else { "fused" };
+                                let q2_vector_load = q2_load_override.unwrap_or(true);
+                                let q2_load_name = if q2_vector_load { "vector" } else { "scalar" };
+                                let _q8_scope =
+                                    lisa_engine::core::quant::Glm53Q8PrefillScope::new(use_ds4_mpp);
+                                let _moe_scope = grouped_override.map(
+                                    lisa_engine::core::quant::Glm53GroupedMoePrefillScope::new,
+                                );
+                                let _pair_scope = pair_override
+                                    .map(lisa_engine::core::quant::Glm53GroupedMoePairScope::new);
+                                let _q2_load_scope = q2_load_override
+                                    .map(lisa_engine::core::quant::Glm53GroupedMoeQ2LoadScope::new);
+                                let _down_tile_scope = down_tile_override.map(
+                                    lisa_engine::core::quant::Glm53GroupedMoeDownTileScope::new,
+                                );
+                                let mut caches = tower.new_caches();
+                                tower.clear_context();
+                                let t = std::time::Instant::now();
+                                let last = tower.prefill(&prompt, &mut caches)?;
+                                let logits = tower.head(&last)?;
+                                let next = lisa_mlx::ops::indexing::argmax(&logits, None)?;
+                                next.eval().map_err(|e| anyhow::anyhow!("{e}"))?;
+                                let next_token = next.item_cast::<i32>() as u32;
+                                if use_ds4_mpp && moe_grouped == "abba" {
+                                    let values = logits.to_vec1::<f32>()?;
+                                    match grouped_override {
+                                        Some(true) => {
+                                            grouped_warm_logits = Some((values, next_token))
+                                        }
+                                        Some(false) => {
+                                            stock_warm_logits = Some((values, next_token))
+                                        }
+                                        _ => unreachable!("ABBA warmup forces each MoE schedule"),
+                                    }
+                                }
+                                if use_ds4_mpp && moe_q2_load == "abba" {
+                                    let values = logits.to_vec1::<f32>()?;
+                                    match q2_load_override {
+                                        Some(true) => {
+                                            vector_load_warm_logits = Some((values, next_token))
+                                        }
+                                        Some(false) => {
+                                            scalar_load_warm_logits = Some((values, next_token))
+                                        }
+                                        _ => unreachable!("Q2 load ABBA warms each load path"),
+                                    }
+                                }
+                                if use_ds4_mpp && moe_down_tile == "abba" {
+                                    let values = logits.to_vec1::<f32>()?;
+                                    match down_tile_override {
+                                        Some(64) => tile64_warm_logits = Some((values, next_token)),
+                                        Some(128) => {
+                                            tile128_warm_logits = Some((values, next_token))
+                                        }
+                                        _ => unreachable!("down tile ABBA warms each tile path"),
+                                    }
+                                }
+                                eprintln!(
+                                    "warmup q8={q8_name:>7} moe={moe_name:>7} pair={pair_name:>5} q2={q2_load_name:>6} down={down_tile_override:?}: {:>7.1} ms, next_token={}",
+                                    t.elapsed().as_secs_f64() * 1e3,
+                                    next_token
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            if let (Some((grouped, grouped_token)), Some((stock, stock_token))) =
+                (grouped_warm_logits.as_ref(), stock_warm_logits.as_ref())
+            {
+                anyhow::ensure!(
+                    grouped.len() == stock.len(),
+                    "MoE schedule logits have different lengths"
+                );
+                let mut exact = 0usize;
+                let mut max_abs = 0.0f64;
+                let mut diff_sq = 0.0f64;
+                let mut reference_sq = 0.0f64;
+                for (&a, &b) in grouped.iter().zip(stock) {
+                    if a.to_bits() == b.to_bits() {
+                        exact += 1;
+                    }
+                    let delta = (a as f64) - (b as f64);
+                    max_abs = max_abs.max(delta.abs());
+                    diff_sq += delta * delta;
+                    reference_sq += (b as f64) * (b as f64);
+                }
+                let rel_l2 = (diff_sq / reference_sq.max(f64::MIN_POSITIVE)).sqrt();
+                println!(
+                    "warmup logits q8=ds4-mpp: grouped vs stock exact {exact}/{} ({:.4}%), max_abs {:.6e}, rel_l2 {:.6e}, next_token {} / {}{}",
+                    grouped.len(),
+                    exact as f64 * 100.0 / grouped.len() as f64,
+                    max_abs,
+                    rel_l2,
+                    grouped_token,
+                    stock_token,
+                    if grouped_token == stock_token {
+                        " (same)"
+                    } else {
+                        " (DIFFERENT)"
+                    }
+                );
+                if let Some(prefix) = dump_schedule_logits_prefix.as_ref() {
+                    for (name, values) in [("grouped", grouped), ("stock", stock)] {
+                        let path =
+                            std::path::PathBuf::from(format!("{}.{}.json", prefix.display(), name));
+                        let payload = serde_json::json!({
+                            "prompt_tokens": n,
+                            "vocab": values.len(),
+                            "logits": values,
+                        });
+                        std::fs::write(&path, serde_json::to_vec(&payload)?)?;
+                        println!("wrote {name} warmup logits: {}", path.display());
+                    }
+                }
+            }
+            if let (Some((tile64, token64)), Some((tile128, token128))) =
+                (tile64_warm_logits.as_ref(), tile128_warm_logits.as_ref())
+            {
+                anyhow::ensure!(
+                    tile64.len() == tile128.len(),
+                    "down tile logits have different lengths"
+                );
+                let exact = tile64
+                    .iter()
+                    .zip(tile128)
+                    .filter(|(a, b)| a.to_bits() == b.to_bits())
+                    .count();
+                let max_abs = tile64
+                    .iter()
+                    .zip(tile128)
+                    .map(|(a, b)| (f64::from(*a) - f64::from(*b)).abs())
+                    .fold(0.0, f64::max);
+                println!(
+                    "grouped down tile warmup: 64/128 exact logits {exact}/{}, max_abs={max_abs:.8}, next_token={token64}/{token128}",
+                    tile64.len()
+                );
+            }
+            if let (Some((vector, vector_token)), Some((scalar, scalar_token))) = (
+                vector_load_warm_logits.as_ref(),
+                scalar_load_warm_logits.as_ref(),
+            ) {
+                anyhow::ensure!(
+                    vector.len() == scalar.len(),
+                    "Q2 load logits have different lengths"
+                );
+                let exact = vector
+                    .iter()
+                    .zip(scalar)
+                    .filter(|(a, b)| a.to_bits() == b.to_bits())
+                    .count();
+                let max_abs = vector
+                    .iter()
+                    .zip(scalar)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                println!(
+                    "warmup logits q8=ds4-mpp moe=grouped: vector vs scalar exact {exact}/{}, max_abs {:.6e}, next_token {} / {}",
+                    vector.len(),
+                    max_abs,
+                    vector_token,
+                    scalar_token
+                );
+                anyhow::ensure!(
+                    exact == vector.len() && vector_token == scalar_token,
+                    "vector and scalar affine-Q2 load paths changed prefill logits"
+                );
+            }
             let mut times = Vec::new();
             for i in 0..iters {
-                tower.ngram_history = None;
+                let use_ds4_mpp = match q8_prefill.as_str() {
+                    "ds4-mpp" => true,
+                    "stock" => false,
+                    "abba" => matches!(i % 4, 0 | 3),
+                    _ => unreachable!("clap validates q8-prefill"),
+                };
+                let use_grouped_moe = match moe_grouped.as_str() {
+                    "auto" => n >= lisa_engine::core::quant::GLM53_GROUPED_MOE_MIN_ROWS,
+                    "grouped" => true,
+                    "stock" => false,
+                    "abba" => matches!(i % 4, 0 | 3),
+                    _ => unreachable!("clap validates moe-grouped"),
+                };
+                let use_split_pair = match moe_pair.as_str() {
+                    "auto" => true,
+                    "fused" => false,
+                    "split" => true,
+                    "abba" => !matches!(i % 4, 0 | 3),
+                    _ => unreachable!("clap validates moe-pair"),
+                };
+                let use_vector_q2_load = match moe_q2_load.as_str() {
+                    "vector" => true,
+                    "scalar" => false,
+                    "abba" => matches!(i % 4, 0 | 3),
+                    _ => unreachable!("clap validates moe-q2-load"),
+                };
+                let down_tile = match moe_down_tile.as_str() {
+                    "auto" => 64,
+                    "64" => 64,
+                    "128" => 128,
+                    "abba" => {
+                        if matches!(i % 4, 0 | 3) {
+                            64
+                        } else {
+                            128
+                        }
+                    }
+                    _ => unreachable!("clap validates moe-down-tile"),
+                };
+                let q8_name = if use_ds4_mpp { "ds4-mpp" } else { "stock" };
+                let moe_name = if use_grouped_moe { "grouped" } else { "stock" };
+                let pair_name = if use_split_pair { "split" } else { "fused" };
+                let q2_load_name = if use_vector_q2_load {
+                    "vector"
+                } else {
+                    "scalar"
+                };
+                let _q8_scope = lisa_engine::core::quant::Glm53Q8PrefillScope::new(use_ds4_mpp);
+                let _moe_scope = (moe_grouped != "auto").then(|| {
+                    lisa_engine::core::quant::Glm53GroupedMoePrefillScope::new(use_grouped_moe)
+                });
+                let _pair_scope = (moe_pair != "auto").then(|| {
+                    lisa_engine::core::quant::Glm53GroupedMoePairScope::new(use_split_pair)
+                });
+                let _q2_load_scope = (moe_q2_load != "vector").then(|| {
+                    lisa_engine::core::quant::Glm53GroupedMoeQ2LoadScope::new(use_vector_q2_load)
+                });
+                let _down_tile_scope = (moe_down_tile != "auto").then(|| {
+                    lisa_engine::core::quant::Glm53GroupedMoeDownTileScope::new(down_tile)
+                });
                 let mut caches = tower.new_caches();
+                tower.clear_context();
                 let t = std::time::Instant::now();
-                let (mixed, _) = tower.forward(&arr, Some(&mut caches))?;
-                let last = mixed.index((.., mixed.dim(1) - 1, ..));
+                let last = tower.prefill(&prompt, &mut caches)?;
                 let logits = tower.head(&last)?;
                 let next = lisa_mlx::ops::indexing::argmax(&logits, None)?;
                 next.eval().map_err(|e| anyhow::anyhow!("{e}"))?;
+                let next_token = next.item_cast::<i32>() as u32;
                 let secs = t.elapsed().as_secs_f64();
-                times.push(secs);
+                times.push((
+                    use_ds4_mpp,
+                    use_grouped_moe,
+                    use_split_pair,
+                    use_vector_q2_load,
+                    secs,
+                    down_tile,
+                ));
                 println!(
-                    "iter {i:2}: {:>7.1} tok/s ({:>7.1} ms)",
+                    "iter {i:2} q8={q8_name:>7} moe={moe_name:>7} pair={pair_name:>5} q2={q2_load_name:>6} down={down_tile:>3}: {:>7.1} tok/s ({:>7.1} ms), next_token={next_token}",
                     n as f64 / secs,
                     secs * 1e3
                 );
             }
-            times.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            println!(
-                "median {:.1} tok/s | best {:.1} tok/s ({:.1} ms)",
-                n as f64 / times[times.len() / 2],
-                n as f64 / times[0],
-                times[0] * 1e3
-            );
+            let median = |mut values: Vec<f64>| {
+                values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                if values.len() % 2 == 0 {
+                    (values[values.len() / 2 - 1] + values[values.len() / 2]) * 0.5
+                } else {
+                    values[values.len() / 2]
+                }
+            };
+            for (use_ds4_mpp, q8_name) in [(true, "ds4-mpp"), (false, "stock")] {
+                for (use_grouped_moe, moe_name) in [(true, "grouped"), (false, "stock")] {
+                    for (use_split_pair, pair_name) in [(true, "split"), (false, "fused")] {
+                        for (use_vector_load, q2_load_name) in [(true, "vector"), (false, "scalar")]
+                        {
+                            let path_times: Vec<f64> = times
+                                .iter()
+                                .filter_map(|(q8, moe, pair, q2, seconds, _down_tile)| {
+                                    (*q8 == use_ds4_mpp
+                                        && *moe == use_grouped_moe
+                                        && *pair == use_split_pair
+                                        && *q2 == use_vector_load)
+                                        .then_some(*seconds)
+                                })
+                                .collect();
+                            if path_times.is_empty() {
+                                continue;
+                            }
+                            let median_secs = median(path_times.clone());
+                            let best_secs =
+                                path_times.iter().copied().min_by(f64::total_cmp).unwrap();
+                            println!(
+                                "q8={q8_name:>7} moe={moe_name:>7} pair={pair_name:>5} q2={q2_load_name:>6} median {:.1} tok/s | best {:.1} tok/s ({:.1} ms)",
+                                n as f64 / median_secs,
+                                n as f64 / best_secs,
+                                best_secs * 1e3
+                            );
+                        }
+                    }
+                }
+            }
+            if moe_grouped == "abba" {
+                for (cycle, samples) in times.chunks_exact(4).enumerate() {
+                    let grouped_ms = median(vec![samples[0].4, samples[3].4]) * 1e3;
+                    let stock_ms = median(vec![samples[1].4, samples[2].4]) * 1e3;
+                    println!(
+                        "MoE ABBA cycle {cycle}: grouped {:.1} ms, stock {:.1} ms, delta {:+.2}%",
+                        grouped_ms,
+                        stock_ms,
+                        (grouped_ms / stock_ms - 1.0) * 100.0
+                    );
+                }
+            }
+            if moe_down_tile == "abba" {
+                for (cycle, samples) in times.chunks_exact(4).enumerate() {
+                    let tile64_ms = median(vec![samples[0].4, samples[3].4]) * 1e3;
+                    let tile128_ms = median(vec![samples[1].4, samples[2].4]) * 1e3;
+                    println!(
+                        "grouped down tile ABBA cycle {cycle}: 64-row {:.1} ms, 128-row {:.1} ms, delta {:+.2}%",
+                        tile64_ms,
+                        tile128_ms,
+                        (tile128_ms / tile64_ms - 1.0) * 100.0
+                    );
+                }
+            }
+            if q8_prefill == "abba" {
+                for (use_grouped_moe, moe_name) in [(true, "grouped"), (false, "stock")] {
+                    let q8_times: Vec<f64> = times
+                        .iter()
+                        .filter_map(|(_, moe, _, _, seconds, _down_tile)| {
+                            (*moe == use_grouped_moe).then_some(*seconds)
+                        })
+                        .collect();
+                    for (cycle, samples) in q8_times.chunks_exact(4).enumerate() {
+                        let mpp_ms = median(vec![samples[0], samples[3]]) * 1e3;
+                        let stock_ms = median(vec![samples[1], samples[2]]) * 1e3;
+                        println!(
+                            "Q8 ABBA ({moe_name}) cycle {cycle}: ds4-mpp {:.1} ms, stock {:.1} ms, delta {:+.2}%",
+                            mpp_ms,
+                            stock_ms,
+                            (mpp_ms / stock_ms - 1.0) * 100.0
+                        );
+                    }
+                }
+            }
+            if moe_pair == "abba" {
+                for (cycle, samples) in times.chunks_exact(4).enumerate() {
+                    let fused_ms = median(vec![samples[0].4, samples[3].4]) * 1e3;
+                    let split_ms = median(vec![samples[1].4, samples[2].4]) * 1e3;
+                    println!(
+                        "MoE pair ABBA cycle {cycle}: fused {:.1} ms, split {:.1} ms, delta {:+.2}%",
+                        fused_ms,
+                        split_ms,
+                        (split_ms / fused_ms - 1.0) * 100.0
+                    );
+                }
+            }
+            if moe_q2_load == "abba" {
+                for (cycle, samples) in times.chunks_exact(4).enumerate() {
+                    let vector_ms = median(vec![samples[0].4, samples[3].4]) * 1e3;
+                    let scalar_ms = median(vec![samples[1].4, samples[2].4]) * 1e3;
+                    println!(
+                        "MoE Q2-load ABBA cycle {cycle}: vector {:.1} ms, scalar {:.1} ms, delta {:+.2}%",
+                        vector_ms,
+                        scalar_ms,
+                        (vector_ms / scalar_ms - 1.0) * 100.0
+                    );
+                }
+            }
             Ok(())
         }
         Command::Golden {
@@ -954,7 +1710,9 @@ fn embedded_qwen35_golden(dir: &std::path::Path) -> &'static str {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(g) else {
             continue;
         };
-        let Some(m) = v["model"].as_str() else { continue };
+        let Some(m) = v["model"].as_str() else {
+            continue;
+        };
         let short = m.rsplit('/').next().unwrap_or(m);
         if path.contains(&m.replace('/', "--")) || path.contains(short) {
             return g;
@@ -1093,7 +1851,7 @@ fn golden_qwen35(
         }
     };
     let tok = tokenizer::Tokenizer::load(model)?;
-    generate::set_eos_ids(tok.im_end_ids.clone());
+    generate::set_eos_ids_for_model(tok.im_end_ids.clone(), tower.as_ref());
 
     let cases = g["cases"]
         .as_array_mut()

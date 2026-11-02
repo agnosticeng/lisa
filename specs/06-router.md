@@ -1,93 +1,83 @@
-# specs/06 — Router PLD/MTP hybride
+# 06 — Prompt-lookup / MTP routing
 
-HEAD base 69d2f60. Contraintes respectées: séquentiel, memory-guard (<20 Go libre
-= abort; plancher observé ~66 Go), max-tokens 128, ignore_eos, greedy.
+Historical Qwen campaign at base `69d2f60`. Measurements below describe that
+source and machine, not a current guarantee for every model. Current numerical
+and safety requirements are in [00](00-contracts.md); GLM's separate MTP path
+is described in [11](11-glm53-flash.md).
 
-## 0. Corrections de la premise de départ (mesuré, pas inventé)
+## Existing mechanisms and routing boundary
 
-1. **Il n'existe aucun "gate ngram-score 0.010" dans le repo** — PLD est un flag
- opt-in (`--pld`, greedy, `pld_enable`), jamais gaté automatiquement.
-2. **Les deux moteurs SONT déjà combinés**: `generate_mtp_depth`
- (session.rs ~601-666) mélange copy-draft (PLD) et chaîne MTP PAR ROUND
- ("copy hits lead the proposal and the MTP chain fills the remainder",
- lossless, full-copy round = chaîne sautée mais restart maintenu §9.3).
-3. Le PLD pur (`pld_decode`, generate.rs) est le chemin sans drafter.
+The campaign found no automatic `ngram-score 0.010` gate. Plain PLD was an
+explicit greedy opt-in. The Qwen MTP loop already combined copy proposals with
+its draft chain within each round: copy hits supply covered positions and the
+chain fills the remainder. A full-copy round can skip chain construction while
+preserving the draft-head restart.
 
-## 1. Coexistence
+Both mechanisms use one loaded model. PLD adds no weights; MTP owns the draft
+head. Switching proposal sources inside the MTP loop was exercised by its auto
+runs. Switching a persistent session from plain PLD to MTP was not admitted:
+the plain path did not populate all token/multi-state history needed to prime
+the MTP head. A future transition requires explicit history/state proof; the
+campaign's request-level router did not establish it.
 
-- Mémoire/process: oui — un seul modèle chargé; PLD = zéro poids additionnel,
- MTP = sidecar drafter. Les deux chemins vivent dans le même binaire et la
- même `Session` (caches partagés, l'un OU l'autre par requête).
-- **Switching intra-génération (MTP loop)**: SAIN et déjà exercé — chaque run
- auto alterne round chaîne (d2..d6) / pas série (EV=0) / round copy, des
- dizaines de fois par run (logs `[mtp.auto] picks`), avec sorties
- reproductibles rep-à-rep. Test dédié = les runs auto de la table (ci-dessous).
-- **Switching inter-moteurs sur la même Session (PLD puis MTP)**: NON SÛR par
- construction — un tour PLD (`Session::generate`) commit des tokens dans les
- caches sans alimentner `mtp_tokens`/`mtp_multi`; un tour MTP ultérieur prime
- la tête sur une historique tronquée (trou token/multi-pairs). Non tenté;
- règle: un seul moteur par session persistante (le routage est par requête).
+## Baseline decision table
 
-## 2. Table de décision (27B agnosticeng/Qwen3.8-27B-4bit, ~2k KV, 128 tok,
-interleavé ×2 ordre alterné, medians, bench/tools/router_table.sh)
+Model: `agnosticeng/Qwen3.8-27B-4bit`; about 2K KV, 128 output tokens, greedy,
+forced-length decoding. Runs were sequential, one model resident, with memory
+preflight and two interleaved repetitions in alternating order. Rates are
+median tokens/s.
 
-| régime | serial | PLD pur | MTP-auto |
-|---|---|---|---|
-| écho | 22.6 | **33.5** | 17.3 (PIRE que série) |
-| prose | 22.9 | 22.8 (auto-gaté: 2 rounds, 1 hit) | 21.6 |
-| mixte | 23.5 | **24.8** | 20.8 |
+| Content | Serial | Plain PLD | MTP auto |
+| --- | ---: | ---: | ---: |
+| Echo | 22.6 | 33.5 | 17.3 |
+| Prose | 22.9 | 22.8 | 21.6 |
+| Mixed | 23.5 | 24.8 | 20.8 |
 
-- PLD pur ne perd JAMAIS: son fallback copy-miss EST un pas série et les
- drafts sont toujours vérifiés (lossless).
-- MTP-auto PERD sur écho: chaque round full-copy paie le restart de tête
- (`draft_step`) et les rounds copy sont exclus du pricing EV → EV surestimé
- (EV affiché d2:39 vs réalisé 17.3).
-- L'avantage MTP sur prose ne se matérialise pas à ~2k KV; il est documenté à
- long KV (specs/03: auto 41.6 vs série 33.6 à 12.5k).
+A PLD miss falls back to a serial step, and every proposal is verified. This
+explains its small overhead in these cases; it is not a universal proof that
+PLD can never regress. MTP auto lost on echo here because full-copy rounds
+still paid head restart while those rounds were excluded from EV pricing.
+Long-context prose had a different balance; [03](03-draft-long.md) records
+41.6 versus 33.6 tokens/s at 12.5K after the controller fix.
 
-## 3. Routeur implémenté
+## Implemented router
 
-- `echo_score` (copy_draft.rs): fraction des positions 4-gram du prompt dont
- le 4-gram est réapparu plus tôt. Séparation FAIBLE sur tokens réels (mesuré:
- écho 0.857, prose 0.707, mixte 0.594 — les 4-grammes de subwords récurrents
- gonflent la prose); tests unitaires sur synthétique (echo>0.9, novel<0.05,
- mixte intermédiaire).
-- Règle (`lisa run --router`, `--router-threshold` 0.80 par défaut... voir
- main.rs: PLD si echo ≥ threshold OU prompt < LONG_KV=8192 tokens; sinon
- policy `--depth`). Le seuil ne garde que la branche long-KV (direction
- coûteuse: prose→pld). À court KV, PLD-par-défaut est quasi-optimal.
-- Traçage: `[router] echo_score ... -> pld|depth policy`.
+`echo_score` in `core/copy_draft.rs` measures the fraction of prompt 4-gram
+positions that occurred earlier. Actual subword repeats gave echo/prose/mixed
+scores of 0.857/0.707/0.594, so the score separated content less cleanly than
+synthetic tests suggested.
 
-## 4. A/B certifié (bench/tools/router_ab.sh; base = `--depth auto` vs
-`--router`; ×3 paires interleavées, ordre alterné, même session)
+The CLI router selected PLD when the score met the configured threshold
+(default 0.80) or the prompt was shorter than 8,192 tokens. Otherwise it used
+the selected depth policy. The trace reported the score and selected engine.
+The threshold therefore governed the long-context branch; the short-context
+branch selected PLD independently.
 
-| régime | base (medians) | router | gain | par paire |
-|---|---|---|---|---|
-| écho | 19.5 | **34.4** | **+76%** | net positif 3/3 |
-| prose | 16.7 | 18.7 | +12% | net positif 3/3 |
-| mixte | 22.9 | 21.7 | −5% brut = parité (drift thermique) | +0.1/−1.4/+1.7 |
+## Interleaved before/after result
 
-- Note drift: base prose 21.6 (table) → 16.7 (A/B) entre sessions; seules les
- paires même-session comptent (leçon specs/16/27 re-confirmée).
-- **Identité de tokens vérifiée**: router≡PLD forcé, texte généré identique
- (écho et mixte) — le routeur ne change que le choix du moteur.
-- Objectif "mixte ≥ max(moteurs seuls) par segment": atteint au sens table
- (routeur=PLD=24.8 = meilleur des 3 sur mixte); l'A/B mixte vs MTP-auto est
- une parité dans la fenêtre thermique de la session A/B.
+Three alternating pairs compared `--depth auto` with `--router` in the same
+measurement session. Rates are median tokens/s.
 
-## 5. Vérifications
+| Content | Auto baseline | Router | Observed change |
+| --- | ---: | ---: | --- |
+| Echo | 19.5 | 34.4 | +76%; positive in all three pairs |
+| Prose | 16.7 | 18.7 | +12%; positive in all three pairs |
+| Mixed | 22.9 | 21.7 | -5% raw; pair deltas +0.1/-1.4/+1.7 within session drift |
 
-- Golden 310/310 ×2 (agnosticeng/Qwen3.8-27B-4bit). lib lisa-engine 24/24
- (dont 2 nouveaux tests echo_score). qwen4 golden non runnable sur cette
- machine (ngram.safetensors absent, préexistant).
-- RAM: plancher observé ~66 Go libre, cap 120 Go respecté, runs séquentiels.
+Router and forced PLD emitted identical text on the tested echo and mixed
+cases. Baseline prose drifted from 21.6 in the decision table to 16.7 in the
+later pairs; cross-session rates were not used as causal evidence.
 
-## 6. Reste
+Validation at that revision: Qwen35 golden 310/310 twice and 24 engine tests,
+including two score tests. Flash-Next could not run because the local checkpoint
+lacked `ngram.safetensors`; it was not certified by this campaign. Minimum
+observed free memory was about 66 GB; the run obeyed its detected-RAM budget.
 
-- Routeur côté serve (`lisa-serve` lit cfg.pld/depth process-wide; exposer le
- même routage par requête en respectant la contrainte une-session-un-moteur).
-- Branche long-KV non re-mesurée ici (seuil 0.80 garde specs/03 comme
- référence: MTP 41.6 vs PLD≈série sur prose 12.5k; à re-valider par un A/B
- dédié long avant de durcir la règle).
-- Étendre pld_decode à capturer les lignes multi (forward_capture) pour
- rendre sûr un escalade PLD→MTP intra-génération (aujourd'hui interdit).
+## Unresolved by this campaign
+
+- Per-request serving integration with persistent-session history preserved.
+- A dedicated long-context interleaved comparison before changing the threshold.
+- Safe plain-PLD-to-MTP transitions with complete multi-state history.
+
+Recheck current implementation and reproduce the relevant workload before
+reopening any item; historical open status is not proof that it is still absent.

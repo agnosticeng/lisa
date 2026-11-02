@@ -14,8 +14,8 @@
 //! flag set closed.
 
 use lisa_mlx::Array;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 static ON: AtomicBool = AtomicBool::new(false);
 /// The distribution pushed by the most recent draft step on this thread.
@@ -243,13 +243,7 @@ pub fn log_summary(samples: &[RoundSample], accept_hist: &[usize]) {
         eprintln!(
             "[mtp.oracle] first-failure rank of the true token: 1:{} 2:{} 3-4:{} \
              5-8:{} 9-32:{} >32:{} outside:{} (n={chain_fail})",
-            b[0],
-            b[1],
-            b[2],
-            b[3],
-            b[4],
-            b[5],
-            outside
+            b[0], b[1], b[2], b[3], b[4], b[5], outside
         );
         for (ki, &k) in KS.iter().enumerate() {
             let gain = repair[ki] as f64 / rounds as f64;
@@ -280,7 +274,10 @@ pub fn log_summary(samples: &[RoundSample], accept_hist: &[usize]) {
             pct(down_le2, down)
         );
     }
-    eprintln!("[mtp.oracle] per-index acceptance, linear chain: [{}]", fmt(&base, &cnt));
+    eprintln!(
+        "[mtp.oracle] per-index acceptance, linear chain: [{}]",
+        fmt(&base, &cnt)
+    );
     for (ki, &k) in KS.iter().enumerate() {
         let col: Vec<usize> = hits.iter().map(|h| h[ki]).collect();
         eprintln!(

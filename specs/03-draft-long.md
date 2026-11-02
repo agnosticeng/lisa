@@ -1,26 +1,31 @@
 # Spec 03 — Draft quality in long context (why the auto ceiling at 15.6k)
 
+Historical Qwen campaign. Results and implementation descriptions below refer
+to their recorded source versions; later sections may supersede earlier
+findings. Current contracts are in [00](00-contracts.md) and
+[AGENTS.md](../AGENTS.md). These measurements do not certify current GLM paths.
+
 ## Context
 
 At ~15.6k prompt tokens the MTP auto controller picks d2/d3 and acceptance on
 natural prose is 1.6–1.8 tok/round (per-index roughly [0.86 0.62 0.11 0.03 …]).
 On short haiku-style prompts the same draft reaches 2.5+/round, and the d6 trim
-fix (spec 11 §15) proved 3.5 tok/round is reachable at short KV. The auto
+fix (the earlier Qwen draft-history correction) proved 3.5 tok/round is reachable at short KV. The auto
 ceiling of ~28 tok/s on long prose is therefore an *acceptance* ceiling, not a
-verify-cost ceiling (specs 23/24 already cut verify cost). Question: why does
+verify-cost ceiling (the earlier verify-kernel work already cut verify cost). Question: why does
 the draft degrade with context length, and is it repairable without inventing
 machinery?
 
 ## Constraints (user directive)
 
-- HARD CAP 120 GB RAM total; sequential runs only, one model loaded at a time.
+- Budget = detected physical RAM minus 8 GiB; sequential runs only, one model loaded at a time.
 - `memory_pressure` check before every run; max-tokens ≤ 128 (256 for final runs).
 - Flaky tests → isolated runs, never diagnose inside a parallel suite.
 - Interleaved same-session A/B only (box drifts ±40%).
 
 ## Phase 1 — Measure
 
-On ONE long natural-English text (`bench/data/long_prompt.txt`, ~75 KB,
+On one long natural-English text (about 75 KB,
 Qwen3.8-27B-4bit), same text family for every arm:
 
 (a) **Acceptance per index × depth × KV length** at kv ∈ {1k, 4k, 8k, 16k}
@@ -67,7 +72,7 @@ if winning, A/B protocol 24-style (interleaved same-session, ×3 pairs).
 
 ### Phase 1(a) — acceptance per index × depth × KV (same prose file)
 
-`bench/data/long_prompt.txt`, char-prefixes, `lisa run --depth {2,3,4}`,
+The same long-prose text, character prefixes, `lisa run --depth {2,3,4}`,
 max-tokens 128. Char targets 1k/4k/8k/16k tokenize to
 (respectively) ~0.8k/3.1k/6.2k/12.5k tokens (4.85 chars/token); the "16k" arm
 below is 12,545 KV rows (printed `prompt_tokens`).
@@ -92,7 +97,7 @@ flat (2.76 → 2.66 tok/round from 1k to 12.5k; per-index depth coverage
 actually *improves* mid-chain at long KV). The 1.6–1.8 "decline" reported at
 15.6k is the AUTO CONTROLLER's d2/d3 mix, not a draft-quality collapse: d2 is
 1.6/round at every KV. Short-haiku 2.5+/round at d2 is a TEXT effect
-(repetitive echo prose), not a KV effect — same class as the spec-23 trap note.
+(repetitive echo prose), not a KV effect; context length alone did not explain it.
 
 ### Phase 1(b) — pipeline decomposition (draft head → 2-bit lm_head → top-32 → re-score)
 
@@ -123,11 +128,11 @@ genuinely uncertain on novel prose, not a pipeline artifact.
  a miss the exact re-score repairs every time (Finding B: final == full
  ≥ 99.3%). "A miss costs acceptance, never output."
 - 3-bit is not measurable here anyway: it needs MLX's permuted 3-bit host
- encoder, which does not exist in this repo (spec-12 trap). Analytically the
+ encoder, which does not exist in this repo. Analytically the
  extra bit buys nothing Finding B does not already neutralize, so 2-bit ships.
 - No separate long-context draft machinery is warranted: acceptance is flat in
  KV (Finding A), so there is nothing long-KV-specific for a wider head to fix.
-- The long-context cost gap (specs/23: our ~28 tok/s decode at 15.6k) is a COST
+- The earlier long-context cost gap (about 28 tokens/s at 15.6K) is a COST
  edge, not an acceptance edge: our serial step ~40 ms and verify/row 7.3 ms at
  15.6k are the driver; the draft pipeline is exonerated by Findings A/B.
 
@@ -150,8 +155,8 @@ Two changes, both measured-first:
 
 1. **Round-cost table recalibration at the long bucket** (`lisa-bench
  round-cost --kv 1024,12288 --docs`): the 8-16k bucket still carried
- pre-spec-24 verify prices (the S-row qk-norm+rope port was never
- re-calibrated into the table — the spec-24 "reset a bucket cell" trap).
+ prices from before the verify-kernel changes (the S-row qk-norm+rope port was never
+ recalibrated into the table).
  New 8-16k row: serial 33.35 ms | draft 1.70 | S3 63.68 S4 75.96 S5 80.08
  S6 79.98 S7 87.72. Alone this did NOT move auto reliably (interleaved
  old/new-table medians 34.2 vs 34.5 tok/s — generation-path variance
@@ -168,7 +173,7 @@ Two changes, both measured-first:
 
 Not landed (measured zero): context-gated/3-bit requant, top-64 shortlist,
 PLD — see Phase 1(b)/(auto observations); 3-bit additionally needs MLX's
-permuted 3-bit host encoder that does not exist in this repo (spec-12 trap).
+permuted 3-bit host encoder that does not exist in this repo.
 
 ## Phase 3 — verdict
 
@@ -184,24 +189,25 @@ permuted 3-bit host encoder that does not exist in this repo (spec-12 trap).
  reach.
 - Verification: lib tests 21/21, `per_depth_acceptance…` new pin green,
  smoke green, qwen3_5 golden 310/310 ×2, workspace build clean. Memory:
- sequential single-model runs only; system 92% free pre-run (137 GB
- machine, ≤120 GB cap respected; one model resident ≈ 20 GB).
+ sequential single-model runs only; system 92% free pre-run, detected-RAM
+ budget respected; one model resident about 20 GB.
 - Residual: box drift makes single pairs unreliable — always interleave;
  EV still prices from the shared EMA until a depth has 3 trusted rounds
  (first ~6 rounds of a request stay conservative by design).
-## Additional measured findingsserving campaign)
+## Additional measured findings from the serving campaign
 
 - **Speculation density is content-bound.** lisa decodes at **57.7 tok/s on
  predictable** content vs **39.6 on novel** (1.46×); the draft composition
  is sound — the copy merges **per position** (proposal `i` takes the copy
  token when one covers it, else the chain's own prediction; only a
  full-depth copy hit skips the chain). The lever is lookup-draft
- composition/length: **1.3-1.5× on file rewrites**; the PLD draft length
- defaults to 5.
-- **Verify-width cost bar (why `COPY_LEN_MAX = 6`).** A verify is 1.4-2× a
+ composition/length: **1.3-1.5× on file rewrites**; the PLD draft length in that measurement was five.
+- **Historical verify-width cost bar (then `COPY_LEN_MAX = 6`).** A verify is 1.4-2× a
  serial step (S3 54.3 ms, S7 78.0, **S8 108.0** — the S-cliff that
  justifies `COPY_LEN_MAX = 6`), so speculation pays only through accepted
- tokens; the copy is already optimal on echo (mean 6.00 of 6).
+ tokens; the copy was already optimal on echo (mean 6.00 of 6). The later
+ S=8 result in [08](08-tree-draft.md) raised the MTP copy-proposal default
+ to seven; the public plain-PLD clamp remains six.
 - **Open item — yield per verify on predictable NON-echo content.** Needs a
  workload that reproduces the decode-rate gap before optimizing; three
  "gaps" of that campaign turned out not to be code.

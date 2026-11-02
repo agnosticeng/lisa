@@ -15,6 +15,7 @@
 //! an `Array`/`Stream` surface, and a backend supplies it.
 
 pub mod gdn;
+pub mod glm53;
 pub mod hf;
 pub mod laya;
 pub mod qwen3_5;
@@ -24,15 +25,34 @@ pub mod speculate;
 use std::path::{Path, PathBuf};
 
 use lisa_mlx::Array;
+use lisa_mlx::ops::indexing::IndexOp;
 
-use crate::core::cache::LayerCache;
+use crate::core::cache::{IndexerTape, LayerCache};
 
 /// The interface the runtime needs from a decoder-only text model.
 pub trait LanguageModel {
-    /// Maximum sequence length (prompt + generated).
+    /// Explicit arithmetic identity for cached model state, available before
+    /// any lazy pipeline compilation. None preserves the runtime's legacy law.
+    fn cache_numerical_law(&self) -> Option<u64> {
+        None
+    }
+    /// Effective sequence limit (prompt + generated), including runtime capacity.
     fn max_position_embeddings(&self) -> usize;
+    /// Configure the runtime context limit before warmup or creating sessions.
+    /// Models that support this report the effective limit through
+    /// `max_position_embeddings`; other models keep their existing behavior.
+    fn set_context_capacity(&mut self, capacity: usize) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "runtime context capacity {capacity} is not supported by this model; omit --ctx-size"
+        )
+    }
     /// End-of-sequence token id.
     fn eos_token_id(&self) -> i64;
+    /// All token ids that end generation. Models with a multi-token stop set
+    /// override this while keeping `eos_token_id` as the legacy primary id.
+    fn eos_token_ids(&self) -> Vec<i64> {
+        vec![self.eos_token_id()]
+    }
     /// Fresh per-layer caches for one stream.
     fn new_caches(&self) -> Vec<LayerCache>;
     /// One forward over `ids [B,S]`; returns `(mixed [B,S,H], multi)`.
@@ -41,6 +61,51 @@ pub trait LanguageModel {
         ids: &Array,
         caches: Option<&mut Vec<LayerCache>>,
     ) -> anyhow::Result<(Array, Array)>;
+    /// Forward one decode token for independently positioned streams that keep
+    /// separate per-row caches. Architectures with row-local sparse state may
+    /// override this to batch the stateless tower operations while advancing
+    /// each row's cache at its own absolute position.
+    fn forward_ragged(
+        &mut self,
+        ids: &Array,
+        per_row_caches: &mut [Vec<LayerCache>],
+    ) -> anyhow::Result<(Array, Array)> {
+        anyhow::ensure!(
+            ids.dim(0) as usize == per_row_caches.len() && ids.dim(1) == 1,
+            "ragged forward expects one token and cache per row, got ids {:?}, caches {}",
+            ids.shape(),
+            per_row_caches.len()
+        );
+        let n = per_row_caches.len();
+        let mut mixed_rows = Vec::with_capacity(n);
+        let mut multi_rows = Vec::with_capacity(n);
+        let tails = self.context_tails();
+        let mut next_tails = Vec::with_capacity(per_row_caches.len());
+        for (row, caches) in per_row_caches.iter_mut().enumerate() {
+            if tails.len() == n {
+                self.set_context_tails(vec![tails[row].clone()]);
+            }
+            let ids_row = ids.index((row as i32..row as i32 + 1, ..));
+            let (mixed, multi) = self.forward(&ids_row, Some(caches))?;
+            mixed_rows.push(mixed);
+            multi_rows.push(multi);
+            let updated = self.context_tails();
+            if updated.len() == 1 {
+                next_tails.push(updated[0].clone());
+            }
+        }
+        if next_tails.len() == n {
+            self.set_context_tails(next_tails);
+        } else if tails.len() == per_row_caches.len() {
+            self.set_context_tails(tails);
+        }
+        let mixed_refs: Vec<&Array> = mixed_rows.iter().collect();
+        let multi_refs: Vec<&Array> = multi_rows.iter().collect();
+        Ok((
+            Array::concatenate(&mixed_refs, 0)?,
+            Array::concatenate(&multi_refs, 0)?,
+        ))
+    }
     /// Forward with the speculative-verify capture enabled.
     fn forward_capture(
         &mut self,
@@ -48,8 +113,54 @@ pub trait LanguageModel {
         caches: Option<&mut Vec<LayerCache>>,
         capture: bool,
     ) -> anyhow::Result<(Array, Array)>;
+    /// Install a layer capture for targeted model-parity tests.
+    #[cfg(test)]
+    fn set_debug_capture_for_test(&mut self, _layers: Vec<usize>) -> anyhow::Result<()> {
+        anyhow::bail!("debug capture is not supported by this model")
+    }
+    /// Install a test capture limited to selected layer keys.
+    #[cfg(test)]
+    fn set_debug_capture_filtered_for_test(
+        &mut self,
+        layers: Vec<usize>,
+        _key_filters: Vec<String>,
+    ) -> anyhow::Result<()> {
+        self.set_debug_capture_for_test(layers)
+    }
+    /// Flush the targeted model-parity capture to an NPZ file.
+    #[cfg(test)]
+    fn flush_debug_capture_for_test(&mut self, _path: &str) -> anyhow::Result<()> {
+        anyhow::bail!("debug capture is not supported by this model")
+    }
+    /// Record output-head vectors for a diagnostic parity run. Production
+    /// dispatch remains active; the caller excludes this run from timings.
+    fn enable_logit_capture(&mut self) -> anyhow::Result<()> {
+        anyhow::bail!("logit capture is not supported by this model")
+    }
+    /// Record selected internal stages while retaining production dispatch.
+    fn enable_stage_capture(
+        &mut self,
+        _layers: Vec<usize>,
+        _keys: Vec<String>,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("stage capture is not supported by this model")
+    }
+    /// Write the diagnostic vectors after generation has completed.
+    fn write_logit_capture(&self, _path: &str) -> anyhow::Result<()> {
+        anyhow::bail!("logit capture is not supported by this model")
+    }
     /// Prefill `tokens`; returns the last row's hidden state.
     fn prefill(&mut self, tokens: &[u32], caches: &mut Vec<LayerCache>) -> anyhow::Result<Array>;
+    /// Commit one generated token; returns its last hidden state. Models with
+    /// a distinct generation graph override this without changing prompt or
+    /// suffix prefill, including one-token prompt chunks.
+    fn decode_token(
+        &mut self,
+        token: u32,
+        caches: &mut Vec<LayerCache>,
+    ) -> anyhow::Result<Array> {
+        self.prefill(&[token], caches)
+    }
     /// Prefill `tokens`; returns the last hidden state and the multi stream.
     fn prefill_multi(
         &mut self,
@@ -58,6 +169,16 @@ pub trait LanguageModel {
     ) -> anyhow::Result<(Array, Array)>;
     /// The output head: hidden `[.., H]` -> logits `[.., vocab]`.
     fn head(&self, mixed: &Array) -> lisa_mlx::error::Result<Array>;
+    /// Apply the output head to independently cached decode rows. A model may
+    /// override this when its reference engine falls back from native batch
+    /// execution to a row-serial graph at a context or batch-size boundary.
+    fn head_ragged(
+        &self,
+        mixed: &Array,
+        _per_row_caches: &[Vec<LayerCache>],
+    ) -> lisa_mlx::error::Result<Array> {
+        self.head(mixed)
+    }
     /// Warm the kernels for the scored shapes.
     fn warmup(&mut self, seed: &[u32]) -> anyhow::Result<()>;
 
@@ -66,6 +187,16 @@ pub trait LanguageModel {
     /// scheduler to lone streams (the exact single-stream path).
     fn batch_decode_ok(&self) -> bool {
         true
+    }
+    /// Some batch-capable towers require every live row to share one absolute
+    /// cache position. The scheduler then admits only matching prompt lengths.
+    fn batch_decode_equal_length_only(&self) -> bool {
+        false
+    }
+    /// Whether independently positioned streams can share a decode batch
+    /// while retaining row-local cache state.
+    fn batch_decode_ragged_supported(&self) -> bool {
+        false
     }
     /// O3: bytes of KV a single token occupies for one stream (0 = unknown, in
     /// which case admission is skipped rather than guessed).
@@ -93,6 +224,23 @@ pub trait LanguageModel {
     /// Whether this model can draft speculative tokens.
     fn has_drafter(&self) -> bool {
         false
+    }
+    /// Whether the model has a target-hidden MTP head (GLM 5.3). Unlike the
+    /// independent Qwen draft chain, this head must be advanced alongside
+    /// target hidden rows and is driven by `target_mtp_step`.
+    fn has_target_mtp(&self) -> bool {
+        false
+    }
+    /// One target-conditioned draft step at an absolute target position.
+    fn target_mtp_step(
+        &mut self,
+        _cache: &mut IndexerTape,
+        _target_multi: &Array,
+        _next_token: u32,
+        _position: usize,
+        _min_position: usize,
+    ) -> anyhow::Result<Array> {
+        anyhow::bail!("this model has no target-hidden MTP head")
     }
     /// Reset the drafter's own caches.
     fn drafter_reset(&mut self) {}
@@ -196,6 +344,18 @@ pub fn load_dir_with(dir: &Path, backend: lisa_mlx::backend::Backend) -> anyhow:
             let config = qwen4::ModelConfig::from_json(&dir.join("config.json"))?;
             Ok(Loaded::Language(Box::new(qwen4::Tower::load(dir, config)?)))
         }
+        // GLM-5.3 Flash (KDA + NoPE-MLA DSA, 288-expert MoE, mHC, MTP).
+        "glm5_next" | "glm5_next_text" => {
+            anyhow::ensure!(
+                backend == lisa_mlx::backend::Backend::Metal,
+                "the glm53 model requires the metal backend (got {})",
+                backend.name()
+            );
+            let config = glm53::config::ModelConfig::from_json(&dir.join("config.json"))?;
+            Ok(Loaded::Language(Box::new(glm53::tower::Tower::load(
+                dir, config,
+            )?)))
+        }
         // Qwen 3.8 27B (dense hybrid GDN + full-attention, native MTP head).
         "qwen3_5" | "qwen3_5_text" => {
             anyhow::ensure!(
@@ -219,7 +379,7 @@ pub fn load_dir_with(dir: &Path, backend: lisa_mlx::backend::Backend) -> anyhow:
             )?)))
         }
         other => anyhow::bail!(
-            "unsupported model_type {other:?} in {}; supported: qwen4_exp, qwen3_5, laya",
+            "unsupported model_type {other:?} in {}; supported families: qwen4_exp, qwen3_5, glm5_next, laya",
             dir.display()
         ),
     }

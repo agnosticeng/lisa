@@ -43,7 +43,8 @@ pub(crate) const MLX_GEMM_PREAMBLE: &str = include_str!("../shaders/common/matmu
 pub(crate) const MLX_QUANTIZED_UTILS_PREAMBLE: &str =
     include_str!("../shaders/common/matmul/quantized_utils.metal");
 /// MLX `metal::quantized()` — preprocessed `kernels/quantized.h` (affine kernels).
-pub(crate) const MLX_QUANTIZED_PREAMBLE: &str = include_str!("../shaders/common/matmul/quantized.metal");
+pub(crate) const MLX_QUANTIZED_PREAMBLE: &str =
+    include_str!("../shaders/common/matmul/quantized.metal");
 /// MLX `metal::unary_ops()` — preprocessed `kernels/unary_ops.h`.
 pub(crate) const MLX_UNARY_OPS_PREAMBLE: &str =
     include_str!("../shaders/common/elementwise/unary_ops.metal");
@@ -73,7 +74,8 @@ const MLX_FUSED_ADD_RMS_SOURCE: &str =
     include_str!("../shaders/common/attention/fused_add_rms.metal");
 /// Norm-in-qmv mega-kernel (specs/16 phase 1): fused add+rms prologue inside
 /// `affine_qmv_fast`. Must come AFTER `MLX_QUANTIZED_PREAMBLE` (uses qdot).
-pub(crate) const MLX_NORM_QMV_SOURCE: &str = include_str!("../shaders/common/matmul/norm_qmv.metal");
+pub(crate) const MLX_NORM_QMV_SOURCE: &str =
+    include_str!("../shaders/common/matmul/norm_qmv.metal");
 /// MLX `kernels/rope.metal` (AOT source; project include stripped). Function
 /// constants: 1 = forward, 2 = traditional, 3 = head_seq_transpose.
 const MLX_ROPE_SOURCE: &str = include_str!("../shaders/common/attention/rope.metal");
@@ -93,12 +95,14 @@ use crate::runtime::MetalRuntime;
 
 mod attention;
 mod buf;
-#[cfg(test)]
-mod mpp_probe;
 mod compile;
 mod elementwise;
+mod glm53_q8_pair;
+mod glm53_q8_tiny;
 mod kernel;
 mod matmul;
+#[cfg(test)]
+mod mpp_probe;
 mod nax;
 mod norm;
 mod reduce;
@@ -110,6 +114,8 @@ pub use buf::*;
 pub(crate) use compile::builtin_template_def;
 pub use compile::*;
 pub use elementwise::*;
+pub use glm53_q8_pair::*;
+pub use glm53_q8_tiny::*;
 pub use kernel::*;
 pub use matmul::*;
 pub use nax::*;

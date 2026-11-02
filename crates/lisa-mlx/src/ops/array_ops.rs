@@ -321,6 +321,31 @@ pub fn argpartition_axis(a: &Array, kth: i32, axis: i32) -> Result<Array> {
 // paths, which keep their bit-exact dispatch.
 thread_local! {
     static VERIFY_SPLITK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static GLM53_LM_HEAD_QMV_TILE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Scoped serial GLM output-head QMV tile override for matched in-situ A/Bs.
+/// `None` keeps MLX's 4-row SIMD-group schedule; `Some(8)` tests a wider tile.
+pub struct Glm53LmHeadQmvTileScope {
+    previous: Option<usize>,
+}
+
+impl Glm53LmHeadQmvTileScope {
+    pub fn new(rows_per_simdgroup: usize) -> Self {
+        assert!(matches!(rows_per_simdgroup, 4 | 8));
+        let previous = GLM53_LM_HEAD_QMV_TILE.with(|slot| {
+            let previous = slot.get();
+            slot.set(Some(rows_per_simdgroup));
+            previous
+        });
+        Self { previous }
+    }
+}
+
+impl Drop for Glm53LmHeadQmvTileScope {
+    fn drop(&mut self) {
+        GLM53_LM_HEAD_QMV_TILE.with(|slot| slot.set(self.previous));
+    }
 }
 
 /// RAII guard for [`VERIFY_SPLITK`]: enables the split-K verify lane on this
@@ -348,7 +373,8 @@ fn verify_splitk_enabled() -> bool {
 }
 
 /// mlx `quantized_matmul` (transpose=true, affine). The input is flattened
-/// to 2-D `[M, K]`: `M == 1` takes the qmv kernel, `M > 1` the split-K qmm.
+/// to 2-D `[M, K]`: M=1 uses qmv, small batches use qmv_wide, then the qmm
+/// prefill path selects split-K or the stock non-split GEMM.
 pub fn quantized_matmul(
     x: &Array,
     w: &Array,
@@ -384,7 +410,26 @@ pub fn quantized_matmul(
         // 36.66/37.21 vs 36.75/36.20 ms median) and kp=4 on the wide-N
         // projections regresses hard (85-88 ms). Kernel-level opt-in, like
         // the msg/nax precedents — the stock serial dispatch stays qmv_fast.
-        crate::jit::affine_qmv_fast(x.t.device(), &x2, &w.t, &sc, &b2, group_size, bits)?
+        let lm_head_tile =
+            if k == 4096 && n >= 100_000 && group_size == 64 && bits == 8 && dt == Dtype::Float32 {
+                GLM53_LM_HEAD_QMV_TILE.with(std::cell::Cell::get)
+            } else {
+                None
+            };
+        if let Some(rows_per_simdgroup) = lm_head_tile {
+            crate::jit::affine_qmv_fast_results(
+                x.t.device(),
+                &x2,
+                &w.t,
+                &sc,
+                &b2,
+                group_size,
+                bits,
+                rows_per_simdgroup,
+            )?
+        } else {
+            crate::jit::affine_qmv_fast(x.t.device(), &x2, &w.t, &sc, &b2, group_size, bits)?
+        }
     } else if m < crate::jit::qmv_batch_limit(k, n) {
         // MLX uses qmv_wide for 2 <= M < vector_limit (affine, gen>=15).
         // Tail-ULP contract exception (AGENTS.md §9, MTP verify rows only):
@@ -416,23 +461,93 @@ pub fn quantized_matmul(
                 // fast-kernel path uses is not wired here). Kept as
                 // kernel-level opt-in (jit::affine_verify_qmm_nax_m16), like
                 // the msg tile precedent.
-                Err(_) => crate::jit::qmv_wide(x.t.device(), &x2, &w.t, &sc, &b2, group_size, bits)?,
+                Err(_) => {
+                    crate::jit::qmv_wide(x.t.device(), &x2, &w.t, &sc, &b2, group_size, bits)?
+                }
             }
         } else {
             crate::jit::qmv_wide(x.t.device(), &x2, &w.t, &sc, &b2, group_size, bits)?
         }
     } else {
-        // Split-K when the tiling supports it (A/B-verified); qmm_nax is
-        // MLX's other non-split path when split_k would collapse to 1.
+        // Split-K when the tiling supports it (A/B-verified). On the current
+        // MLX Metal reference, F32 affine qmm falls back to the stock SIMT
+        // kernel when split_k collapses to 1, including on NAX hardware. A
+        // real GLM-5.3 shared-expert prefill (M=96, K=N=4096, Q8/group-64)
+        // matched that path bit-for-bit; qmm_nax differed by 6.55e-4 rel-L2
+        // for gate/up and 6.20e-4 for down. Keep NAX for the non-F32 fallback
+        // until it has an equivalent direct-reference check.
         match crate::jit::affine_qmm_splitk(x.t.device(), &x2, &w.t, &sc, &b2, group_size, bits) {
             Ok(o) => o,
+            Err(_) if dt == Dtype::Float32 => {
+                crate::jit::affine_qmm(x.t.device(), &x2, &w.t, &sc, &b2, group_size, bits)?
+            }
             Err(_) if k % 64 == 0 && x.t.device().nax() => {
-                // `qmm_nax` is the MPP fallback; without it, surface the
-                // split-K error rather than compiling a NAX kernel.
                 crate::jit::qmm_nax(x.t.device(), &x2, &w.t, &sc, &b2, group_size, bits)?
             }
-            Err(e) => return Err(e),
+            Err(_) => crate::jit::affine_qmm(x.t.device(), &x2, &w.t, &sc, &b2, group_size, bits)?,
         }
+    };
+    let mut shape: Vec<usize> = x.shape()[..rank - 1].iter().map(|&d| d as usize).collect();
+    shape.push(n);
+    Ok(Array::new(out.reshape_dims(shape)?))
+}
+
+/// Affine quantized matmul for independent decode rows. When the shape is
+/// eligible, dispatch the stock M=1 qmv schedule over the row axis in one
+/// command; each row keeps the same accumulation order as an independent
+/// serial call. Shapes outside the fast qmv lane fall back to serial row
+/// calls, which is slower but preserves their arithmetic schedule.
+pub fn quantized_matmul_serial_rows(
+    x: &Array,
+    w: &Array,
+    scales: &Array,
+    biases: Option<&Array>,
+    transpose: bool,
+    group_size: i32,
+    bits: i32,
+) -> Result<Array> {
+    if !transpose {
+        crate::bail!("quantized_matmul_serial_rows: only transpose=true supported");
+    }
+    let bi = biases.ok_or_else(|| {
+        crate::error::Error::Msg("quantized_matmul_serial_rows: affine biases required".into())
+    })?;
+    let rank = x.rank();
+    let k = x.dim(rank as i32 - 1) as usize;
+    let rows = x.size() / k;
+    let n = w.dim(0) as usize;
+    // This is a decode-session helper, not a prefill path. Use the normal
+    // quantized GEMM once the independent-row count gets large.
+    if rows <= 1 || rows > 8 {
+        return quantized_matmul(x, w, scales, Some(bi), transpose, group_size, bits);
+    }
+
+    let dt = promote_dtype(x.t.dtype(), scales.t.dtype());
+    let x2 = x.t.to_dtype(dt)?.reshape(&[rows, k])?.contiguous()?;
+    let sc = scales.t.to_dtype(dt)?.contiguous()?;
+    let b2 = bi.t.to_dtype(dt)?.contiguous()?;
+    if !matches!(dt, Dtype::Bfloat16 | Dtype::Float16 | Dtype::Float32) {
+        crate::bail!("quantized_matmul_serial_rows: unsupported compute dtype {dt:?}");
+    }
+
+    let out = if crate::jit::qmv_fast_eligible(k, n, bits) {
+        crate::jit::affine_qmv_fast(x.t.device(), &x2, &w.t, &sc, &b2, group_size, bits)?
+    } else {
+        let mut pieces = Vec::with_capacity(rows as usize);
+        for row in 0..rows as usize {
+            let one = x2.narrow(0, row, 1)?;
+            pieces.push(quantized_matmul(
+                &Array::new(one),
+                w,
+                scales,
+                Some(bi),
+                transpose,
+                group_size,
+                bits,
+            )?);
+        }
+        let refs: Vec<&Array> = pieces.iter().collect();
+        Array::concatenate(&refs, 0)?.t
     };
     let mut shape: Vec<usize> = x.shape()[..rank - 1].iter().map(|&d| d as usize).collect();
     shape.push(n);
@@ -531,6 +646,102 @@ mod tests {
     use super::*;
     use crate::ops::quantize;
 
+    #[test]
+    fn affine_qmv_row_batch_matches_independent_serial_calls() {
+        if !crate::device::metal_available() {
+            eprintln!("[affine-qmv-rows] skipping: no Metal device available");
+            return;
+        }
+        const K: usize = 512;
+        const N: usize = 64;
+        const M: usize = 3;
+        let mut seed = 0x2f1d_4a73u64;
+        let mut random = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((seed >> 40) as f32 / 8_388_608.0) - 1.0
+        };
+        for bits in [2, 4, 8] {
+            let weights: Vec<f32> = (0..N * K).map(|_| random()).collect();
+            let (w, scales, biases) = quantize(
+                &Array::from_slice(&weights, &[N as i32, K as i32]),
+                64,
+                bits,
+            )
+            .unwrap();
+            let scales = scales
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap()
+                .contiguous()
+                .unwrap();
+            let biases = biases
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap()
+                .contiguous()
+                .unwrap();
+            let inputs: Vec<f32> = (0..M * K).map(|_| random()).collect();
+            let x = Array::from_slice(&inputs, &[M as i32, K as i32])
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap()
+                .contiguous()
+                .unwrap();
+            let batched =
+                quantized_matmul_serial_rows(&x, &w, &scales, Some(&biases), true, 64, bits)
+                    .unwrap();
+            batched.eval().unwrap();
+            let actual = batched.as_slice::<u16>().to_vec();
+            assert_eq!(actual.len(), M * N);
+            for row in 0..M {
+                let input = Array::from_slice(&inputs[row * K..(row + 1) * K], &[1, K as i32])
+                    .as_dtype(Dtype::Bfloat16)
+                    .unwrap()
+                    .contiguous()
+                    .unwrap();
+                let expected =
+                    quantized_matmul(&input, &w, &scales, Some(&biases), true, 64, bits).unwrap();
+                expected.eval().unwrap();
+                let expected = expected.as_slice::<u16>().to_vec();
+                assert_eq!(
+                    &actual[row * N..(row + 1) * N],
+                    expected,
+                    "bits={bits} row={row}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn selected_buffer_readback_waits_only_through_its_last_writer() {
+        if !crate::device::metal_available() {
+            eprintln!("[partial-readback] skipping: no Metal device available");
+            return;
+        }
+        let stream = Stream::thread_local_or_default();
+        let x = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4]);
+        let one = x
+            .add(&Array::from_slice(&[10.0f32, 10.0, 10.0, 10.0], &[4]))
+            .unwrap();
+        let one_cb = one.t.readback_cb_id();
+        stream.runtime().commands.flush().unwrap();
+
+        let two = x
+            .add(&Array::from_slice(&[20.0f32, 20.0, 20.0, 20.0], &[4]))
+            .unwrap();
+        let two_cb = two.t.readback_cb_id();
+        assert!(two_cb > one_cb, "test needs a later command buffer");
+        stream.runtime().commands.flush().unwrap();
+
+        assert_eq!(
+            one.to_vec1_wait_through::<f32>().unwrap(),
+            vec![11.0, 12.0, 13.0, 14.0]
+        );
+        assert_eq!(
+            stream.runtime().commands.completed_id(),
+            one_cb,
+            "partial readback must leave the later writer un-waited"
+        );
+        assert_eq!(two.to_vec1::<f32>().unwrap(), vec![21.0, 22.0, 23.0, 24.0]);
+    }
+
     /// THE TAIL-ULP CONTRACT (AGENTS.md §9, MTP verify rows only): the
     /// split-K verify tile vs the qmv_wide chain it replaces —
     ///   1. maxdiff <= 1 bf16 ULP on EVERY output element, and
@@ -564,9 +775,195 @@ mod tests {
     }
 
     #[test]
+    fn affine_qmm_float32_matches_qmv_rows() {
+        if !crate::device::metal_available() {
+            eprintln!("skipping: no Metal device available");
+            return;
+        }
+        let mut seed = 0x53_u64;
+        let mut random = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((seed >> 40) as f32 / 8_388_608.0) - 1.0
+        };
+        const M: usize = 16;
+        const K: usize = 64;
+        const N: usize = 64;
+        let wv: Vec<f32> = (0..N * K).map(|_| random()).collect();
+        let (w, scales, biases) =
+            quantize(&Array::from_slice(&wv, &[N as i32, K as i32]), 64, 8).unwrap();
+        let scales = scales
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let biases = biases
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let xv: Vec<f32> = (0..M * K).map(|_| random()).collect();
+        let x = Array::from_slice(&xv, &[M as i32, K as i32])
+            .contiguous()
+            .unwrap();
+        let actual = Array::new(
+            crate::jit::affine_qmm(x.t.device(), &x.t, &w.t, &scales.t, &biases.t, 64, 8).unwrap(),
+        );
+        actual.eval().unwrap();
+        let actual = actual.as_slice::<f32>();
+        let mut error_sq = 0.0f32;
+        let mut reference_sq = 0.0f32;
+        for row in 0..M {
+            let input = Array::from_slice(&xv[row * K..(row + 1) * K], &[1, K as i32])
+                .contiguous()
+                .unwrap();
+            let expected = crate::jit::affine_qmv_fast(
+                input.t.device(),
+                &input.t,
+                &w.t,
+                &scales.t,
+                &biases.t,
+                64,
+                8,
+            )
+            .unwrap();
+            expected.eval().unwrap();
+            let expected = expected.as_slice::<f32>();
+            for col in 0..N {
+                let diff = actual[row * N + col] - expected[col];
+                error_sq += diff * diff;
+                reference_sq += expected[col] * expected[col];
+            }
+        }
+        let relative = error_sq.sqrt() / reference_sq.sqrt().max(1e-20);
+        assert!(relative < 2e-4, "F32 qmm rel_l2={relative:.6}");
+    }
+
+    #[test]
+    fn affine_qmv_wide_output_tile_matches_reference_bitwise() {
+        if !crate::device::metal_available() {
+            eprintln!("[affine-qmv-wide] skipping: no Metal device available");
+            return;
+        }
+        const K: usize = 4096;
+        const N: usize = 4096;
+        let mut seed = 0x53_4096_8_u64;
+        let mut random = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((seed >> 40) as f32 / 8_388_608.0) - 1.0
+        };
+        let weight_values: Vec<f32> = (0..N * K).map(|_| random()).collect();
+        let (weight, scales, biases) = quantize(
+            &Array::from_slice(&weight_values, &[N as i32, K as i32]),
+            64,
+            8,
+        )
+        .unwrap();
+        let scales = scales
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let biases = biases
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let input_values: Vec<f32> = (0..K).map(|_| random()).collect();
+        let input = Array::from_slice(&input_values, &[1, K as i32])
+            .contiguous()
+            .unwrap();
+        let reference = Array::new(
+            crate::jit::affine_qmv_fast(
+                input.t.device(),
+                &input.t,
+                &weight.t,
+                &scales.t,
+                &biases.t,
+                64,
+                8,
+            )
+            .unwrap(),
+        );
+        let candidate = Array::new(
+            crate::jit::affine_qmv_fast_results(
+                input.t.device(),
+                &input.t,
+                &weight.t,
+                &scales.t,
+                &biases.t,
+                64,
+                8,
+                8,
+            )
+            .unwrap(),
+        );
+        reference.eval().unwrap();
+        candidate.eval().unwrap();
+        assert_eq!(
+            candidate.to_vec1::<f32>().unwrap(),
+            reference.to_vec1::<f32>().unwrap(),
+            "wider Q8 output tile must retain every reference logit bit"
+        );
+    }
+
+    #[test]
+    fn float32_qmm_fallback_matches_stock_kernel_when_splitk_is_ineligible() {
+        if !crate::device::metal_available() {
+            eprintln!("[affine-qmm-f32-fallback] skipping: no Metal device available");
+            return;
+        }
+        const M: usize = 96;
+        const K: usize = 4096;
+        const N: usize = 4096;
+        let mut seed = 0x53_96_40_96_u64;
+        let mut random = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((seed >> 40) as f32 / 8_388_608.0) - 1.0
+        };
+        let weights: Vec<f32> = (0..N * K).map(|_| random()).collect();
+        let (w, scales, biases) =
+            quantize(&Array::from_slice(&weights, &[N as i32, K as i32]), 64, 8).unwrap();
+        let scales = scales
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let biases = biases
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let inputs: Vec<f32> = (0..M * K).map(|_| random()).collect();
+        let x = Array::from_slice(&inputs, &[M as i32, K as i32])
+            .contiguous()
+            .unwrap();
+        assert!(M >= crate::jit::qmv_batch_limit(K, N));
+        assert!(
+            crate::jit::affine_qmm_splitk(x.t.device(), &x.t, &w.t, &scales.t, &biases.t, 64, 8,)
+                .is_err()
+        );
+
+        let actual = quantized_matmul(&x, &w, &scales, Some(&biases), true, 64, 8).unwrap();
+        let expected = Array::new(
+            crate::jit::affine_qmm(x.t.device(), &x.t, &w.t, &scales.t, &biases.t, 64, 8).unwrap(),
+        );
+        actual.eval().unwrap();
+        expected.eval().unwrap();
+        assert_eq!(
+            actual.to_vec1::<f32>().unwrap(),
+            expected.to_vec1::<f32>().unwrap(),
+            "F32 split-K fallback must match MLX's stock affine qmm"
+        );
+    }
+
+    #[test]
     fn verify_qmm_splitk_tailulp_vs_qmv_wide() {
         for (k, n) in [(5120usize, 17408usize), (5120usize, 151936usize)] {
-            let s_list: &[usize] = if n >= 100_000 { &[3, 5, 7] } else { &[3, 5, 7, 8] };
+            let s_list: &[usize] = if n >= 100_000 {
+                &[3, 5, 7]
+            } else {
+                &[3, 5, 7, 8]
+            };
             for s in s_list.iter().copied() {
                 for draw in 0..3u64 {
                     let mut seed = 1000u64.wrapping_mul(draw + 1).wrapping_add(s as u64);
@@ -698,16 +1095,39 @@ mod tests {
     /// pin beyond M=8 (pinned by the splitk test above, s=8).
     #[test]
     fn verify_qmm_m16_lane_gates() {
-        assert_eq!(crate::jit::verify_qmm_splitk_lane(8, 5120, 17408, 4), Some((2, 2)));
+        assert_eq!(
+            crate::jit::verify_qmm_splitk_lane(8, 5120, 17408, 4),
+            Some((2, 2))
+        );
         assert_eq!(crate::jit::verify_qmm_splitk_lane(9, 5120, 17408, 4), None);
-        assert_eq!(crate::jit::verify_qmm_nax_m16_lane(9, 5120, 17408, 4, 64), true);
+        assert_eq!(
+            crate::jit::verify_qmm_nax_m16_lane(9, 5120, 17408, 4, 64),
+            true
+        );
         // M=8 is eligible for BOTH (splitk wins by dispatch order); the gate
         // itself accepts 8..=16.
-        assert_eq!(crate::jit::verify_qmm_nax_m16_lane(8, 5120, 17408, 4, 64), true);
-        assert_eq!(crate::jit::verify_qmm_nax_m16_lane(16, 5120, 17408, 4, 64), true);
-        assert_eq!(crate::jit::verify_qmm_nax_m16_lane(9, 5120, 17408, 4, 32), true);
-        assert_eq!(crate::jit::verify_qmm_nax_m16_lane(9, 5104, 17408, 4, 64), false, "K % 128");
-        assert_eq!(crate::jit::verify_qmm_nax_m16_lane(9, 5120, 151936, 4, 64), false, "huge-N");
+        assert_eq!(
+            crate::jit::verify_qmm_nax_m16_lane(8, 5120, 17408, 4, 64),
+            true
+        );
+        assert_eq!(
+            crate::jit::verify_qmm_nax_m16_lane(16, 5120, 17408, 4, 64),
+            true
+        );
+        assert_eq!(
+            crate::jit::verify_qmm_nax_m16_lane(9, 5120, 17408, 4, 32),
+            true
+        );
+        assert_eq!(
+            crate::jit::verify_qmm_nax_m16_lane(9, 5104, 17408, 4, 64),
+            false,
+            "K % 128"
+        );
+        assert_eq!(
+            crate::jit::verify_qmm_nax_m16_lane(9, 5120, 151936, 4, 64),
+            false,
+            "huge-N"
+        );
     }
 
     /// TAIL-ULP PINS for the splitk variant axis (VLOAD uint4 loads /
@@ -827,9 +1247,7 @@ mod tests {
         let hd = 256usize;
         let mut seed = 97531u64;
         let mut rnd = move || {
-            seed = seed
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1);
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
             ((seed >> 40) as f32 / 8_388_608.0) - 1.0
         };
         // Interleaved weight rows: per head [q rows | gate rows] (hd-wide).
@@ -871,8 +1289,7 @@ mod tests {
                 .unwrap()
                 .contiguous()
                 .unwrap();
-            let y_ref =
-                quantized_matmul(&x, &wq, &scales, Some(&biases), true, 64, 4).unwrap();
+            let y_ref = quantized_matmul(&x, &wq, &scales, Some(&biases), true, 64, 4).unwrap();
             // y_ref is [1, N]: flatten before gathering output ROWS.
             let y_gath_ref = y_ref
                 .reshape(&[n as i32])
@@ -881,15 +1298,20 @@ mod tests {
                 .unwrap()
                 .contiguous()
                 .unwrap();
-            let y_merged =
-                quantized_matmul(&x, &wq_g, &sc_g, Some(&bi_g), true, 64, 4).unwrap();
-            let a = y_merged.as_dtype(Dtype::Float32).unwrap().to_vec1::<f32>().unwrap();
+            let y_merged = quantized_matmul(&x, &wq_g, &sc_g, Some(&bi_g), true, 64, 4).unwrap();
+            let a = y_merged
+                .as_dtype(Dtype::Float32)
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
             let b = y_gath_ref
                 .as_dtype(Dtype::Float32)
                 .unwrap()
                 .to_vec1::<f32>()
                 .unwrap();
-            let bad: Vec<usize> = (0..n).filter(|&i| a[i].to_bits() != b[i].to_bits()).collect();
+            let bad: Vec<usize> = (0..n)
+                .filter(|&i| a[i].to_bits() != b[i].to_bits())
+                .collect();
             assert!(
                 bad.is_empty(),
                 "draw {draw}: {} mismatched words, first at {}",
@@ -911,9 +1333,7 @@ mod tests {
         let stream = Stream::thread_local_or_default();
         let mut seed = 24680u64;
         let mut rnd = move || {
-            seed = seed
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1);
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
             ((seed >> 40) as f32 / 8_388_608.0) - 1.0
         };
         // --- sigmoid_mul on the offset gate view (2 x 32768 words) ---
@@ -931,16 +1351,29 @@ mod tests {
                 .unwrap()
                 .contiguous()
                 .unwrap();
-            let gate_view = y.index((.., (m as i32)..(2 * m as i32))).reshape(&[1, 1, 1, m as i32]).unwrap();
+            let gate_view = y
+                .index((.., (m as i32)..(2 * m as i32)))
+                .reshape(&[1, 1, 1, m as i32])
+                .unwrap();
             let gate_copy = gate_view.contiguous().unwrap();
             let a4 = a.reshape(&[1, 1, 1, m as i32]).unwrap();
             let f_view = crate::models::qwen35::kernels::sigmoid_mul(&gate_view, &a4, &stream)
                 .expect("kernel");
             let f_copy = crate::models::qwen35::kernels::sigmoid_mul(&gate_copy, &a4, &stream)
                 .expect("kernel");
-            let v = f_view.as_dtype(Dtype::Float32).unwrap().to_vec1::<f32>().unwrap();
-            let c = f_copy.as_dtype(Dtype::Float32).unwrap().to_vec1::<f32>().unwrap();
-            let bad: Vec<usize> = (0..m).filter(|&i| v[i].to_bits() != c[i].to_bits()).collect();
+            let v = f_view
+                .as_dtype(Dtype::Float32)
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let c = f_copy
+                .as_dtype(Dtype::Float32)
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let bad: Vec<usize> = (0..m)
+                .filter(|&i| v[i].to_bits() != c[i].to_bits())
+                .collect();
             assert!(
                 bad.is_empty(),
                 "sigmoid_mul draw {draw}: {} mismatched words",
@@ -965,10 +1398,7 @@ mod tests {
         let kw = mk((hk * hd) as usize, &mut rnd);
         let cosv = mk(64, &mut rnd);
         let sinv = mk(64, &mut rnd);
-        let q_view = y
-            .index(0..(qn as i32))
-            .reshape(&[1i32, qn as i32])
-            .unwrap();
+        let q_view = y.index(0..(qn as i32)).reshape(&[1i32, qn as i32]).unwrap();
         let q_copy = q_view.contiguous().unwrap();
         let (oq_v, ok_v) = crate::models::qwen35::kernels::qk_norm_rope(
             &q_view, &krow, &qw, &kw, &cosv, &sinv, eps, hq, hk, &stream,
@@ -978,13 +1408,33 @@ mod tests {
             &q_copy, &krow, &qw, &kw, &cosv, &sinv, eps, hq, hk, &stream,
         )
         .expect("kernel");
-        let vv = oq_v.as_dtype(Dtype::Float32).unwrap().to_vec1::<f32>().unwrap();
-        let cc = oq_c.as_dtype(Dtype::Float32).unwrap().to_vec1::<f32>().unwrap();
-        let bad: Vec<usize> = (0..vv.len()).filter(|&i| vv[i].to_bits() != cc[i].to_bits()).collect();
+        let vv = oq_v
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let cc = oq_c
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let bad: Vec<usize> = (0..vv.len())
+            .filter(|&i| vv[i].to_bits() != cc[i].to_bits())
+            .collect();
         assert!(bad.is_empty(), "oq: {} mismatched words", bad.len());
-        let vv = ok_v.as_dtype(Dtype::Float32).unwrap().to_vec1::<f32>().unwrap();
-        let cc = ok_c.as_dtype(Dtype::Float32).unwrap().to_vec1::<f32>().unwrap();
-        let bad: Vec<usize> = (0..vv.len()).filter(|&i| vv[i].to_bits() != cc[i].to_bits()).collect();
+        let vv = ok_v
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let cc = ok_c
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let bad: Vec<usize> = (0..vv.len())
+            .filter(|&i| vv[i].to_bits() != cc[i].to_bits())
+            .collect();
         assert!(bad.is_empty(), "ok: {} mismatched words", bad.len());
         println!("qgate_offset_views: sigmoid_mul 2x32768 + qk_norm_rope bit-exact");
     }
@@ -1048,28 +1498,26 @@ mod tests {
                 // (also arms the looped-rms tgs record the prologue reads).
                 let (sum_ref, normed_ref) =
                     crate::ops::fast::fused_add_rms_norm(&x, &r, &nw, eps).unwrap();
-                let y_ref =
-                    quantized_matmul(&normed_ref, &wq, &scales, Some(&biases), true, 64, 4)
-                        .unwrap();
+                let y_ref = quantized_matmul(&normed_ref, &wq, &scales, Some(&biases), true, 64, 4)
+                    .unwrap();
                 let _ = y_ref.eval();
                 let _ = sum_ref.eval();
                 let _ = normed_ref.eval();
                 for write_norm in [false, true] {
-                    let (y_new, sum_new, normed_new) =
-                        crate::jit::affine_qmv_fast_addnorm(
-                            x.t.device(),
-                            &x.t,
-                            &r.t,
-                            &nw.t,
-                            &wq.t,
-                            &scales.t,
-                            &biases.t,
-                            eps,
-                            64,
-                            4,
-                            write_norm,
-                        )
-                        .unwrap();
+                    let (y_new, sum_new, normed_new) = crate::jit::affine_qmv_fast_addnorm(
+                        x.t.device(),
+                        &x.t,
+                        &r.t,
+                        &nw.t,
+                        &wq.t,
+                        &scales.t,
+                        &biases.t,
+                        eps,
+                        64,
+                        4,
+                        write_norm,
+                    )
+                    .unwrap();
                     let _ = y_new.eval();
                     let _ = sum_new.eval();
                     let a = y_ref.as_slice::<u16>();
@@ -1113,7 +1561,9 @@ mod tests {
                             nb[nbad[0]]
                         );
                     }
-                    println!("addnorm bit-exact: k={k} n={n} draw={draw} wn={write_norm} OK ({n} y + {k} sum words)");
+                    println!(
+                        "addnorm bit-exact: k={k} n={n} draw={draw} wn={write_norm} OK ({n} y + {k} sum words)"
+                    );
                 }
             }
         }
@@ -1182,27 +1632,25 @@ mod tests {
                     .unwrap();
                 let (sum_ref, normed_ref) =
                     crate::ops::fast::fused_add_rms_norm(&x, &r, &nw, eps).unwrap();
-                let y_ref =
-                    quantized_matmul(&normed_ref, &wq, &scales, Some(&biases), true, 64, 4)
-                        .unwrap();
+                let y_ref = quantized_matmul(&normed_ref, &wq, &scales, Some(&biases), true, 64, 4)
+                    .unwrap();
                 let _ = y_ref.eval();
                 let _ = normed_ref.eval();
                 for write_norm in [false, true] {
-                    let (y_new, sum_new, normed_new) =
-                        crate::jit::affine_qmv_fast_addnorm_tu(
-                            x.t.device(),
-                            &x.t,
-                            &r.t,
-                            &nw.t,
-                            &wq.t,
-                            &scales.t,
-                            &biases.t,
-                            eps,
-                            64,
-                            4,
-                            write_norm,
-                        )
-                        .unwrap();
+                    let (y_new, sum_new, normed_new) = crate::jit::affine_qmv_fast_addnorm_tu(
+                        x.t.device(),
+                        &x.t,
+                        &r.t,
+                        &nw.t,
+                        &wq.t,
+                        &scales.t,
+                        &biases.t,
+                        eps,
+                        64,
+                        4,
+                        write_norm,
+                    )
+                    .unwrap();
                     let _ = y_new.eval();
                     let _ = sum_new.eval();
                     // sum: bit-exact (elementwise chain, no reduction).
@@ -1226,28 +1674,20 @@ mod tests {
                             first_bad = Some((i, *p, *q));
                         }
                     }
-                    let (ia, _) = a
-                        .iter()
-                        .enumerate()
-                        .fold((0usize, f32::MIN), |(bi, bv), (i, &p)| {
-                            let v = f32::from_bits((p as u32) << 16);
-                            if v > bv {
-                                (i, v)
-                            } else {
-                                (bi, bv)
-                            }
-                        });
-                    let (ib, _) = b
-                        .iter()
-                        .enumerate()
-                        .fold((0usize, f32::MIN), |(bi, bv), (i, &p)| {
-                            let v = f32::from_bits((p as u32) << 16);
-                            if v > bv {
-                                (i, v)
-                            } else {
-                                (bi, bv)
-                            }
-                        });
+                    let (ia, _) =
+                        a.iter()
+                            .enumerate()
+                            .fold((0usize, f32::MIN), |(bi, bv), (i, &p)| {
+                                let v = f32::from_bits((p as u32) << 16);
+                                if v > bv { (i, v) } else { (bi, bv) }
+                            });
+                    let (ib, _) =
+                        b.iter()
+                            .enumerate()
+                            .fold((0usize, f32::MIN), |(bi, bv), (i, &p)| {
+                                let v = f32::from_bits((p as u32) << 16);
+                                if v > bv { (i, v) } else { (bi, bv) }
+                            });
                     assert!(
                         first_bad.is_none(),
                         "k={k} n={n} draw={draw} wn={write_norm}: y exceeds 1 ULP at {:?} (maxdiff {maxd})",
@@ -1386,20 +1826,36 @@ mod bench {
             let (wq, scales, biases) =
                 quantize(&Array::from_slice(&wv, &[n as i32, k as i32]), 64, 4).unwrap();
             let wq = wq.contiguous().unwrap();
-            let sc = scales.as_dtype(Dtype::Bfloat16).unwrap().contiguous().unwrap();
-            let bi = biases.as_dtype(Dtype::Bfloat16).unwrap().contiguous().unwrap();
+            let sc = scales
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap()
+                .contiguous()
+                .unwrap();
+            let bi = biases
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap()
+                .contiguous()
+                .unwrap();
             let xv: Vec<f32> = (0..m * k).map(|_| rnd()).collect();
             let x = Array::from_slice(&xv, &[m as i32, k as i32])
                 .as_dtype(Dtype::Bfloat16)
                 .unwrap()
                 .contiguous()
                 .unwrap();
-            let mut f = || {
+            let f = || {
                 let _ = crate::jit::affine_verify_qmm_splitk(
-                    x.t.device(), &x.t, &wq.t, &sc.t, &bi.t, 64, 4,
+                    x.t.device(),
+                    &x.t,
+                    &wq.t,
+                    &sc.t,
+                    &bi.t,
+                    64,
+                    4,
                 );
             };
-            for _ in 0..3 { f(); }
+            for _ in 0..3 {
+                f();
+            }
             let _ = x.eval();
             let mut total = std::time::Duration::ZERO;
             for _ in 0..10 {
@@ -1487,7 +1943,13 @@ mod bench {
             time("splitk        ", &mut f4);
             let mut f5 = || {
                 let _ = crate::jit::affine_verify_qmm_msg(
-                    x.t.device(), &x.t, &wq.t, &scales.t, &biases.t, 64, 4,
+                    x.t.device(),
+                    &x.t,
+                    &wq.t,
+                    &scales.t,
+                    &biases.t,
+                    64,
+                    4,
                 );
             };
             time("msg           ", &mut f5);
@@ -1603,8 +2065,16 @@ mod bench {
             let (wq, scales, biases) =
                 quantize(&Array::from_slice(&wv, &[n as i32, k as i32]), 64, 4).unwrap();
             let wq = wq.contiguous().unwrap();
-            let scales = scales.as_dtype(Dtype::Bfloat16).unwrap().contiguous().unwrap();
-            let biases = biases.as_dtype(Dtype::Bfloat16).unwrap().contiguous().unwrap();
+            let scales = scales
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap()
+                .contiguous()
+                .unwrap();
+            let biases = biases
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap()
+                .contiguous()
+                .unwrap();
             let xv: Vec<f32> = (0..m * k).map(|_| rnd() * 4.0 - 2.0).collect();
             let x = Array::from_slice(&xv, &[m as i32, k as i32])
                 .as_dtype(Dtype::Bfloat16)
