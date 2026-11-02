@@ -1,4 +1,5 @@
 use super::*;
+use objc2_metal::MTLDevice;
 
 /// A tensor. Mirrors `lisa_mlx::Array`: the shape is cached as `i32` so
 /// `shape()`/`dim()` match mlx's signatures exactly (mlx works in `i32`).
@@ -31,6 +32,98 @@ impl Array {
     pub fn from_slice<T: SliceElem>(data: &[T], shape: &[i32]) -> Self {
         let dims: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
         Self::new(T::tensor(data, dims, &Self::runtime_ref()).expect("from_slice"))
+    }
+
+    /// Create an MTLBuffer around an externally owned page-aligned region.
+    /// Used by the safetensors loader to keep checkpoint payloads file-backed.
+    pub fn buffer_from_external(
+        pointer: std::ptr::NonNull<std::ffi::c_void>,
+        length: usize,
+        owner: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+        label: &str,
+    ) -> crate::error::Result<std::sync::Arc<crate::runtime::Buffer>> {
+        Self::runtime_ref().buffer_from_external(pointer, length, owner, label)
+    }
+
+    /// Construct a contiguous tensor view into a Metal buffer. `offset_bytes`
+    /// must be aligned to the tensor dtype; the view never mutates the region.
+    pub fn from_buffer_offset(
+        buffer: std::sync::Arc<crate::runtime::Buffer>,
+        offset_bytes: usize,
+        shape: &[i32],
+        dtype: Dtype,
+    ) -> crate::error::Result<Self> {
+        if shape.iter().any(|&dim| dim < 0) {
+            return Err(crate::error::Exception::custom(
+                "buffer tensor dimensions must be nonnegative".to_string(),
+            ));
+        }
+        let element_size = dtype.size_of();
+        if offset_bytes % element_size != 0 {
+            return Err(crate::error::Exception::custom(
+                "buffer tensor offset is not dtype-aligned".to_string(),
+            ));
+        }
+        let dims: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
+        let byte_len = dims
+            .iter()
+            .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
+            .and_then(|elements| elements.checked_mul(element_size))
+            .ok_or_else(|| {
+                crate::error::Exception::custom("buffer tensor size overflow".to_string())
+            })?;
+        if offset_bytes
+            .checked_add(byte_len)
+            .is_none_or(|end| end > buffer.length())
+        {
+            return Err(crate::error::Exception::custom(
+                "buffer tensor view exceeds external storage".to_string(),
+            ));
+        }
+        let rt = Self::runtime_ref();
+        let tensor = crate::array::Array::from_parts_offset(
+            &rt,
+            buffer,
+            &dims,
+            dtype,
+            offset_bytes / element_size,
+        );
+        Ok(Self::new(tensor))
+    }
+
+    /// Device limit used to choose page-aligned mapped checkpoint windows.
+    pub fn max_buffer_length() -> usize {
+        Self::runtime_ref().device().maxBufferLength()
+    }
+
+    /// Stable identity of the backing Metal buffer for indirect resource
+    /// declaration. Array views into the same mapped window share this id.
+    pub fn backing_buffer_id(&self) -> usize {
+        self.t.buffer().id()
+    }
+
+    /// Create a command-scoped residency set for indirectly addressed model
+    /// resources on supported Metal versions.
+    pub fn new_residency_set(initial_capacity: usize) -> Option<crate::runtime::ResidencySet> {
+        crate::runtime::ResidencySet::new(Self::runtime_ref().device(), initial_capacity)
+    }
+
+    /// Register this array's backing allocation in a residency set used by
+    /// kernels that access the array through a GPU address.
+    pub fn add_to_residency_set(&self, set: &crate::runtime::ResidencySet) -> bool {
+        set.add(self.t.buffer())
+    }
+
+    /// Register a committed model residency set on the default Metal queue.
+    pub fn add_residency_set_to_queue(set: &crate::runtime::ResidencySet) -> bool {
+        Self::runtime_ref().commands.add_residency_set_to_queue(set)
+    }
+
+    /// Register a model residency set without prewarming all allocations.
+    pub fn add_residency_set_to_queue_without_request(set: &crate::runtime::ResidencySet) -> bool {
+        Self::runtime_ref()
+            .commands
+            .add_residency_set_to_queue_without_request(set)
     }
 
     /// lisa-mlx `Array::from_f32`: a scalar array.
@@ -80,6 +173,14 @@ impl Array {
 
     pub fn dtype(&self) -> Dtype {
         self.t.dtype()
+    }
+
+    /// GPU virtual address of this array's first logical element. The backing
+    /// buffer must be retained until queued GPU work using this address ends.
+    pub fn gpu_address(&self) -> Option<u64> {
+        let offset = self.t.layout().offset.checked_mul(self.dtype().size_of())?;
+        let address = self.t.buffer().gpu_address().checked_add(offset as u64)?;
+        (address != 0).then_some(address)
     }
 
     fn axis(&self, dim: i32) -> usize {
@@ -145,91 +246,29 @@ impl Array {
     ) -> Array {
         let dims: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
         let n: usize = dims.iter().product();
-        // The source may be an `mmap` slice at an odd byte offset (safetensors
-        // header length is not padded), so element loads through `T*` would be
-        // misaligned. Copy through an 8-aligned buffer via unaligned reads when
-        // needed; MLX copies the data anyway, so this only doubles a one-shot
-        // load copy for the rare misaligned tensors.
-        let mut realigned: Vec<u64>;
-        let mut ptr = ptr;
-        let esize = match dtype {
+        // Safetensors payload bases need not be aligned to the tensor dtype.
+        // Copy bytes directly into aligned MLX storage: typed reads from an
+        // mmap slice can be unaligned, and staging through a temporary Vec
+        // doubled the load traffic for the GLM checkpoint's 82 GB of U32
+        // packed weights.
+        let element_size = match dtype {
             Dtype::Bfloat16 | Dtype::Float16 | Dtype::Int16 => 2,
             Dtype::Float32 | Dtype::Uint32 | Dtype::Int32 => 4,
             Dtype::Float64 | Dtype::Int64 => 8,
             Dtype::Uint8 | Dtype::Bool => 1,
             other => panic!("from_raw_data: unsupported dtype {other:?}"),
         };
-        if esize > 1 && ptr as usize % esize != 0 {
-            let total = n * esize;
-            realigned = vec![0u64; total.div_ceil(8)];
-            let dst = realigned.as_mut_ptr() as *mut u8;
-            for i in 0..total {
-                unsafe { dst.add(i).write((ptr as *const u8).add(i).read()) };
-            }
-            ptr = realigned.as_ptr() as *const std::ffi::c_void;
-        }
+        let bytes = n
+            .checked_mul(element_size)
+            .expect("from_raw_data: tensor byte size overflow");
         let rt = Stream::thread_local_or_default().runtime().clone();
-        let a = unsafe {
-            match dtype {
-                Dtype::Bfloat16 => crate::array::Array::from_slice_dt(
-                    &rt,
-                    std::slice::from_raw_parts(ptr as *const half::bf16, n),
-                    &dims,
-                    dtype,
-                ),
-                Dtype::Float16 => crate::array::Array::from_slice_dt(
-                    &rt,
-                    std::slice::from_raw_parts(ptr as *const half::f16, n),
-                    &dims,
-                    dtype,
-                ),
-                Dtype::Float32 => crate::array::Array::from_slice_dt(
-                    &rt,
-                    std::slice::from_raw_parts(ptr as *const f32, n),
-                    &dims,
-                    dtype,
-                ),
-                Dtype::Float64 => crate::array::Array::from_slice_dt(
-                    &rt,
-                    std::slice::from_raw_parts(ptr as *const f64, n),
-                    &dims,
-                    dtype,
-                ),
-                Dtype::Uint8 => crate::array::Array::from_slice_dt(
-                    &rt,
-                    std::slice::from_raw_parts(ptr as *const u8, n),
-                    &dims,
-                    dtype,
-                ),
-                Dtype::Uint32 => crate::array::Array::from_slice_dt(
-                    &rt,
-                    std::slice::from_raw_parts(ptr as *const u32, n),
-                    &dims,
-                    dtype,
-                ),
-                Dtype::Int16 => crate::array::Array::from_slice_dt(
-                    &rt,
-                    std::slice::from_raw_parts(ptr as *const i16, n),
-                    &dims,
-                    dtype,
-                ),
-                Dtype::Int32 => crate::array::Array::from_slice_dt(
-                    &rt,
-                    std::slice::from_raw_parts(ptr as *const i32, n),
-                    &dims,
-                    dtype,
-                ),
-                Dtype::Int64 => crate::array::Array::from_slice_dt(
-                    &rt,
-                    std::slice::from_raw_parts(ptr as *const i64, n),
-                    &dims,
-                    dtype,
-                ),
-                other => panic!("from_raw_data: unsupported dtype {other:?}"),
-            }
+        let buffer = rt
+            .buffer_for_full_write(bytes, "array")
+            .expect("from_raw_data");
+        unsafe {
+            std::ptr::copy_nonoverlapping(ptr.cast::<u8>(), buffer.contents(), bytes);
         }
-        .expect("from_raw_data");
-        Array::new(a)
+        Array::new(crate::array::Array::from_parts(&rt, buffer, &dims, dtype))
     }
 
     /// mlx `Array::sum_axis` (last-axis sum via the ported reduce kernel).
@@ -356,6 +395,17 @@ impl Array {
         self.t.device().synchronize()
     }
 
+    /// Enqueue-only materialization (ds4/MLX parity): a **no-op** in the eager
+    /// engine — the producing dispatches are already encoded into the open
+    /// serial encoder, and the kernel bound right after lands behind them in
+    /// the same encoder (FIFO order guarantees the buffer is written first).
+    /// No commit, no rotate, no fence — the ds4 single-stream model. (A
+    /// `commands.flush()` here rotated the encoder per kernel and exploded
+    /// the cross-encoder fence count: 110 s/token decode.)
+    pub fn eval_enqueue(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// The id of the command buffer dispatches are currently encoding into
     /// (the barrier id for [`Array::eval_wait_through`]).
     pub fn readback_cb_id(&self) -> u64 {
@@ -376,6 +426,16 @@ impl Array {
 
     pub fn to_vec1<T: Copy + 'static>(&self) -> Result<Vec<T>> {
         self.t.flatten_all()?.contiguous()?.to_vec1::<T>()
+    }
+
+    /// Read a contiguous view after waiting only for the command buffer that
+    /// last used its backing storage. Subsequent command buffers remain in
+    /// flight, which lets routing read back a small selector result without
+    /// draining unrelated speculative work.
+    pub fn to_vec1_wait_through<T: Copy + 'static>(&self) -> Result<Vec<T>> {
+        let flat = self.t.flatten_all()?.contiguous()?;
+        let cb_id = flat.readback_cb_id();
+        flat.to_vec_wait_through::<T>(cb_id)
     }
 
     // ---- elementwise ----

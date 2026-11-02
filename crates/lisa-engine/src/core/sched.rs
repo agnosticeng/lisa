@@ -105,9 +105,13 @@ fn run_speculative(
     depth: usize,
     on_token: &mut dyn FnMut(usize, u32) -> anyhow::Result<()>,
 ) -> anyhow::Result<Vec<Vec<u32>>> {
+    if tower.has_target_mtp() && requests.len() > 1 {
+        return run_target_mtp_round_robin(tower, requests, on_token);
+    }
     let n = requests.iter().map(|r| r.id).max().map_or(0, |m| m + 1);
     let mut out: Vec<Vec<u32>> = vec![Vec::new(); n];
     for mut req in requests {
+        let _eos_scope = req.ignore_eos.then(crate::core::generate::ignore_eos_scope);
         let id = req.id;
         eprintln!("[batched] slot {id} serial: mtp depth={depth} (maximumSpeculativeBatch == 1)");
         let mut sess = Session::new(tower);
@@ -115,6 +119,12 @@ fn run_speculative(
             out[id].push(t);
             on_token(id, t)
         };
+        let mtp_sampler =
+            if !tower.has_target_mtp() && req.sampler.greedy() && !req.sampler.mtp_exact_sampling {
+                None
+            } else {
+                Some(&mut req.sampler)
+            };
         sess.generate_mtp_depth(
             tower,
             &req.prompt,
@@ -125,14 +135,80 @@ fn run_speculative(
                 crate::core::session::MtpDepth::Fixed(depth)
             },
             None,
-            if req.sampler.greedy() {
-                None
-            } else {
-                Some(&mut req.sampler)
-            },
+            mtp_sampler,
             &mut cb,
         )?;
     }
+    Ok(out)
+}
+
+/// Interleave independent GLM target-MTP sessions at a verified round
+/// boundary. DS4's server submits one speculative cycle per active session;
+/// its current GLM batch implementation then evaluates those cycles through
+/// the serialized fallback. A resumable cycle retains the sampled carry and
+/// pending proposal while every other live stream advances.
+fn run_target_mtp_round_robin(
+    tower: &mut dyn LanguageModel,
+    mut requests: Vec<Request>,
+    on_token: &mut dyn FnMut(usize, u32) -> anyhow::Result<()>,
+) -> anyhow::Result<Vec<Vec<u32>>> {
+    eprintln!(
+        "[batched] GLM target-MTP round-robin: {} streams, one target cycle per turn",
+        requests.len()
+    );
+    let n = requests.iter().map(|r| r.id).max().map_or(0, |m| m + 1);
+    let mut out: Vec<Vec<u32>> = vec![Vec::new(); n];
+    let mut sessions = (0..requests.len())
+        .map(|_| Session::new(tower))
+        .collect::<Vec<_>>();
+    let mut done = vec![false; requests.len()];
+    let mut live = requests.len();
+
+    while live > 0 {
+        for index in 0..requests.len() {
+            if done[index] {
+                continue;
+            }
+            let req = &mut requests[index];
+            let _eos_scope = req.ignore_eos.then(crate::core::generate::ignore_eos_scope);
+            let id = req.id;
+            let remaining = req.max_tokens.saturating_sub(out[id].len());
+            if remaining == 0 || out[id].last().is_some_and(|&token| is_eos(token)) {
+                done[index] = true;
+                live -= 1;
+                continue;
+            }
+
+            let input = if sessions[index].fed.is_empty() {
+                req.prompt.as_slice()
+            } else {
+                &[]
+            };
+            let before = out[id].len();
+            let mut cb = |token| {
+                out[id].push(token);
+                on_token(id, token)?;
+                Ok(crate::core::session::TargetMtpSamplingMode::Configured)
+            };
+            sessions[index].target_mtp_cycle(
+                tower,
+                input,
+                remaining,
+                Some(&mut req.sampler),
+                &mut cb,
+            )?;
+            anyhow::ensure!(
+                out[id].len() > before,
+                "GLM target-MTP scheduler made no progress for request {id}"
+            );
+            if out[id].len() >= req.max_tokens || out[id].last().is_some_and(|&token| is_eos(token))
+            {
+                done[index] = true;
+                live -= 1;
+            }
+        }
+    }
+
     Ok(out)
 }
 
@@ -165,10 +241,12 @@ fn run_batch(
     let mut out: Vec<Vec<u32>> = Vec::new();
     let mut batch = ContinuousBatch::empty(cap_hint);
     let mut active: Vec<Active> = Vec::new();
-    let interleave = std::env::var("LISA_NO_INTERLEAVE").is_err();
+    let interleave =
+        std::env::var("LISA_NO_INTERLEAVE").is_err() && !tower.batch_decode_equal_length_only();
     // One-shot `[batched] decode engaged` marker: output equality alone cannot
     // tell a batched run from N serial ones.
-    static decode_engaged: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static DECODE_ENGAGED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
 
     // One lockstep decode round: feed each active stream its last emitted
     // token, emit the next. Used both by the main loop and by the interleave
@@ -214,7 +292,20 @@ fn run_batch(
             let Some(req) = queue.pop_front().or_else(|| next()) else {
                 break;
             };
-            if !batch.admits_within_pad_waste(req.prompt.len()) {
+            if tower.batch_decode_equal_length_only()
+                && !tower.batch_decode_ragged_supported()
+                && !batch.admits_equal_length(req.prompt.len())
+            {
+                eprintln!(
+                    "[batched] slot {} deferred: model cache rows require equal positions",
+                    req.id
+                );
+                deferred.push(req);
+                continue;
+            }
+            if !tower.batch_decode_ragged_supported()
+                && !batch.admits_within_pad_waste(req.prompt.len())
+            {
                 eprintln!(
                     "[batched] slot {} deferred: padded attention would exceed {}x useful (kv skew {} vs {:?})",
                     req.id,
@@ -291,7 +382,7 @@ fn run_batch(
         }
 
         decode_round(tower, &mut batch, &mut active, &mut out, on_token)?;
-        if batch.len() > 1 && !decode_engaged.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        if batch.len() > 1 && !DECODE_ENGAGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
             eprintln!("[batched] decode engaged (slots={})", batch.len());
         }
         for a in active.iter_mut() {

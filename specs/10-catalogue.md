@@ -1,6 +1,7 @@
 # specs/10-catalogue — Optimization-catalogue dispositions without a topical spec
 
-Thecampaign triaged the full optimization catalogue (our own
+Historical Qwen campaign; current requirements are in [00](00-contracts.md).
+The campaign triaged the full optimization catalogue (our own
 earlier prototypes and experiments) item by item: landed, already in place,
 falsified, or set aside with a reason. Items whose topic is owned by another
 spec live there (serving/admission/law → 00, batching/wave/EV/parity → 01,
@@ -12,8 +13,9 @@ robustness, not throughput.
 
 ## Set aside (measured or documented reason — do not reopen without new evidence)
 
-- **Confidence calibration**: premise absent — our MTP head is *trained*;
- the pathology that idea treats does not exist here.
+- **Confidence calibration**: set aside because this campaign did not establish
+ a calibration defect in the trained MTP head. Training alone is not proof of
+ calibration; reopen only with a measured error and a concrete target.
 - **Layered-logit decoding (dynamic logit-lens variants)**: quality-only,
  opt-in, 0 tok/s.
 - **Entropy temperature / power sampling**: would change the sampling
@@ -32,12 +34,13 @@ robustness, not throughput.
  path exists; major kernel work, out of campaign.
 - **HBM↔device split KV cache**: premise broken — no HBM↔PCIe split on
  Apple Silicon (unified memory).
-- **Block top-k sparse attention**: needs continue-training; our full
- attention is on the certified path.
+- **Replacing the 27B full-attention pattern with block top-k sparsity**:
+ requires model-quality validation beyond a faithful kernel port. Existing
+ Qwen4 and GLM sparse attention are different checkpoint contracts.
 - **int8 event-driven sparsity**: measure-gated — count real activation
  zeros first.
-- **Draft-guided expert prefetch**: premise broken — unified memory means
- every expert of the shipped 4-bit expert classes is resident.
+- **Draft-guided expert prefetch**: not needed for the resident expert paths measured in this campaign. Unified
+ memory alone does not guarantee residency; GLM has a separate explicit owner.
 - **`/metrics` endpoint · tool-parser coverage · suffix decoding**:
  comfort / already covered by the serving surface (00-contracts §2).
 
@@ -56,7 +59,8 @@ robustness, not throughput.
 
 ## Blocked / open
 
-- **9B → 27B oracle A/B**: blocked — needs two models resident, which
- machine safety forbids (00-contracts §3); owner decision.
+- **Joint 9B → 27B oracle experiment**: not run under the one-resident-model
+ constraint. Ordinary comparisons can run sequentially; a joint experiment
+ needs an explicit design that also respects the memory contract.
 - **O4 c3 / #30**: see specs/03 and specs/05 respectively (the two items
  with topical homes).

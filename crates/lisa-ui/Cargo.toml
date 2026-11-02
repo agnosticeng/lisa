@@ -1,14 +1,16 @@
 [package]
 name = "lisa-ui"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
-serde_json = "1"
-lisa-engine = { path = "../lisa-engine" }
-lisa-serve = { path = "../lisa-serve" }
-objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = [
+anyhow.workspace = true
+serde_json.workspace = true
+lisa-engine.workspace = true
+lisa-serve.workspace = true
+objc2.workspace = true
+objc2-foundation = { workspace = true, features = [
     "NSObject",
     "NSString",
     "NSArray",
@@ -30,7 +32,7 @@ objc2-foundation = { version = "0.3", features = [
     "NSRunLoop",
     "NSTimer",
 ] }
-objc2-app-kit = { version = "0.3", features = [
+objc2-app-kit = { workspace = true, features = [
     "NSApplication",
     "NSWindow",
     "NSWindowController",

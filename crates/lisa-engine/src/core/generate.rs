@@ -36,6 +36,42 @@ pub fn set_eos_ids(ids: Vec<u32>) {
     *EOS_IDS.write().unwrap() = ids;
 }
 
+/// Temporarily suppress EOS for one serialized generation job. Restores the
+/// previous set on every exit, including failures before or during decode.
+/// The caller must not overlap this scope with another generation job.
+pub fn ignore_eos_scope() -> IgnoreEosScope {
+    let previous = std::mem::take(&mut *EOS_IDS.write().unwrap());
+    IgnoreEosScope { previous }
+}
+
+#[must_use = "dropping the scope restores EOS handling"]
+pub struct IgnoreEosScope {
+    previous: Vec<u32>,
+}
+
+impl Drop for IgnoreEosScope {
+    fn drop(&mut self) {
+        set_eos_ids(std::mem::take(&mut self.previous));
+    }
+}
+
+/// Configure tokenizer stop ids together with any additional model-declared
+/// stop ids. The caller owns the process-wide EOS scope, so ignore-EOS paths
+/// can still explicitly clear it with `set_eos_ids(Vec::new())`.
+pub fn set_eos_ids_for_model(ids: Vec<u32>, tower: &dyn LanguageModel) {
+    let mut all = ids;
+    for id in tower
+        .eos_token_ids()
+        .into_iter()
+        .filter_map(|id| u32::try_from(id).ok())
+    {
+        if !all.contains(&id) {
+            all.push(id);
+        }
+    }
+    set_eos_ids(all);
+}
+
 pub fn is_eos(id: u32) -> bool {
     EOS_IDS.read().unwrap().contains(&id)
 }
@@ -116,6 +152,7 @@ pub fn pld_decode(
                 // non-draft stretch, so at temperature 1.0 a no-copy prompt
                 // produced deterministic text identical across seeds.
                 let token = match stochastic.as_deref_mut() {
+                    Some(sm) if tower.has_target_mtp() => sm.draw_ds4(&logits, committed)?,
                     Some(sm) => match sm.draw_row(&logits) {
                         Some(t) => t,
                         None => crate::models::speculate::argmax_id(&logits)?,
@@ -218,7 +255,11 @@ pub fn pld_decode(
                 // re-fed the carry, so `keep` rows of it are the committed
                 // continuation (EOS excluded; the rollback captures make the
                 // GDN/PLE states bit-exact again).
-                let keep = if eos_seen { (emitted - 1).max(1) } else { emitted };
+                let keep = if eos_seen {
+                    (emitted - 1).max(1)
+                } else {
+                    emitted
+                };
                 for c in caches.iter_mut() {
                     match c {
                         LayerCache::Full(f) => f.trim(advance - keep),
@@ -279,7 +320,11 @@ pub fn generate(
     let t0 = Instant::now();
     let last = tower.prefill(prompt, &mut caches)?;
     let logits = tower.head(&last)?;
-    let token = sampler.draw(&logits, prompt)?;
+    let token = if tower.has_target_mtp() {
+        sampler.draw_ds4(&logits, prompt)?
+    } else {
+        sampler.draw(&logits, prompt)?
+    };
 
     // Force eval of the whole prefill graph before timing decode.
     lisa_mlx::transforms::eval([&logits]).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -337,7 +382,11 @@ pub fn generate(
         let logits = tower.head(&last)?;
         let mut history: Vec<u32> = prompt.to_vec();
         history.extend_from_slice(&generated);
-        let token = sampler.draw(&logits, &history)?;
+        let token = if tower.has_target_mtp() {
+            sampler.draw_ds4(&logits, &history)?
+        } else {
+            sampler.draw(&logits, &history)?
+        };
         decode_seconds += start.elapsed().as_secs_f64();
         generated.push(token);
         on_token(token)?;

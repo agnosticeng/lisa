@@ -5,5 +5,6 @@
 //! the engine reads `lisa_mlx::kernels::…` regardless of where they live.
 
 pub mod gdn;
+pub mod glm53;
 pub mod qwen35;
 pub mod qwen4;

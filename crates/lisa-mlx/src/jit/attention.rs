@@ -1,7 +1,7 @@
 use objc2_metal::MTLSize;
 
 use crate::array::{Array, Dtype};
-use crate::runtime::ConstVal;
+use crate::runtime::{ConstVal, Math};
 
 use super::compile::{
     builtin_template_def, compile_builtin, compile_builtin_bool_consts,
@@ -11,6 +11,266 @@ use super::nax::{compile_nax_jit, matmul_nax};
 use super::{DType, Device, Tensor};
 use super::{MLX_SDPA_VECTOR_PREAMBLE, MLX_SOFTMAX_PREAMBLE, MLX_UTILS_PREAMBLE, NAX_ATTN_HEADER};
 use crate::error::Result;
+
+const DS4_FLASH_ATTN_SOURCE: &str =
+    include_str!("../shaders/common/attention/ds4_flash_attn.metal");
+const DS4_FLASH_ATTN_PREAMBLE: &str = r#"
+#define N_SIMDWIDTH 32
+#define FOR_UNROLL(x) _Pragma("clang loop unroll(full)") for (x)
+#ifndef MAX
+#define MAX(x, y) ((x) > (y) ? (x) : (y))
+#endif
+#ifndef MIN
+#define MIN(x, y) ((x) < (y) ? (x) : (y))
+#endif
+#define M_PI_F 3.14159265358979323846f
+"#;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Ds4FlashAttnArgs {
+    ne01: i32,
+    ne02: i32,
+    ne03: i32,
+    nb01: u64,
+    nb02: u64,
+    nb03: u64,
+    ne11: i32,
+    ne_12_2: i32,
+    ne_12_3: i32,
+    ns10: i32,
+    nb11: u64,
+    nb12: u64,
+    nb13: u64,
+    ns20: i32,
+    nb21: u64,
+    nb22: u64,
+    nb23: u64,
+    ne31: i32,
+    ne32: i32,
+    ne33: i32,
+    nb31: u64,
+    nb32: u64,
+    nb33: u64,
+    ne1: i32,
+    ne2: i32,
+    ne3: i32,
+    scale: f32,
+    max_bias: f32,
+    m0: f32,
+    m1: f32,
+    n_head_log2: i32,
+    logit_softcap: f32,
+}
+
+/// DS4's dense-causal raw FlashAttention path for GLM's 512-wide compact KV.
+/// The query remains F32 at the binding and is staged to F16 by the reference
+/// kernel. The result is F32, matching DS4's attention-lora buffer.
+pub fn ds4_flash_attention_prefill_raw_heads(
+    q: &Tensor,
+    kv: &Tensor,
+    q_row0: usize,
+    scale: f32,
+) -> Result<Tensor> {
+    let (b, n_q, n_head, head_dim) = (
+        q.dim(0) as usize,
+        q.dim(1) as usize,
+        q.dim(2) as usize,
+        q.dim(3) as usize,
+    );
+    let n_kv = kv.dim(1) as usize;
+    if q.rank() != 4
+        || kv.rank() != 3
+        || b != 1
+        || n_q == 0
+        || n_head != 64
+        || head_dim != 512
+        || kv.dim(0) != 1
+        || kv.dim(2) != 512
+        || q.dtype() != Dtype::Float32
+        || kv.dtype() != Dtype::Float16
+        || !scale.is_finite()
+        || scale <= 0.0
+        || q_row0.checked_add(n_q).is_none_or(|end| end > n_kv)
+    {
+        return Err(crate::array::err(format!(
+            "DS4 raw FlashAttention expects q=[1,nq,64,512] F32 and kv=[1,nkv,512] F16, got {:?}/{:?} at row {q_row0}",
+            q.shape(),
+            kv.shape()
+        )));
+    }
+
+    let device = q.device();
+    let n_kv_padded = n_kv.div_ceil(64) * 64;
+    let kv_padded = if n_kv_padded == n_kv {
+        kv.contiguous()?
+    } else {
+        let padding = Array::zeros(device, &[1, n_kv_padded - n_kv, 512], Dtype::Float16)?;
+        Array::cat(&[kv.clone(), padding], 1)?.contiguous()?
+    };
+
+    // DS4's causal mask stores half(0) for visible keys and half(-infinity)
+    // for future and padded keys. Its block map uses 0=masked, 1=partial,
+    // 2=fully unmasked.
+    let mask_bytes = n_q
+        .checked_mul(n_kv_padded)
+        .and_then(|elements| elements.checked_mul(std::mem::size_of::<u16>()))
+        .ok_or_else(|| crate::array::err("DS4 flash mask size overflow"))?;
+    let mask_buffer = device.buffer_for_full_write(mask_bytes, "glm53_ds4_flash_mask")?;
+    unsafe {
+        let dst = mask_buffer.contents() as *mut u16;
+        for qi in 0..n_q {
+            let visible = q_row0 + qi;
+            for ki in 0..n_kv_padded {
+                let value = if ki < n_kv && ki <= visible {
+                    0u16
+                } else {
+                    0xfc00u16
+                };
+                *dst.add(qi * n_kv_padded + ki) = value;
+            }
+        }
+    }
+    let mask = Array::from_parts(
+        device,
+        mask_buffer,
+        &[1, n_q, 1, n_kv_padded],
+        Dtype::Float16,
+    );
+    let n_q_blocks = n_q.div_ceil(8);
+    let n_kv_blocks = n_kv_padded / 64;
+    let mut block_map = vec![0i8; n_q_blocks * n_kv_blocks];
+    for qb in 0..n_q_blocks {
+        let q_begin = qb * 8;
+        let q_end = (q_begin + 8).min(n_q);
+        for kb in 0..n_kv_blocks {
+            let k_begin = kb * 64;
+            let k_end = k_begin + 64;
+            let mut saw_visible = false;
+            let mut all_visible = true;
+            for qi in q_begin..q_end {
+                let visible_end = (q_row0 + qi + 1).min(n_kv);
+                let block_visible = k_begin < visible_end;
+                let block_fully_visible = k_end <= visible_end;
+                saw_visible |= block_visible;
+                all_visible &= block_fully_visible;
+            }
+            block_map[qb * n_kv_blocks + kb] = if !saw_visible {
+                0
+            } else if all_visible {
+                2
+            } else {
+                1
+            };
+        }
+    }
+    let block_map =
+        Array::from_slice_dt(device, &block_map, &[n_q_blocks * n_kv_blocks], Dtype::Int8)?;
+
+    let output_bytes = n_q * n_head * head_dim * std::mem::size_of::<f32>();
+    let output_buffer = device.buffer_for_full_gpu_write(output_bytes, "glm53_ds4_flash_out")?;
+    let output = Array::from_parts(
+        device,
+        output_buffer.clone(),
+        &[1, n_q, n_head, head_dim],
+        Dtype::Float32,
+    );
+
+    let source = format!("{MLX_UTILS_PREAMBLE}{DS4_FLASH_ATTN_PREAMBLE}{DS4_FLASH_ATTN_SOURCE}");
+    let pipeline = device.compile_with_constants(
+        &source,
+        "kernel_flash_attn_ext_f16_dk512_dv512",
+        Math::CompilerDefault,
+        &[
+            (300, ConstVal::Bool(true)),  // has mask
+            (301, ConstVal::Bool(false)), // has sinks
+            (302, ConstVal::Bool(false)), // has bias
+            (303, ConstVal::Bool(false)), // has softcap
+            (304, ConstVal::Bool(false)), // KV already padded to 64 rows
+            (310, ConstVal::Bool(n_q % 8 != 0)),
+            (320, ConstVal::Int(512)),
+            (321, ConstVal::Int(512)),
+            (322, ConstVal::Int(8)),
+        ],
+    )?;
+
+    let row_bytes = head_dim * std::mem::size_of::<f32>();
+    let kv_row_bytes = 512 * std::mem::size_of::<u16>();
+    let args = Ds4FlashAttnArgs {
+        ne01: n_q as i32,
+        ne02: n_head as i32,
+        ne03: 1,
+        nb01: (n_head * row_bytes) as u64,
+        nb02: row_bytes as u64,
+        nb03: (n_q * n_head * row_bytes) as u64,
+        ne11: n_kv_padded as i32,
+        ne_12_2: 1,
+        ne_12_3: 1,
+        ns10: 512,
+        nb11: kv_row_bytes as u64,
+        nb12: (n_kv_padded * kv_row_bytes) as u64,
+        nb13: (n_kv_padded * kv_row_bytes) as u64,
+        ns20: 512,
+        nb21: kv_row_bytes as u64,
+        nb22: (n_kv_padded * kv_row_bytes) as u64,
+        nb23: (n_kv_padded * kv_row_bytes) as u64,
+        ne31: n_q as i32,
+        ne32: 1,
+        ne33: 1,
+        nb31: (n_kv_padded * std::mem::size_of::<u16>()) as u64,
+        nb32: mask_bytes as u64,
+        nb33: mask_bytes as u64,
+        ne1: n_head as i32,
+        ne2: n_q as i32,
+        ne3: 1,
+        scale,
+        max_bias: 0.0,
+        m0: 0.0,
+        m1: 0.0,
+        n_head_log2: 0,
+        logit_softcap: 0.0,
+    };
+
+    let (q_buffer, q_layout) = q.buffer_and_layout();
+    let (kv_buffer, kv_layout) = kv_padded.buffer_and_layout();
+    let (mask_buffer, mask_layout) = mask.buffer_and_layout();
+    let (block_buffer, block_layout) = block_map.buffer_and_layout();
+    {
+        let guard = device.commands.encoder()?;
+        let encoder = guard.encoder();
+        encoder.set_pipeline(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input(1, Some(q_buffer), q_layout.offset * q.dtype().size_of());
+        encoder.set_input(
+            2,
+            Some(kv_buffer),
+            kv_layout.offset * kv_padded.dtype().size_of(),
+        );
+        encoder.set_input(
+            3,
+            Some(kv_buffer),
+            kv_layout.offset * kv_padded.dtype().size_of(),
+        );
+        encoder.set_input(
+            4,
+            Some(mask_buffer),
+            mask_layout.offset * mask.dtype().size_of(),
+        );
+        encoder.set_input(5, Some(q_buffer), q_layout.offset * q.dtype().size_of());
+        encoder.set_input(6, Some(q_buffer), q_layout.offset * q.dtype().size_of());
+        encoder.set_input(
+            7,
+            Some(block_buffer),
+            block_layout.offset * block_map.dtype().size_of(),
+        );
+        encoder.set_output(8, Some(&output_buffer), 0);
+        let shared_bytes = 8 * (512 + 2 * 512 + 4 * 64) * std::mem::size_of::<u16>();
+        encoder.set_threadgroup_memory_length(0, shared_bytes);
+        encoder.dispatch_groups_3d((n_q_blocks, n_head, 1), (32, 8, 1));
+    }
+
+    Ok(output)
+}
 
 /// MLX `fast::scaled_dot_product_attention` vector path (`sdpa_vector`,
 /// `scaled_dot_product_attention.cpp:364`) — single/few query rows, no array
@@ -73,7 +333,7 @@ pub fn sdpa_vector(
     let (b, h, ql) = (qd[0], qd[1], qd[2]);
     let out_dims = vec![b, h, ql, vd];
     let count: usize = out_dims.iter().product();
-    let obuf = mdev.buffer((count) as usize * (q.dtype()).size_of(), "sdpa_out")?;
+    let obuf = mdev.buffer_for_gpu_write((count) as usize * (q.dtype()).size_of(), "sdpa_out")?;
     let out = Array::from_parts(mdev, obuf.clone(), &out_dims, q.dtype());
 
     let gqa_factor = (q.dims()[1] / k.dims()[1]) as i32;
@@ -206,10 +466,14 @@ pub fn sdpa_vector_2pass(
             (20, ConstVal::Bool(mask.is_some())),
             (21, ConstVal::Bool(false)), // query_transposed
             (22, ConstVal::Bool(do_causal)),
-            (23, ConstVal::Bool(mask.is_some() && mask.unwrap().dtype() == Dtype::Bool)),
-            (24, ConstVal::Bool(
-                mask.is_some() && mask.unwrap().dtype() != Dtype::Bool,
-            )),
+            (
+                23,
+                ConstVal::Bool(mask.is_some() && mask.unwrap().dtype() == Dtype::Bool),
+            ),
+            (
+                24,
+                ConstVal::Bool(mask.is_some() && mask.unwrap().dtype() != Dtype::Bool),
+            ),
             (25, ConstVal::Bool(false)), // has_sinks
             (26, ConstVal::Int(blocks as i32)),
         ],
@@ -220,20 +484,23 @@ pub fn sdpa_vector_2pass(
     let (b, h, ql) = (qd[0], qd[1], qd[2]);
     let out_dims = vec![b, h, ql, vd];
     let out_count: usize = out_dims.iter().product();
-    let obuf = mdev.buffer((out_count) as usize * (q.dtype()).size_of(), "sdpa_out")?;
+    let obuf =
+        mdev.buffer_for_gpu_write((out_count) as usize * (q.dtype()).size_of(), "sdpa_out")?;
     let out = Array::from_parts(mdev, obuf.clone(), &out_dims.clone(), q.dtype());
 
     // intermediates: [b,h,ql,blocks,vd] (q dtype) and [b,h,ql,blocks] (f32)
     let interm_dims = vec![b, h, ql, blocks, vd];
     let interm_count: usize = interm_dims.iter().product();
-    let ibuf = mdev.buffer(
+    let ibuf = mdev.buffer_for_gpu_write(
         (interm_count) as usize * (q.dtype()).size_of(),
         "sdpa_interm",
     )?;
     let red_dims = vec![b, h, ql, blocks];
     let red_count: usize = red_dims.iter().product();
-    let sbuf = mdev.buffer((red_count) as usize * (DType::F32).size_of(), "sdpa_sums")?;
-    let mbuf = mdev.buffer((red_count) as usize * (DType::F32).size_of(), "sdpa_maxs")?;
+    let sbuf =
+        mdev.buffer_for_gpu_write((red_count) as usize * (DType::F32).size_of(), "sdpa_sums")?;
+    let mbuf =
+        mdev.buffer_for_gpu_write((red_count) as usize * (DType::F32).size_of(), "sdpa_maxs")?;
 
     let k_head_stride: usize = if k.dims()[1] == 1 {
         k.stride()[0]
@@ -361,7 +628,7 @@ pub fn softmax_last_axis(device: &Device, x: &Tensor, precise: bool) -> Result<T
     let pipeline = compile_builtin(device, &source, &kernel_name)?;
 
     let count = x.elem_count();
-    let obuf = mdev.buffer((count) as usize * (dt).size_of(), "softmax_out")?;
+    let obuf = mdev.buffer_for_gpu_write((count) as usize * (dt).size_of(), "softmax_out")?;
     let out = Array::from_parts(mdev, obuf.clone(), &dims.clone(), dt);
 
     let guard = mdev.commands.encoder()?;
@@ -468,7 +735,8 @@ pub fn sdpa_full_nax(
     let store_dims = vec![b, h, ql, bd];
     let o_str = [(h * ql * bd) as i64, (ql * bd) as i64, bd as i64];
     let count: usize = store_dims.iter().product();
-    let obuf = mdev.buffer((count) as usize * (q.dtype()).size_of(), "sdpa_full_out")?;
+    let obuf =
+        mdev.buffer_for_gpu_write((count) as usize * (q.dtype()).size_of(), "sdpa_full_out")?;
     let store = Array::from_parts(mdev, obuf.clone(), &store_dims, q.dtype());
 
     let nq = ql.div_ceil(bq);
@@ -579,7 +847,8 @@ pub fn sdpa(
             let (sh, st) = (q.dims(), q.stride());
             q.buffer_and_layout().1.is_contiguous()
                 || sh[0] == 1
-                || sh[1] == 1 && st[3] == 1
+                || sh[1] == 1
+                    && st[3] == 1
                     && st[2] == sh[3] * sh[if sh[0] == 1 { 1 } else { 0 }]
                     && st[if sh[0] == 1 { 1 } else { 0 }] == sh[3]
         };
@@ -616,11 +885,7 @@ pub fn sdpa(
                 sdpa_vector(device, q, k, v, scale, dc, mask)
             };
         }
-        let (q, k, v) = (
-            q.contiguous()?,
-            k.contiguous()?,
-            v.contiguous()?,
-        );
+        let (q, k, v) = (q.contiguous()?, k.contiguous()?, v.contiguous()?);
         let (q, k, v) = (&q, &k, &v);
         if mask.is_some() && !matches!(d, 192 | 256) {
             // Unchanged legacy semantics: the dense chain only takes array

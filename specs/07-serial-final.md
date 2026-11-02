@@ -1,5 +1,10 @@
 # specs/07 — Serial-step FINAL audit and verdict
 
+Historical Qwen campaign. Results and implementation descriptions below refer
+to their recorded source versions; later sections may supersede earlier
+findings. Current contracts are in [00](00-contracts.md) and
+[AGENTS.md](../AGENTS.md). These measurements do not certify current GLM paths.
+
 Question: after all waves, is there still a real ≥1 ms lever in the serial decode step
 (37-40 ms measured here), or is the residual fully attributed to
 the lazy-graph MLX-C runtime class? Method: fresh `lisa-bench serial-audit` at HEAD with
@@ -10,7 +15,7 @@ remaining fusion/launch/reorder candidate checked against the falsification ledg
 
 ```
 wall ms/step median 41.18 (mean 41.16)
-dispatches/step 640 (was 704 @ specs/16, 672 @ fde22cd)
+dispatches/step 640 (was 704 after the earlier fusion work, 672 @ fde22cd)
 GPU ms/step 40.04 un-attributed (idle/gaps) 1.14 ms
 ```
 
@@ -21,14 +26,14 @@ GPU ms/step 40.04 un-attributed (idle/gaps) 1.14 ms
 | swiglu2_packed | 4.40 | 64 | 68 µs each, slot-bound |
 | gdn_decode_complete | 3.25 | 96 | fused 2-dispatch, 34 µs each |
 | copy_rows_into (KV write) | 1.54 | 64 | post specs/04-wave2 strided-src |
-| sdpa 2-pass | 1.57 | 48 | dense measured cheaper at kv1024 (specs/23) |
+| sdpa 2-pass | 1.57 | 48 | dense measured cheaper at kv1024 (earlier attention comparison) |
 | sigmoid_mul_tail | 0.82 | 16 | fused arm engaged |
-| qk_norm_rope | 0.76 | 16 | specs/24 rows arm (serial s=1 kernel) |
+| qk_norm_rope | 0.76 | 16 | fused rows arm (serial s=1 kernel) |
 | argmax (draft head) | 0.31 | 1 | keyed |
 | everything else | ~0.25 | ~45 | scalar 49, zeros 1, array 3, casts ~8, index 3 |
 
-Launch-count history: 798 (pre) → 704 (specs/16) → 672 (q\|gate merge) → **640 (HEAD)**.
-The 45 cbs/step cadence ceiling stays 1.33 ms (specs/16 phase 3, specs/11 §13); current
+Launch-count history: 798 (pre) → 704 (earlier fusions) → 672 (q\|gate merge) → **640 (HEAD)**.
+The 45 cbs/step cadence ceiling stays 1.33 ms (earlier command-cadence measurements); current
 idle measurement 1.14 ms is inside it.
 
 ## 2. NEW FACT — the serial qmv bandwidth gap is FALSIFIED
@@ -84,18 +89,18 @@ serial step.**
  implementation at this width pays (add+rms fusion declines D>4096, so add and rms run
  as two ops).
 - norm-in-qmv: falsified twice (occupancy specs/11-wave2, reduction-redistribution
- specs/16 §5.2). swiglu-in-down-qmm is the same O(N×tgs) prologue-recompute class
+ the earlier serial-fusion audit). swiglu-in-down-qmm is the same O(N×tgs) prologue-recompute class
  (5120 consumer threadgroups re-reading a 70 KB intermediate) — falsified by the same
  law without a run.
 - sdpa+sigmoid_mul_tail already fused; cross-layer batching impossible (sequential
- dependency chain); qk_norm_rope rows arm exists (specs/24).
+ dependency chain); qk_norm_rope rows arm exists (the earlier verify-kernel port).
 
 (b) Avoidable launches: the entire non-top tail (scalar 49, zeros 1, array 3, casts ~8)
 is ≈0.25 ms of GPU time; killing all of it cannot reach 1 ms. Dispatch merges are bounded
 by the 1.14 ms idle measurement.
 
 (c) Reordering/hoisting: idle 1.14 ms/step is the only un-attributed wall; cos/sin and
-const hoists landed in specs/16; cb-cadence merges falsified (specs/11 §13, specs/19).
+constant hoists had landed; command-buffer cadence merges were measured and rejected.
 
 ## 4. Verdict — **RE-OPENED**
 
@@ -127,18 +132,18 @@ Assumed deltas ledger (revised):
 1. ~~Serial qmv BW 62-75 % vs 85-97 % on the saturating path~~ — FALSIFIED for serial
  (§2): the splitk-verify BW number does not transfer.
 2. The lazy-graph MLX-C runtime advantage: unquantifiable from outside and the
- dispatch count is not the limiter (specs/22 xctrace); per-op GPU content at
+ dispatch count is not the limiter (the system trace); per-op GPU content at
  D=5120 is the same class (add+rms two ops, stock rms price). What remains of the
  ~34-vs-41 comparison is benchmark-inference vs in-pipeline measurement (the serial
- cell never serves at 16k; specs/22 showed our GPU busy/token FASTER on the haiku
+ cell never serves at 16k; the earlier system trace showed our GPU busy/token FASTER on the haiku
  path). Closing the serial-step file with floor accepted; the only named campaign
  lever left remains batched decode kernels (specs/07 item 2) and verify-round GPU
- content (specs/01 §7), not the serial step.
+ content (specs/01 §4), not the serial step.
 
 Serial ledger anchors: 39.3-41.2 ms wall, 640 dispatches, GPU 40.0, idle 1.1.
 Reproduction: `LISA_TRACE=1 LISA_CB_RECORD=1 cargo run --release -p lisa-bench -- \
  serial-audit --model agnosticeng/Qwen3.8-27B-4bit --kv 1024 --steps 32`
-Artifacts: bench/data/spec30/serial_audit.txt, serial.trace.json.
+The campaign retained a serial audit and Chrome trace for these measurements.
 
 Machine safety: sequential single-model run, memory_pressure 89 % free before both runs,
 no second model loaded; prior certified serve peak 31.8 GB — cap respected (this run's
@@ -211,7 +216,7 @@ dispatches — in-session medians only).
  latency-first runs.
 
  ## 7. Item-2 verdict at HEAD (0f054a1) — the streaming/non-overlap slot class,
-## measured, falsified where falsified (this session, one box, sequential)
+## 7. Subsequent measurements on one machine
 
 ### 7.1 The fresh census (verify-audit / serial-audit at HEAD)
 
@@ -220,7 +225,7 @@ Serial step, kv 1024, 32 counted steps (`lisa-bench serial-audit`, GPU probe on)
 `affine_qmv_fast 34.67 ms` (ALL projections, one kernel name) + phases
 `fused_add_rms 0.96 + gdn_decode_complete 0.77 + swiglu2_packed 0.40 +
 copies ~0.5 + sdpa 0.50 + misc < 0.2` ≈ 1.9 ms. The GPU is BUSY; the phase
-fusions of specs/16-24 landed. **The specs/07 §2 "12.3 ms that does not
+earlier serial/verify fusions landed. **The specs/07 §2 "12.3 ms that does not
 overlap the stream" is, at HEAD, inside the qmv stream itself**: ~14.5 GB of
 quantized weights in 34.67 ms = **417 GB/s effective = 76 % of the 548 GB/s
 achievable** (§2's corrected denominator). The 18.63/8.52/4.40 phase table of
@@ -239,7 +244,7 @@ kernels are cheap at verify widths; their in-situ CB-attributed ms is
 launch-context (dependency-boundary slot), not kernel execution.** A
 row-parallel phase redesign therefore has nothing to win — the row-scaling
 S3→S7 measured ~1.2×, not 2.3× (a fixed per-launch slot, matching specs/01
-§3's "per-launch GPU slot price" and the micro-port washes of specs/01 §5).
+§3's "per-launch GPU slot price" and the micro-port washes of specs/02 §5).
 
 Census caveat, now measured: the CB per-kernel gpu-ms attribution
 OVER-COUNTS when exec windows overlap (the 16k S7 run: per-kernel sum
@@ -248,7 +253,7 @@ back-to-back launches (the gpu-slot method at n=256: `qmv_fast 5120→17408`
 62.5 µs for a 45 MB read = 770 GB/s, above the 614.4 physical peak —
 impossible, therefore under-attributed). Per-class census stands; per-launch
 absolutes from either counter do not. The only un-attributed-free instrument
-remains xctrace (specs/22/26), artifacts gone with bench/data/.
+remains the historical system trace; its raw capture is not a shared fixture.
 
 ### 7.2 The occupancy/tile axis of the splitk verify tile — FALSIFIED in situ
 
@@ -264,7 +269,7 @@ steps 16, ~1 min cooldowns (the boot drifts ±40 % — in-pair deltas only):
 | 2:4 (kp=4) | 70.3 / 79.3 | 73.7 / 75.9 | wash |
 | 1:4 | 66.2 / 84.0 | 110.6 / 103.1 | **loses +60 %** |
 | 2:8 (kp=8) | 58.2 / 64.3 | 79.8 / 77.4 | **loses +30 %** |
-| 4:2 (BN=4 @M7) | 60.6 / 131.2 | 1769 / 2114 | **stack-spill (specs/15 §2 reproduced in situ)** |
+| 4:2 (BN=4 @M7) | 60.6 / 131.2 | 1769 / 2114 | **stack-spill (the earlier spill reproduced in situ)** |
 
 The shipped (BN=2, kp=2) tile wins or ties every interleaved pair. Threadgroup
 count and warps-per-threadgroup are not the residual; the "wide-tile BN=8,
@@ -276,7 +281,7 @@ measured shape.
 - **Verify path (the MTP round's bulk): CLOSED.** The splitk tile is at its
   measured floor; the occupancy axis is falsified in situ; the phase kernels
   are cheap (real-exec µs class) and their in-situ slot price is not
-  reachable by kernel redesign (falsified twice: specs/01 §5 micro-ports,
+  reachable by kernel redesign (falsified twice: specs/02 §5 micro-ports,
   this session's row-parallel hypothesis).
 - **Serial path: the 417-GB/s qmv deficit (~8 ms/step) is REAL but
   STRICT-locked.** specs/00 pins serial M=1 bit-exact; any reassociation
@@ -294,15 +299,15 @@ measured shape.
 
 Landed this session: the instrumentation (gpu-slot M=3/7 phase shapes in
 `bench_gpu_slot`; `LISA_VERIFY_QMM_TILE` seam + pure parser pin), the in-situ
-falsification tables above, artifacts under `bench/data/probe7/` (censuses +
+falsification tables above and the recorded campaign captures (censuses +
 sweep logs). Goldens 310/310; `verify_qmm*` lib tests green. No production
 kernel changed — the default tile and every dispatch are byte-identical.
 
-## 8. The serial split-K qmv port — unlocked by portage-1:1, falsified in situ
+## 8. Historical serial split-K qmv experiment — not admitted
 
-specs/00 §1 replaced the bit-exact pin with portage-1:1 (reorders legal, goldens
-re-capturable), which unlocked §7.3's "STRICT-locked" serial deficit for one
-measured attempt. The port: the reference's split-K accumulation structure on
+This experiment was attempted under a temporary relaxed campaign premise.
+That premise is superseded by the current STRICT contract; unchanged greedy
+goldens alone do not admit a reordered serial reduction. The experiment: the reference's split-K accumulation structure on
 the serial M=1 GEMV — `shaders/common/matmul/verify_qmm.metal`'s
 `affine_verify_qmm_splitk` body instantiated at MROWS = 1 (K partitions of whole
 quantization groups across K_PARTS simdgroups of one threadgroup, fp32 partition
@@ -323,8 +328,8 @@ K_PARTS = 2 for N ≥ 4096 else 4, BN = 2.
 - **K_PARTS sweep**: the wider-partition hypothesis (K_PARTS = 4 on the
   wide-N projections, deeper chains) REGRESSES hard: 85.37 / 87.79 ms median
   (+135 %). Falsified.
-- **Verdict: NO-LAND.** Per the falsified-lane precedent (specs/15 PPT,
-  specs/19 msg), the serial dispatch stays `affine_qmv_fast`;
+- **Verdict: NO-LAND.** Consistent with the earlier rejected tile and large-output
+  experiments, the serial dispatch stays `affine_qmv_fast`;
   `jit::affine_qmv_splitk` + `qmv_splitk_lane` remain as kernel-level opt-in
   infra. Goldens were NOT re-captured: the shipping path's numerics are
   unchanged (the wired-lane run proved the tracked goldens still pass).

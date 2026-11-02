@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::cache::LayerCache;
+use crate::core::cache::{IndexerTape, LayerCache};
 use crate::models::LanguageModel;
 use crate::models::speculate::argmax_id;
 
@@ -314,10 +314,7 @@ impl ModelCost {
         // extrapolation rule fills in (reference `roundMs`: "else null —
         // outside the measured span the caller's prior fills in, never
         // extrapolated").
-        let has_lower = m
-            .keys()
-            .rev()
-            .any(|k| *k < w && trusted(*k).is_some());
+        let has_lower = m.keys().rev().any(|k| *k < w && trusted(*k).is_some());
         let has_upper = m.keys().any(|k| *k > w && trusted(*k).is_some());
         if !has_lower || !has_upper {
             return None;
@@ -371,7 +368,9 @@ impl ModelCost {
         }
         let top = self.measured_round_ms(widest, bucket)?;
         let prev = self.measured_round_ms(widest.saturating_sub(1).max(2), bucket);
-        let slope = prev.map_or(0.0, |p| (top - p).max(0.0) / (widest - widest.saturating_sub(1)) as f64);
+        let slope = prev.map_or(0.0, |p| {
+            (top - p).max(0.0) / (widest - widest.saturating_sub(1)) as f64
+        });
         let prior = 0.6 * serial_ms.max(0.0);
         Some(top + (depth - widest) as f64 * slope.max(prior))
     }
@@ -517,10 +516,7 @@ pub fn adaptive_cap_for_machine() -> (usize, String) {
         None
     };
     match row {
-        Some(c) => (
-            c,
-            format!("measured per-silicon row '{chip}' -> cap {c}"),
-        ),
+        Some(c) => (c, format!("measured per-silicon row '{chip}' -> cap {c}")),
         None => (
             DEFAULT_CAP,
             format!(
@@ -550,12 +546,10 @@ pub fn measure_at_kv(
     tokens: &[u32],
     widths: &[u32],
     steps: usize,
-) -> anyhow::Result<(
-    f64,
-    f64,
-    BTreeMap<u32, f64>,
-    BTreeMap<u32, f64>,
-)> {
+) -> anyhow::Result<(f64, f64, BTreeMap<u32, f64>, BTreeMap<u32, f64>)> {
+    if tower.has_target_mtp() {
+        return measure_target_mtp_at_kv(tower, tokens, widths, steps);
+    }
     anyhow::ensure!(
         tower.has_drafter(),
         "round-cost measurement needs a model with an MTP drafter"
@@ -570,7 +564,7 @@ pub fn measure_at_kv(
     let mut serial: Vec<f64> = Vec::new();
     for i in 0..(steps + warm) {
         let t0 = std::time::Instant::now();
-        let logits = sess.feed(tower, &[tok])?;
+        let logits = sess.decode_token(tower, tok)?;
         let id = argmax_id(&logits)?;
         let dt = t0.elapsed().as_secs_f64() * 1e3;
         if i >= warm {
@@ -686,6 +680,106 @@ pub fn measure_at_kv(
         verify.insert(s, median(&times));
     }
     Ok((median(&serial), median(&draft), chain, verify))
+}
+
+/// Measure GLM's target-conditioned MTP path. It has one proposal position, so
+/// its only verify width is S=2; the proposal consumes a target multi-stream
+/// row and a private indexer tape rather than an independent drafter cache.
+fn measure_target_mtp_at_kv(
+    tower: &mut dyn LanguageModel,
+    tokens: &[u32],
+    widths: &[u32],
+    steps: usize,
+) -> anyhow::Result<(f64, f64, BTreeMap<u32, f64>, BTreeMap<u32, f64>)> {
+    anyhow::ensure!(
+        widths.iter().all(|&width| width == 2),
+        "GLM target-MTP supports only verify width S=2"
+    );
+    anyhow::ensure!(steps > 0, "round-cost needs at least one timed step");
+
+    const WARM: usize = 4;
+    let mut sess = crate::core::session::Session::new(tower);
+    let ctx_len = tower.context_window();
+    let logits = sess.feed(tower, tokens)?;
+    let mut tok = argmax_id(&logits)?;
+
+    // Price an ordinary serial decode step at this live KV length.
+    let mut serial = Vec::with_capacity(steps);
+    for i in 0..(steps + WARM) {
+        let start = std::time::Instant::now();
+        let logits = sess.decode_token(tower, tok)?;
+        tok = argmax_id(&logits)?;
+        if i >= WARM {
+            serial.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+
+    // Seed the GLM MTP head exactly as the first target-MTP round does: feed
+    // the pending target token, obtain its multi stream, and sample carry.
+    let position = sess.fed.len();
+    anyhow::ensure!(
+        position < tower.max_position_embeddings(),
+        "GLM target-MTP round-cost seed exceeds model context"
+    );
+    tower.set_context_tails(vec![sess_tail(&sess, ctx_len)]);
+    let seed_ids = lisa_mlx::Array::from_slice(&[tok as i32], &[1i32, 1]);
+    let (seed_mixed, seed_multi) =
+        tower.forward_capture(&seed_ids, Some(&mut sess.caches), false)?;
+    let seed_logits = tower.head(&seed_mixed)?;
+    let carry = argmax_id(&seed_logits)?;
+    sess.fed.push(tok);
+
+    // A GLM proposal is one target-conditioned MTP step. Use a fresh private
+    // tape for each sample so every timed call prices the first proposal at
+    // the same absolute target position and starts from the same state.
+    let mut draft = Vec::with_capacity(steps);
+    for i in 0..(steps + WARM) {
+        let mut cache = IndexerTape::new();
+        let start = std::time::Instant::now();
+        let proposal = tower.target_mtp_step(&mut cache, &seed_multi, carry, position, position)?;
+        let _draft_id = argmax_id(&proposal)?;
+        if i >= WARM {
+            draft.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+    let draft_ms = median(&draft);
+
+    // Price the exact two-row target verify path used by GLM generation. The
+    // target caches are restored after each pass; the MTP tape is not read by
+    // this forward and remains independent of the verify transaction.
+    let mut verify = Vec::with_capacity(steps);
+    let mut proposal_cache = IndexerTape::new();
+    let proposal =
+        tower.target_mtp_step(&mut proposal_cache, &seed_multi, carry, position, position)?;
+    let draft_id = argmax_id(&proposal)?;
+    let verify_ids = lisa_mlx::Array::from_slice(&[carry as i32, draft_id as i32], &[1i32, 2]);
+    for i in 0..(steps + WARM) {
+        let snapshots: Vec<_> = sess
+            .caches
+            .iter()
+            .map(LayerCache::snapshot_rollback)
+            .collect();
+        tower.set_context_tails(vec![sess_tail(&sess, ctx_len)]);
+        let start = std::time::Instant::now();
+        let (mixed, _) = tower.forward_capture(&verify_ids, Some(&mut sess.caches), false)?;
+        let logits = tower.head(&mixed)?;
+        let top = lisa_mlx::ops::indexing::argmax_axis(&logits, -1, None)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        top.eval().map_err(|error| anyhow::anyhow!("{error}"))?;
+        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+        for (cache, snapshot) in sess.caches.iter_mut().zip(&snapshots) {
+            cache.restore_rollback(snapshot)?;
+        }
+        if i >= WARM {
+            verify.push(elapsed);
+        }
+    }
+
+    let mut chain = BTreeMap::new();
+    chain.insert(1, draft_ms);
+    let mut verify_by_width = BTreeMap::new();
+    verify_by_width.insert(2, median(&verify));
+    Ok((median(&serial), draft_ms, chain, verify_by_width))
 }
 
 fn sess_tail(sess: &crate::core::session::Session, ctx_len: usize) -> Vec<i64> {
@@ -1091,12 +1185,11 @@ impl DepthController {
         // raw floor and the slope-capped extrapolation past the widest
         // measured width. The legacy per-cell direct read stays as the
         // fallback for partially measured tables.
-        t.cost_source_ms(depth, bucket, self.serial_ms)
-            .or_else(|| {
-                let v = t.cell(Which::Verify, (depth + 1) as u32, bucket)?;
-                let dcost = self.draft_cost_ms(t, depth, bucket)?;
-                Some(v as f64 + dcost)
-            })
+        t.cost_source_ms(depth, bucket, self.serial_ms).or_else(|| {
+            let v = t.cell(Which::Verify, (depth + 1) as u32, bucket)?;
+            let dcost = self.draft_cost_ms(t, depth, bucket)?;
+            Some(v as f64 + dcost)
+        })
     }
 
     /// The tokens a round at `depth` is priced with: trusted MEASURED tokens
@@ -1359,8 +1452,8 @@ impl DepthController {
                 let costly = from_table && base_r * mc >= 1.0;
                 if !costly && base + 1 <= hi_cap {
                     m_hi = base + 1;
-                    tau = (base_r * mc / self.ev_acc[(base - 1).min(5)].max(1e-6))
-                        .clamp(0.05, 0.95);
+                    tau =
+                        (base_r * mc / self.ev_acc[(base - 1).min(5)].max(1e-6)).clamp(0.05, 0.95);
                 }
             }
         }
@@ -1420,12 +1513,11 @@ impl DepthController {
                 _ => false,
             }
         };
-        (2..=self.cap)
-            .find(|&d| {
-                !self.settled_worse.contains(&d)
-                    && !table_measured(d)
-                    && self.round_n.get(&d).copied().unwrap_or(0) < MIN_SAMPLES
-            })
+        (2..=self.cap).find(|&d| {
+            !self.settled_worse.contains(&d)
+                && !table_measured(d)
+                && self.round_n.get(&d).copied().unwrap_or(0) < MIN_SAMPLES
+        })
     }
 
     /// One trial-schedule tick, called from `pick` AFTER the round counter
@@ -1446,7 +1538,11 @@ impl DepthController {
         if self.rounds >= self.next_trial {
             // The pick's own kv is not at hand here; the target search uses
             // the last-seen bucket via the caller's kv (stored at pick).
-            match self.trial_kv.take().and_then(|kv| self.width_trial_target(kv)) {
+            match self
+                .trial_kv
+                .take()
+                .and_then(|kv| self.width_trial_target(kv))
+            {
                 Some(d) => {
                     self.trial_target = Some(d);
                     self.trial_end = self.rounds + EXPLORE_BLOCK - 1;
@@ -1470,13 +1566,7 @@ impl DepthController {
     /// table must not count) is dropped here. The caller passes only
     /// single-chunk shapes (the same exclusion as `observe_round`).
     /// Returns true when a sample FOLDED (the caller persists at request end).
-    pub fn observe_table_round(
-        &mut self,
-        kv_len: usize,
-        width_s: u32,
-        ms: f64,
-        tok: f64,
-    ) -> bool {
+    pub fn observe_table_round(&mut self, kv_len: usize, width_s: u32, ms: f64, tok: f64) -> bool {
         let prev = self.prev_round_w.replace(width_s);
         if prev.is_some() && prev != Some(width_s) {
             return false; // transition round
@@ -1626,9 +1716,17 @@ impl DepthController {
         }
         self.regime_prev_shape = Some(two_chunk);
         let (ema, n, key) = if two_chunk {
-            (self.regime_two_ms_tok, self.regime_two_n, self.regime_two_m_lo)
+            (
+                self.regime_two_ms_tok,
+                self.regime_two_n,
+                self.regime_two_m_lo,
+            )
         } else {
-            (self.regime_single_ms_tok, self.regime_single_n, self.regime_single_m_lo)
+            (
+                self.regime_single_ms_tok,
+                self.regime_single_n,
+                self.regime_single_m_lo,
+            )
         };
         // New base depth: reseed (a shape's ms/tok at a different m_lo is a
         // different price).
@@ -1727,7 +1825,6 @@ impl DepthController {
         self.rounds = EV_WARMUP_ROUNDS; // warmup consumed
     }
 
-
     /// Cost model for a round at `depth`, in ms. Priority: in-run measurement
     /// (the live machine at the live width), then the persisted table at the
     /// bucket `bucket_to_read` resolves (nearest trusted, lower preferred),
@@ -1810,10 +1907,7 @@ impl DepthController {
             // The gate reads the SAME bucket `bucket_to_read` resolves
             // (nearest trusted, lower preferred). No trusted bucket at this kv: the
             // trial is the only pricing (the `_ => true` arm below).
-            let read_bucket = self
-                .table
-                .as_ref()
-                .and_then(|t| t.bucket_to_read(kv_len));
+            let read_bucket = self.table.as_ref().and_then(|t| t.bucket_to_read(kv_len));
             let stps = self.serial_tps();
             let trial = (2..=self.cap).find(|d| {
                 if self.round_n.get(d).copied().unwrap_or(0) >= 3 || self.settled_worse.contains(d)
@@ -1829,9 +1923,7 @@ impl DepthController {
                                 self.draft_cost_ms(t, *d, bucket)?,
                             ))
                         }) {
-                            Some((v, dr)) => {
-                                cap(etok) / (v as f64 + dr) * 1000.0 >= stps * 0.95
-                            }
+                            Some((v, dr)) => cap(etok) / (v as f64 + dr) * 1000.0 >= stps * 0.95,
                             None => true, // no trusted prior: the trial is the only pricing
                         }
                     }
@@ -2034,11 +2126,7 @@ mod tests {
         c.standing_lo = Some(1);
         c.standing_r = 1e9; // hysteresis keeps the collapsed base if allowed
         let p = c.plan_src(6, 1000, false);
-        assert!(
-            p.m_lo >= 6,
-            "plan base {} sank below the EV pick 6",
-            p.m_lo
-        );
+        assert!(p.m_lo >= 6, "plan base {} sank below the EV pick 6", p.m_lo);
         // The extension horizon may still reach above the pick, never below.
         assert!(p.m_hi >= p.m_lo);
     }
@@ -2066,7 +2154,11 @@ mod tests {
         // Serial trusted (constructor measurement), so the gate is armed.
         // Past the bootstrap warmup so this pick IS an EV-vs-gate decision.
         c.rounds = EV_WARMUP_ROUNDS;
-        assert_eq!(c.pick(1000, usize::MAX), 2, "gate outranks the 3% EV margin");
+        assert_eq!(
+            c.pick(1000, usize::MAX),
+            2,
+            "gate outranks the 3% EV margin"
+        );
     }
 
     /// Forced-continuation term: at the tail of a forced-length decode the
@@ -2121,7 +2213,11 @@ mod tests {
         // d3 is trusted now: its EV uses ITS OWN acc, where index 2 reads the
         // measured ~1.0, not the shared EMA's value.
         let own = c.depth_acc.get(&3).copied().unwrap();
-        assert!(own[2] > 0.9, "d3's index-2 EMA tracks its own rounds: {}", own[2]);
+        assert!(
+            own[2] > 0.9,
+            "d3's index-2 EMA tracks its own rounds: {}",
+            own[2]
+        );
         assert!(c.acc_for(3)[2] > 0.9, "acc_for(d3) uses the per-depth EMA");
         // An untrusted depth still prices from the shared EMA.
         assert!((c.acc_for(5)[2] - c.acc[2]).abs() < 1e-9);
@@ -2232,7 +2328,10 @@ mod tests {
         // slope (20-10)/2 = 5 vs prior 0.6*40 = 24 -> max(24) per step:
         // 20 + 24 = 44 chain; verify 100 -> 144.
         let past = m.marginal_past_widest(5, 0, 40.0).unwrap();
-        assert!((past - 144.0).abs() < 1e-4, "slope capped by the prior: {past}");
+        assert!(
+            (past - 144.0).abs() < 1e-4,
+            "slope capped by the prior: {past}"
+        );
         // Raw floor: an untrusted verify sample ABOVE the interpolated price
         // floors depth 3's price.
         let mut raw = [Cell::default(); 6];
@@ -2251,7 +2350,10 @@ mod tests {
         // sits at verify width 4, which is depth 3's row — it must not leak
         // into depth 4's price.
         let d4 = m.cost_source_ms(4, 0, 40.0).unwrap();
-        assert!((d4 - 120.0).abs() < 1e-4, "chain 20 + verify exact 100: {d4}");
+        assert!(
+            (d4 - 120.0).abs() < 1e-4,
+            "chain 20 + verify exact 100: {d4}"
+        );
     }
 
     /// P1: measured tokens replace the EMA model only when count-trusted.
@@ -2283,7 +2385,10 @@ mod tests {
         c.observe_pair(120.0, Some(4.0));
         assert!((c.ms - 110.0).abs() < 1e-4 && (c.tok - 3.5).abs() < 1e-4);
         c.observe_pair(140.0, Some(5.0));
-        assert!((c.tok - (3.5 + (5.0 - 3.5) / 3.0)).abs() < 1e-4, "mean at n=2");
+        assert!(
+            (c.tok - (3.5 + (5.0 - 3.5) / 3.0)).abs() < 1e-4,
+            "mean at n=2"
+        );
         c.observe_pair(140.0, Some(5.0));
         assert!((c.tok - (4.0 * 0.9 + 5.0 * 0.1)).abs() < 1e-4, "EMA at n=3");
     }
@@ -2304,8 +2409,14 @@ mod tests {
     #[test]
     fn serving_round_fold_rejects_bad_and_reseeds_stale() {
         let mut m = ModelCost::default();
-        assert!(!m.observe_round_cell(4, 0, f64::NAN, 3.0), "non-finite rejected");
-        assert!(!m.observe_round_cell(4, 0, 0.0, 3.0), "non-positive rejected");
+        assert!(
+            !m.observe_round_cell(4, 0, f64::NAN, 3.0),
+            "non-finite rejected"
+        );
+        assert!(
+            !m.observe_round_cell(4, 0, 0.0, 3.0),
+            "non-positive rejected"
+        );
         assert!(m.observe_round_cell(4, 0, 150.0, 3.0));
         assert!(m.observe_round_cell(4, 0, 160.0, 3.5));
         assert!(m.observe_round_cell(4, 0, 155.0, 3.2));
@@ -2338,9 +2449,15 @@ mod tests {
     fn ev_observe_is_conditional_on_the_first_rejection() {
         let mut c = DepthController::new(None, 40.0, 6);
         c.ev_observe(4, 2);
-        assert!(c.ev_acc[0] > EV_PRIOR && c.ev_acc[1] > EV_PRIOR, "accepted folds up");
+        assert!(
+            c.ev_acc[0] > EV_PRIOR && c.ev_acc[1] > EV_PRIOR,
+            "accepted folds up"
+        );
         assert!(c.ev_acc[2] < EV_PRIOR, "the rejecting index folds down");
-        assert!((c.ev_acc[3] - EV_PRIOR).abs() < 1e-12, "unreached index untouched");
+        assert!(
+            (c.ev_acc[3] - EV_PRIOR).abs() < 1e-12,
+            "unreached index untouched"
+        );
         assert!((c.ev_acc[5] - EV_PRIOR).abs() < 1e-12);
     }
 
@@ -2358,7 +2475,14 @@ mod tests {
         m.serial_ms = serial;
         // Steep verify curve (~+80 ms/row) with a flat chain: the horizon
         // closes once cond (seeded 0.85) <= best_r * marginal.
-        for (s, vms) in [(2u32, 90.0f32), (3, 170.0), (4, 250.0), (5, 330.0), (6, 410.0), (7, 490.0)] {
+        for (s, vms) in [
+            (2u32, 90.0f32),
+            (3, 170.0),
+            (4, 250.0),
+            (5, 330.0),
+            (6, 410.0),
+            (7, 490.0),
+        ] {
             let mut v = [Cell::default(); 6];
             v[0] = Cell {
                 ms: vms,
@@ -2441,8 +2565,13 @@ mod tests {
             (DepthController::chain_log_conf(&[0.0, -0.5]) + 0.5).abs() < 1e-9,
             "inputs are logs: sum of clamped logs"
         );
-        assert_eq!(DepthController::chain_log_conf(&[f64::NAN]), f64::NEG_INFINITY);
-        assert!(DepthController::chain_log_conf(&[-2.0]) > DepthController::chain_log_conf(&[-5.0]));
+        assert_eq!(
+            DepthController::chain_log_conf(&[f64::NAN]),
+            f64::NEG_INFINITY
+        );
+        assert!(
+            DepthController::chain_log_conf(&[-2.0]) > DepthController::chain_log_conf(&[-5.0])
+        );
     }
 
     /// P4: the dry-spell gate — a cost-aware threshold, streak collapse into
@@ -2461,7 +2590,10 @@ mod tests {
         for _ in 0..31 {
             assert!(!c.ext_dry_allows());
         }
-        assert!(c.ext_dry_allows(), "cooldown consumed after 32 considered rounds");
+        assert!(
+            c.ext_dry_allows(),
+            "cooldown consumed after 32 considered rounds"
+        );
         // A firing resets the streak mid-spell.
         let mut c2 = DepthController::new(None, 40.0, 6);
         for _ in 0..10 {
@@ -2476,7 +2608,11 @@ mod tests {
         // off sooner.
         c2.sync_ms = 12.0;
         c2.live_round_ms = 40.0; // sync = 30% of the round -> threshold 1? round(0.30/0.30)=1 -> clamp 3
-        assert_eq!(c2.ext_dry_threshold_public(), 3, "expensive sync -> DRY_MIN");
+        assert_eq!(
+            c2.ext_dry_threshold_public(),
+            3,
+            "expensive sync -> DRY_MIN"
+        );
         c2.sync_ms = 4.0;
         assert_eq!(c2.ext_dry_threshold_public(), 3, "0.30/0.10 = 3");
         c2.sync_ms = 1.0;
@@ -2502,7 +2638,7 @@ mod tests {
         // Force logic: single-chunk forced, but a 2-round explore block opens.
         let mut forced = 0;
         let mut saw_trial = false;
-        for r in 0..200 {
+        for _ in 0..200 {
             c.regime_tick();
             if !c.regime_force_single() {
                 saw_trial = true;
@@ -2528,7 +2664,11 @@ mod tests {
         for _ in 0..12 {
             c2.regime_observe(true, 2, 18.0, 0.0); // EMA crosses below single: ratio <= 1.0
         }
-        assert_eq!(c2.regime_two_chunk_worse(), Some(false), "standing worse flips at ratio <= 1.0");
+        assert_eq!(
+            c2.regime_two_chunk_worse(),
+            Some(false),
+            "standing worse flips at ratio <= 1.0"
+        );
         // Transition drop: alternating shapes fold nothing new.
         let mut c3 = DepthController::new(None, 40.0, 6);
         c3.regime_observe(false, 2, 20.0, 0.0);
@@ -2590,10 +2730,18 @@ mod tests {
         assert_eq!(m.serial_prior_ms(2343), None, "own seed does not anchor");
         // Neighbour trusted: kv 2343 reads the <2k cell — the exact repro24k
         // shape (empty 2-4k cell, n = 36 under <2k).
-        m.serial_ms[0] = Cell { ms: 38.5, tok: 0.0, n: 36 };
+        m.serial_ms[0] = Cell {
+            ms: 38.5,
+            tok: 0.0,
+            n: 36,
+        };
         assert_eq!(m.serial_prior_ms(2343), Some(38.5));
         // Own bucket trusted: it reads itself.
-        m.serial_ms[1] = Cell { ms: 41.0, tok: 0.0, n: 3 };
+        m.serial_ms[1] = Cell {
+            ms: 41.0,
+            tok: 0.0,
+            n: 3,
+        };
         assert_eq!(m.serial_prior_ms(2343), Some(41.0));
     }
 
@@ -2607,7 +2755,11 @@ mod tests {
         c.observe(60.0);
         assert!((c.ms - 50.0).abs() < 1e-6, "first fold is a mean: {}", c.ms);
         c.observe(60.0);
-        assert!((c.ms - 53.3333).abs() < 1e-3, "still a mean at n=2: {}", c.ms);
+        assert!(
+            (c.ms - 53.3333).abs() < 1e-3,
+            "still a mean at n=2: {}",
+            c.ms
+        );
         c.observe(60.0); // n = 3 before this call: EMA (BETA 0.10) takes over
         assert_eq!(c.n, 4);
         assert!((c.ms - 54.0).abs() < 1e-3, "EMA after trust: {}", c.ms);
@@ -2637,7 +2789,10 @@ mod tests {
         let (val, warm) = probe_warm_stats(&samples);
         assert_eq!(warm, 6, "PROBE_TICKS - PROBE_WARM folds");
         let expect = (41.0 + 40.5 + 40.2 + 40.9 + 40.1 + 40.6) / 6.0;
-        assert!((val - expect).abs() < 1e-9, "value = mean of warm folds: {val}");
+        assert!(
+            (val - expect).abs() < 1e-9,
+            "value = mean of warm folds: {val}"
+        );
         let c = DepthController::new_with_serial(None, val, warm, 6);
         assert!(c.serial_trusted(), "warm folds >= MIN_SAMPLES");
     }
@@ -2669,19 +2824,39 @@ mod tests {
         // so the pick must come from the table, not from the default.
         let mut m = ModelCost::default();
         let mut serial = [Cell::default(); 6];
-        serial[0] = Cell { ms: 40.0, tok: 0.0, n: 3 };
+        serial[0] = Cell {
+            ms: 40.0,
+            tok: 0.0,
+            n: 3,
+        };
         m.serial_ms = serial;
         let mut v3 = [Cell::default(); 6];
-        v3[0] = Cell { ms: 100.0, tok: 0.0, n: 3 };
+        v3[0] = Cell {
+            ms: 100.0,
+            tok: 0.0,
+            n: 3,
+        };
         m.verify_ms.insert(3, v3);
         let mut v5 = [Cell::default(); 6];
-        v5[0] = Cell { ms: 60.0, tok: 0.0, n: 3 };
+        v5[0] = Cell {
+            ms: 60.0,
+            tok: 0.0,
+            n: 3,
+        };
         m.verify_ms.insert(5, v5);
         let mut ch2 = [Cell::default(); 6];
-        ch2[0] = Cell { ms: 40.0, tok: 0.0, n: 3 };
+        ch2[0] = Cell {
+            ms: 40.0,
+            tok: 0.0,
+            n: 3,
+        };
         m.chain_ms.insert(2, ch2);
         let mut ch4 = [Cell::default(); 6];
-        ch4[0] = Cell { ms: 10.0, tok: 0.0, n: 3 };
+        ch4[0] = Cell {
+            ms: 10.0,
+            tok: 0.0,
+            n: 3,
+        };
         m.chain_ms.insert(4, ch4);
         let mut c2 = DepthController::new_with_serial(Some(m), 86.31, 0, 6);
         c2.rounds = EV_WARMUP_ROUNDS;
@@ -2703,16 +2878,32 @@ mod tests {
         // 25.375 tok/s: beats serial outright, but NOT the EV loop's 3%
         // margin (25.75) — EV parks, the gate must keep d2.
         let mut serial = [Cell::default(); 6];
-        serial[0] = Cell { ms: 40.0, tok: 0.0, n: 3 };
+        serial[0] = Cell {
+            ms: 40.0,
+            tok: 0.0,
+            n: 3,
+        };
         m.serial_ms = serial;
         let mut v3 = [Cell::default(); 6];
-        v3[0] = Cell { ms: 87.6, tok: 0.0, n: 3 };
+        v3[0] = Cell {
+            ms: 87.6,
+            tok: 0.0,
+            n: 3,
+        };
         m.verify_ms.insert(3, v3);
         let mut v4 = [Cell::default(); 6];
-        v4[0] = Cell { ms: 500.0, tok: 0.0, n: 3 };
+        v4[0] = Cell {
+            ms: 500.0,
+            tok: 0.0,
+            n: 3,
+        };
         m.verify_ms.insert(4, v4);
         let mut ch2 = [Cell::default(); 6];
-        ch2[0] = Cell { ms: 3.53, tok: 0.0, n: 3 };
+        ch2[0] = Cell {
+            ms: 3.53,
+            tok: 0.0,
+            n: 3,
+        };
         m.chain_ms.insert(2, ch2);
         let mut c = DepthController::new(Some(m), 40.0, 6);
         c.rounds = EV_WARMUP_ROUNDS;
@@ -2742,7 +2933,12 @@ mod tests {
         let mut rate = None;
         for _ in 0..DEPTH_WINDOW {
             rate = DepthController::floor_disable_observe(
-                &mut drafted, &mut accepted, &mut idx, 1, 8, 1,
+                &mut drafted,
+                &mut accepted,
+                &mut idx,
+                1,
+                8,
+                1,
             );
         }
         let rate = rate.expect("a full window of base-depth-one rounds returns a rate");
@@ -2779,7 +2975,12 @@ mod tests {
         for _ in 0..DEPTH_WINDOW - 1 {
             assert_eq!(
                 DepthController::floor_disable_observe(
-                    &mut drafted, &mut accepted, &mut idx, 1, 1, 0,
+                    &mut drafted,
+                    &mut accepted,
+                    &mut idx,
+                    1,
+                    1,
+                    0,
                 ),
                 None
             );
@@ -2794,15 +2995,19 @@ mod tests {
         for _ in 0..DEPTH_WINDOW - 1 {
             assert_eq!(
                 DepthController::floor_disable_observe(
-                    &mut drafted, &mut accepted, &mut idx, 1, 1, 0,
+                    &mut drafted,
+                    &mut accepted,
+                    &mut idx,
+                    1,
+                    1,
+                    0,
                 ),
                 None
             );
         }
-        let rate = DepthController::floor_disable_observe(
-            &mut drafted, &mut accepted, &mut idx, 1, 1, 0,
-        )
-        .expect("sixteenth failure");
+        let rate =
+            DepthController::floor_disable_observe(&mut drafted, &mut accepted, &mut idx, 1, 1, 0)
+                .expect("sixteenth failure");
         assert!(rate.abs() < 1e-5);
         assert!(rate < DISABLE_BELOW);
     }

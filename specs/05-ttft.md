@@ -1,10 +1,14 @@
 # specs/05 — TTFT / Prefill decomposition and cold-start ports
 
+Historical Qwen campaign. Results and implementation descriptions below refer
+to their recorded source versions; later sections may supersede earlier
+findings. Current contracts are in [00](00-contracts.md) and
+[AGENTS.md](../AGENTS.md). These measurements do not certify current GLM paths.
+
 Baseline (clean tree, goldens green). Model `agnosticeng/Qwen3.8-27B-4bit`,
 serial `lisa run --max-tokens 1 --depth 0 --seed 0`, raw prompts, 3 reps, medians.
 Instrumentation: one `[ttft] +<s>` stderr milestone per phase (`lisa_engine::ttft_mark`,
-anchored at `main`); per-shape warmup and per-chunk prefill marks. Artifacts:
-`bench/data/ttft/{baseline_serial,after_serial}.txt`, `/tmp/ttft_prof.json`.
+anchored at `main`); per-shape warmup and per-chunk prefill marks.
 
 ## Phase 1 — where the first-token time goes (process → token 1)
 
@@ -47,6 +51,7 @@ Key findings:
 ## Phase 2 — ports landed
 
 ### Port 1: draft-head disk cache (`draft_head_2bit_gs64.lsdh`)
+
 `Qwen35Tower::load` now passes the checkpoint dir to `build_draft_lm_head_cached`: first
 run builds and saves the packed 2-bit/gs64 tensors (atomic tmp+rename, geometry-guarded
 magic/gs/bits/V/K header — the trunk head is itself packed, so logical-vs-logical width
@@ -56,6 +61,7 @@ Traps hit: packed-dim math twice (words/row = K·bits/32; logical K = words·32/
 trunk reference's own width must be unpacked with ITS bits before comparing).
 
 ### Port 2: warmup s=2048 dropped (shapes 1/9/40 remain)
+
 `Qwen35Tower::warmup` no longer runs the throwaway 2048-token forward; the first real
 prefill chunk pays the ~0.45 s JIT instead. **−2.3 s per serial generate** at every
 length; serve startup also gets cheaper (first big-prompt request pays the JIT once).
@@ -75,11 +81,16 @@ Serve-resident TTFT (warm model, e.g. 4.1k) is prefill-dominated (~6 s); the por
 the per-PROCESS costs, which is what cold start and every CLI/server restart pay.
 
 ### Validation
+
 golden 310/310 ×2, `lisa-bench smoke` green, `lisa-engine` lib tests 22/22 (--release).
 RAM: single model resident, peak unchanged (~31.8 GB class); +0.4 GB cache file read.
 
-## Remaining
-1. **Prefix-cache resume stall (specs §9)**: `restore_session` restores full KV snapshots
+## Remaining at the end of this campaign
+
+Later Qwen prefix-cache checks measured a 16.7× resume improvement. The older
+stall below is a reproduction hypothesis, not a current known defect.
+
+1. **Prefix-cache resume stall hypothesis**: `restore_session` restores full KV snapshots
  (O(n) memcpy, ~0.5 GB @8k ≈ 0.1 s — should NOT stall seconds). Suspects beyond the
  copy: a `trim_cache` sync at resume, drafter offset replay, or snapshot capture during
  prefill. Needs a reproduction run before touching.
@@ -95,7 +106,7 @@ RAM: single model resident, peak unchanged (~31.8 GB class); +0.4 GB cache file 
  credit is absent (partial) — multi-chunk prefill + decode-share + shrink:
  the decode-share part remains unimplemented.
 - **`shortest_validated_tail` scheduling — set aside**: its −60 % TTFT comes
- from a *queue* under load; our serve is effectively single-user. Reopen
+ from a *queue* under load; the campaign did not measure a representative queue. Reopen
  only with real concurrency (cf. prefix-homogeneous batching, specs/01 §5).
 - **ANE/GPU hybrid prefill — FALSIFIED for this box (M5 Max).** The engine
  uses zero ANE (repo-wide 0 occurrences; an earlier "ANE is in our code"

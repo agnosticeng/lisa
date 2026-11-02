@@ -1,5 +1,11 @@
-reference/
+/reference/
 /models/
 /target/
 *.log
 .DS_Store
+
+# Local development artifacts.
+/bench/
+/tools/
+/docs/glm53/
+/crates/*/bench/

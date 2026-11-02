@@ -21,22 +21,15 @@ pub const COPY_K: usize = 3;
 /// is 1.000 across 6-12 — reach 7.
 pub const COPY_LEN_MAX: usize = 7;
 
-/// Effective copy-length cap: `COPY_LEN_MAX`, or `LISA_COPY_LEN_MAX` when it
-/// raises it. A value of 0, an unset variable, or a parse error all fall back
-/// to the const default — the default path is byte-identical.
-///
-/// Measured test knob for the S >= 8 verify lane (specs/08): a copy hit wider
-/// than 6 widens the round past the split-K fast lane (S = w + 1 > 7) onto the
-/// tiled verify lane, whose wide end prices near parity with the fast lane.
+/// Effective copy-length cap, overridden by a positive `LISA_COPY_LEN_MAX`.
+/// Zero, an unset variable or a parse error uses the default seven-token cap.
+/// Overrides above seven exceed the split-K verify lane (S = width + 1 > 8)
+/// and require separate numerical and performance validation.
 pub fn copy_len_max() -> usize {
     match std::env::var("LISA_COPY_LEN_MAX") {
         Ok(s) => {
             let v = s.trim().parse::<usize>().unwrap_or(COPY_LEN_MAX);
-            if v == 0 {
-                COPY_LEN_MAX
-            } else {
-                v
-            }
+            if v == 0 { COPY_LEN_MAX } else { v }
         }
         Err(_) => COPY_LEN_MAX,
     }
@@ -152,12 +145,7 @@ pub const MIN_COPY_CONT: usize = 2;
 ///    k-gram being predicted (`p + k > s.len() - k`), so the "continuation" is
 ///    just the text we are trying to predict echoed back;
 /// 2. **short continuation** — fewer than [`MIN_COPY_CONT`] committed tokens.
-pub fn copy_lookup_guarded(
-    s: &[u32],
-    idx: &CopyIndex,
-    k: usize,
-    depth: usize,
-) -> Option<Vec<u32>> {
+pub fn copy_lookup_guarded(s: &[u32], idx: &CopyIndex, k: usize, depth: usize) -> Option<Vec<u32>> {
     let want = depth.max(MIN_COPY_CONT);
     if k != idx.k || s.len() < k + want {
         return None;
@@ -190,11 +178,7 @@ pub struct WidthRamp {
 impl WidthRamp {
     pub fn new(base: usize, max: usize) -> Self {
         let base = base.clamp(1, max);
-        Self {
-            base,
-            max,
-            w: base,
-        }
+        Self { base, max, w: base }
     }
     pub fn width(&self) -> usize {
         self.w
@@ -279,7 +263,9 @@ mod tests {
     fn echo_score_separates_repetition_from_novelty() {
         let echo: Vec<u32> = (0..200).map(|i| (i % 7) as u32).collect();
         assert!(echo_score(&echo) > 0.9, "echo {}", echo_score(&echo));
-        let novel: Vec<u32> = (0u32..200).map(|i| (i.wrapping_mul(2654435761) % 99991) as u32).collect();
+        let novel: Vec<u32> = (0u32..200)
+            .map(|i| (i.wrapping_mul(2654435761) % 99991) as u32)
+            .collect();
         assert!(echo_score(&novel) < 0.05, "novel {}", echo_score(&novel));
         assert_eq!(echo_score(&[1, 2, 3]), 0.0);
     }
@@ -289,7 +275,9 @@ mod tests {
     /// margin, measured on the bench prompts (specs/router).
     #[test]
     fn echo_score_mixed_is_intermediate() {
-        let novel: Vec<u32> = (0u32..400).map(|i| (i.wrapping_mul(2654435761) % 99991) as u32).collect();
+        let novel: Vec<u32> = (0u32..400)
+            .map(|i| (i.wrapping_mul(2654435761) % 99991) as u32)
+            .collect();
         let block: Vec<u32> = (0..40).map(|i| (i % 5) as u32).collect();
         let mut mixed = novel.clone();
         for _ in 0..4 {

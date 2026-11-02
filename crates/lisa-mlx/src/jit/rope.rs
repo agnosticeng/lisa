@@ -62,7 +62,7 @@ pub fn rope(
     )?;
 
     let count = x.elem_count();
-    let obuf = mdev.buffer((count) as usize * (in_dt).size_of(), "rope_out")?;
+    let obuf = mdev.buffer_for_full_gpu_write((count) as usize * (in_dt).size_of(), "rope_out")?;
     let out = Array::from_parts(mdev, obuf.clone(), &dims_v.clone(), in_dt);
 
     let in_strides = layout.stride().to_vec();

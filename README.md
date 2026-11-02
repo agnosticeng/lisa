@@ -1,76 +1,100 @@
 # lisa
 
-**Local LLM inference for Apple Silicon. One native binary. No Python, no MLX, no framework.**
+Local inference for Apple Silicon, with a Rust engine, a native Metal runtime,
+JIT-compiled kernels, a command-line interface, an HTTP server and a macOS app.
 
 ![lisa](docs/images/screenshot.png)
 
-A from-scratch Rust + Metal inference engine for hybrid GDN + MoE + MTP
-models — Qwen 3.8 27B and Flash-Next. Speculative decoding with an
-expected-value controller, JIT-compiled Metal kernels, an OpenAI-compatible
-server, and a native macOS app.
+## Setup
 
-## Quick start
-
-```bash
-cargo build --release      # -> target/release/lisa
-```
-
-Run:
+Use macOS on Apple Silicon, a Rust toolchain supporting edition 2024, and Apple
+command line developer tools. Language-model inference requires Metal. Model
+weights are separate; RAM must accommodate weights, caches and working buffers.
 
 ```bash
+cargo build --release --workspace
 ./target/release/lisa run --model agnosticeng/Qwen3.8-27B-4bit \
-  --prompt "Explain multi-token prediction in two sentences."
+  --prompt "Explain multi-token prediction in two sentences." --max-tokens 64
 ```
 
-Serve — any OpenAI-compatible client works, streaming included:
+`--model` accepts a local checkpoint directory or a Hugging Face repository ID.
+Repository IDs use the local hub cache or download the checkpoint when missing.
+
+Start the server, including streaming `/v1/chat/completions`:
 
 ```bash
-./target/release/lisa serve --model agnosticeng/Qwen3.8-27B-4bit --addr 127.0.0.1:8000
+./target/release/lisa serve --model agnosticeng/Qwen3.8-27B-4bit \
+  --addr 127.0.0.1:8000
 ```
 
-Or use the desktop app:
+Launch the desktop app with `./target/release/lisa-ui`. Chat and the app's HTTP
+server use automatic MTP when the loaded checkpoint supports it. Use
+`./target/release/lisa --help` and each subcommand's `--help` for options.
+`chat` and cohort `batch` currently support Qwen4; use `run` or `serve` for
+the other language-model families.
+
+## Models
+
+The loader uses `model_type` to select a family for `run` and `serve`:
+
+| Family | Accepted `model_type` values |
+| --- | --- |
+| Qwen 3.8 Flash-Next | `qwen4_exp`, `qwen4_exp_text` |
+| Qwen 3.8 27B | `qwen3_5`, `qwen3_5_text` |
+| GLM-5.3 Flash | `glm5_next`, `glm5_next_text` |
+
+Compatible tensor names, shapes and quantization are also required. Laya
+(`laya`) is a separate typed-decision model, exposed through `decide` and
+`/v1/decisions`, with CPU and Metal backends.
+
+### GLM-5.3 checkpoints
+
+GLM loads compatible MLX-format quantized weights through a resident index at
+`<model>/.lisa-resident/index.json`, with its validated backing files. The index
+must match the checkpoint; downloading ordinary weight shards alone is insufficient.
+
+Prepare a local checkpoint once with the native CPU command below. It copies
+the original tensor bytes into aligned storage, verifies SHA-256 readback and
+publishes the index atomically. Allow approximately one extra checkpoint's
+worth of free disk space. Existing prepared storage is never overwritten.
 
 ```bash
-./target/release/lisa-ui
+./target/release/lisa prepare --model /path/to/glm53 --plan-only
+./target/release/lisa prepare --model /path/to/glm53
+./target/release/lisa run --model /path/to/glm53 \
+  --ctx-size 32768 --temperature 0 --max-tokens 64 --prompt "Hello"
 ```
 
-## Correctness
+`prepare` accepts a local directory only. `--plan-only` reports storage needs
+without copying weights. Loading rejects a missing or stale index.
 
-Correctness is tracked: **310/310** (27B) and **256/256** (Flash-Next)
-bit-exact goldens, serial and speculative.
+GLM's default context capacity is 32,768 tokens, capped by the checkpoint limit.
+`run` and `serve` accept `--ctx-size` to set that capacity.
+
+## Validation and development
+
+Run GPU checks sequentially, with other model processes stopped and at least
+8 GiB reserved for the host:
 
 ```bash
+cargo test --release --workspace --lib -- --test-threads=1
+./target/release/lisa-bench smoke
 ./target/release/lisa-bench golden --model agnosticeng/Qwen3.8-27B-4bit
 ```
 
-## Why it's fast
+Model checks require the corresponding checkpoint. Numerical and performance
+results apply to the checkpoint, configuration and execution path measured.
+GLM integration tests also require the external captures selected through
+`LISA_GLM53_FIXTURE_DIR`; see the
+[fixture inventory](crates/lisa-engine/src/models/glm53/fixtures/README.md).
+For a compilation-only check, use `cargo check --workspace --all-targets`.
 
-- **MTP speculation with an EV controller** — the embedded head drafts, the
-  target verifies in one wide forward, and a measured round-cost table picks
-  the depth where speculation pays (serial when it doesn't).
-- **A buffer pool that never sleeps** — weights, caches, and scratch buffers
-  are managed to the MB; nothing superfluous stays resident.
-- **JIT Metal kernels** compiled at runtime, NAX tensor-op paths on M5-class
-  GPUs, split-K fallbacks on M1–M4.
-- **Continuous batching** — per-slot attention over a packed KV cache.
+Read [AGENTS.md](AGENTS.md) for development and numerical rules. The
+[GLM status](specs/11-glm53-flash.md) records implemented paths, measured cases
+and remaining acceptance gaps.
 
-## Docs
+## License and provenance
 
-Engineering depth lives in [specs/](specs/) (contracts and measured
-verdicts) and [AGENTS.md](AGENTS.md) (numerics contracts, read before
-touching kernels).
-
-## References
-
-| Reference | What it is | Link |
-| --- | --- | --- |
-| mlx-fast | The Qwen MLX Challenge — the decode-throughput leaderboard for Qwen 3.8 27B | <https://www.yukon.org/mlxfast> |
-| mlx-serve | Native LLM inference server for Apple Silicon (Zig backend, Swift macOS app; OpenAI- and Anthropic-compatible) | <https://github.com/ddalcu/mlx-serve> |
-| mlx | Apple's array framework for Apple Silicon — source of the vendored Metal kernels | <https://github.com/ml-explore/mlx> |
-
-## License
-
-MIT — see [LICENSE](LICENSE). The Metal kernels are a port of the upstream
-[MLX](https://github.com/ml-explore/mlx) kernel library, vendored for
-provenance; the runtime and orchestration are original. Model weights are
-subject to their own terms.
+lisa is [MIT licensed](LICENSE). Sources include adaptations from MLX, DS4 and
+other projects; see [NOTICE](NOTICE). The GLM port follows DS4 execution with
+MLX-format weights. Model weights retain their own licenses.

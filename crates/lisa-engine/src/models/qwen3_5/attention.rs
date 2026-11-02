@@ -88,9 +88,7 @@ impl Qwen35Attention {
                 }
             }
             let idx = Array::from_slice(&idx, &[total as i32]);
-            let gather = |a: &Array| -> lisa_mlx::error::Result<Array> {
-                a.take_axis(&idx, 0)
-            };
+            let gather = |a: &Array| -> lisa_mlx::error::Result<Array> { a.take_axis(&idx, 0) };
             Some(QuantizedLinear {
                 weight: gather(&q_proj.weight)?,
                 scales: gather(&q_proj.scales)?,
@@ -168,10 +166,7 @@ impl Qwen35Attention {
             if let (true, Some(qg_proj)) = (merged, self.q_gate_proj.as_ref()) {
                 let y = qg_proj.forward(x)?.reshape(&[b, 2 * heads * hd])?; // [b, Q|G]
                 let qn = heads * hd;
-                let q = Some(
-                    y.index((.., 0..qn))
-                        .reshape(&[b, s, heads, hd])?,
-                );
+                let q = Some(y.index((.., 0..qn)).reshape(&[b, s, heads, hd])?);
                 let gate = if self.gated {
                     Some(y.index((.., qn..)).reshape(&[b, s, heads, hd])?)
                 } else {
@@ -267,12 +262,7 @@ impl Qwen35Attention {
                     None => (kk, v),
                 };
                 let out = fast::scaled_dot_product_attention(
-                    &qk,
-                    &live_k,
-                    &live_v,
-                    self.scale,
-                    sdpa_mask,
-                    None,
+                    &qk, &live_k, &live_v, self.scale, sdpa_mask, None,
                 )?;
                 return Ok(self.attention_tail(out, gate, b, s, heads, hd)?);
             }
@@ -292,21 +282,19 @@ impl Qwen35Attention {
                 let stream = lisa_mlx::Stream::thread_local_or_default();
                 let qg2 = qg.reshape(&[s, heads * 2 * hd])?;
                 let k2 = k.reshape(&[s, self.kv_heads as i32 * hd])?;
-                if let Some((qk, kk, gate)) =
-                    lisa_mlx::models::qwen35::kernels::qk_norm_rope_rows(
-                        &qg2,
-                        &k2,
-                        &self.q_norm.weight,
-                        &self.k_norm.weight,
-                        &cos_bf,
-                        &sin_bf,
-                        self.q_norm.eps,
-                        heads,
-                        self.kv_heads as i32,
-                        s,
-                        &stream,
-                    )
-                {
+                if let Some((qk, kk, gate)) = lisa_mlx::models::qwen35::kernels::qk_norm_rope_rows(
+                    &qg2,
+                    &k2,
+                    &self.q_norm.weight,
+                    &self.k_norm.weight,
+                    &cos_bf,
+                    &sin_bf,
+                    self.q_norm.eps,
+                    heads,
+                    self.kv_heads as i32,
+                    s,
+                    &stream,
+                ) {
                     let v = v.transpose_axes(&[0, 2, 1, 3])?;
                     let (live_k, live_v) = match cache.as_deref_mut() {
                         Some(c) => c.update(&kk, &v)?,
@@ -369,12 +357,7 @@ impl Qwen35Attention {
             {
                 Some(o) => o,
                 None => fast::scaled_dot_product_attention(
-                    &q,
-                    &live_k,
-                    &live_v,
-                    self.scale,
-                    sdpa_mask,
-                    None,
+                    &q, &live_k, &live_v, self.scale, sdpa_mask, None,
                 )?,
             }
         } else {
@@ -438,12 +421,18 @@ impl Qwen35Attention {
             let q_i = q
                 .index((i, ..))
                 .reshape(&[1, q.dim(1), q.dim(2), q.dim(3)])?; // [1, heads, 1, hd]
-            let k_i = live_k
-                .index((i, .., origin..offset as i32, ..))
-                .reshape(&[1, live_k.dim(1), kv_len, live_k.dim(3)])?; // [1, kv_h, kl, hd]
-            let v_i = live_v
-                .index((i, .., origin..offset as i32, ..))
-                .reshape(&[1, live_v.dim(1), kv_len, live_v.dim(3)])?;
+            let k_i = live_k.index((i, .., origin..offset as i32, ..)).reshape(&[
+                1,
+                live_k.dim(1),
+                kv_len,
+                live_k.dim(3),
+            ])?; // [1, kv_h, kl, hd]
+            let v_i = live_v.index((i, .., origin..offset as i32, ..)).reshape(&[
+                1,
+                live_v.dim(1),
+                kv_len,
+                live_v.dim(3),
+            ])?;
             // Decode (s == 1): every key is a causal prefix, so the causal
             // mask is vacuous — the same `mode = ""` the per-slot arm uses.
             outs.push(fast::scaled_dot_product_attention(
@@ -478,13 +467,7 @@ impl Qwen35Attention {
             Some(g) => {
                 let stream = lisa_mlx::Stream::thread_local_or_default();
                 match lisa_mlx::models::qwen35::kernels::sigmoid_mul_tail(
-                    &g,
-                    &out,
-                    b,
-                    s,
-                    heads,
-                    hd,
-                    &stream,
+                    &g, &out, b, s, heads, hd, &stream,
                 ) {
                     Some(r) => r,
                     None => {
@@ -504,7 +487,9 @@ impl Qwen35Attention {
                     }
                 }
             }
-            None => out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, s, heads * hd])?,
+            None => out
+                .transpose_axes(&[0, 2, 1, 3])?
+                .reshape(&[b, s, heads * hd])?,
         };
         let out = out.as_dtype(Dtype::Bfloat16)?;
         self.o_proj.forward(&out)

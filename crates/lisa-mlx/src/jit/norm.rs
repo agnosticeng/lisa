@@ -100,8 +100,8 @@ pub fn fused_add_rms_norm(
     }
 
     let count = x.elem_count();
-    let sum_buf = device.buffer(count * dt.size_of(), "fused_add_rms_sum")?;
-    let norm_buf = device.buffer(count * dt.size_of(), "fused_add_rms_norm")?;
+    let sum_buf = device.buffer_for_full_gpu_write(count * dt.size_of(), "fused_add_rms_sum")?;
+    let norm_buf = device.buffer_for_full_gpu_write(count * dt.size_of(), "fused_add_rms_norm")?;
     let sum = Array::from_parts(device, sum_buf.clone(), &dims.clone(), dt);
     let normed = Array::from_parts(device, norm_buf.clone(), &dims.clone(), dt);
 
@@ -214,7 +214,7 @@ pub fn rms_norm(device: &Device, x: &Tensor, weight: Option<&Tensor>, eps: f32) 
     }
 
     let count = x.elem_count();
-    let obuf = mdev.buffer((count) as usize * (dt).size_of(), "rms_out")?;
+    let obuf = mdev.buffer_for_full_gpu_write((count) as usize * (dt).size_of(), "rms_out")?;
     let out = Array::from_parts(mdev, obuf.clone(), &dims.clone(), dt);
 
     let guard = mdev.commands.encoder()?;

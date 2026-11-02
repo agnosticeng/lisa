@@ -1,17 +1,22 @@
 [package]
 name = "lisa-mlx"
-version = "0.1.0"
-edition = "2024"
-description = "Drop-in replacement for the lisa-mlx surface on the native Metal runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native tensor runtime and Metal kernels for LISA"
 
 [lib]
 name = "lisa_mlx"
 path = "src/lib.rs"
 
+[features]
+# Enable only when the local GLM-5.3 DS4 capture archive is available.
+glm53-fixtures = []
+
 [dependencies]
 # No MLX dependency: the library name is `lisa_mlx` so call sites resolve here.
-objc2 = "0.6"
-objc2-metal = { version = "0.3", features = [
+objc2.workspace = true
+objc2-metal = { workspace = true, features = [
     "MTLFunctionConstantValues",
     "MTLLibrary",
     "MTLDevice",
@@ -22,9 +27,13 @@ objc2-metal = { version = "0.3", features = [
     "MTLCommandEncoder",
     "MTLComputeCommandEncoder",
     "MTLComputePipeline",
+    "MTLAllocation",
+    "MTLResidencySet",
     "MTLFence",
     "MTLTypes",
+    "MTLGPUAddress",
+    "block2",
 ] }
-block2 = "0.6"
-objc2-foundation = "0.3"
-half = "2.7.1"
+block2.workspace = true
+objc2-foundation.workspace = true
+half.workspace = true

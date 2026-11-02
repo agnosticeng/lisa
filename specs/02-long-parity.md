@@ -1,5 +1,10 @@
 # specs/02 — Long-context parity analysis (16k): MTP-or-serial, round economics, gap decomposition
 
+Historical Qwen campaign. Results and implementation descriptions below refer
+to their recorded source versions; later sections may supersede earlier
+findings. Current contracts are in [00](00-contracts.md) and
+[AGENTS.md](../AGENTS.md). These measurements do not certify current GLM paths.
+
 Campaign: certified long A/B (707ee82/f8912d8) = lisa 25.6–30.3 tok/s
 (15.6k natural prompt, 256 tokens FORCED ignore_eos, greedy, same-session interleaved).
 Mandate: explain and close the long-context gap.
@@ -79,7 +84,7 @@ anyway — the two copies per layer were pure dead slots). s==1 keeps eager
 materialization (its own fused arm needs the dense row).
 - verify-audit S3@16k: 944→912 dispatches, contiguous 128→96/verify; wall wash
  in isolation (66.1→67.0) — expected: slots overlap the splitk tail; judged on
- interleaved e2e only (specs/02 lesson, see SKILL).
+ interleaved e2e only.
 - Golden 310/310 (bit-identity: when the arm engages the copies were dead code;
  when it declines the composed chain builds identical arrays). Lib 23/23.
 
@@ -106,12 +111,12 @@ COST, not acceptance** (§1–§2: acceptance parity, our realized 108–134 ms
 served). Decomposition of our S3@16k verify (GPU-bound, 65.4 of 66 ms
 attributed):
 
-- splitk verify qmm 23.7 ms — at parity family (specs/15 closed).
+- splitk verify qmm 23.7 ms — the measured split-K family (see [04](04-wave2-tails-cert.md)).
 - copies (copy_strided 9.6 + copy2 3.1) — 128 small slot-priced copies;
  PORT A removed the 32 dead ones (e2e wash — slots overlap the splitk tail).
  Remaining 96: GDN z reshape ×48 + tail transposes ×48. Next candidate port,
  same falsification risk.
-- fused_add_rms 8.4 ms — floor (specs/16 §5.2 closed: norm-in-qmv loses).
+- fused_add_rms 8.4 ms — measured floor for the tested design: norm-in-qmv loses (see [07](07-serial-final.md)).
 - GDN kernels 8.0 ms, sdpa 3.1, swiglu2 4.5, qk-norm-rope 1.4 (engaged).
 - Round extras outside the verify cell: draft chain GPU ~10–15 ms (NOT visible
  in the round-cost draft cell — enqueue-only measurement, fix the table), plus

@@ -11,11 +11,11 @@
 
 use std::collections::HashMap;
 
-use lisa_mlx::ops::indexing::IndexOp;
 use lisa_mlx::Array;
+use lisa_mlx::ops::indexing::IndexOp;
 
 use crate::core::cache::FullAttentionCache;
-use crate::core::norm::{positions, RmsNorm, Rotary};
+use crate::core::norm::{RmsNorm, Rotary, positions};
 use crate::core::quant::{QuantizedEmbedding, QuantizedLinear};
 use crate::models::qwen3_5::tower::DecoderLayer;
 
@@ -72,10 +72,9 @@ impl MtpHead {
             norm,
             rope: Rotary::new(config.rotary_dimensions(), config.rope_theta),
             hidden_size: hidden,
-            caches: vec![crate::core::cache::LayerCache::Full(FullAttentionCache::new(
-                config.num_key_value_heads,
-                config.head_dim,
-            ))],
+            caches: vec![crate::core::cache::LayerCache::Full(
+                FullAttentionCache::new(config.num_key_value_heads, config.head_dim),
+            )],
         }))
     }
 
@@ -121,7 +120,9 @@ impl MtpHead {
         let cos_bf = cos.as_dtype(lisa_mlx::Dtype::Bfloat16)?;
         let sin_bf = sin.as_dtype(lisa_mlx::Dtype::Bfloat16)?;
         let cache = self.caches.first_mut();
-        let (sum, m) = self.layer.forward(&x, None, cache, &cos_bf, &sin_bf, offset, false)?;
+        let (sum, m) = self
+            .layer
+            .forward(&x, None, cache, &cos_bf, &sin_bf, offset, false)?;
         let hidden_next = self.norm.forward_residual_add(&sum, &m)?.1;
         let last = hidden_next
             .index((.., hidden_next.dim(1) - 1, ..))
@@ -136,9 +137,9 @@ impl MtpHead {
             Some(crate::core::cache::LayerCache::Full(f)) => (f.kv_heads, f.head_dim),
             _ => (KV, HD),
         };
-        self.caches = vec![crate::core::cache::LayerCache::Full(FullAttentionCache::new(
-            kv_heads, head_dim,
-        ))];
+        self.caches = vec![crate::core::cache::LayerCache::Full(
+            FullAttentionCache::new(kv_heads, head_dim),
+        )];
     }
 
     pub fn cache_offset(&self) -> usize {

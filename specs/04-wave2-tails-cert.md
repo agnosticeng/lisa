@@ -1,5 +1,10 @@
 # specs/04 — Wave-2 batched-kernel tails + certification protocol
 
+Historical Qwen campaign. Results and implementation descriptions below refer
+to their recorded source versions; later sections may supersede earlier
+findings. Current contracts are in [00](00-contracts.md) and
+[AGENTS.md](../AGENTS.md). These measurements do not certify current GLM paths.
+
 Base 76de0d7 → wave commits 220ae47 (strided-src `copy_rows_into`).
 Baseline anchor for every A/B: lisa @ **68c6127**, worktree `/tmp/lisa-baseline`
 (rebuilt release the run). Ratios quoted below are same-session
@@ -18,8 +23,8 @@ M3 Ultra desktop figure; this machine's published peak is **614.4 GB/s**
 exceeds the achievable 548, so this byte/ms estimate needs re-measurement
 before it is quoted as a saturation claim. The residual is JIT codegen class
 (weight-stream scheduling), NOT missing S-tiling — there is no "3.5 ms/row"
-arithmetic to recover; per-row accounting double-counts rows. specs/15 §6
-(tiling exhaustion) stands; this is the one structural lever left
+arithmetic to recover; per-row accounting double-counts rows. The earlier
+tiling sweep remains historical evidence; this is the one structural lever left
 ("BW splitk codegen", effort L+).
 
 ## 2. Wave-1 kernels (recap, ce70d68 + 76de0d7)
@@ -75,15 +80,15 @@ Traps hit on the way (worth keeping):
 
 - **fused_add_rms (7.9-8.2 ms, 128 launches):** already S-generic —
  `n_rows × threadgroup` grid handles any S; the looped arm (>4096) is the
- correct shape at D=5120. Norm-in-qmv fusion is CLOSED (specs/16 §5.2, wave-2
- occupancy falsification): at k=5120 every consumer threadgroup re-runs the
+ correct shape at D=5120. Norm-in-qmv fusion is CLOSED (the serial-fusion and wave-2
+ occupancy measurements): at k=5120 every consumer threadgroup re-runs the
  reduction and loses. No arm found; judged already optimal at this design
  point. Remaining cost = the slot price of 128 row-looped rms launches.
 - **GDN (5.1-7.4 ms) / swiglu2 (4.2-4.3 ms):** already fused (2-dispatch GDN,
  packed swiglu2, gated_rms_silu). No further fusion attempted — forcing it
  would re-open the occupancy trap.
 
-## 5. Certification protocol (the wave-1 gap) — `bench/tools/spec27_cert.sh`
+## 5. Historical certification protocol
 
 Protocol verdict-24, executed the run against the 68c6127 anchor:
 - Long: 15.6k natural prompt, 256 tokens FORCED (ignore_eos both sides — the
@@ -94,8 +99,8 @@ Protocol verdict-24, executed the run against the 68c6127 anchor:
  (base-first / new-first / base-first) — the second side of an A/B runs
  ~5-10 ms hotter; fixed order biases the ratio.
 - Short: haiku/64 forced (ignore_eos), 3 reps per side, non-regression control.
-- Prior certified ratio (specs/01 §7): **0.54** (24.3-26.7 vs 43.9-46.9).
-- Results: see §7 verdict (filled from bench/data/spec27/).
+- Prior certified ratio (specs/01 §4): **0.54** (24.3-26.7 vs 43.9-46.9).
+- Results: see the scoped verdict in §7.
 
 ## 6. GPU readback race under contention — CLOSED (fix in lisa-mlx runtime/commands.rs)
 
@@ -133,8 +138,8 @@ runtime's flush was not):
 2. **Freed completion block (UAF)**: `ComputeEncoder::end` registered a
  second `addCompletedHandler` block for the cross-encoder fence-map cleanup
  and dropped it when `end` returned. The objc2-metal binding passes a raw
- `*mut DynBlock` and does NOT copy (same fact the specs/16 arm_completion
- fix established), so completion invoked a freed block — benign while the
+ `*mut DynBlock` and does NOT copy (also established by the earlier completion-handler
+ lifetime fix), so completion invoked a freed block — benign while the
  heap kept the bytes intact, but under parallel heap churn the stale
  captures removed the WRONG fence entry (or none), the next encoder skipped
  its `waitForFence`, and kernels read in-flight producers. Fix: the cleanup
@@ -147,11 +152,11 @@ future parity-pin failure against it before calling it a numerics bug.
 
 EXTINCTION EVIDENCE: see §8.
 
-## 7. Certified verdict, bench/data/spec27/)
+## 7. Campaign verdict
 
 Protocol of §5 executed: 3 interleaved long pairs (order alternated), 3+3
 short control reps, one model resident at a time, peak RAM well under the
-120 GB cap (single 27B serve, same as every certified session).
+detected-RAM-minus-8-GiB budget (one 27B server).
 
 - LONG (15.6k / 256 forced): base(68c6127) 29.78 / 32.08 / 39.81 tok/s
  (median **32.1**), new(HEAD+220ae47) 21.61 / 36.08 / 39.19 (median
@@ -180,10 +185,10 @@ Campaign ledger (batched-kernel tails, specs/01→04):
  (norm-in-qmv closed, occupancy-falsified); (3) the readback race — CLOSED,
  see §6;
  (4) our ~51 ms verify GPU — the residual is GPU CONTENT (qmm BW +
- slot-priced small kernels), not round structure (specs/01 §7 xctrace:
+ slot-priced small kernels), not round structure (specs/01 §3 system trace:
  ~90-100 % GPU-busy in-round).
 
-## 8. §6 extinction evidence, post-fix)
+## 8. Post-fix race checks
 
 Repro baseline (buggy): `cargo test -p lisa-mlx --lib --release
 -- --test-threads=16` failed ~1 run in 2 (qk_norm_rope_rows, sigmoid_mul,
@@ -203,10 +208,10 @@ Post-fix runs, all green:
  sigmoid_mul_matches_composed, sigmoid_mul_tail_matches_transposed,
  gated_rms_strided_z_view_matches_contiguous, gated_rms_silu_matches_composed
  (5/5 each), keyed_same_seed_same_tokens (5/5) — **0 flakes in 45 runs**.
-- Goldens: `lisa-bench golden` (27B) 310/310 ×2. check.sh equivalent
- (build --workspace --release + test --lib + smoke): green. NOTE: stock
- check.sh uses the dev profile and hung >12 min on `cargo test --workspace
- --lib` (known trap) — killed and re-run the same steps in release.
+- Goldens: `lisa-bench golden` (27B) 310/310 twice. Release workspace
+ build, library tests and smoke passed. The campaign abandoned a stalled
+ development-profile run and repeated the sequence in release; current
+ validation commands are specified in AGENTS.md.
 
 Perf (round-cost, 27B, sequential single-model, interleaved passes to cancel
 thermal drift): serial kv1024 39.47/39.39 vs base 39.39 ms; S7@kv1024
@@ -214,21 +219,24 @@ thermal drift): serial kv1024 39.47/39.39 vs base 39.39 ms; S7@kv1024
 host-bookkeeping-only (it REMOVES one addCompletedHandler registration per
 encoder and the pre-wait list drain; no new GPU-side synchronization).
 
-# specs/04 wave 3 CLOSED: tail-ULP codegen axis — FLOOR AT OUR SHAPES
-Question: specs/15 §6 exhausted PPT/BN/K_PARTS under the strict bit-exact
-constraint; the verify path is now tail-ULP (§9.7) — does the relaxed
+## Wave 3: tail-ULP codegen variants did not improve the measured shapes
+
+Question: the earlier split-K sweep exhausted PPT/BN/K_PARTS under the strict bit-exact
+constraint; the verify path is now tail-ULP within the Qwen MTP verify scope — does the relaxed
 contract reopen a BW win (62-75% peak → ~85%)?
-## What was falsified, and why (re-read of specs/14/§6 ledgers)
-- specs/14 full-K fp32 re-scored tile: was built BIT-EXACT (qmv_fast numerics);
+### What the earlier kernel measurements ruled out
+
+- The earlier full-K fp32 rescored tile: was built BIT-EXACT (qmv_fast numerics);
  its in-situ loss (S7 126.5 vs 102.5 ms) was STRUCTURAL (full-K per-thread
  chains serialize the mixed pipeline). Tail-ULP does not change that design's
  failure mode.
-- specs/15 §6 PPT=2: BIT-IDENTICAL to PPT=1 by construction — its
+- The earlier PPT=2 variant: BIT-IDENTICAL to PPT=1 by construction — its
  falsification (+3.7% S7) was STRUCTURAL. BN=4: stack-spill at M=5 on our
  Metal compiler — STRUCTURAL. CONCLUSION: the old constraint was NOT what
  blocked any of these; relaxing it reopens nothing as-is. What tail-ULP
  actually opens is NEW codegen designs, so we built two:
 ## Variants built and pinned (commit 4e8ef50, infra; production path unchanged)
+
 - VLOAD=1: 4 consecutive packs/thread/iter loaded with ONE 16-byte uint4 per
  column (lane*4+it, stride 128; requires per_part%4==0 — K%64 already
  aligns). NOT the falsified PPT shape (different lane→pack map AND load
@@ -243,8 +251,8 @@ contract reopen a BW win (62-75% peak → ~85%)?
  which DROPS y without eval — timings were enqueue-only and showed fake
  2-3x "wins". Any isolated kernel timing must eval + sync the OUTPUT
  tensor, and even then isolated numbers do not rank in-pipeline.
-## In-situ interleaved round-cost (arbitre; S3/S7@16k, steps 12, 3
-## order-alternated pairs per arm, sequential single-model)
+### In-situ interleaved round-cost (S3/S7 at 16K, 12 steps, three alternating pairs)
+
 - stock (c0de159+infra): S3 med 71.3-72.1, S7 med 81-86.3 ms (thermal swings
  to 152 on one contaminated rep — discarded by the serial-drift control).
 - fm=true: S3 med 69.2, S7 med 79.7 — pair deltas −1.3/+5.6/−7.8 ms = WASH
@@ -255,6 +263,7 @@ contract reopen a BW win (62-75% peak → ~85%)?
  fully coalesced (32 lanes x 4B consecutive = 128B transactions); the
  kernel is DRAM-BW-bound, not issue-bound.
 ## Verdict: CODEGEN FLOOR AT OUR SHAPES, now measured not assumed
+
 Splitk verify qmm ~24-26 ms for ~13.5-15.5 GB quantized weights = 510-605
 GB/s is the floor for THIS tile class on our JIT compiler: fp32 codegen
 (math mode, load width, pack-per-thread) does not convert in situ; every
@@ -265,10 +274,10 @@ remaining candidate explanations are (a) attribution (total-round GPU incl.
 overlap, not kernel efficiency) or (b) an occupancy/scheduling property
 outside the tile (threadgroup count vs N/BN grid).
 Objectives GPU/verify S7 ≤20 ms / round ≤75 ms NOT met by this wave; e2e
-unchanged (no branchement — nothing to branch). Goldens 256/256 x2, lib
+unchanged (no production dispatch change). Goldens 256/256 x2, lib
 27/27 incl. both tail-ULP pins. Do not reopen codegen variants on this
 tile without new evidence (e.g. a wide-tile BN=8 redesign, pack-gated).
-## 9. Pre-wave anchor for the same cell (recorded
+## 9. Recorded pre-wave anchor for the same cell
 
 Before the raw-view kernel waves, the same S7@16k round measured **130.4 ms**
 at **1392 dispatches** — the copies/rms slot-price class, largely eradicated

@@ -462,17 +462,19 @@ mod parity {
                 .unwrap();
             let fused = swiglu2_packed(&gu, &stream).expect("packed kernel");
             // Composed reference per row: silu(gate) * up on the two halves.
-            let gate = gu
-                .index((.., 0..f))
-                .copied()
-                .unwrap();
+            let gate = gu.index((.., 0..f)).copied().unwrap();
             let up = gu.index((.., f..2 * f)).copied().unwrap();
-            let reference = crate::ops::nn::silu(&gate)
+            let reference = crate::ops::nn::silu(&gate).unwrap().multiply(&up).unwrap();
+            let fv = fused
+                .as_dtype(Dtype::Float32)
                 .unwrap()
-                .multiply(&up)
+                .to_vec1::<f32>()
                 .unwrap();
-            let fv = fused.as_dtype(Dtype::Float32).unwrap().to_vec1::<f32>().unwrap();
-            let rv = reference.as_dtype(Dtype::Float32).unwrap().to_vec1::<f32>().unwrap();
+            let rv = reference
+                .as_dtype(Dtype::Float32)
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
             // ≤1 bf16 ULP relative: mlx_silu (exact_header) vs composed
             // nn::silu can differ by exactly 1 mantissa step on rare draws
             // (pre-existing production class — the B=1 serial decode runs
@@ -517,7 +519,9 @@ mod parity {
             ((seed >> 40) as f32 / 8_388_608.0) - 1.0
         };
         let specials = [0.0f32, -0.0, 1.0, -1.0, 20.0, -20.0, 88.0, -88.0];
-        let mut gv: Vec<f32> = (0..n - specials.len()).map(|_| rnd() * 40.0 - 20.0).collect();
+        let mut gv: Vec<f32> = (0..n - specials.len())
+            .map(|_| rnd() * 40.0 - 20.0)
+            .collect();
         gv.extend(specials);
         let mut uv: Vec<f32> = (0..n - specials.len()).map(|_| rnd() * 4.0 - 2.0).collect();
         uv.extend(specials);
@@ -602,8 +606,16 @@ mod parity {
             .filter(|&i| f[i].to_bits() != c[i].to_bits())
             .collect();
         if !bad.is_empty() {
-            let gi = g.as_dtype(Dtype::Float32).unwrap().to_vec1::<f32>().unwrap();
-            let ai = a.as_dtype(Dtype::Float32).unwrap().to_vec1::<f32>().unwrap();
+            let gi = g
+                .as_dtype(Dtype::Float32)
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let ai = a
+                .as_dtype(Dtype::Float32)
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
             for &i in bad.iter().take(3) {
                 let x = gi[i] as f64;
                 let sig_f32 = 1.0 / (1.0 + (-x.abs()).exp());
@@ -611,7 +623,13 @@ mod parity {
                 let bf = |v: f64| half::bf16::from_f32(v as f32).to_f32();
                 eprintln!(
                     "i={} g={} a={} | sig_f32={:.10} sig_bf16={} | fused={} composed={} | fused_exact={} composed_exact={}",
-                    i, gi[i], ai[i], sig, bf(sig), f[i], c[i],
+                    i,
+                    gi[i],
+                    ai[i],
+                    sig,
+                    bf(sig),
+                    f[i],
+                    c[i],
                     bf(bf(sig) as f64 * ai[i] as f64),
                     bf(sig as f64 * ai[i] as f64),
                 );
@@ -680,23 +698,34 @@ mod parity {
             // rope with the row's angle row.
             let q_half = qg.index((Ellipsis, 0, ..)).contiguous().unwrap();
             let gate_half = qg.index((Ellipsis, 1, ..)).contiguous().unwrap();
-            let qn = fast::rms_norm(
-                &q_half.reshape(&[1, s, hq, hd]).unwrap(),
-                Some(&qw),
-                eps,
-            )
-            .unwrap();
+            let qn =
+                fast::rms_norm(&q_half.reshape(&[1, s, hq, hd]).unwrap(), Some(&qw), eps).unwrap();
             let kn = fast::rms_norm(&k.reshape(&[1, s, hk, hd]).unwrap(), Some(&kw), eps).unwrap();
             let mut cq_rows = Vec::new();
             let mut ck_rows = Vec::new();
             for r in 0..s {
                 let cos_r = cos.index((r, ..)).reshape(&[1, 1, 1, rd]).unwrap();
                 let sin_r = sin.index((r, ..)).reshape(&[1, 1, 1, rd]).unwrap();
-                cq_rows.push(rope(&qn.index((0, r, ..)).reshape(&[1, 1, hq, hd]).unwrap().transpose_axes(&[0, 2, 1, 3]).unwrap(), &cos_r, &sin_r));
-                ck_rows.push(rope(&kn.index((0, r, ..)).reshape(&[1, 1, hk, hd]).unwrap().transpose_axes(&[0, 2, 1, 3]).unwrap(), &cos_r, &sin_r));
+                cq_rows.push(rope(
+                    &qn.index((0, r, ..))
+                        .reshape(&[1, 1, hq, hd])
+                        .unwrap()
+                        .transpose_axes(&[0, 2, 1, 3])
+                        .unwrap(),
+                    &cos_r,
+                    &sin_r,
+                ));
+                ck_rows.push(rope(
+                    &kn.index((0, r, ..))
+                        .reshape(&[1, 1, hk, hd])
+                        .unwrap()
+                        .transpose_axes(&[0, 2, 1, 3])
+                        .unwrap(),
+                    &cos_r,
+                    &sin_r,
+                ));
             }
-            let cq = ops::concatenate(&cq_rows.iter().collect::<Vec<_>>(), 2)
-                .unwrap(); // [1, hq, s, hd]
+            let cq = ops::concatenate(&cq_rows.iter().collect::<Vec<_>>(), 2).unwrap(); // [1, hq, s, hd]
             let ck = ops::concatenate(&ck_rows.iter().collect::<Vec<_>>(), 2).unwrap();
             let cg = gate_half; // [s, hq, hd]
 
@@ -719,7 +748,11 @@ mod parity {
                 ("k", fk, ck),
                 ("g", fg, cg.reshape(&[s, hq * hd]).unwrap()),
             ] {
-                let fv = f.as_dtype(Dtype::Float32).unwrap().to_vec1::<f32>().unwrap();
+                let fv = f
+                    .as_dtype(Dtype::Float32)
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
                 let cv = c
                     .reshape(&[-1])
                     .unwrap()
@@ -776,7 +809,11 @@ mod parity {
             let x2 = rotated.index((Ellipsis, half..rd));
             let neg_x2 = -x2;
             let swapped = ops::concatenate(&[&neg_x2, &x1], -1).unwrap();
-            let out = rotated.multiply(&cos).unwrap().add(&swapped.multiply(&sin).unwrap()).unwrap();
+            let out = rotated
+                .multiply(&cos)
+                .unwrap()
+                .add(&swapped.multiply(&sin).unwrap())
+                .unwrap();
             let rest = x.index((Ellipsis, rd..hd));
             ops::concatenate(&[&out, &rest], -1).unwrap()
         };
@@ -785,10 +822,14 @@ mod parity {
         let cq = rope(&qn.transpose_axes(&[0, 2, 1, 3]).unwrap());
         let ck = rope(&kn.transpose_axes(&[0, 2, 1, 3]).unwrap());
 
-        let (fq, fk) = qk_norm_rope(&q, &k, &qw, &kw, &cos, &sin, eps, hq, hk, &stream)
-            .expect("kernel");
+        let (fq, fk) =
+            qk_norm_rope(&q, &k, &qw, &kw, &cos, &sin, eps, hq, hk, &stream).expect("kernel");
         for (name, f, c) in [("q", fq, &cq), ("k", fk, &ck)] {
-            let fv = f.as_dtype(Dtype::Float32).unwrap().to_vec1::<f32>().unwrap();
+            let fv = f
+                .as_dtype(Dtype::Float32)
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
             let cv = c
                 .reshape(&[-1])
                 .unwrap()
@@ -800,7 +841,11 @@ mod parity {
                 .filter(|&i| fv[i].to_bits() != cv[i].to_bits())
                 .collect();
             if !bad.is_empty() {
-                let qf = q.as_dtype(Dtype::Float32).unwrap().to_vec1::<f32>().unwrap();
+                let qf = q
+                    .as_dtype(Dtype::Float32)
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
                 let rn = fast::rms_norm(&q.reshape(&[1, 1, hq, hd]).unwrap(), Some(&qw), eps)
                     .unwrap()
                     .reshape(&[-1])
@@ -809,11 +854,19 @@ mod parity {
                     .unwrap()
                     .to_vec1::<f32>()
                     .unwrap();
-                for &i in bad.iter().take(4).chain(bad.iter().find(|&&i| i >= 64)).take(6) {
+                for &i in bad
+                    .iter()
+                    .take(4)
+                    .chain(bad.iter().find(|&&i| i >= 64))
+                    .take(6)
+                {
                     eprintln!(
                         "[{name}] i={i} j={} src={:+} rms={:+} fused={:+} composed={:+}",
                         i % 256,
-                        qf[i], rn[i], fv[i], cv[i]
+                        qf[i],
+                        rn[i],
+                        fv[i],
+                        cv[i]
                     );
                 }
             }

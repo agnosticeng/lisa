@@ -55,7 +55,9 @@ impl Array {
             )));
         }
         let bytes = expect * std::mem::size_of::<T>();
-        let buf = rt.buffer(bytes, "array")?;
+        // This constructor immediately copies the complete logical payload, so
+        // zeroing the fresh shared buffer first only adds memory traffic.
+        let buf = rt.buffer_for_full_write(bytes, "array")?;
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, buf.contents(), bytes);
         }
@@ -181,6 +183,19 @@ impl Array {
         dtype: Dtype,
     ) -> Self {
         Self::wrap(Arc::clone(rt), buf, Layout::contiguous(shape), dtype)
+    }
+
+    /// Build a contiguous tensor view at an element offset into an existing buffer.
+    pub fn from_parts_offset(
+        rt: &Arc<MetalRuntime>,
+        buf: Arc<Buffer>,
+        shape: &[usize],
+        dtype: Dtype,
+        offset: usize,
+    ) -> Self {
+        let mut layout = Layout::contiguous(shape);
+        layout.offset = offset;
+        Self::wrap(Arc::clone(rt), buf, layout, dtype)
     }
 
     /// `storage_and_layout()` equivalent.
@@ -340,7 +355,10 @@ impl Array {
                 continue;
             }
             if have != 1 {
-                return Err(err(format!("broadcast: incompatible shape {:?} -> {:?}", self.layout.shape, shape)));
+                return Err(err(format!(
+                    "broadcast: incompatible shape {:?} -> {:?}",
+                    self.layout.shape, shape
+                )));
             }
             strides[i] = 0;
         }
@@ -372,7 +390,7 @@ impl Array {
         let out = Self::wrap(
             Arc::clone(&self.rt),
             self.rt
-                .buffer(self.size() * self.dtype.size_of(), "contiguous")?,
+                .buffer_for_full_gpu_write(self.size() * self.dtype.size_of(), "contiguous")?,
             Layout::contiguous(&self.layout.shape),
             self.dtype,
         );
@@ -438,9 +456,10 @@ impl Array {
     }
 
     /// The id of the command buffer dispatches are currently encoding into
-    /// (the barrier id for [`Array::eval_wait_through`]).
+    /// that last used this array's backing buffer (the barrier id for
+    /// [`Array::eval_wait_through`]).
     pub fn readback_cb_id(&self) -> u64 {
-        self.rt.commands.current_cb_id()
+        self.buf.last_used_cb()
     }
 
     /// Read the elements back to the host, walking the layout.
@@ -449,6 +468,23 @@ impl Array {
             return Err(err("to_vec: element size mismatch"));
         }
         self.eval()?;
+        self.read_vec_after_wait()
+    }
+
+    /// Read this buffer after waiting only through the command buffer that
+    /// last used it. Later command buffers remain in flight.
+    pub fn to_vec_wait_through<T: Copy>(&self, cb_id: u64) -> Result<Vec<T>> {
+        if self.dtype.size_of() != std::mem::size_of::<T>() {
+            return Err(err("to_vec: element size mismatch"));
+        }
+        let _wait = crate::trace::span_detail("mlx.readback.wait_through", cb_id);
+        self.eval_wait_through(cb_id)?;
+        drop(_wait);
+        let _copy = crate::trace::span("mlx.readback.host_copy");
+        self.read_vec_after_wait()
+    }
+
+    fn read_vec_after_wait<T: Copy>(&self) -> Result<Vec<T>> {
         // Readback-race detector (specs/04 §6): after `eval`, every command
         // buffer that ever bound this buffer must be at or below the
         // synchronously-advanced `completed_id`. A hit proves the producing
@@ -457,7 +493,7 @@ impl Array {
         // readback (this runs per sampled token in serve).
         static RB_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *RB_DEBUG.get_or_init(|| std::env::var_os("LISA_RB_DEBUG").is_some()) {
-            let used = self.buf.debug_used_cb();
+            let used = self.buf.last_used_cb();
             let waited = self.rt.commands.completed_id();
             if used > waited {
                 eprintln!(

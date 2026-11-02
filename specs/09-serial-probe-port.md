@@ -1,5 +1,10 @@
 # Spec 09 — The adaptive depth controller: serial prior, probe, bootstrap, trusted gate
 
+Historical Qwen campaign. Results and implementation descriptions below refer
+to their recorded source versions; later sections may supersede earlier
+findings. Current contracts are in [00](00-contracts.md) and
+[AGENTS.md](../AGENTS.md). These measurements do not certify current GLM paths.
+
 ## Verdict
 
 **Designed, landed, certified.** The controller's failure mode at 2–4k KV
@@ -13,8 +18,7 @@ measured before/after.
 
 ## 1. The failure chain it closes (lisa's own code, before this design)
 
-kv 2343, prompt `bench/data/router_prose.txt`, EOS active (arm `b.auto.eos`,
-`bench/data/repro24k/`):
+KV 2343, the campaign prose prompt, EOS active (arm `b.auto.eos`):
 
 1. `~/.lisa/round_cost.json` bucket `2-4k` was **all-zero** (`serial_ms[1] =
  (0.0, 0)`, every chain/verify cell `n = 0`).
@@ -79,15 +83,13 @@ returns null until both are trusted (`round_cost.rs:383-391`). The old gate
 required **in-run** counts — precisely unavailable in the empty-picks state
 it existed to rescue.
 
-**M5 — the serial cell is watered mid-request, and the folds persist.** The
-probe is armed when the vote lacks the serial price ("teach the bucket a
-serial token, once"), only when solo/idle/useful
-and the cell is untrusted, at most `MAX_SERIAL_PROBES = 3` per bucket per
-process (`round_cost.rs:88-89`). Each tick folds
-into the **persisted** table, so
-an empty cell heals across requests. (Our serving table is written only
-by `lisa round-cost` — the instrument-of-truth rule — so the in-process fold
-stays in-run; the empty cell is healed by the round-cost fill, §3.)
+**M5 — proposed persisted probe folds; LISA keeps them in-run.** The source
+reference's design could teach an untrusted bucket through bounded, idle serial
+probes and persist the resulting samples. LISA did not adopt that persistence:
+its serving probes update in-run estimates, and only `lisa-bench round-cost`
+writes the persisted measurement table. The explicit table fill in §3 supplied
+the missing trusted cells. Do not describe ordinary serving traffic as healing
+the on-disk table.
 
 **M6 — the grid and walk are unchanged.** The six-bucket grid for `qwen3_5`
 (`round_cost.rs:55-57`), `MIN_WIDTHS = 1`, `MIN_SAMPLES = 3`,
@@ -134,7 +136,7 @@ site bypassed them.
  unknown serial it cannot price absolutely; M3's default-depth arm covers
  exactly that case. A per-chip fitted row table is out of scope.
 - **No cross-request persistence of in-run serial folds.** Our table is
- written only by `lisa round-cost`, so a serving run's probe folds stay
+ written only by `lisa-bench round-cost`, so a serving run's probe folds stay
  in-run; the empty cell is healed by the round-cost fill above, not by
  serving traffic.
 - **No tok column in our table.** Our cells store verify+chain cost cells
@@ -143,14 +145,13 @@ site bypassed them.
 - **Warmup depth is fixed at 2.** Our controller has a single default
  (`session.rs:413`), so warmup = 2; there is no incumbent depth to nudge.
 
-## 5. Validation (measured, this box,
+## 5. Validation on the campaign machine
 
-- **Repro BEFORE** (fresh pre-fix binary, `bench/data/repro24k.before/
- b.auto.eos.FRESH.*`): `serial step 99.79 ms` (86.31 at HEAD) from a
+- **Repro BEFORE** (fresh pre-fix binary): `serial step 99.79 ms` (86.31 at HEAD) from a
  2-tick cold probe, `picks []`, `EV tok/s []`, `acc EMA [0.750 ×6]`,
  3 tokens, **zero rounds** — the run dies inside the probe on the probe's
  own forked EOS.
-- **Repro AFTER** (`bench/data/repro24k/`, final tree, all three arms
+- **Repro AFTER** (the campaign's final tree, all three arms
  identical — greedy deterministic): `serial step 35.12 ms (table prior,
  bucket 2-4k)`, `picks [0x1 2x22 3x22 4x3]`, `[mtp.round] … rounds 47
  accepted 79`, EV populated; the arm now emits all 128 tokens (the
@@ -162,14 +163,14 @@ site bypassed them.
  `round_ms` settles at d2 53 / d3 57 / d4 65 ms — table-like from the
  first folded round — and serial stays pinned to the 35.12 prior; a
  post-round serial tick measured ~139 ms and is dropped as a transition.
-- **e2e `--depth auto --ignore-eos`, kv 2343, 128 tok**: avant 20.6 (b arm
- 1.1 — dead) → après 20.9-24.3 over five runs (a 20.7-21.4, b 21.8-22.6,
+- **e2e `--depth auto --ignore-eos`, kv 2343, 128 tok**: before 20.6 (b arm
+ 1.1 — dead) → after 20.9-24.3 over five runs (a 20.7-21.4, b 21.8-22.6,
  c 20.9-24.3; prefill-chunk jitter of ±0.4 s swings the metric ±1.5 tok/s).
- Decode-phase only (total − prefill − head-prime): avant 35.4 → après
+ Decode-phase only (total − prefill − head-prime): before 35.4 → after
  ~41-45 tok/s; serial control decode 25.4 tok/s.
 - **Goldens ×2**: `TOTAL: 310/310 (100.0%) OK` twice. Workspace lib tests
- 66 pass / 11 ignored (5 new controller tests for M1-M4). `tools/check.sh`
- green (build + tests + smoke).
+ 66 pass / 11 ignored (five new controller tests for M1-M4). Workspace
+ build, library tests and smoke passed.
 
 ## 6. Design alternatives rejected here (do not reopen)
 

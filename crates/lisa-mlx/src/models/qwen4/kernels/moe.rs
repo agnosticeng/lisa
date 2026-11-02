@@ -268,8 +268,8 @@ pub fn router_gemv(x: &Array, w: &Array, stream: &Stream) -> Option<Array> {
         .into_iter()
         .next()
 }
+#[cfg(test)]
 mod counting_sort_check {
-    #[allow(unused_imports)] // utilisé sous cfg(test) uniquement
     use lisa_mlx::Array;
 
     /// Regression: the counting sort must be a stable permutation into sorted

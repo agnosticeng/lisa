@@ -22,8 +22,10 @@ pub fn warm(_stream: &lisa_mlx::Stream) {
     ple::warm();
 }
 
-pub use attn::{attn_gate, attn_prep_split, gated_rms, gated_rms_silu, hc_mix, inject_norm, silu_head, swiglu2};
-pub use common::{EXACT_HEADER, copy_rows_into, indirect_bench};
+pub use attn::{
+    attn_gate, attn_prep_split, gated_rms, gated_rms_silu, hc_mix, inject_norm, silu_head, swiglu2,
+};
+pub use common::{EXACT_HEADER, copy_rows_concat_into, copy_rows_into, indirect_bench};
 pub use gdn::{
     GatedDeltaKernels, gated_delta_kernel, gated_delta_ops, gated_delta_ops_capture,
     gdn_decode_complete, gdn_kernel_available, gdn_prep, gdn_prep_fused, gdn_rows, gdn_two_row,

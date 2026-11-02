@@ -24,36 +24,40 @@ pub static LABEL_GPU_NS: std::sync::Mutex<Vec<(String, u64)>> = std::sync::Mutex
 /// `cb_labels` at command-buffer completion. Unlike `LABEL_GPU_NS` this needs no
 /// GPU duration to be attributed, so a kernel that ran is listed even when its
 /// time rounds to zero — which is what makes a kernel-engagement census exact.
-pub static LABEL_DISPATCH: std::sync::Mutex<Vec<(String, u64)>> =
-    std::sync::Mutex::new(Vec::new());
+pub static LABEL_DISPATCH: std::sync::Mutex<Vec<(String, u64)>> = std::sync::Mutex::new(Vec::new());
 
 pub static ENCODER_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// GPU-probe mode (`LISA_GPU_PROBE=1`): one dispatch per command buffer
 /// (`per_buffer=1`), so each completed buffer's `GPUStartTime`/`GPUEndTime`
-/// is a per-kernel measurement, not a proportional split. Records hold the
-/// kernel label and the buffer's absolute GPU start/end (host-clock seconds,
-/// as reported by Metal), which lets `trace::report` separate real execution
-/// time from inter-kernel launch gaps on the GPU timeline.
-pub static GPU_PROBE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// interval can be attributed to its single kernel. This is a diagnostic
+/// command-buffer interval, not a hardware-counter measurement of exclusive
+/// shader occupancy. Records hold the kernel label and absolute GPU start/end
+/// timestamps for timeline analysis.
+static GPU_PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 pub static GPU_PROBE_RECORDS: std::sync::Mutex<Vec<(String, f64, f64)>> =
     std::sync::Mutex::new(Vec::new());
 
 pub fn gpu_probe_enabled() -> bool {
-    if GPU_PROBE.load(std::sync::atomic::Ordering::Relaxed) {
-        return true;
-    }
-    let on = std::env::var_os("LISA_GPU_PROBE").is_some();
-    GPU_PROBE.store(on, std::sync::atomic::Ordering::Relaxed);
-    on
+    *GPU_PROBE.get_or_init(|| std::env::var_os("LISA_GPU_PROBE").is_some())
+}
+
+/// Whether explicit diagnostics need per-dispatch kernel labels. Cache the
+/// environment-derived gate so the disabled production path never checks the
+/// environment once per dispatch.
+pub fn kernel_label_capture_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| gpu_probe_enabled() || cb_record_file().is_some())
 }
 
 /// Per-command-buffer recorder (`LISA_CB_RECORD=<path>`): appends one JSON
 /// line per completed command buffer — its GPU duration and per-label
-/// dispatch counts — without changing the encoding behavior (per_buffer
-/// stays 16). Thousands of cbs with varying kernel mixes give a
-/// least-squares system whose solution is the real per-kernel GPU time,
-/// separating execution from launch gaps on the unmodified timeline.
+/// dispatch counts — without changing the configured submission cadence
+/// (`LISA_PER_BUFFER`; its default is 65536). Thousands of cbs with varying
+/// kernel mixes give a least-squares system whose solution estimates per-kernel
+/// command-buffer intervals on the unmodified submission cadence. It is a
+/// diagnostic model, not a hardware-counter measurement of exclusive shader
+/// occupancy.
 pub fn cb_record_file() -> Option<std::path::PathBuf> {
     static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
     PATH.get_or_init(|| {

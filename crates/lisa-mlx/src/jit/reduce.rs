@@ -69,7 +69,7 @@ pub fn reduce_last_axis(device: &Device, x: &Tensor, op_name: &str) -> Result<Te
     let pipeline = compile_builtin(device, &source, &kernel_name)?;
 
     let out_count: usize = out_dims.iter().product::<usize>().max(1);
-    let obuf = mdev.buffer((out_count) as usize * (dt).size_of(), "reduce_out")?;
+    let obuf = mdev.buffer_for_gpu_write((out_count) as usize * (dt).size_of(), "reduce_out")?;
     let out = Array::from_parts(mdev, obuf.clone(), &out_dims.clone(), dt);
 
     let guard = mdev.commands.encoder()?;
@@ -198,7 +198,8 @@ fn arg_reduce_axis(
     let ndim = out_dims.len();
 
     let out_count: usize = out_dims.iter().product::<usize>().max(1);
-    let obuf = mdev.buffer((out_count) as usize * (DType::U32).size_of(), "arg_out")?;
+    let obuf =
+        mdev.buffer_for_gpu_write((out_count) as usize * (DType::U32).size_of(), "arg_out")?;
     let out = Array::from_parts(mdev, obuf.clone(), &out_dims.clone(), DType::U32);
 
     let guard = mdev.commands.encoder()?;
@@ -291,7 +292,7 @@ pub fn reduce_axis0_sum(device: &Device, inter: &Tensor) -> Result<Tensor> {
     let pipeline = compile_builtin(device, &source, &kname)?;
 
     let out_count = rest;
-    let obuf = mdev.buffer(
+    let obuf = mdev.buffer_for_gpu_write(
         (out_count) as usize * (inter.dtype()).size_of(),
         "colred_out",
     )?;

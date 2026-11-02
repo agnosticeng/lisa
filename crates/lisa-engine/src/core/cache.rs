@@ -6,10 +6,13 @@ use lisa_mlx::ops::indexing::{IndexMutOp, IndexOp};
 use lisa_mlx::{Array, Dtype, ops};
 
 pub struct IndexerTape {
-    /// Raw indexer keys `[B, cap, D]`, appended in place (doubling), so an
-    /// append is O(s) rather than a whole-tape copy.
+    /// Raw per-token features `[B, cap, D]`, appended in place (doubling), so
+    /// an append is O(s) rather than a whole-tape copy. GLM stores its raw
+    /// indexer key and pool gate here; compact MLA latents have a separate F16
+    /// buffer below. `raw_start` is the absolute token represented by row zero.
     raw: Option<Array>,
     cap: usize,
+    raw_start: usize,
     /// Total raw tokens appended.
     pub total: usize,
     /// Normalized + roped pooled keys `[B, pcap, D]`, written in place.
@@ -19,6 +22,10 @@ pub struct IndexerTape {
     /// until the visible context exceeds the budget.
     pub pooled_upto: usize,
     cr: usize,
+    /// Optional compact GLM MLA latent cache `[B, cap, D]` in IEEE F16.
+    compact: Option<Array>,
+    compact_cap: usize,
+    compact_total: usize,
 }
 
 impl IndexerTape {
@@ -26,30 +33,45 @@ impl IndexerTape {
         Self {
             raw: None,
             cap: 0,
+            raw_start: 0,
             total: 0,
             pooled: None,
             pcap: 0,
             pooled_upto: 0,
             cr: 0,
+            compact: None,
+            compact_cap: 0,
+            compact_total: 0,
         }
     }
 
-    fn grow_raw(&mut self, needed: usize, b: i32, d: i32) -> lisa_mlx::error::Result<()> {
+    fn grow_raw(
+        &mut self,
+        needed: usize,
+        b: i32,
+        d: i32,
+        dtype: Dtype,
+    ) -> lisa_mlx::error::Result<()> {
         let same_batch = self.raw.as_ref().map_or(true, |r| r.dim(0) == b);
-        if self.cap >= needed && same_batch {
+        let needed_rows = needed.saturating_sub(self.raw_start);
+        if self.cap >= needed_rows && same_batch {
             return Ok(());
         }
         let mut new_cap = if self.cap == 0 {
-            needed + 256
+            needed_rows + 256
         } else {
             self.cap
         };
-        while new_cap < needed {
+        while new_cap < needed_rows {
             new_cap *= 2;
         }
-        let mut np = ops::zeros::<half::bf16>(&[b, new_cap as i32, d])?;
+        let mut np = match dtype {
+            Dtype::Float32 => ops::zeros::<f32>(&[b, new_cap as i32, d])?,
+            Dtype::Float16 => ops::zeros::<half::f16>(&[b, new_cap as i32, d])?,
+            _ => ops::zeros::<half::bf16>(&[b, new_cap as i32, d])?,
+        };
         if let Some(old) = &self.raw {
-            let keep = self.total as i32;
+            let keep = self.total.saturating_sub(self.raw_start) as i32;
             if keep > 0 {
                 np.index_mut((.., 0..keep, ..), old.index((.., 0..keep, ..)));
             }
@@ -63,11 +85,12 @@ impl IndexerTape {
     pub fn append(&mut self, raw_k: &Array, cr: usize) -> lisa_mlx::error::Result<()> {
         self.cr = cr;
         let (b, s, d) = (raw_k.dim(0), raw_k.dim(1), raw_k.dim(2));
-        self.grow_raw(self.total + s as usize, b, d)?;
+        self.grow_raw(self.total + s as usize, b, d, raw_k.dtype())?;
         let stream = lisa_mlx::Stream::thread_local_or_default();
         let raw = self.raw.as_ref().unwrap();
-        if lisa_mlx::kernels::copy_rows_into(raw_k, raw, self.total as i32, &stream).is_none() {
-            let range = self.total as i32..(self.total + s as usize) as i32;
+        let write_at = self.total.saturating_sub(self.raw_start);
+        if lisa_mlx::kernels::copy_rows_into(raw_k, raw, write_at as i32, &stream).is_none() {
+            let range = write_at as i32..(write_at + s as usize) as i32;
             self.raw
                 .as_mut()
                 .unwrap()
@@ -77,11 +100,311 @@ impl IndexerTape {
         Ok(())
     }
 
-    /// The raw keys for token range `[start, end)`, `[B, end-start, D]`.
+    /// Append two same-position feature arrays into adjacent fields of the raw
+    /// tape without first allocating their concatenation.
+    pub fn append_fields(
+        &mut self,
+        first: &Array,
+        second: &Array,
+        cr: usize,
+    ) -> lisa_mlx::error::Result<()> {
+        if first.rank() != 3
+            || second.rank() != 3
+            || first.dim(0) != second.dim(0)
+            || first.dim(1) != second.dim(1)
+            || first.dtype() != second.dtype()
+        {
+            return Err(lisa_mlx::error::Error::msg(
+                "indexer tape fields must be rank-3 tensors with matching rows and dtypes",
+            ));
+        }
+        self.cr = cr;
+        let (batch, steps) = (first.dim(0), first.dim(1) as usize);
+        let width = first.dim(2) + second.dim(2);
+        self.grow_raw(self.total + steps, batch, width, first.dtype())?;
+        let stream = lisa_mlx::Stream::thread_local_or_default();
+        let write_at = self.total.saturating_sub(self.raw_start) as i32;
+        let dst = self.raw.as_ref().expect("raw tape was grown");
+        if lisa_mlx::kernels::copy_rows_concat_into(first, second, dst, write_at, &stream).is_none()
+        {
+            let packed = ops::concatenate(&[first, second], 2)?;
+            if lisa_mlx::kernels::copy_rows_into(&packed, dst, write_at, &stream).is_none() {
+                let range = write_at..(write_at + steps as i32);
+                self.raw
+                    .as_mut()
+                    .expect("raw tape was grown")
+                    .index_mut((.., range, ..), packed);
+            }
+        }
+        self.total += steps;
+        Ok(())
+    }
+
+    /// The raw features for token range `[start, end)`, `[B, end-start, D]`.
     pub fn raw_slice(&self, start: usize, end: usize) -> Option<Array> {
+        if start < self.raw_start || start > end || end > self.total {
+            return None;
+        }
+        let first = start - self.raw_start;
+        let last = end - self.raw_start;
         self.raw
             .as_ref()
+            .map(|r| r.index((.., first as i32..last as i32, ..)))
+    }
+
+    /// Absolute origin of the retained raw indexer rows.
+    pub fn raw_start(&self) -> usize {
+        self.raw_start
+    }
+
+    /// Number of live compact-cache rows.
+    pub fn compact_total(&self) -> usize {
+        self.compact_total
+    }
+
+    /// Pooling ratio used to build the indexer tape.
+    pub fn compression_ratio(&self) -> usize {
+        self.cr
+    }
+
+    /// Discard raw indexer rows older than the completed-pool rollback window.
+    /// Pooled keys and compact latents remain full length; only the raw inputs
+    /// needed to finish a pool after a short speculative rollback are retained.
+    pub fn compact_raw_history(&mut self, rollback_rows: usize) -> lisa_mlx::error::Result<()> {
+        if self.cr == 0 || self.raw.is_none() {
+            return Ok(());
+        }
+        let desired = self.total.saturating_sub(rollback_rows);
+        let group_aligned = desired / self.cr * self.cr;
+        let pooled_end = self.pooled_upto.saturating_mul(self.cr);
+        let new_start = group_aligned.min(pooled_end).min(self.total);
+        if new_start.saturating_sub(self.raw_start) < 256 {
+            return Ok(());
+        }
+        let retained = self.total - new_start;
+        let source = self
+            .raw_slice(new_start, self.total)
+            .expect("raw range is present before compaction");
+        let batch = source.dim(0);
+        let width = source.dim(2);
+        let new_cap = retained + 256;
+        let mut next = match source.dtype() {
+            Dtype::Float32 => ops::zeros::<f32>(&[batch, new_cap as i32, width])?,
+            Dtype::Float16 => ops::zeros::<half::f16>(&[batch, new_cap as i32, width])?,
+            _ => ops::zeros::<half::bf16>(&[batch, new_cap as i32, width])?,
+        };
+        let stream = lisa_mlx::Stream::thread_local_or_default();
+        if lisa_mlx::kernels::copy_rows_into(&source, &next, 0, &stream).is_none() {
+            next.index_mut((.., 0..retained as i32, ..), source);
+        }
+        self.raw = Some(next);
+        self.raw_start = new_start;
+        self.cap = new_cap;
+        Ok(())
+    }
+
+    /// Append compact GLM MLA latents as F16. The indexer feature tape must
+    /// already have been appended so both histories share the same positions.
+    pub fn append_compact_f16(&mut self, latents: &Array) -> lisa_mlx::error::Result<()> {
+        let latents = latents.as_dtype(Dtype::Float16)?;
+        let (b, s, d) = (latents.dim(0), latents.dim(1), latents.dim(2));
+        let needed = self.compact_total + s as usize;
+        if needed != self.total {
+            return Err(lisa_mlx::error::Error::msg(format!(
+                "compact cache length {needed} does not match indexer tape length {}",
+                self.total
+            )));
+        }
+        let same_batch = self.compact.as_ref().map_or(true, |r| r.dim(0) == b);
+        if self.compact_cap < needed || !same_batch {
+            let mut new_cap = if self.compact_cap == 0 {
+                needed + 256
+            } else {
+                self.compact_cap
+            };
+            while new_cap < needed {
+                new_cap *= 2;
+            }
+            let mut next = ops::zeros::<half::f16>(&[b, new_cap as i32, d])?;
+            if let Some(old) = &self.compact {
+                let keep = self.compact_total as i32;
+                if keep > 0 {
+                    next.index_mut((.., 0..keep, ..), old.index((.., 0..keep, ..)));
+                }
+            }
+            self.compact = Some(next);
+            self.compact_cap = new_cap;
+        }
+        let start = self.compact_total as i32;
+        let range = start..needed as i32;
+        let stream = lisa_mlx::Stream::thread_local_or_default();
+        let dst = self.compact.as_ref().unwrap();
+        if lisa_mlx::kernels::copy_rows_into(&latents, dst, start, &stream).is_none() {
+            self.compact
+                .as_mut()
+                .unwrap()
+                .index_mut((.., range, ..), latents);
+        }
+        self.compact_total = needed;
+        Ok(())
+    }
+
+    /// Reserve the compact F16 cache for a kernel that writes directly into
+    /// its storage. The logical length is committed separately, after the
+    /// matching raw indexer rows have been appended successfully.
+    pub fn reserve_compact_f16_append(
+        &mut self,
+        batch: i32,
+        steps: usize,
+        width: i32,
+    ) -> lisa_mlx::error::Result<(Array, usize)> {
+        let needed = self
+            .compact_total
+            .checked_add(steps)
+            .ok_or_else(|| lisa_mlx::error::Error::msg("compact cache length overflow"))?;
+        if self.compact_total != self.total {
+            return Err(lisa_mlx::error::Error::msg(format!(
+                "compact cache length {} does not match indexer tape length {} before reserve",
+                self.compact_total, self.total
+            )));
+        }
+        if batch <= 0 || steps == 0 || width <= 0 || needed > i32::MAX as usize {
+            return Err(lisa_mlx::error::Error::msg(
+                "invalid compact cache append geometry",
+            ));
+        }
+        let same_geometry = self
+            .compact
+            .as_ref()
+            .map_or(true, |cache| cache.dim(0) == batch && cache.dim(2) == width);
+        if self.compact_cap < needed || !same_geometry {
+            let mut new_cap = if self.compact_cap == 0 || !same_geometry {
+                needed
+                    .checked_add(256)
+                    .ok_or_else(|| lisa_mlx::error::Error::msg("compact cache capacity overflow"))?
+            } else {
+                self.compact_cap
+            };
+            while new_cap < needed {
+                new_cap = new_cap.checked_mul(2).ok_or_else(|| {
+                    lisa_mlx::error::Error::msg("compact cache capacity overflow")
+                })?;
+            }
+            if new_cap > i32::MAX as usize {
+                return Err(lisa_mlx::error::Error::msg(
+                    "compact cache capacity exceeds Metal array dimensions",
+                ));
+            }
+            let mut next = ops::zeros::<half::f16>(&[batch, new_cap as i32, width])?;
+            if let Some(old) = &self.compact {
+                let keep = self.compact_total as i32;
+                if keep > 0 && old.dim(0) == batch && old.dim(2) == width {
+                    next.index_mut((.., 0..keep, ..), old.index((.., 0..keep, ..)));
+                }
+            }
+            self.compact = Some(next);
+            self.compact_cap = new_cap;
+        }
+        Ok((
+            self.compact
+                .as_ref()
+                .expect("compact cache was allocated")
+                .clone(),
+            self.compact_total,
+        ))
+    }
+
+    /// Commit a compact-cache range written directly by a Metal kernel.
+    pub fn commit_compact_f16_append(
+        &mut self,
+        start: usize,
+        steps: usize,
+    ) -> lisa_mlx::error::Result<()> {
+        let has_capacity = self.compact.as_ref().is_some_and(|cache| {
+            cache.dtype() == Dtype::Float16
+                && cache.dim(0) > 0
+                && cache.dim(1) as usize >= self.total
+        });
+        if start != self.compact_total
+            || steps == 0
+            || start.checked_add(steps) != Some(self.total)
+            || self.total > self.compact_cap
+            || !has_capacity
+        {
+            return Err(lisa_mlx::error::Error::msg(format!(
+                "invalid direct compact cache commit: start={start}, steps={steps}, compact={}, tape={}, capacity={}",
+                self.compact_total, self.total, self.compact_cap
+            )));
+        }
+        self.compact_total = self.total;
+        Ok(())
+    }
+
+    /// Write one compact GLM MLA latent row at its absolute token position.
+    ///
+    /// The GLM MTP head has a private attention cache whose first live row may
+    /// be well past zero (the current prompt boundary). Keeping absolute slots
+    /// lets its selected-token list match ds4's `[min_pos..=pos]` convention.
+    pub fn write_compact_f16_at(
+        &mut self,
+        latent: &Array,
+        position: usize,
+    ) -> lisa_mlx::error::Result<()> {
+        let latent = latent.as_dtype(Dtype::Float16)?;
+        let (b, s, d) = (latent.dim(0), latent.dim(1), latent.dim(2));
+        if s != 1 {
+            return Err(lisa_mlx::error::Error::msg(format!(
+                "compact cache positional write requires one row, got {s}"
+            )));
+        }
+        let needed = position.saturating_add(1);
+        let same_batch = self.compact.as_ref().map_or(true, |r| r.dim(0) == b);
+        let same_dim = self.compact.as_ref().map_or(true, |r| r.dim(2) == d);
+        if self.compact_cap < needed || !same_batch || !same_dim {
+            let mut new_cap = self.compact_cap.max(256);
+            while new_cap < needed {
+                new_cap = new_cap.saturating_mul(2);
+            }
+            let mut next = ops::zeros::<half::f16>(&[b, new_cap as i32, d])?;
+            if let Some(old) = &self.compact {
+                let keep = self.compact_total.min(new_cap) as i32;
+                if keep > 0 && same_batch && same_dim {
+                    next.index_mut((.., 0..keep, ..), old.index((.., 0..keep, ..)));
+                }
+            }
+            self.compact = Some(next);
+            self.compact_cap = new_cap;
+        }
+        let stream = lisa_mlx::Stream::thread_local_or_default();
+        let dst = self.compact.as_ref().unwrap();
+        if lisa_mlx::kernels::copy_rows_into(&latent, dst, position as i32, &stream).is_none() {
+            self.compact
+                .as_mut()
+                .unwrap()
+                .index_mut((.., position as i32..needed as i32, ..), latent);
+        }
+        self.compact_total = self.compact_total.max(needed);
+        Ok(())
+    }
+
+    /// The live compact GLM MLA latents `[B, end-start, D]` in F16.
+    pub fn compact_slice(&self, start: usize, end: usize) -> Option<Array> {
+        if end > self.compact_total || start > end {
+            return None;
+        }
+        self.compact
+            .as_ref()
             .map(|r| r.index((.., start as i32..end as i32, ..)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn raw_live_for_test(&self) -> Option<Array> {
+        self.raw_slice(self.raw_start, self.total)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn compact_live_for_test(&self) -> Option<Array> {
+        self.compact_slice(0, self.compact_total)
     }
 
     /// Append `pooled` `[B, n_new, D]` into the pooled buffer.
@@ -100,7 +423,11 @@ impl IndexerTape {
             while new_cap < needed {
                 new_cap *= 2;
             }
-            let mut np = ops::zeros::<half::bf16>(&[b, new_cap as i32, d])?;
+            let mut np = match pooled.dtype() {
+                Dtype::Float32 => ops::zeros::<f32>(&[b, new_cap as i32, d])?,
+                Dtype::Float16 => ops::zeros::<half::f16>(&[b, new_cap as i32, d])?,
+                _ => ops::zeros::<half::bf16>(&[b, new_cap as i32, d])?,
+            };
             if let Some(old) = &self.pooled {
                 let keep = self.pooled_upto as i32;
                 if keep > 0 {
@@ -125,6 +452,11 @@ impl IndexerTape {
         Ok(())
     }
 
+    /// Append a GLM pooled key after the ds4-compatible F16 cache cast.
+    pub fn push_pooled_f16(&mut self, pooled: &Array) -> lisa_mlx::error::Result<()> {
+        self.push_pooled(&pooled.as_dtype(Dtype::Float16)?)
+    }
+
     /// The live pooled keys `[B, pooled_upto, D]` (a view of the buffer).
     pub fn pooled_view(&self) -> Option<Array> {
         self.pooled
@@ -137,8 +469,13 @@ impl IndexerTape {
         if self.cr == 0 {
             return;
         }
+        debug_assert!(
+            offset >= self.raw_start,
+            "rollback exceeds retained raw indexer history"
+        );
         self.total = offset;
         self.pooled_upto = self.pooled_upto.min(offset / self.cr);
+        self.compact_total = self.compact_total.min(offset);
     }
 
     /// Host-side clone of the tape (prefix-cache entries outlive the session,
@@ -147,19 +484,138 @@ impl IndexerTape {
         TapeSnapshot {
             raw: self.raw.clone(),
             total: self.total,
+            raw_start: self.raw_start,
             pooled: self.pooled.clone(),
             pooled_upto: self.pooled_upto,
             cr: self.cr,
+            compact: self.compact.clone(),
+            compact_total: self.compact_total,
         }
     }
 
     pub fn restore(&mut self, s: &TapeSnapshot) {
         self.raw = s.raw.clone();
+        self.cap = self.raw.as_ref().map_or(0, |a| a.dim(1) as usize);
         self.total = s.total;
+        self.raw_start = s.raw_start;
         self.pooled = s.pooled.clone();
+        self.pcap = self.pooled.as_ref().map_or(0, |a| a.dim(1) as usize);
         self.pooled_upto = s.pooled_upto;
         self.cr = s.cr;
+        self.compact = s.compact.clone();
+        self.compact_cap = self.compact.as_ref().map_or(0, |a| a.dim(1) as usize);
+        self.compact_total = s.compact_total;
     }
+
+    /// Pack same-position GLM tapes for a lockstep decode batch. Ragged tape
+    /// lengths are rejected because pool boundaries and absolute raw origins
+    /// are shared metadata in DS4's GLM indexer path.
+    pub fn pack_equal(tapes: &[&Self]) -> lisa_mlx::error::Result<Self> {
+        let Some(first) = tapes.first().copied() else {
+            return Ok(Self::new());
+        };
+        for tape in &tapes[1..] {
+            if tape.total != first.total
+                || tape.raw_start != first.raw_start
+                || tape.pooled_upto != first.pooled_upto
+                || tape.cr != first.cr
+                || tape.compact_total != first.compact_total
+            {
+                return Err(lisa_mlx::error::Error::msg(
+                    "GLM batched indexer tapes must have equal position metadata",
+                ));
+            }
+        }
+        // Do not concatenate allocation slack. Equal-length streams can have
+        // different backing capacities after prefix-cache restore or chunked
+        // prefill; only their live rows have to share a packed shape.
+        let raw = concat_live_tape_field(
+            tapes,
+            |tape| tape.raw_slice(tape.raw_start, tape.total),
+            "raw",
+        )?;
+        let pooled = concat_live_tape_field(tapes, |tape| tape.pooled_view(), "pooled")?;
+        let compact = concat_live_tape_field(
+            tapes,
+            |tape| tape.compact_slice(0, tape.compact_total),
+            "compact",
+        )?;
+        Ok(Self {
+            cap: raw.as_ref().map_or(0, |array| array.dim(1) as usize),
+            pcap: pooled.as_ref().map_or(0, |array| array.dim(1) as usize),
+            compact_cap: compact.as_ref().map_or(0, |array| array.dim(1) as usize),
+            raw,
+            raw_start: first.raw_start,
+            total: first.total,
+            pooled,
+            pooled_upto: first.pooled_upto,
+            cr: first.cr,
+            compact,
+            compact_total: first.compact_total,
+        })
+    }
+
+    /// Extract one row from a packed lockstep tape without changing its
+    /// absolute position or rollback metadata.
+    pub fn extract_row(&self, row: usize) -> lisa_mlx::error::Result<Self> {
+        let raw = extract_tape_field(self.raw.as_ref(), row, "raw")?;
+        let pooled = extract_tape_field(self.pooled.as_ref(), row, "pooled")?;
+        let compact = extract_tape_field(self.compact.as_ref(), row, "compact")?;
+        Ok(Self {
+            cap: raw.as_ref().map_or(0, |array| array.dim(1) as usize),
+            pcap: pooled.as_ref().map_or(0, |array| array.dim(1) as usize),
+            compact_cap: compact.as_ref().map_or(0, |array| array.dim(1) as usize),
+            raw,
+            raw_start: self.raw_start,
+            total: self.total,
+            pooled,
+            pooled_upto: self.pooled_upto,
+            cr: self.cr,
+            compact,
+            compact_total: self.compact_total,
+        })
+    }
+}
+
+fn concat_live_tape_field(
+    tapes: &[&IndexerTape],
+    get: impl Fn(&IndexerTape) -> Option<Array>,
+    label: &str,
+) -> lisa_mlx::error::Result<Option<Array>> {
+    let mut arrays = Vec::with_capacity(tapes.len());
+    for tape in tapes {
+        match get(tape) {
+            Some(array) => arrays.push(array),
+            None if arrays.is_empty() && tapes.iter().all(|candidate| get(candidate).is_none()) => {
+                return Ok(None);
+            }
+            None => {
+                return Err(lisa_mlx::error::Error::msg(format!(
+                    "GLM batched indexer {label} storage is missing from one stream",
+                )));
+            }
+        }
+    }
+    let refs: Vec<&Array> = arrays.iter().collect();
+    Ok(Some(ops::concatenate(&refs, 0)?))
+}
+
+fn extract_tape_field(
+    array: Option<&Array>,
+    row: usize,
+    label: &str,
+) -> lisa_mlx::error::Result<Option<Array>> {
+    let Some(array) = array else {
+        return Ok(None);
+    };
+    if array.rank() != 3 || row >= array.dim(0) as usize {
+        return Err(lisa_mlx::error::Error::msg(format!(
+            "GLM batched indexer {label} row {row} is outside shape {:?}",
+            array.shape(),
+        )));
+    }
+    let row_range = row as i32..(row as i32 + 1);
+    Ok(Some(array.index((row_range, .., ..)).contiguous()?))
 }
 
 /// A [`IndexerTape`] clone for a prefix-cache entry.
@@ -167,9 +623,12 @@ impl IndexerTape {
 pub struct TapeSnapshot {
     raw: Option<Array>,
     total: usize,
+    raw_start: usize,
     pooled: Option<Array>,
     pooled_upto: usize,
     cr: usize,
+    compact: Option<Array>,
+    compact_total: usize,
 }
 
 /// Contiguous KV cache for one full-attention layer: `[B, kvHeads, capacity, D]`
@@ -302,8 +761,8 @@ impl FullAttentionCache {
     }
 }
 
-/// Per-layer recurrent state for the gated deltanet: a short-convolution
-/// state `[B, 3, 10240]` (bf16) and the fp32 SSM state `[B, 48, 128, 128]`.
+/// Per-layer recurrent state for linear-attention layers. Qwen GDN keeps its
+/// model-specific conv dtype; GLM KDA stores both conv and SSM state in F32.
 pub struct GdnCache {
     pub conv: Option<Array>,
     pub ssm: Option<Array>,
@@ -426,6 +885,73 @@ impl LayerCache {
         }
     }
 
+    /// Capture the small amount of state needed to undo an append-only verify
+    /// transaction. Unlike `snapshot_prefix`, this does not copy live KV rows:
+    /// full-attention buffers remain in place and only their logical offsets
+    /// and indexer metadata are saved. Linear-attention recurrent arrays are
+    /// cloned by reference, as in prefix snapshots.
+    pub fn snapshot_rollback(&self) -> LayerRollbackState {
+        match self {
+            LayerCache::Full(f) => LayerRollbackState::Full {
+                offset: f.offset,
+                tape: f.indexer_tape.snapshot(),
+                ple_conv: f.ple_conv.clone(),
+                next_pos: f.next_pos.clone(),
+            },
+            LayerCache::Linear(g) => {
+                let (conv, ssm, ple_conv) = g.snapshot_state();
+                LayerRollbackState::Linear {
+                    conv,
+                    ssm,
+                    ple_conv,
+                }
+            }
+        }
+    }
+
+    /// Restore an append-only verify transaction captured by
+    /// `snapshot_rollback`. Rows written past the restored boundary remain in
+    /// the backing buffers and are overwritten by the next append.
+    pub fn restore_rollback(&mut self, state: &LayerRollbackState) -> lisa_mlx::error::Result<()> {
+        match (self, state) {
+            (
+                LayerCache::Full(f),
+                LayerRollbackState::Full {
+                    offset,
+                    tape,
+                    ple_conv,
+                    next_pos,
+                },
+            ) => {
+                if *offset > f.offset {
+                    return Err(lisa_mlx::error::Error::msg(format!(
+                        "full-attention rollback boundary {offset} exceeds live offset {}",
+                        f.offset
+                    )));
+                }
+                f.offset = *offset;
+                f.indexer_tape.restore(tape);
+                f.ple_conv = ple_conv.clone();
+                f.next_pos = next_pos.clone();
+                Ok(())
+            }
+            (
+                LayerCache::Linear(g),
+                LayerRollbackState::Linear {
+                    conv,
+                    ssm,
+                    ple_conv,
+                },
+            ) => {
+                g.restore_state(&(conv.clone(), ssm.clone(), ple_conv.clone()));
+                Ok(())
+            }
+            _ => Err(lisa_mlx::error::Error::msg(
+                "cache kind changed during verify transaction",
+            )),
+        }
+    }
+
     /// Install a prefix-cache entry's state into this (fresh) cache.
     pub fn restore_prefix(&mut self, s: &LayerState) {
         match (self, s) {
@@ -473,12 +999,26 @@ pub enum LayerState {
     Linear(LinearPrefixState),
 }
 
+/// Lightweight append-only cache checkpoint for speculative verification.
+pub enum LayerRollbackState {
+    Full {
+        offset: usize,
+        tape: TapeSnapshot,
+        ple_conv: Option<Array>,
+        next_pos: Option<Vec<usize>>,
+    },
+    Linear {
+        conv: Option<Array>,
+        ssm: Option<Array>,
+        ple_conv: Option<Array>,
+    },
+}
+
 // --- SSD-spill codec (core/prefix_cache.rs) ---------------------------------
 // A `LayerState` serializes to host bytes: one u8 presence tag per array,
-// then dtype tag + shape + raw LE payload. `decode` rebuilds the arrays as
-// host-backed (`Array::from_raw_data`); MLX copies them to the GPU on first
-// use, exactly like the safetensors-restore path in the reference spill
-// design. Keyed by a content hash of the entry's tokens in prefix_cache.rs.
+// then dtype tag + shape + raw LE payload. `decode` rebuilds owned device
+// arrays through `Array::from_raw_data`. Entries are keyed by their tokens
+// and numerical law in prefix_cache.rs.
 
 fn dtype_tag(d: Dtype) -> u8 {
     match d {
@@ -494,7 +1034,6 @@ fn dtype_tag(d: Dtype) -> u8 {
         Dtype::Float32 => 10,
         Dtype::Float64 => 11,
         Dtype::Bfloat16 => 12,
-        _ => 0,
     }
 }
 
@@ -540,7 +1079,6 @@ macro_rules! enc_payload {
             Dtype::Int16 => one!(i16),
             Dtype::Int32 => one!(i32),
             Dtype::Int64 => one!(i64),
-            other => anyhow::bail!("prefix spill: unsupported dtype {other:?}"),
         }
     }};
 }
@@ -600,7 +1138,8 @@ fn dec_arr(cur: &mut &[u8]) -> anyhow::Result<Option<Array>> {
         anyhow::bail!("prefix spill: payload size mismatch");
     }
     let shape_i: Vec<i32> = shape.iter().map(|&d| d as i32).collect();
-    let a = unsafe { Array::from_raw_data(bytes.as_ptr() as *const std::ffi::c_void, &shape_i, dtype) };
+    let a =
+        unsafe { Array::from_raw_data(bytes.as_ptr() as *const std::ffi::c_void, &shape_i, dtype) };
     Ok(Some(a))
 }
 
@@ -611,15 +1150,20 @@ impl LayerState {
         let mut out = Vec::new();
         match self {
             LayerState::Full(s) => {
-                out.push(0);
+                // Tag 3 adds the raw-tail base. Tags 0 and 2 remain readable
+                // for spill records written before raw-history compaction.
+                out.push(3);
                 out.extend((s.offset as u64).to_le_bytes());
                 enc_arr(&mut out, &s.keys)?;
                 enc_arr(&mut out, &s.values)?;
                 enc_arr(&mut out, &s.tape.raw)?;
                 out.extend((s.tape.total as u64).to_le_bytes());
+                out.extend((s.tape.raw_start as u64).to_le_bytes());
                 enc_arr(&mut out, &s.tape.pooled)?;
                 out.extend((s.tape.pooled_upto as u64).to_le_bytes());
                 out.extend((s.tape.cr as u64).to_le_bytes());
+                enc_arr(&mut out, &s.tape.compact)?;
+                out.extend((s.tape.compact_total as u64).to_le_bytes());
                 enc_arr(&mut out, &s.ple_conv)?;
             }
             LayerState::Linear(s) => {
@@ -644,15 +1188,28 @@ impl LayerState {
             k
         };
         Ok(match kind {
-            0 => {
+            0 | 2 | 3 => {
+                let has_compact = kind >= 2;
+                let has_raw_start = kind >= 3;
                 let offset = rd_u64(cur)? as usize;
                 let keys = dec_arr(cur)?;
                 let values = dec_arr(cur)?;
                 let tape_raw = dec_arr(cur)?;
                 let total = rd_u64(cur)? as usize;
+                let raw_start = if has_raw_start {
+                    rd_u64(cur)? as usize
+                } else {
+                    0
+                };
                 let pooled = dec_arr(cur)?;
                 let pooled_upto = rd_u64(cur)? as usize;
                 let cr = rd_u64(cur)? as usize;
+                let compact = if has_compact { dec_arr(cur)? } else { None };
+                let compact_total = if has_compact {
+                    rd_u64(cur)? as usize
+                } else {
+                    0
+                };
                 let ple_conv = dec_arr(cur)?;
                 LayerState::Full(FullPrefixState {
                     keys,
@@ -661,9 +1218,12 @@ impl LayerState {
                     tape: TapeSnapshot {
                         raw: tape_raw,
                         total,
+                        raw_start,
                         pooled,
                         pooled_upto,
                         cr,
+                        compact,
+                        compact_total,
                     },
                     ple_conv,
                 })
@@ -672,7 +1232,11 @@ impl LayerState {
                 let conv = dec_arr(cur)?;
                 let ssm = dec_arr(cur)?;
                 let ple_conv = dec_arr(cur)?;
-                LayerState::Linear(LinearPrefixState { conv, ssm, ple_conv })
+                LayerState::Linear(LinearPrefixState {
+                    conv,
+                    ssm,
+                    ple_conv,
+                })
             }
             k => anyhow::bail!("prefix spill: bad layer kind {k}"),
         })
@@ -680,8 +1244,480 @@ impl LayerState {
 }
 
 #[cfg(test)]
-mod spill_codec_tests {
+mod cache_state_tests {
     use super::*;
+
+    #[test]
+    fn indexer_tape_append_fields_matches_packed_append() -> lisa_mlx::error::Result<()> {
+        let key = Array::from_slice(&[0.25f32, -1.0, 2.0, 3.5], &[1, 2, 2]);
+        let gate = Array::from_slice(&[-0.5f32, 0.75], &[1, 2, 1]);
+        let packed = ops::concatenate(&[&key, &gate], 2)?;
+        let mut expected = IndexerTape::new();
+        let mut actual = IndexerTape::new();
+        expected.append(&packed, 4)?;
+        actual.append_fields(&key, &gate, 4)?;
+        let want = expected.raw_slice(0, 2).expect("packed raw rows");
+        let got = actual.raw_slice(0, 2).expect("field raw rows");
+        let want = want.to_vec1::<f32>()?;
+        let got = got.to_vec1::<f32>()?;
+        assert_eq!(
+            want.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            got.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn glm_mtp_compact_cache_replaces_rejected_draft_at_same_position()
+    -> lisa_mlx::error::Result<()> {
+        let mut tape = IndexerTape::new();
+        tape.write_compact_f16_at(&Array::from_slice(&[1.25f32], &[1, 1, 1]), 10)?;
+        tape.write_compact_f16_at(&Array::from_slice(&[2.5f32], &[1, 1, 1]), 11)?;
+
+        // A rejected proposal is retried at the same absolute target position
+        // with the replacement token's latent. The later row must stay intact.
+        tape.write_compact_f16_at(&Array::from_slice(&[9.75f32], &[1, 1, 1]), 10)?;
+        let rows = tape.compact_slice(10, 12).expect("written MTP cache rows");
+        rows.eval()?;
+        assert_eq!(
+            rows.reshape(&[2])?.to_vec1::<half::f16>()?,
+            &[half::f16::from_f32(9.75), half::f16::from_f32(2.5)]
+        );
+        assert_eq!(tape.compact_total, 12);
+        Ok(())
+    }
+
+    #[cfg(feature = "glm53-fixtures")]
+    #[test]
+    fn glm_compact_cache_matches_ds4_metal_positional_f16_writes() -> lisa_mlx::error::Result<()> {
+        const ROWS: usize = 8;
+        const DIM: usize = 512;
+        const START: usize = 254;
+        const REPLACED_ROW: usize = 3;
+        const FIXTURE: &[u8] =
+            include_bytes!("../models/glm53/fixtures/dsa_compact_cache_ds4_metal.bin");
+        assert_eq!(FIXTURE.len(), ROWS * DIM * 2);
+
+        fn row_values(row_index: usize) -> Vec<f32> {
+            (0..DIM)
+                .map(|i| {
+                    let logical = row_index * DIM + i;
+                    let centered = ((logical * 73 + 29) % 2001) as i32 - 1000;
+                    centered as f32 / 997.0
+                })
+                .collect()
+        }
+
+        let mut tape = IndexerTape::new();
+        for row in 0..ROWS {
+            tape.write_compact_f16_at(
+                &Array::from_slice(&row_values(row), &[1, 1, DIM as i32]),
+                START + row,
+            )?;
+        }
+        tape.write_compact_f16_at(
+            &Array::from_slice(&row_values(ROWS + REPLACED_ROW), &[1, 1, DIM as i32]),
+            START + REPLACED_ROW,
+        )?;
+
+        let rows = tape
+            .compact_slice(START, START + ROWS)
+            .expect("DS4 comparison cache rows");
+        rows.eval()?;
+        let actual = rows
+            .reshape(&[(ROWS * DIM) as i32])?
+            .to_vec1::<half::f16>()?;
+        let actual_bits: Vec<u16> = actual.iter().map(|value| value.to_bits()).collect();
+        let expected_bits: Vec<u16> = FIXTURE
+            .chunks_exact(2)
+            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+            .collect();
+        assert_eq!(actual_bits, expected_bits);
+        Ok(())
+    }
+
+    #[test]
+    fn direct_compact_append_reservation_preserves_rows_across_growth()
+    -> lisa_mlx::error::Result<()> {
+        const WIDTH: usize = 512;
+        let mut tape = IndexerTape::new();
+        let key0 = Array::from_slice(&vec![0.0f32; 257], &[1, 257, 1]);
+        let gate0 = Array::from_slice(&vec![0.0f32; 257], &[1, 257, 1]);
+        let (cache0, start0) = tape.reserve_compact_f16_append(1, 257, WIDTH as i32)?;
+        assert_eq!(start0, 0);
+        assert_eq!(cache0.dim(1), 513);
+        let first = Array::from_slice(
+            &vec![half::f16::from_f32(1.25); 257 * WIDTH],
+            &[1, 257, WIDTH as i32],
+        );
+        let stream = lisa_mlx::Stream::thread_local_or_default();
+        assert!(lisa_mlx::kernels::copy_rows_into(&first, &cache0, 0, &stream).is_some());
+        tape.append_fields(&key0, &gate0, 1)?;
+        tape.commit_compact_f16_append(start0, 257)?;
+
+        let (cache1, start1) = tape.reserve_compact_f16_append(1, 257, WIDTH as i32)?;
+        assert_eq!(start1, 257);
+        assert_eq!(cache1.dim(1), 1026);
+        let replacement = Array::from_slice(
+            &vec![half::f16::from_f32(2.5); 257 * WIDTH],
+            &[1, 257, WIDTH as i32],
+        );
+        assert!(
+            lisa_mlx::kernels::copy_rows_into(&replacement, &cache1, start1 as i32, &stream)
+                .is_some()
+        );
+        let key1 = Array::from_slice(&vec![0.0f32; 257], &[1, 257, 1]);
+        let gate1 = Array::from_slice(&vec![0.0f32; 257], &[1, 257, 1]);
+        tape.append_fields(&key1, &gate1, 1)?;
+        tape.commit_compact_f16_append(start1, 257)?;
+
+        let rows = tape
+            .compact_slice(0, 514)
+            .expect("reserved compact rows after growth");
+        let values = rows.to_vec1::<half::f16>()?;
+        assert!(
+            values[..257 * WIDTH]
+                .iter()
+                .all(|value| *value == half::f16::from_f32(1.25))
+        );
+        assert!(
+            values[257 * WIDTH..514 * WIDTH]
+                .iter()
+                .all(|value| *value == half::f16::from_f32(2.5))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn indexer_tape_packs_and_extracts_equal_position_rows() -> lisa_mlx::error::Result<()> {
+        let mut tapes = Vec::new();
+        for stream in 0..2 {
+            let raw: Vec<f32> = (0..8).map(|i| (stream * 100 + i) as f32).collect();
+            let compact: Vec<f32> = (0..12).map(|i| (stream * 1000 + i) as f32).collect();
+            let pooled = [stream as f32 + 0.5, stream as f32 + 1.5];
+            let mut tape = IndexerTape::new();
+            tape.append(&Array::from_slice(&raw, &[1, 4, 2]), 4)?;
+            tape.append_compact_f16(&Array::from_slice(&compact, &[1, 4, 3]))?;
+            tape.push_pooled_f16(&Array::from_slice(&pooled, &[1, 1, 2]))?;
+            tapes.push(tape);
+        }
+
+        let packed = IndexerTape::pack_equal(&[&tapes[0], &tapes[1]])?;
+        assert_eq!(packed.total, 4);
+        assert_eq!(packed.raw_start, 0);
+        assert_eq!(packed.pooled_upto, 1);
+        assert_eq!(packed.compact_total, 4);
+        assert_eq!(packed.raw.as_ref().unwrap().dim(0), 2);
+        assert_eq!(packed.pooled.as_ref().unwrap().dim(0), 2);
+        assert_eq!(packed.compact.as_ref().unwrap().dim(0), 2);
+
+        for stream in 0..2 {
+            let row = packed.extract_row(stream)?;
+            let raw = row.raw_slice(0, 4).expect("packed raw row");
+            let compact = row.compact_slice(0, 4).expect("packed compact row");
+            let pooled = row.pooled_view().expect("packed pooled row");
+            assert_eq!(
+                raw.to_vec1::<f32>()?,
+                (0..8)
+                    .map(|i| (stream * 100 + i) as f32)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                compact.to_vec1::<half::f16>()?,
+                (0..12)
+                    .map(|i| half::f16::from_f32((stream * 1000 + i) as f32))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                pooled.to_vec1::<half::f16>()?,
+                [
+                    half::f16::from_f32(stream as f32 + 0.5),
+                    half::f16::from_f32(stream as f32 + 1.5),
+                ]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn indexer_compaction_snapshot_and_rollback_preserve_absolute_rows()
+    -> lisa_mlx::error::Result<()> {
+        let values: Vec<f32> = (0..600 * 2).map(|v| v as f32).collect();
+        let rows = Array::from_slice(&values, &[1, 600, 2]);
+        let mut tape = IndexerTape::new();
+        tape.append(&rows, 4)?;
+        tape.pooled_upto = 150;
+        tape.compact_raw_history(32)?;
+
+        assert_eq!(tape.total, 600);
+        assert_eq!(tape.raw_start, 568);
+        assert!(tape.raw_slice(0, 4).is_none());
+        let tail = tape.raw_slice(568, 600).expect("retained rollback tail");
+        tail.eval()?;
+        let expected: Vec<f32> = values[568 * 2..].to_vec();
+        assert_eq!(tail.as_slice::<f32>(), expected.as_slice());
+
+        let snapshot = tape.snapshot();
+        let mut restored = IndexerTape::new();
+        restored.restore(&snapshot);
+        assert_eq!(restored.raw_start, 568);
+        assert_eq!(restored.total, 600);
+        assert_eq!(restored.pooled_upto, 150);
+        assert!(restored.raw_slice(567, 569).is_none());
+
+        // Roll back by two complete pools, then append replacement rows. The
+        // absolute origin stays fixed while the retained tail is overwritten.
+        restored.trim(592);
+        let replacement_values = [9000.0f32, 9001.0, 9002.0, 9003.0];
+        let replacement = Array::from_slice(&replacement_values, &[1, 2, 2]);
+        restored.append(&replacement, 4)?;
+        let replaced = restored.raw_slice(592, 594).expect("replacement rows");
+        replaced.eval()?;
+        assert_eq!(replaced.as_slice::<f32>(), &replacement_values);
+        assert_eq!(restored.total, 594);
+        assert_eq!(restored.raw_start, 568);
+        Ok(())
+    }
+
+    #[test]
+    fn glm_indexer_prefix_restore_replays_partial_pool_after_rollback()
+    -> lisa_mlx::error::Result<()> {
+        let raw_values: Vec<f32> = (0..600).map(|v| v as f32).collect();
+        let mut full = FullAttentionCache::new(1, 1);
+        full.offset = 600;
+        full.indexer_tape
+            .append(&Array::from_slice(&raw_values, &[1, 600, 1]), 4)?;
+
+        let compact_values: Vec<f32> = (0..600).map(|v| (v as f32) * 0.5).collect();
+        full.indexer_tape
+            .append_compact_f16(&Array::from_slice(&compact_values, &[1, 600, 1]))?;
+        let pooled_values: Vec<f32> = (0..150).map(|v| v as f32).collect();
+        full.indexer_tape
+            .push_pooled_f16(&Array::from_slice(&pooled_values, &[1, 150, 1]))?;
+        full.indexer_tape.compact_raw_history(32)?;
+        assert_eq!(full.indexer_tape.raw_start, 568);
+
+        let prefix = LayerCache::Full(full).snapshot_prefix();
+        let mut restored = LayerCache::Full(FullAttentionCache::new(1, 1));
+        restored.restore_prefix(&prefix);
+        let LayerCache::Full(restored) = &mut restored else {
+            unreachable!();
+        };
+
+        // Roll back into the final pool, then replace the two speculative rows.
+        // The pool is rebuilt from the preserved prefix rows plus the new rows.
+        restored.trim(6);
+        let replacement_raw = Array::from_slice(&[900.0f32, 901.0], &[1, 2, 1]);
+        restored.indexer_tape.append(&replacement_raw, 4)?;
+        let replacement_compact = Array::from_slice(&[450.0f32, 450.5], &[1, 2, 1]);
+        restored
+            .indexer_tape
+            .append_compact_f16(&replacement_compact)?;
+
+        let pool_raw = restored
+            .indexer_tape
+            .raw_slice(592, 596)
+            .expect("partial-pool prefix remains available after restore");
+        pool_raw.eval()?;
+        assert_eq!(
+            pool_raw.reshape(&[4])?.to_vec1::<f32>()?,
+            &[592.0, 593.0, 900.0, 901.0]
+        );
+        let rebuilt_pool = Array::from_slice(&[846.5f32], &[1, 1, 1]);
+        restored.indexer_tape.push_pooled_f16(&rebuilt_pool)?;
+        let pooled_tail = restored
+            .indexer_tape
+            .pooled_view()
+            .expect("restored pooled-key cache")
+            .index((.., 148..149, ..))
+            .reshape(&[1])?;
+        pooled_tail.eval()?;
+        assert_eq!(
+            pooled_tail.to_vec1::<half::f16>()?,
+            &[half::f16::from_f32(846.5)]
+        );
+
+        let live_compact = restored
+            .indexer_tape
+            .compact_slice(592, 596)
+            .expect("compact cache was truncated and replayed with raw rows");
+        live_compact.eval()?;
+        assert_eq!(
+            live_compact.reshape(&[4])?.to_vec1::<half::f16>()?,
+            &[
+                half::f16::from_f32(296.0),
+                half::f16::from_f32(296.5),
+                half::f16::from_f32(450.0),
+                half::f16::from_f32(450.5),
+            ]
+        );
+        assert_eq!(restored.offset, 594);
+        assert_eq!(restored.indexer_tape.total, 596);
+        assert_eq!(restored.indexer_tape.pooled_upto, 149);
+        assert_eq!(restored.indexer_tape.raw_start, 568);
+        Ok(())
+    }
+
+    #[cfg(feature = "glm53-fixtures")]
+    #[test]
+    fn glm_indexer_pool_rollback_and_replay_match_ds4_incremental_cache() -> anyhow::Result<()> {
+        if !lisa_mlx::device::metal_available() {
+            eprintln!("[glm-indexer-pool-replay] skipping: no Metal device available");
+            return Ok(());
+        }
+        const POOLS: usize = 2;
+        const POOL_SIZE: usize = 4;
+        const DIM: usize = 128;
+        const ROW_VALUES: usize = POOLS * POOL_SIZE * DIM;
+        const ROW_BYTES: usize = ROW_VALUES * std::mem::size_of::<f32>();
+        const NORM_BYTES: usize = DIM * std::mem::size_of::<f32>();
+        const APE_BYTES: usize = POOL_SIZE * DIM * std::mem::size_of::<u16>();
+        const POOL_BYTES: usize = POOLS * DIM * std::mem::size_of::<u16>();
+        const FIXTURE: &[u8] = include_bytes!(
+            "../../../lisa-mlx/src/models/glm53/fixtures/indexer_pool_lifecycle_ds4.bin"
+        );
+        assert_eq!(
+            FIXTURE.len(),
+            ROW_BYTES + NORM_BYTES + ROW_BYTES + NORM_BYTES + APE_BYTES + POOL_BYTES
+        );
+
+        let decode_f32 = |bytes: &[u8]| {
+            bytes
+                .chunks_exact(std::mem::size_of::<f32>())
+                .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("F32 fixture word")))
+                .collect::<Vec<_>>()
+        };
+        let decode_bf16 = |bytes: &[u8]| {
+            bytes
+                .chunks_exact(std::mem::size_of::<u16>())
+                .map(|chunk| half::bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])))
+                .collect::<Vec<_>>()
+        };
+        let expected: Vec<half::f16> = FIXTURE[FIXTURE.len() - POOL_BYTES..]
+            .chunks_exact(std::mem::size_of::<u16>())
+            .map(|chunk| half::f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])))
+            .collect();
+        let raw = decode_f32(&FIXTURE[..ROW_BYTES]);
+        let norm_weight = decode_f32(&FIXTURE[ROW_BYTES..ROW_BYTES + NORM_BYTES]);
+        let gate_start = ROW_BYTES + NORM_BYTES;
+        let gate = decode_f32(&FIXTURE[gate_start..gate_start + ROW_BYTES]);
+        let bias_start = gate_start + ROW_BYTES;
+        let norm_bias = decode_f32(&FIXTURE[bias_start..bias_start + NORM_BYTES]);
+        let ape_start = bias_start + NORM_BYTES;
+        let ape = decode_bf16(&FIXTURE[ape_start..ape_start + APE_BYTES]);
+
+        let append_rows = |tape: &mut IndexerTape,
+                           start: usize,
+                           count: usize,
+                           raw_rows: &[f32],
+                           gate_rows: &[f32]|
+         -> anyhow::Result<()> {
+            let start_at = start * DIM;
+            let end_at = (start + count) * DIM;
+            let raw =
+                Array::from_slice(&raw_rows[start_at..end_at], &[1, count as i32, DIM as i32]);
+            let gate =
+                Array::from_slice(&gate_rows[start_at..end_at], &[1, count as i32, DIM as i32]);
+            tape.append_fields(&raw, &gate, POOL_SIZE)?;
+            Ok(())
+        };
+        let pool_rows = |raw_rows: &[f32], gate_rows: &[f32]| -> anyhow::Result<Array> {
+            let raw = Array::from_slice(raw_rows, &[1, 1, POOL_SIZE as i32, DIM as i32]);
+            let gate = Array::from_slice(gate_rows, &[1, 1, POOL_SIZE as i32, DIM as i32]);
+            let norm_weight = Array::from_slice(&norm_weight, &[DIM as i32]);
+            let norm_bias = Array::from_slice(&norm_bias, &[DIM as i32]);
+            let ape = Array::from_slice(&ape, &[POOL_SIZE as i32, DIM as i32]);
+            lisa_mlx::models::glm53::kernels::indexer_pool_fused(
+                &raw,
+                &gate,
+                &ape,
+                &norm_weight,
+                &norm_bias,
+                1e-6,
+                &lisa_mlx::Stream::thread_local_or_default(),
+            )
+            .ok_or_else(|| anyhow::anyhow!("DS4-shaped DSA pool kernel declined"))
+        };
+
+        let mut tape = IndexerTape::new();
+        for (start, count) in [(0, 1), (1, 2), (3, 1)] {
+            append_rows(&mut tape, start, count, &raw, &gate)?;
+        }
+        let first_pool = pool_rows(&raw[..POOL_SIZE * DIM], &gate[..POOL_SIZE * DIM])?;
+        tape.push_pooled_f16(&first_pool)?;
+        let checkpoint = tape.snapshot();
+
+        let mut speculative_raw = vec![0.0f32; POOL_SIZE * DIM];
+        let mut speculative_gate = vec![0.0f32; POOL_SIZE * DIM];
+        for row in 0..POOL_SIZE {
+            for channel in 0..DIM {
+                let index = row * DIM + channel;
+                let source = ((row + 1) % POOL_SIZE) * DIM + channel;
+                speculative_raw[index] = raw[source] * -0.5 + (row + 2) as f32 * 0.0625;
+                speculative_gate[index] = gate[source] * 0.25 + (row + 1) as f32 * 0.125;
+            }
+        }
+        let mut speculative_full_raw = vec![0.0f32; ROW_VALUES];
+        let mut speculative_full_gate = vec![0.0f32; ROW_VALUES];
+        speculative_full_raw[POOL_SIZE * DIM..].copy_from_slice(&speculative_raw);
+        speculative_full_gate[POOL_SIZE * DIM..].copy_from_slice(&speculative_gate);
+        append_rows(
+            &mut tape,
+            4,
+            2,
+            &speculative_full_raw,
+            &speculative_full_gate,
+        )?;
+        append_rows(
+            &mut tape,
+            6,
+            2,
+            &speculative_full_raw,
+            &speculative_full_gate,
+        )?;
+        let speculative_pool = pool_rows(&speculative_raw, &speculative_gate)?;
+        let speculative_bits: Vec<u16> = speculative_pool
+            .to_vec1::<half::f16>()?
+            .iter()
+            .map(|value| value.to_bits())
+            .collect();
+        tape.push_pooled_f16(&speculative_pool)?;
+        tape.trim(4);
+        assert_eq!(tape.total, 4);
+        assert_eq!(tape.pooled_upto, 1);
+
+        for (start, count) in [(4, 1), (5, 2), (7, 1)] {
+            append_rows(&mut tape, start, count, &raw, &gate)?;
+        }
+        let replayed_pool = pool_rows(&raw[POOL_SIZE * DIM..], &gate[POOL_SIZE * DIM..])?;
+        tape.push_pooled_f16(&replayed_pool)?;
+        let actual: Vec<u16> = tape
+            .pooled_view()
+            .expect("replayed pooled cache")
+            .to_vec1::<half::f16>()?
+            .iter()
+            .map(|value| value.to_bits())
+            .collect();
+        let expected_bits: Vec<u16> = expected.iter().map(|value| value.to_bits()).collect();
+        anyhow::ensure!(
+            actual == expected_bits,
+            "LISA pooled cache after rollback/replay differs from DS4 incremental Metal"
+        );
+        anyhow::ensure!(
+            speculative_bits != expected_bits[DIM..],
+            "speculative pool fixture unexpectedly equals the replacement replay"
+        );
+        anyhow::ensure!(
+            tape.total == 8 && tape.pooled_upto == 2 && tape.raw_start == 0,
+            "unexpected live DSA tape state after replay"
+        );
+        anyhow::ensure!(checkpoint.total == 4 && checkpoint.pooled_upto == 1);
+        eprintln!(
+            "[glm-indexer-pool-replay] all {} F16 cache values match DS4 after speculative completion, rollback, and replacement replay",
+            actual.len()
+        );
+        Ok(())
+    }
 
     /// The spill codec round-trips a Full layer state: shapes, dtypes and
     /// offset/tape scalars survive; the restored arrays are host-backed and
@@ -706,9 +1742,12 @@ mod spill_codec_tests {
             tape: TapeSnapshot {
                 raw: tape_raw,
                 total: 3,
+                raw_start: 0,
                 pooled: None,
                 pooled_upto: 1,
                 cr: 4,
+                compact: None,
+                compact_total: 0,
             },
             ple_conv: None,
         });
@@ -730,6 +1769,117 @@ mod spill_codec_tests {
         assert_eq!(t.as_slice::<u32>(), &[7, 8, 9]);
         let v = b.values.as_ref().expect("values");
         assert_eq!(v.dtype(), Dtype::Bfloat16);
+        Ok(())
+    }
+
+    #[test]
+    fn glm_compacted_tape_spill_restore_preserves_live_absolute_rows() -> anyhow::Result<()> {
+        let raw_values: Vec<f32> = (0..600 * 2).map(|v| v as f32 * 0.25).collect();
+        let compact_values: Vec<f32> = (0..600 * 2).map(|v| v as f32 * 0.5).collect();
+        let pooled_values: Vec<f32> = (0..150 * 2).map(|v| v as f32 * 0.125).collect();
+
+        let mut full = FullAttentionCache::new(1, 2);
+        full.offset = 600;
+        full.indexer_tape
+            .append(&Array::from_slice(&raw_values, &[1, 600, 2]), 4)?;
+        full.indexer_tape
+            .append_compact_f16(&Array::from_slice(&compact_values, &[1, 600, 2]))?;
+        full.indexer_tape
+            .push_pooled_f16(&Array::from_slice(&pooled_values, &[1, 150, 2]))?;
+        full.indexer_tape.compact_raw_history(32)?;
+        assert_eq!(full.indexer_tape.raw_start, 568);
+
+        // Exercise the exact layer-state codec used by SSD prefix spill, then
+        // restore into a fresh GLM full-attention cache.
+        let state = LayerCache::Full(full).snapshot_prefix();
+        let bytes = state.encode()?;
+        let mut cursor: &[u8] = &bytes;
+        let restored_state = LayerState::decode(&mut cursor)?;
+        assert!(cursor.is_empty());
+        let mut restored = LayerCache::Full(FullAttentionCache::new(1, 2));
+        restored.restore_prefix(&restored_state);
+        let LayerCache::Full(restored) = &mut restored else {
+            anyhow::bail!("decoded cache kind mismatch");
+        };
+
+        assert_eq!(restored.offset, 600);
+        assert_eq!(restored.indexer_tape.raw_start, 568);
+        assert_eq!(restored.indexer_tape.total, 600);
+        assert_eq!(restored.indexer_tape.pooled_upto, 150);
+        let raw = restored
+            .indexer_tape
+            .raw_slice(568, 600)
+            .expect("retained raw rollback window");
+        raw.eval()?;
+        assert_eq!(
+            raw.reshape(&[64])?.to_vec1::<f32>()?,
+            &raw_values[568 * 2..]
+        );
+        let compact = restored
+            .indexer_tape
+            .compact_slice(568, 600)
+            .expect("compact latent history");
+        compact.eval()?;
+        let expected_compact: Vec<half::f16> = compact_values[568 * 2..]
+            .iter()
+            .map(|&value| half::f16::from_f32(value))
+            .collect();
+        assert_eq!(
+            compact.reshape(&[64])?.to_vec1::<half::f16>()?,
+            expected_compact
+        );
+        let pooled = restored
+            .indexer_tape
+            .pooled_view()
+            .expect("pooled key history")
+            .index((.., 149..150, ..));
+        pooled.eval()?;
+        let expected_pooled: Vec<half::f16> = pooled_values[149 * 2..150 * 2]
+            .iter()
+            .map(|&value| half::f16::from_f32(value))
+            .collect();
+        assert_eq!(
+            pooled.reshape(&[2])?.to_vec1::<half::f16>()?,
+            expected_pooled
+        );
+
+        // Roll back across the final pool and replay replacement rows after
+        // spill restore; absolute positions and the retained pool prefix must
+        // remain valid.
+        restored.trim(6);
+        let replacement_raw = Array::from_slice(&[9000.0f32, 9001.0, 9002.0, 9003.0], &[1, 2, 2]);
+        restored.indexer_tape.append(&replacement_raw, 4)?;
+        let replacement_compact =
+            Array::from_slice(&[9100.0f32, 9101.0, 9102.0, 9103.0], &[1, 2, 2]);
+        restored
+            .indexer_tape
+            .append_compact_f16(&replacement_compact)?;
+        let replayed_raw = restored
+            .indexer_tape
+            .raw_slice(594, 596)
+            .expect("replacement raw rows");
+        replayed_raw.eval()?;
+        assert_eq!(
+            replayed_raw.reshape(&[4])?.to_vec1::<f32>()?,
+            &[9000.0, 9001.0, 9002.0, 9003.0]
+        );
+        let replayed_compact = restored
+            .indexer_tape
+            .compact_slice(594, 596)
+            .expect("replacement compact rows");
+        replayed_compact.eval()?;
+        assert_eq!(
+            replayed_compact.reshape(&[4])?.to_vec1::<half::f16>()?,
+            &[
+                half::f16::from_f32(9100.0),
+                half::f16::from_f32(9101.0),
+                half::f16::from_f32(9102.0),
+                half::f16::from_f32(9103.0),
+            ]
+        );
+        assert_eq!(restored.indexer_tape.raw_start, 568);
+        assert_eq!(restored.indexer_tape.total, 596);
+        assert_eq!(restored.indexer_tape.pooled_upto, 148);
         Ok(())
     }
 }

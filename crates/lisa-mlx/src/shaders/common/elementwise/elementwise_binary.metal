@@ -157,6 +157,7 @@ template <
     init_binary_k(op_name, binary_op, bf16, bfloat, bool)   \
     init_binary_k(op_name, binary_op, u8, uint8_t, bool)    \
     init_binary_k(op_name, binary_op, u32, uint32_t, bool)  \
+    init_binary_k(op_name, binary_op, i32, int32_t, bool) \
     init_binary_k(op_name, binary_op, i64, int64_t, bool)
 #else
 #define init_boolean_binary(op_name, binary_op)             \
@@ -164,6 +165,7 @@ template <
     init_binary_k(op_name, binary_op, f16, half, bool)      \
     init_binary_k(op_name, binary_op, u8, uint8_t, bool)    \
     init_binary_k(op_name, binary_op, u32, uint32_t, bool)  \
+    init_binary_k(op_name, binary_op, i32, int32_t, bool) \
     init_binary_k(op_name, binary_op, i64, int64_t, bool)
 #endif
 

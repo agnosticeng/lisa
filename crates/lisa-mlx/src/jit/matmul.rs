@@ -2,17 +2,18 @@ use std::sync::Arc;
 
 use objc2_metal::MTLSize;
 
+use super::buf::add_strides_and_shapes;
 use crate::array::{Array, Dtype};
 use crate::error::{Error, Result};
 use crate::runtime::{Buffer, ComputePipeline, ConstVal, MetalRuntime};
 
+use super::compile::compile_builtin_math;
 use super::compile::{builtin_template_def, compile_builtin, get_2d_grid_dims, type_string};
 use super::reduce::reduce_axis0_sum;
 use super::{Device, Tensor};
 use super::{
     MLX_GEMM_PREAMBLE, MLX_QUANTIZED_PREAMBLE, MLX_QUANTIZED_UTILS_PREAMBLE, MLX_UTILS_PREAMBLE,
 };
-use super::compile::compile_builtin_math;
 
 /// Mirror of MLX `qmv_fast_k_alignment` (`quantized.cpp:147`): the K step in
 /// `qmv_fast_impl` must divide K for the fast path to be valid.
@@ -117,8 +118,21 @@ pub fn affine_qmv_source(
     group_size: i32,
     bits: i32,
 ) -> Result<(String, String)> {
+    affine_qmv_source_results(x, w, group_size, bits, 4)
+}
+
+fn affine_qmv_source_results(
+    x: &Tensor,
+    w: &Tensor,
+    group_size: i32,
+    bits: i32,
+    results_per_simdgroup: usize,
+) -> Result<(String, String)> {
     let (_, k) = x.dims2();
     let (n, _) = w.dims2();
+    if !matches!(results_per_simdgroup, 4 | 8) {
+        crate::bail!("affine_qmv_fast: unsupported rows per SIMD group {results_per_simdgroup}");
+    }
     let type_str = type_string(x.dtype())?;
     let fast = n % 8 == 0 && (k as i32) % qmv_fast_k_alignment(bits) == 0;
     let func = if fast {
@@ -129,9 +143,14 @@ pub fn affine_qmv_source(
     let mut kname = String::from("affine_");
     kname.push_str(if fast { "qmv_fast_" } else { "qmv_" });
     kname.push_str(type_str);
-    kname.push_str(&format!("_gs_{group_size}_b_{bits}_batch_0"));
+    kname.push_str(&format!("_gs_{group_size}_b_{bits}"));
+    if results_per_simdgroup != 4 {
+        kname.push_str(&format!("_rpsg{results_per_simdgroup}"));
+    }
+    kname.push_str("_batch_0");
     // template args: type, group_size, bits, batched=false, has_global_scale=false,
-    // results_per_simdgroup=4 (bool prints as 0/1, as in C++ ostream).
+    // results_per_simdgroup is 4 on the MLX path; the GLM huge-vocabulary
+    // candidate can instantiate 8 while retaining each output row's math.
     let template_def = builtin_template_def(
         &kname,
         func,
@@ -141,7 +160,7 @@ pub fn affine_qmv_source(
             bits.to_string(),
             "0".to_string(),
             "0".to_string(),
-            "4".to_string(),
+            results_per_simdgroup.to_string(),
         ],
     );
     let source = format!(
@@ -177,6 +196,43 @@ pub fn affine_qmv_fast(
     affine_qmv_dispatch(device, &pipeline, x, w, scales, biases)
 }
 
+/// Shape-tuned fast affine QMV variant. The result tile changes only how many
+/// independent output rows one SIMD group owns; each row keeps the same K
+/// loop, qdot sequence, and SIMD reduction as the stock 4-row schedule.
+pub fn affine_qmv_fast_results(
+    device: &Device,
+    x: &Tensor,
+    w: &Tensor,
+    scales: &Tensor,
+    biases: &Tensor,
+    group_size: i32,
+    bits: i32,
+    results_per_simdgroup: usize,
+) -> Result<Tensor> {
+    let (m, k) = x.dims2();
+    let (n, _) = w.dims2();
+    if m != 1
+        || !matches!(results_per_simdgroup, 4 | 8)
+        || n % (2 * results_per_simdgroup) != 0
+        || (k as i32) % qmv_fast_k_alignment(bits) != 0
+    {
+        crate::bail!(
+            "affine_qmv_fast_results: unsupported shape M={m} K={k} N={n}, rows-per-SIMD-group={results_per_simdgroup}"
+        );
+    }
+    let (kname, source) = affine_qmv_source_results(x, w, group_size, bits, results_per_simdgroup)?;
+    let pipeline = compile_builtin(device, &source, &kname)?;
+    affine_qmv_dispatch_results(
+        device,
+        &pipeline,
+        x,
+        w,
+        scales,
+        biases,
+        results_per_simdgroup,
+    )
+}
+
 /// Dispatch a prebuilt affine qmv pipeline over these inputs.
 pub fn affine_qmv_dispatch(
     device: &Device,
@@ -186,13 +242,25 @@ pub fn affine_qmv_dispatch(
     scales: &Tensor,
     biases: &Tensor,
 ) -> Result<Tensor> {
+    affine_qmv_dispatch_results(device, pipeline, x, w, scales, biases, 4)
+}
+
+fn affine_qmv_dispatch_results(
+    device: &Device,
+    pipeline: &ComputePipeline,
+    x: &Tensor,
+    w: &Tensor,
+    scales: &Tensor,
+    biases: &Tensor,
+    results_per_simdgroup: usize,
+) -> Result<Tensor> {
     let mdev = device;
     let (m, k) = x.dims2();
     let (n, _) = w.dims2();
     let out_dtype = x.dtype();
 
     let ycount = m * n;
-    let ybuf = mdev.buffer((ycount) as usize * (out_dtype).size_of(), "qmv_out")?;
+    let ybuf = mdev.buffer_for_gpu_write((ycount) as usize * (out_dtype).size_of(), "qmv_out")?;
     let y = Array::from_parts(mdev, ybuf.clone(), &vec![m, n], out_dtype);
 
     let guard = mdev.commands.encoder()?;
@@ -217,7 +285,7 @@ pub fn affine_qmv_dispatch(
     let nn = n as i32;
     enc.set_bytes(6, &nn);
 
-    let bn = 8usize;
+    let bn = 2 * results_per_simdgroup;
     enc.dispatch_groups_size(
         MTLSize {
             width: m,
@@ -278,8 +346,7 @@ pub fn affine_qmv_fast_addnorm(
         crate::bail!("addnorm qmv: only bfloat16 pinned");
     }
     let wn = if write_norm { 1 } else { 0 };
-    let kname =
-        format!("affine_qmv_fast_addnorm_{type_str}_gs_{group_size}_b_{bits}_wn_{wn}");
+    let kname = format!("affine_qmv_fast_addnorm_{type_str}_gs_{group_size}_b_{bits}_wn_{wn}");
     let template_def = builtin_template_def(
         &kname,
         "affine_qmv_fast_addnorm",
@@ -297,16 +364,22 @@ pub fn affine_qmv_fast_addnorm(
     let pipeline = compile_builtin(device, &source, &kname)?;
 
     let out_dtype = x.dtype();
-    let ybuf = device.buffer((m * n) as usize * out_dtype.size_of(), "qmv_out")?;
+    let ybuf = device.buffer_for_gpu_write((m * n) as usize * out_dtype.size_of(), "qmv_out")?;
     let y = Array::from_parts(device, ybuf.clone(), &vec![m, n], out_dtype);
-    let sbuf = device.buffer(k as usize * out_dtype.size_of(), "fused_add_rms_sum")?;
+    let sbuf =
+        device.buffer_for_gpu_write(k as usize * out_dtype.size_of(), "fused_add_rms_sum")?;
     let sum = Array::from_parts(device, sbuf.clone(), &vec![m, k], out_dtype);
     // ALWAYS allocated and bound: the kernel stages the normed row to this
     // scratch unconditionally (the stock qmv_fast_impl re-reads it); nil
     // buffer bindings are UB on the write + read-back path.
-    let nb = device.buffer(k as usize * out_dtype.size_of(), "fused_add_rms_norm")?;
+    let nb = device.buffer_for_gpu_write(k as usize * out_dtype.size_of(), "fused_add_rms_norm")?;
     let normed = if write_norm {
-        Some(Array::from_parts(device, nb.clone(), &vec![m, k], out_dtype))
+        Some(Array::from_parts(
+            device,
+            nb.clone(),
+            &vec![m, k],
+            out_dtype,
+        ))
     } else {
         None
     };
@@ -412,9 +485,7 @@ pub fn affine_qmv_fast_addnorm_tu(
         crate::bail!("addnorm-tu qmv: only bfloat16 pinned");
     }
     let wn = if write_norm { 1 } else { 0 };
-    let kname = format!(
-        "affine_qmv_fast_addnorm_tu_{type_str}_gs_{group_size}_b_{bits}_wn_{wn}"
-    );
+    let kname = format!("affine_qmv_fast_addnorm_tu_{type_str}_gs_{group_size}_b_{bits}_wn_{wn}");
     let template_def = builtin_template_def(
         &kname,
         "affine_qmv_fast_addnorm_tu",
@@ -432,13 +503,19 @@ pub fn affine_qmv_fast_addnorm_tu(
     let pipeline = compile_builtin(device, &source, &kname)?;
 
     let out_dtype = x.dtype();
-    let ybuf = device.buffer((m * n) as usize * out_dtype.size_of(), "qmv_out")?;
+    let ybuf = device.buffer_for_gpu_write((m * n) as usize * out_dtype.size_of(), "qmv_out")?;
     let y = Array::from_parts(device, ybuf.clone(), &vec![m, n], out_dtype);
-    let sbuf = device.buffer(k as usize * out_dtype.size_of(), "fused_add_rms_sum")?;
+    let sbuf =
+        device.buffer_for_gpu_write(k as usize * out_dtype.size_of(), "fused_add_rms_sum")?;
     let sum = Array::from_parts(device, sbuf.clone(), &vec![m, k], out_dtype);
-    let nb = device.buffer(k as usize * out_dtype.size_of(), "fused_add_rms_norm")?;
+    let nb = device.buffer_for_gpu_write(k as usize * out_dtype.size_of(), "fused_add_rms_norm")?;
     let normed = if write_norm {
-        Some(Array::from_parts(device, nb.clone(), &vec![m, k], out_dtype))
+        Some(Array::from_parts(
+            device,
+            nb.clone(),
+            &vec![m, k],
+            out_dtype,
+        ))
     } else {
         None
     };
@@ -544,7 +621,8 @@ pub fn affine_verify_qmm(
 
     let out_dtype = x.dtype();
     let ycount = m * n;
-    let ybuf = device.buffer(ycount as usize * out_dtype.size_of(), "verify_qmm_out")?;
+    let ybuf =
+        device.buffer_for_gpu_write(ycount as usize * out_dtype.size_of(), "verify_qmm_out")?;
     let y = Array::from_parts(device, ybuf.clone(), &vec![m, n], out_dtype);
 
     let guard = device.commands.encoder()?;
@@ -757,7 +835,10 @@ pub fn affine_verify_qmm_splitk_tile_ex(
 
     let out_dtype = x.dtype();
     let ycount = m * n;
-    let ybuf = device.buffer(ycount as usize * out_dtype.size_of(), "verify_qmm_splitk_out")?;
+    let ybuf = device.buffer_for_gpu_write(
+        ycount as usize * out_dtype.size_of(),
+        "verify_qmm_splitk_out",
+    )?;
     let y = Array::from_parts(device, ybuf.clone(), &vec![m, n], out_dtype);
 
     let guard = device.commands.encoder()?;
@@ -815,9 +896,7 @@ pub fn affine_verify_qmm_splitk(
     let (m, k) = x.dims2();
     let (n, _) = w.dims2();
     let Some((bn, k_parts)) = verify_qmm_splitk_lane(m, k, n, bits) else {
-        crate::bail!(
-            "affine_verify_qmm_splitk: shape ineligible (m={m} k={k} n={n} bits={bits})"
-        );
+        crate::bail!("affine_verify_qmm_splitk: shape ineligible (m={m} k={k} n={n} bits={bits})");
     };
     affine_verify_qmm_splitk_tile(
         device, x, w, scales, biases, group_size, bits, bn, k_parts, SPLITK_PPT,
@@ -882,9 +961,8 @@ pub fn affine_qmv_splitk(
     };
     let bn = 2usize;
     let type_str = type_string(x.dtype())?;
-    let kname = format!(
-        "affine_qmv_splitk_{type_str}_gs_{group_size}_b_{bits}_bn_{bn}_kp_{k_parts}_ppt_1"
-    );
+    let kname =
+        format!("affine_qmv_splitk_{type_str}_gs_{group_size}_b_{bits}_bn_{bn}_kp_{k_parts}_ppt_1");
     let template_def = builtin_template_def(
         &kname,
         "affine_verify_qmm_splitk",
@@ -905,7 +983,7 @@ pub fn affine_qmv_splitk(
     let pipeline = compile_builtin(device, &source, &kname)?;
 
     let out_dtype = x.dtype();
-    let ybuf = device.buffer(n * out_dtype.size_of(), "qmv_splitk_out")?;
+    let ybuf = device.buffer_for_gpu_write(n * out_dtype.size_of(), "qmv_splitk_out")?;
     let y = Array::from_parts(device, ybuf.clone(), &vec![1, n], out_dtype);
 
     let guard = device.commands.encoder()?;
@@ -1002,8 +1080,7 @@ pub fn affine_verify_qmm_msg(
     // One specialization per (M, BN) with a distinct host_name (two
     // specializations sharing a name bind the wrong
     // binary). NSG is a fixed design constant.
-    let kname =
-        format!("affine_verify_qmm_msg_{type_str}_gs_{group_size}_b_{bits}_m_{m}_bn_{bn}");
+    let kname = format!("affine_verify_qmm_msg_{type_str}_gs_{group_size}_b_{bits}_m_{m}_bn_{bn}");
     let template_def = builtin_template_def(
         &kname,
         "affine_verify_qmm_msg",
@@ -1023,7 +1100,8 @@ pub fn affine_verify_qmm_msg(
 
     let out_dtype = x.dtype();
     let ycount = m * n;
-    let ybuf = device.buffer(ycount as usize * out_dtype.size_of(), "verify_qmm_msg_out")?;
+    let ybuf =
+        device.buffer_for_gpu_write(ycount as usize * out_dtype.size_of(), "verify_qmm_msg_out")?;
     let y = Array::from_parts(device, ybuf.clone(), &vec![m, n], out_dtype);
 
     let guard = device.commands.encoder()?;
@@ -1071,7 +1149,8 @@ pub fn affine_verify_qmm_msg(
 /// qmv_fast numerics with the input-row grid axis collapsed into the
 /// threadgroup — one weight stream for the whole verify width. See the
 /// kernel header for the split-K provenance.
-pub(crate) const VERIFY_QMM_SOURCE: &str = include_str!("../shaders/common/matmul/verify_qmm.metal");
+pub(crate) const VERIFY_QMM_SOURCE: &str =
+    include_str!("../shaders/common/matmul/verify_qmm.metal");
 
 /// The NAX m16 verify tile (`affine_verify_qmm_nax_m16`): the dedicated
 /// M 8..=16 lane for M5-class matrix units. See the kernel header for the
@@ -1134,9 +1213,7 @@ pub fn affine_verify_qmm_nax_m16(
         crate::jit::DType::BF16 => "bfloat16_t".to_string(),
         other => type_string(other)?.to_string(),
     };
-    let kname = format!(
-        "affine_verify_qmm_nax_m16_{type_str}_gs_{group_size}_b_{bits}_k_{k}"
-    );
+    let kname = format!("affine_verify_qmm_nax_m16_{type_str}_gs_{group_size}_b_{bits}_k_{k}");
     let template_def = builtin_template_def(
         &kname,
         "affine_verify_qmm_nax_m16",
@@ -1157,7 +1234,10 @@ pub fn affine_verify_qmm_nax_m16(
     // (Math::SafeNoLang -> MSL 3.2) could not compile this source at all.
     let pipeline = super::nax::compile_nax_jit(device, &source, &kname, &[])?;
 
-    let ybuf = device.buffer(16 * n as usize * x.dtype().size_of(), "verify_qmm_nax_m16_out")?;
+    let ybuf = device.buffer_for_gpu_write(
+        16 * n as usize * x.dtype().size_of(),
+        "verify_qmm_nax_m16_out",
+    )?;
     let guard = device.commands.encoder()?;
     let enc = guard.encoder();
     enc.set_pipeline(&pipeline);
@@ -1183,10 +1263,23 @@ pub fn affine_verify_qmm_nax_m16(
     // launched with grid.y > 0 (no GPU error, no output) — the reference
     // dispatches (256, N/32, 1), keeping the varying axis on X.
     enc.dispatch_groups_size(
-        MTLSize { width: n / 32, height: 1, depth: 1 },
-        MTLSize { width: 256, height: 1, depth: 1 },
+        MTLSize {
+            width: n / 32,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        },
     );
-    Ok(Array::from_parts(device, ybuf, &vec![16, n as usize], x.dtype()))
+    Ok(Array::from_parts(
+        device,
+        ybuf,
+        &vec![16, n as usize],
+        x.dtype(),
+    ))
 }
 
 /// `GemmParams` (`kernels/mlx_gemm.rs`).
@@ -1237,7 +1330,7 @@ pub fn affine_dequantize(
         *d2.last_mut().unwrap() = k;
         d2
     };
-    let obuf = mdev.buffer(count * scales.dtype().size_of(), "deq_out")?;
+    let obuf = mdev.buffer_for_gpu_write(count * scales.dtype().size_of(), "deq_out")?;
     let out = Array::from_parts(mdev, obuf.clone(), &out_dims, scales.dtype());
 
     let ty = type_string(scales.dtype())?;
@@ -1739,7 +1832,8 @@ pub fn qmv_wide(
     let pipeline = compile_builtin(device, &source, &kname)?;
 
     let count = m * n;
-    let obuf = mdev.buffer((count) as usize * (x.dtype()).size_of(), "qmv_wide_out")?;
+    let obuf =
+        mdev.buffer_for_gpu_write((count) as usize * (x.dtype()).size_of(), "qmv_wide_out")?;
     let out = Array::from_parts(mdev, obuf.clone(), &vec![m, n], x.dtype());
     let guard = mdev.commands.encoder()?;
     let enc = guard.encoder();
@@ -1836,7 +1930,7 @@ pub fn affine_qmm_splitk(
 
     // intermediate [split_k, m, n]
     let icount = split_k * m * n;
-    let ibuf = mdev.buffer(
+    let ibuf = mdev.buffer_for_gpu_write(
         (icount) as usize * (x.dtype()).size_of(),
         "qmm_splitk_inter",
     )?;
@@ -1880,4 +1974,80 @@ pub fn affine_qmm_splitk(
 
     // Sum the split-K partials (axis 0) with MLX's strided reduce.
     reduce_axis0_sum(device, &inter)
+}
+
+/// MLX `qmm()` fallback for affine transposed weights. This is the non-split
+/// SIMT GEMM used when split-K resolves to one partition, including F32 on
+/// NAX devices when TF32 is disabled.
+pub fn affine_qmm(
+    device: &Device,
+    x: &Tensor,
+    w: &Tensor,
+    scales: &Tensor,
+    biases: &Tensor,
+    group_size: i32,
+    bits: i32,
+) -> Result<Tensor> {
+    let (m, k) = x.dims2();
+    let (n, _) = w.dims2();
+    let (bm, bn, wm, wn) = (32usize, 32usize, 2usize, 2usize);
+    let aligned = n % bn == 0;
+    let type_str = type_string(x.dtype())?;
+    let kname = format!(
+        "affine_qmm_t_{type_str}_gs_{group_size}_b_{bits}_alN_{}_batch_0",
+        if aligned { "true" } else { "false" }
+    );
+    let template_def = builtin_template_def(
+        &kname,
+        "affine_qmm_t",
+        &[
+            type_str.to_string(),
+            group_size.to_string(),
+            bits.to_string(),
+            aligned.to_string(),
+            "false".to_string(),
+        ],
+    );
+    let source = format!(
+        "{MLX_UTILS_PREAMBLE}{MLX_GEMM_PREAMBLE}{MLX_QUANTIZED_UTILS_PREAMBLE}{MLX_QUANTIZED_PREAMBLE}{template_def}"
+    );
+    let pipeline = compile_builtin(device, &source, &kname)?;
+    let out = device.buffer_for_gpu_write(m * n * x.dtype().size_of(), "qmm_out")?;
+    let result = Array::from_parts(device, out.clone(), &[m, n], x.dtype());
+
+    let guard = device.commands.encoder()?;
+    let enc = guard.encoder();
+    enc.set_pipeline(&pipeline);
+    for (index, tensor) in [w, scales, biases, x].into_iter().enumerate() {
+        let (buffer, layout) = tensor.buffer_and_layout();
+        enc.set_input(
+            index,
+            Some(buffer),
+            layout.offset * tensor.dtype().size_of(),
+        );
+    }
+    enc.set_output(4, Some(&out), 0);
+    enc.set_bytes(5, &(k as i32));
+    enc.set_bytes(6, &(n as i32));
+    enc.set_bytes(7, &(m as i32));
+    let metadata = add_strides_and_shapes(
+        (x.dims(), x.stride()),
+        (w.dims(), w.stride()),
+        scales.stride(),
+        Some(biases.stride()),
+    );
+    metadata.bind(&enc, 8);
+    enc.dispatch_groups_size(
+        MTLSize {
+            width: n.div_ceil(bn),
+            height: m.div_ceil(bm),
+            depth: 1,
+        },
+        MTLSize {
+            width: 32,
+            height: wn,
+            depth: wm,
+        },
+    );
+    Ok(result)
 }

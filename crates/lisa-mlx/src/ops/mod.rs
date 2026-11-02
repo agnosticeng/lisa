@@ -38,8 +38,8 @@ pub mod transforms;
 pub use array::Array;
 pub use stream::{
     Stream, label_counts, runtime_alloc_count, runtime_dispatch_count, runtime_encoder_count,
-    runtime_label_counts, runtime_label_dispatches, runtime_label_gpu_ms, runtime_poolhit_count, runtime_wait_ns,
-    runtime_zero_ns,
+    runtime_label_counts, runtime_label_dispatches, runtime_label_gpu_ms, runtime_poolhit_count,
+    runtime_wait_ns, runtime_zero_ns,
 };
 pub use traits::{ScalarVal, SliceElem, ZeroElem};
 pub(crate) use traits::{

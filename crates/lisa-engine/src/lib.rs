@@ -1,12 +1,10 @@
-//! lisa — a from-scratch Rust inference engine for Qwen 3.8 Flash-Next (and,
-//! structurally, other decoder-only models).
+//! Native Rust inference for Qwen, GLM and Laya models.
 //!
-//! - [`core`] is model-agnostic: loading, quantization, norm/rope primitives,
+//! - [`core`] provides shared loading, quantization, norm/rope primitives,
 //!   the layer caches, sampling, tokenization, and the generation / batching /
 //!   scheduling loops.
 //! - [`models`] holds the model implementations. The runtime drives them
-//!   through [`models::LanguageModel`]; Qwen 3.8 Flash-Next lives in
-//!   [`models::qwen4`].
+//!   through [`models::LanguageModel`] or [`models::DecisionModel`].
 
 pub mod cli;
 pub mod core;

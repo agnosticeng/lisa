@@ -2,8 +2,8 @@
 //! backend, plus the kernels the model dispatches.
 //!
 //! Layout:
-//!   - [`device`] selects the device backend (Metal today; CPU is a sibling
-//!     module and a [`device::Backend`] variant).
+//!   - [`device`] selects Metal or CPU. Tensor operations require Metal;
+//!     CPU execution is implemented by host-side models such as Laya.
 //!   - The Metal backend: objc2 Metal runtime, the eager `Array`/op surface,
 //!     the generic Metal kernels, and the model-specific kernel wrappers.
 //!   - The Metal modules are re-exported here, so call sites keep reading
@@ -35,8 +35,8 @@ pub use models::qwen4::{
 
 pub use ops::{
     Array, Dtype, Stream, runtime_alloc_count, runtime_dispatch_count, runtime_encoder_count,
-    runtime_label_counts, runtime_label_dispatches, runtime_label_gpu_ms, runtime_poolhit_count, runtime_wait_ns,
-    runtime_zero_ns,
+    runtime_label_counts, runtime_label_dispatches, runtime_label_gpu_ms, runtime_poolhit_count,
+    runtime_wait_ns, runtime_zero_ns,
 };
 pub use ops::{fast, memory, nn, transforms};
 

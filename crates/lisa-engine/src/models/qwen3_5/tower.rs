@@ -4,8 +4,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use lisa_mlx::{Array, Dtype};
 use lisa_mlx::ops::indexing::IndexOp;
+use lisa_mlx::{Array, Dtype};
 
 use crate::core::cache::{FullAttentionCache, GdnCache, LayerCache};
 use crate::core::loader::{Checkpoint, Shard, Weights, sanitize_name};
@@ -39,23 +39,21 @@ impl DenseMlp {
         // the goldens pin). One qmv per layer instead of two.
         let n_gate = gate_proj.dims_out() as i32;
         let n_up = up_proj.dims_out() as i32;
-        let gate_up_proj = if gate_proj.group_size == up_proj.group_size
-            && gate_proj.bits == up_proj.bits
-        {
-            let cat = |a: &Array, b: &Array| {
-                lisa_mlx::ops::concatenate(&[a, b], 0)
-                    .expect("gate|up weight row-concat")
+        let gate_up_proj =
+            if gate_proj.group_size == up_proj.group_size && gate_proj.bits == up_proj.bits {
+                let cat = |a: &Array, b: &Array| {
+                    lisa_mlx::ops::concatenate(&[a, b], 0).expect("gate|up weight row-concat")
+                };
+                Some(QuantizedLinear {
+                    weight: cat(&gate_proj.weight, &up_proj.weight),
+                    scales: cat(&gate_proj.scales, &up_proj.scales),
+                    biases: cat(&gate_proj.biases, &up_proj.biases),
+                    group_size: gate_proj.group_size,
+                    bits: gate_proj.bits,
+                })
+            } else {
+                None
             };
-            Some(QuantizedLinear {
-                weight: cat(&gate_proj.weight, &up_proj.weight),
-                scales: cat(&gate_proj.scales, &up_proj.scales),
-                biases: cat(&gate_proj.biases, &up_proj.biases),
-                group_size: gate_proj.group_size,
-                bits: gate_proj.bits,
-            })
-        } else {
-            None
-        };
         // ROW-JOIN (same trick as the GDN's in_proj_all): once the fused
         // gate|up exists, rebuild
         // gate_proj/up_proj as VIEWS into it and release their originals, so only
@@ -98,7 +96,7 @@ impl DenseMlp {
             // B-generic since the track_swiglu2_packed row-decompose fix
             // (specs/13 re-audit): the kernel used to read gu[i]/gu[F+i]
             // single-row style, corrupting slot >= 1 at B > 1.
-            if (x.rank() >= 2 && x.dim(1) == 1) {
+            if x.rank() >= 2 && x.dim(1) == 1 {
                 let gu = gu_proj.forward(x)?;
                 if let Some(a) = lisa_mlx::models::qwen35::kernels::swiglu2_packed(&gu, &stream) {
                     return self.down_proj.forward(&a);
@@ -278,7 +276,7 @@ impl Qwen35Tower {
         Self::from_weights_cached(weights, config, Some(dir))
     }
 
-    pub fn from_weights(mut w: Weights, config: Qwen35Config) -> anyhow::Result<Self> {
+    pub fn from_weights(w: Weights, config: Qwen35Config) -> anyhow::Result<Self> {
         Self::from_weights_cached(w, config, None)
     }
 
@@ -426,8 +424,7 @@ impl Qwen35Tower {
         }
         let t0 = std::time::Instant::now();
         if let Some(dir) = cache_dir {
-            if let Some(dh) =
-                Self::load_draft_lm_head_cache(dir, DRAFT_GROUP, DRAFT_BITS, lm_head)
+            if let Some(dh) = Self::load_draft_lm_head_cache(dir, DRAFT_GROUP, DRAFT_BITS, lm_head)
             {
                 eprintln!(
                     "[mtp] draft-only lm_head loaded from cache in {:.2}s",
@@ -452,14 +449,8 @@ impl Qwen35Tower {
         scales.eval().ok()?;
         biases.eval().ok()?;
         if let Some(dir) = cache_dir {
-            let _ = Self::save_draft_lm_head_cache(
-                dir,
-                DRAFT_GROUP,
-                DRAFT_BITS,
-                &wq,
-                &scales,
-                &biases,
-            );
+            let _ =
+                Self::save_draft_lm_head_cache(dir, DRAFT_GROUP, DRAFT_BITS, &wq, &scales, &biases);
         }
         eprintln!(
             "[mtp] draft-only lm_head requantized to {DRAFT_BITS}-bit/gs{DRAFT_GROUP} in {:.1}s",
@@ -521,7 +512,9 @@ impl Qwen35Tower {
             Some(i32::from_le_bytes(data.get(off..off + 4)?.try_into().ok()?))
         };
         let rd_usize = |off: usize| -> Option<usize> {
-            Some(usize::from_le_bytes(data.get(off..off + 8)?.try_into().ok()?))
+            Some(usize::from_le_bytes(
+                data.get(off..off + 8)?.try_into().ok()?,
+            ))
         };
         if rd_i32(5)? != gs || rd_i32(9)? != bits {
             return None;
@@ -588,8 +581,7 @@ impl Qwen35Tower {
         // logical width k = words*32/bits.
         let v = wq.dim(0) as usize;
         let k = wq.dim(1) as usize * 32 / bits as usize;
-        let mut out =
-            Vec::with_capacity(29 + wq.size() * 4 + (scales.size() + biases.size()) * 2);
+        let mut out = Vec::with_capacity(29 + wq.size() * 4 + (scales.size() + biases.size()) * 2);
         out.extend_from_slice(b"LSDH1");
         out.extend_from_slice(&gs.to_le_bytes());
         out.extend_from_slice(&bits.to_le_bytes());
@@ -683,9 +675,15 @@ impl Qwen35Tower {
         for i in 0..self.layers.len() {
             let _trace_layer = lisa_mlx::trace::span_detail("tower.layer", i as u64);
             let cache = caches.as_deref_mut().map(|c| &mut c[i]);
-            let (h, m_i) =
-                self.layers[i]
-                    .forward(&x, m_prev.take(), cache, &cos_bf, &sin_bf, offset, capture)?;
+            let (h, m_i) = self.layers[i].forward(
+                &x,
+                m_prev.take(),
+                cache,
+                &cos_bf,
+                &sin_bf,
+                offset,
+                capture,
+            )?;
             x = h;
             m_prev = Some(m_i);
         }
@@ -968,7 +966,9 @@ impl crate::models::LanguageModel for Qwen35Tower {
                 // 2-bit shortlist head, so THIS is the head confidence the
                 // tau gate reads — arguably the more faithful surface.
                 if self.conf_capture {
-                    let sm = logits.softmax_axis(-1).map_err(|e| anyhow::anyhow!("{e}"))?;
+                    let sm = logits
+                        .softmax_axis(-1)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
                     let p = lisa_mlx::ops::indexing::take_axis(&sm, &id, -1)
                         .map_err(|e| anyhow::anyhow!("{e}"))?;
                     self.last_conf = Some(p.log().map_err(|e| anyhow::anyhow!("{e}"))?);

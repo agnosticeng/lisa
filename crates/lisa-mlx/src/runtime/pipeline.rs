@@ -29,7 +29,9 @@ impl ComputePipeline {
 
     /// The interned label id (ids start at 1); registers `name` on first use.
     pub(super) fn label_id(&self) -> u32 {
-        *self.label.get_or_init(|| super::env::intern_label(&self.name))
+        *self
+            .label
+            .get_or_init(|| super::env::intern_label(&self.name))
     }
 
     pub fn raw(&self) -> &ProtocolObject<dyn MTLComputePipelineState> {

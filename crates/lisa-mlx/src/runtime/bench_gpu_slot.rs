@@ -5,7 +5,7 @@
 //!
 //! `LISA_TRACE=1 cargo test -p lisa-mlx --lib bench_kernel_gpu_slot -- --ignored --nocapture`
 
-use crate::ops::{array_ops, fast, zeros, Array, Dtype, Stream};
+use crate::ops::{Array, Dtype, Stream, array_ops, fast, zeros};
 
 const KERNEL: &str = r#"
 #include <metal_stdlib>
@@ -70,9 +70,13 @@ fn bench_qmv_cold_stream() {
     };
     let mut sets = Vec::new();
     for _ in 0..reps {
-        let wv: Vec<u32> = (0..(n as usize) * (k as usize / 8)).map(|_| rnd() as u32).collect();
+        let wv: Vec<u32> = (0..(n as usize) * (k as usize / 8))
+            .map(|_| rnd() as u32)
+            .collect();
         let wq = Array::from_slice(&wv, &[n, k / 8]);
-        let sv: Vec<f32> = (0..(n as usize) * (k as usize / 64)).map(|_| (rnd() % 1000) as f32 / 1e6).collect();
+        let sv: Vec<f32> = (0..(n as usize) * (k as usize / 64))
+            .map(|_| (rnd() % 1000) as f32 / 1e6)
+            .collect();
         let sc = Array::from_slice(&sv, &[n, k / 64]);
         let bi = f32arr(&[n, k / 64], 0.0);
         let sc16 = Array::new(sc.t.to_dtype(Dtype::Bfloat16).unwrap());
@@ -83,8 +87,7 @@ fn bench_qmv_cold_stream() {
         let _ = (w.t.eval(), s.t.eval(), b.t.eval());
     });
     let x = bf16(&[1, k], 0.01);
-    let bytes_per = (n as usize * k as usize / 2)
-        + 2 * (n as usize * k as usize / 64) * 2;
+    let bytes_per = (n as usize * k as usize / 2) + 2 * (n as usize * k as usize / 64) * 2;
     // Warm the pipeline JIT once.
     let _ = crate::ops::quantized_matmul(&x, &sets[0].0, &sets[0].1, Some(&sets[0].2), true, 64, 4)
         .unwrap()
@@ -173,33 +176,53 @@ fn bench_kernel_gpu_slot() {
     let wq = zeros::<u32>(&[n, k / 8]).unwrap();
     let sc = f32arr(&[n, k / 64], 1.0);
     let bi = f32arr(&[n, k / 64], 0.0);
-    gpu_slot_us("affine_qmv_serial", "affine_qmv_serial 5120->17408", 256, || {
-        array_ops::quantized_matmul(&x, &wq, &sc, Some(&bi), true, 64, 4).unwrap();
-    });
+    gpu_slot_us(
+        "affine_qmv_serial",
+        "affine_qmv_serial 5120->17408",
+        256,
+        || {
+            array_ops::quantized_matmul(&x, &wq, &sc, Some(&bi), true, 64, 4).unwrap();
+        },
+    );
 
     // qmv_fast 5120 -> 6144 (attn projection scale): ~16 MB read.
     let n2 = 6144i32;
     let wq2 = zeros::<u32>(&[n2, k / 8]).unwrap();
     let sc2 = f32arr(&[n2, k / 64], 1.0);
     let bi2 = f32arr(&[n2, k / 64], 0.0);
-    gpu_slot_us("affine_qmv_serial", "affine_qmv_serial 5120->6144", 256, || {
-        array_ops::quantized_matmul(&x, &wq2, &sc2, Some(&bi2), true, 64, 4).unwrap();
-    });
+    gpu_slot_us(
+        "affine_qmv_serial",
+        "affine_qmv_serial 5120->6144",
+        256,
+        || {
+            array_ops::quantized_matmul(&x, &wq2, &sc2, Some(&bi2), true, 64, 4).unwrap();
+        },
+    );
 
     // swiglu2 [1,17408] (the MLP activation, decode shape).
     let g = bf16(&[1, 17408], 0.5);
     let u = bf16(&[1, 17408], 0.5);
-    gpu_slot_us("custom_kernel_track_swiglu2__bfloat16_t_1_17408_bfloat16_t_bfloat16_t_bfloat16_t", "swiglu2 [1,17408]", 256, || {
-        crate::kernels::swiglu2(&g, &u, &stream);
-    });
+    gpu_slot_us(
+        "custom_kernel_track_swiglu2__bfloat16_t_1_17408_bfloat16_t_bfloat16_t_bfloat16_t",
+        "swiglu2 [1,17408]",
+        256,
+        || {
+            crate::kernels::swiglu2(&g, &u, &stream);
+        },
+    );
 
     // fused add+norm [1,5120] (the B1 kernel) and plain rms.
     let a = bf16(&[1, 5120], 0.5);
     let b = bf16(&[1, 5120], 0.5);
     let wt = bf16(&[5120], 1.0);
-    gpu_slot_us("fused_add_rms_looped_bfloat16", "fused_add_rms [1,5120]", 256, || {
-        fast::fused_add_rms_norm(&a, &b, &wt, 1e-6).unwrap();
-    });
+    gpu_slot_us(
+        "fused_add_rms_looped_bfloat16",
+        "fused_add_rms [1,5120]",
+        256,
+        || {
+            fast::fused_add_rms_norm(&a, &b, &wt, 1e-6).unwrap();
+        },
+    );
     gpu_slot_us("rms_looped_bfloat16", "rms [1,5120]", 256, || {
         fast::rms_norm(&a, Some(&wt), 1e-6).unwrap();
     });
@@ -234,12 +257,16 @@ fn bench_kernel_gpu_slot() {
             "fused_add_rms_looped_bfloat16",
             &format!("fused_add_rms [{rows},5120]"),
             256,
-            || { let _ = fast::fused_add_rms_norm(&a, &b, &wt, 1e-6).unwrap(); },
+            || {
+                let _ = fast::fused_add_rms_norm(&a, &b, &wt, 1e-6).unwrap();
+            },
         );
         let g = bf16(&[rows as i32, 17408], 0.5);
         let u = bf16(&[rows as i32, 17408], 0.5);
         gpu_slot_us(
-            &format!("custom_kernel_track_swiglu2__bfloat16_t_{rows}_17408_bfloat16_t_bfloat16_t_bfloat16_t"),
+            &format!(
+                "custom_kernel_track_swiglu2__bfloat16_t_{rows}_17408_bfloat16_t_bfloat16_t_bfloat16_t"
+            ),
             &format!("swiglu2 [{rows},17408]"),
             256,
             || {
@@ -247,9 +274,14 @@ fn bench_kernel_gpu_slot() {
             },
         );
         let xr = bf16(&[rows as i32, 5120], 0.5);
-        gpu_slot_us("rms_looped_bfloat16", &format!("rms [{rows},5120]"), 256, || {
-            fast::rms_norm(&xr, Some(&wt), 1e-6).unwrap();
-        });
+        gpu_slot_us(
+            "rms_looped_bfloat16",
+            &format!("rms [{rows},5120]"),
+            256,
+            || {
+                fast::rms_norm(&xr, Some(&wt), 1e-6).unwrap();
+            },
+        );
     }
 
     // The M 8..=16 verify-qmm sweep (specs/08 m16 lane campaign): the stock
@@ -268,12 +300,15 @@ fn bench_kernel_gpu_slot() {
         gpu_slot_us(
             // M 8..12 stock = qmv_wide; M >= 13 stock = qmm_nax (compile name
             // read from the jit log on first run).
-            if rows < 13 { "affine_qmv_wide_float_gs_64_b_4_nv_4_kl_8_batch_0" } else { "qmm_nax" },
+            if rows < 13 {
+                "affine_qmv_wide_float_gs_64_b_4_nv_4_kl_8_batch_0"
+            } else {
+                "qmm_nax"
+            },
             &format!("STOCK qmm [{rows},5120]->17408"),
             64,
             || {
-                let _ = array_ops::quantized_matmul(&xr, &wq, &sc, Some(&bi), true, 64, 4)
-                    .unwrap();
+                let _ = array_ops::quantized_matmul(&xr, &wq, &sc, Some(&bi), true, 64, 4).unwrap();
             },
         );
         // The NAX-tiled lane (M >= 13 stock): same entry as stock above for
@@ -285,24 +320,14 @@ fn bench_kernel_gpu_slot() {
             &format!("TILED qmm_nax [{rows},5120]->17408"),
             64,
             || {
-                let _ = crate::jit::qmm_nax(
-                    &xr.t.device(),
-                    &xr.t,
-                    &wq2.t,
-                    &sc.t,
-                    &bi.t,
-                    64,
-                    4,
-                )
-                .unwrap();
+                let _ = crate::jit::qmm_nax(&xr.t.device(), &xr.t, &wq2.t, &sc.t, &bi.t, 64, 4)
+                    .unwrap();
             },
         );
         // Candidate m16 lane: the shipped split-K verify tile at MROWS>7.
         let wq3 = zeros::<u32>(&[17408, 5120 / 8]).unwrap();
         gpu_slot_us(
-            &format!(
-                "affine_verify_qmm_splitk_float_gs_64_b_4_m_{rows}_bn_2_kp_2_ppt_2"
-            ),
+            &format!("affine_verify_qmm_splitk_float_gs_64_b_4_m_{rows}_bn_2_kp_2_ppt_2"),
             &format!("VERIFY-TILE bn2kp2 [{rows},5120]->17408"),
             64,
             || {
@@ -379,8 +404,7 @@ fn bench_verify_qmm_m_sweep() {
             let _ = array_ops::quantized_matmul(&xr, &wq, &sc, Some(&bi), true, 64, 4).unwrap();
         });
         let nax = time_us(32, || {
-            let _ = crate::jit::qmm_nax(&xr.t.device(), &xr.t, &wq.t, &sc.t, &bi.t, 64, 4)
-                .unwrap();
+            let _ = crate::jit::qmm_nax(&xr.t.device(), &xr.t, &wq.t, &sc.t, &bi.t, 64, 4).unwrap();
         });
         let tile = |bn: usize, kp: usize| {
             time_us(32, || {
@@ -408,12 +432,28 @@ fn bench_verify_qmm_m_sweep() {
             let xt = bf16(&[tail as i32, 5120], 0.01);
             time_us(32, || {
                 let _ = crate::jit::affine_verify_qmm_splitk_tile(
-                    &xr.t.device(), &xr.t, &wq.t, &sc.t, &bi.t, 64, 4, 2, 2,
+                    &xr.t.device(),
+                    &xr.t,
+                    &wq.t,
+                    &sc.t,
+                    &bi.t,
+                    64,
+                    4,
+                    2,
+                    2,
                     crate::jit::SPLITK_PPT,
                 )
                 .unwrap();
                 let _ = crate::jit::affine_verify_qmm_splitk_tile(
-                    &xr.t.device(), &xt.t, &wq.t, &sc.t, &bi.t, 64, 4, 2, 2,
+                    &xr.t.device(),
+                    &xt.t,
+                    &wq.t,
+                    &sc.t,
+                    &bi.t,
+                    64,
+                    4,
+                    2,
+                    2,
                     crate::jit::SPLITK_PPT,
                 )
                 .unwrap();
@@ -492,12 +532,7 @@ fn bench_peak_stream() {
     let bytes = (N * 2) as f64;
     let gib = bytes / (1024.0 * 1024.0 * 1024.0);
     let mut best = 0.0f64;
-    for threads in [
-        256usize * 4096,
-        256 * 16384,
-        256 * 65536,
-        256 * 262144,
-    ] {
+    for threads in [256usize * 4096, 256 * 16384, 256 * 65536, 256 * 262144] {
         let before = std::time::Instant::now();
         for _ in 0..iters {
             let g = rt.commands.encoder().unwrap();

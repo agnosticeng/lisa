@@ -90,6 +90,27 @@ pub fn rms_row_exact(
     eps: f32,
     h: usize,
 ) -> lisa_mlx::error::Result<Array> {
+    // ds4 parity: the fused single-kernel port (same pinned association as the
+    // op path below — 4 sequential squares per lane, simd_sum butterfly,
+    // rsqrt(total/128 + eps), bf16 rounding BEFORE the weight multiply).
+    // LISA_GLM53_RMS_OPS=1 forces the op path for A/B comparison.
+    let force_ops = std::env::var("LISA_GLM53_RMS_OPS")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if !force_ops {
+        if let Some(fused) = lisa_mlx::models::glm53::kernels::rms_row_fused(
+            x,
+            eps,
+            h,
+            &lisa_mlx::Stream::thread_local_or_default(),
+        ) {
+            let flat = fused.reshape(&x.shape())?;
+            return match scale {
+                Some(w) => flat.multiply(w),
+                None => Ok(flat),
+            };
+        }
+    }
     use lisa_mlx::ops::indexing::IndexOp;
     let w_full = x.dim(-1) as usize;
     let groups = w_full / h;

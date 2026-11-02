@@ -32,6 +32,8 @@ const SUPPORTED_MODEL_TYPES: &[&str] = &[
     "qwen4_exp_text",
     "qwen3_5",
     "qwen3_5_text",
+    "glm5_next",
+    "glm5_next_text",
     "laya",
 ];
 
@@ -73,9 +75,6 @@ fn discover_models() -> Vec<Model> {
             continue;
         };
         let repo_id = rest.replacen("--", "/", 1);
-        if !repo_id.starts_with("agnosticeng/") {
-            continue;
-        }
         let Ok(snaps) = std::fs::read_dir(entry.path().join("snapshots")) else {
             continue;
         };
@@ -86,12 +85,13 @@ fn discover_models() -> Vec<Model> {
             }
             if let Some(mt) = config_model_type(&path) {
                 if SUPPORTED_MODEL_TYPES.contains(&mt.as_str()) {
+                    let size = model_weight_size(&path, &mt);
                     out.push(Model {
                         repo_id: repo_id.clone(),
                         model_type: mt,
                         path: path.to_string_lossy().to_string(),
                         local: true,
-                        size: dir_size(&path),
+                        size,
                         too_big: false,
                     });
                     break;
@@ -101,6 +101,18 @@ fn discover_models() -> Vec<Model> {
     }
     out.sort_by(|a, b| a.repo_id.cmp(&b.repo_id));
     out
+}
+
+fn model_weight_size(path: &std::path::Path, model_type: &str) -> u64 {
+    let resident = path.join(".lisa-resident");
+    if matches!(model_type, "glm5_next" | "glm5_next_text") && resident.join("index.json").is_file()
+    {
+        // Prepared GLM maps the resident copy. Counting original and prepared
+        // weights together would incorrectly disable a model that fits RAM.
+        dir_size(&resident)
+    } else {
+        dir_size(path)
+    }
 }
 
 /// Recursively total the bytes under `path` (following symlinks, e.g. the HF
@@ -137,6 +149,15 @@ fn ram_total() -> u64 {
                 .ok()
         })
         .unwrap_or(0)
+}
+
+fn model_ram_budget() -> u64 {
+    std::env::var("LISA_RAM_CAP_GB")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .map(|value| (value * (1u64 << 30) as f64) as u64)
+        .unwrap_or_else(|| ram_total().saturating_sub(8u64 << 30))
 }
 
 fn curl_json(url: &str) -> Option<serde_json::Value> {
@@ -1502,6 +1523,126 @@ fn tilde(path: &str) -> String {
     path.to_string()
 }
 
+fn chat_input_ids(
+    tokenizer: &lisa_engine::core::tokenizer::Tokenizer,
+    text: &str,
+    system: Option<&str>,
+    first: bool,
+    is_glm: bool,
+    assistant_im_end: bool,
+) -> anyhow::Result<Vec<u32>> {
+    use lisa_engine::core::tokenizer::{self, GlmReasoning};
+    let prompt = if is_glm {
+        if first {
+            tokenizer::glm_generation_prompt(text, system, GlmReasoning::Disabled)
+        } else {
+            format!("<|user|>{text}<|assistant|><think></think>")
+        }
+    } else if first {
+        tokenizer::chat_prompt_special_with_system(text, system, false)
+    } else {
+        tokenizer::chat_turn_suffix_special(text, false, false, assistant_im_end)
+    };
+    if is_glm {
+        tokenizer.encode_special(&prompt)
+    } else {
+        tokenizer.encode(&prompt, false)
+    }
+}
+
+fn new_chat_session(
+    model: &mut dyn lisa_engine::models::LanguageModel,
+) -> lisa_engine::core::session::Session {
+    use lisa_engine::core::session::{Session, TargetMtpEosPolicy};
+    model.drafter_reset();
+    let mut session = Session::new(model);
+    // Chat turn suffixes start after assistant text, without a committed EOS.
+    session.set_target_mtp_eos_policy(TargetMtpEosPolicy::StopBeforeVerified);
+    session
+}
+
+fn replay_chat_history(
+    model: &mut dyn lisa_engine::models::LanguageModel,
+    tokenizer: &lisa_engine::core::tokenizer::Tokenizer,
+    history: &[(String, String)],
+    system: &str,
+    is_glm: bool,
+    assistant_im_end: bool,
+) -> anyhow::Result<lisa_engine::core::session::Session> {
+    let mut session = new_chat_session(model);
+    let mut feed = |ids: &[u32]| -> anyhow::Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        if model.has_drafter() {
+            let (_, multi) = session.feed_multi(model, ids)?;
+            session.mtp_tokens.extend_from_slice(ids);
+            session.mtp_multi.push(multi);
+        } else {
+            session.feed(model, ids)?;
+        }
+        Ok(())
+    };
+    for (index, (user, reply)) in history.iter().enumerate() {
+        let ids = chat_input_ids(
+            tokenizer,
+            user,
+            Some(system).filter(|s| !s.trim().is_empty()),
+            index == 0,
+            is_glm,
+            assistant_im_end,
+        )?;
+        feed(&ids)?;
+        feed(&tokenizer.encode(reply, false)?)?;
+    }
+    Ok(session)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EngineOwner {
+    Chat,
+    Server,
+}
+
+/// The target's rolling context and Qwen draft head live on the shared model.
+/// Keep each caller's target context and re-prime its own draft history when
+/// ownership changes; consecutive HTTP requests retain their warmed head.
+struct EngineContexts {
+    owner: EngineOwner,
+    chat: Vec<Vec<i64>>,
+    server: Vec<Vec<i64>>,
+}
+
+impl EngineContexts {
+    fn new() -> Self {
+        Self {
+            owner: EngineOwner::Chat,
+            chat: Vec::new(),
+            server: Vec::new(),
+        }
+    }
+
+    fn activate(&mut self, owner: EngineOwner, model: &mut dyn lisa_engine::models::LanguageModel) {
+        if self.owner == owner {
+            return;
+        }
+        let previous = model.context_tails();
+        let next = match owner {
+            EngineOwner::Chat => {
+                self.server = previous;
+                self.chat.clone()
+            }
+            EngineOwner::Server => {
+                self.chat = previous;
+                self.server.clone()
+            }
+        };
+        model.set_context_tails(next);
+        model.drafter_reset();
+        self.owner = owner;
+    }
+}
+
 /// Owns the loaded model on a dedicated thread (the model is not `Send`) and
 /// funnels log/chat events back to the main thread through `events`.
 fn spawn_engine(rx: mpsc::Receiver<Command>, events: Arc<Mutex<Vec<UiEvent>>>) {
@@ -1525,6 +1666,8 @@ fn spawn_engine(rx: mpsc::Receiver<Command>, events: Arc<Mutex<Vec<UiEvent>>>) {
             // Whether the checkpoint's template closes assistant turns with
             // `` (MiMo-style) rather than Qwen's bare newline.
             let mut assistant_im_end = false;
+            let mut is_glm = false;
+            let mut contexts = EngineContexts::new();
 
             // One engine thread serves both UI chat and (optionally) the
             // in-process HTTP server. Commands are preferred; between them the
@@ -1551,7 +1694,9 @@ fn spawn_engine(rx: mpsc::Receiver<Command>, events: Arc<Mutex<Vec<UiEvent>>>) {
                         if let (Some(srv), Some(m), Some(t)) =
                             (server.as_mut(), model.as_mut(), tokenizer.as_ref())
                         {
-                            if srv.step(&mut **m, t) {
+                            if srv.step_with_context(&mut **m, t, |model| {
+                                contexts.activate(EngineOwner::Server, model);
+                            }) {
                                 continue;
                             }
                         }
@@ -1570,8 +1715,12 @@ fn spawn_engine(rx: mpsc::Receiver<Command>, events: Arc<Mutex<Vec<UiEvent>>>) {
                             serve_stop = None;
                             push(UiEvent::ServeStopped);
                         }
+                        session = None;
+                        turn = 0;
                         model = None;
                         tokenizer = None;
+                        model_dir = None;
+                        contexts = EngineContexts::new();
                         push(UiEvent::Log(format!(
                             "loading {} …",
                             tilde(&path.to_string_lossy())
@@ -1580,10 +1729,15 @@ fn spawn_engine(rx: mpsc::Receiver<Command>, events: Arc<Mutex<Vec<UiEvent>>>) {
                             Ok(lisa_engine::models::Loaded::Language(m)) => {
                                 match lisa_engine::core::tokenizer::Tokenizer::load(&path) {
                                     Ok(t) => {
-                                        lisa_engine::core::generate::set_eos_ids(
+                                        lisa_engine::core::generate::set_eos_ids_for_model(
                                             t.im_end_ids.clone(),
+                                            m.as_ref(),
                                         );
                                         tokenizer = Some(t);
+                                        is_glm = matches!(
+                                            config_model_type(&path).as_deref(),
+                                            Some("glm5_next" | "glm5_next_text")
+                                        );
                                         model = Some(m);
                                         model_dir = Some(path.clone());
                                         assistant_im_end = std::fs::read_to_string(
@@ -1592,99 +1746,33 @@ fn spawn_engine(rx: mpsc::Receiver<Command>, events: Arc<Mutex<Vec<UiEvent>>>) {
                                         .map(|t| t.contains("render_assistant_message"))
                                         .unwrap_or(false);
                                         if let Some(m) = model.as_mut() {
-                                            session = Some(
-                                                lisa_engine::core::session::Session::new(&mut **m),
-                                            );
-                                            // Model swap: replay the recorded
-                                            // history into the new session so
-                                            // the chat keeps its context. A
-                                            // generate() with max_tokens = 0
-                                            // prefills the turns and samples
-                                            // nothing; a replay failure falls
-                                            // back to a fresh session.
-                                            let tokenizer = tokenizer.as_ref().expect("tokenizer");
-                                            let mut sampler =
-                                                lisa_engine::core::sampler::Sampler::default();
-                                            if !history.is_empty() {
-                                                let mut sess =
-                                                    lisa_engine::core::session::Session::new(
-                                                        &mut **m,
-                                                    );
-                                                let mut replayed = true;
-                                                for (i, (user, reply)) in history.iter().enumerate()
-                                                {
-                                                    let prompt = if i == 0 {
-                                                        lisa_engine::core::tokenizer::chat_prompt_special_with_system(
-                                                            user,
-                                                            if history_system.is_empty() { None } else { Some(history_system.as_str()) },
-                                                            false,
-                                                        )
-                                                    } else {
-                                                        lisa_engine::core::tokenizer::chat_turn_suffix_special(
-                                                            user,
-                                                            false,
-                                                            false,
-                                                            assistant_im_end,
-                                                        )
-                                                    };
-                                                    match tokenizer.encode(&prompt, false) {
-                                                        Ok(ids) => {
-                                                            let _ = sess.generate(
-                                                                &mut **m,
-                                                                &ids,
-                                                                0,
-                                                                &mut sampler,
-                                                                0,
-                                                                None,
-                                                                &mut |_| Ok(()),
-                                                            );
-                                                            if !reply.is_empty() {
-                                                                match tokenizer.encode(reply, false) {
-                                                                    Ok(rids) => {
-                                                                        let _ = sess.generate(
-                                                                            &mut **m,
-                                                                            &rids,
-                                                                            0,
-                                                                            &mut sampler,
-                                                                            0,
-                                                                            None,
-                                                                            &mut |_| Ok(()),
-                                                                        );
-                                                                    }
-                                                                    Err(_) => {
-                                                                        replayed = false;
-                                                                        break;
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                        Err(_) => {
-                                                            replayed = false;
-                                                            break;
-                                                        }
+                                            // Prefill recorded turns without sampling. Qwen
+                                            // also retains the hidden rows needed to prime MTP.
+                                            match replay_chat_history(
+                                                &mut **m,
+                                                tokenizer.as_ref().expect("tokenizer"),
+                                                &history,
+                                                &history_system,
+                                                is_glm,
+                                                assistant_im_end,
+                                            ) {
+                                                Ok(replayed) => {
+                                                    session = Some(replayed);
+                                                    turn = history.len();
+                                                    if turn > 0 {
+                                                        push(UiEvent::Log(format!(
+                                                            "history replayed ({turn} turns)"
+                                                        )));
                                                     }
                                                 }
-                                                if replayed {
-                                                    session = Some(sess);
-                                                    turn = history.len();
+                                                Err(error) => {
                                                     push(UiEvent::Log(format!(
-                                                        "history replayed ({} turns)",
-                                                        history.len()
+                                                        "history replay failed: {error}"
                                                     )));
-                                                } else {
-                                                    session = Some(
-                                                        lisa_engine::core::session::Session::new(
-                                                            &mut **m,
-                                                        ),
-                                                    );
+                                                    session = Some(new_chat_session(&mut **m));
                                                     turn = 0;
                                                 }
                                             }
-                                            turn = if session.is_some() && turn > 0 {
-                                                turn
-                                            } else {
-                                                0
-                                            };
                                         }
                                         push(UiEvent::Log("model loaded".into()));
                                         push(UiEvent::Loaded(true));
@@ -1732,7 +1820,8 @@ fn spawn_engine(rx: mpsc::Receiver<Command>, events: Arc<Mutex<Vec<UiEvent>>>) {
                         history.clear();
                         history_system.clear();
                         if let Some(m) = model.as_mut() {
-                            session = Some(lisa_engine::core::session::Session::new(&mut **m));
+                            contexts.activate(EngineOwner::Chat, &mut **m);
+                            session = Some(new_chat_session(&mut **m));
                             turn = 0;
                         }
                         push(UiEvent::Log("conversation cleared".into()));
@@ -1743,9 +1832,26 @@ fn spawn_engine(rx: mpsc::Receiver<Command>, events: Arc<Mutex<Vec<UiEvent>>>) {
                             push(UiEvent::Log("no model loaded".into()));
                             continue;
                         };
-                        if session.is_none() {
-                            session = Some(lisa_engine::core::session::Session::new(&mut **model));
-                            turn = 0;
+                        contexts.activate(EngineOwner::Chat, &mut **model);
+                        if session.as_ref().is_none_or(|session| !session.is_valid()) {
+                            match replay_chat_history(
+                                &mut **model,
+                                tokenizer,
+                                &history,
+                                &history_system,
+                                is_glm,
+                                assistant_im_end,
+                            ) {
+                                Ok(replayed) => {
+                                    session = Some(replayed);
+                                    turn = history.len();
+                                }
+                                Err(error) => {
+                                    push(UiEvent::Log(format!("history replay failed: {error}")));
+                                    session = Some(new_chat_session(&mut **model));
+                                    turn = 0;
+                                }
+                            }
                         }
                         if turn == 0 {
                             history.clear();
@@ -1756,21 +1862,14 @@ fn spawn_engine(rx: mpsc::Receiver<Command>, events: Arc<Mutex<Vec<UiEvent>>>) {
                         } else {
                             Some(system.as_str())
                         };
-                        // First turn renders the whole (system + user) prompt; later
-                        // turns append just the new user turn to the session.
-                        let prompt = if turn == 0 {
-                            lisa_engine::core::tokenizer::chat_prompt_special_with_system(
-                                &text, sys, false,
-                            )
-                        } else {
-                            lisa_engine::core::tokenizer::chat_turn_suffix_special(
-                                &text,
-                                false,
-                                false,
-                                assistant_im_end,
-                            )
-                        };
-                        let ids = match tokenizer.encode(&prompt, false) {
+                        let ids = match chat_input_ids(
+                            tokenizer,
+                            &text,
+                            sys,
+                            turn == 0,
+                            is_glm,
+                            assistant_im_end,
+                        ) {
                             Ok(ids) => ids,
                             Err(e) => {
                                 push(UiEvent::Log(format!("encode error: {e}")));
@@ -1781,33 +1880,53 @@ fn spawn_engine(rx: mpsc::Receiver<Command>, events: Arc<Mutex<Vec<UiEvent>>>) {
                         let mut all = Vec::new();
                         let mut emitted = String::new();
                         let sess = session.as_mut().expect("session");
-                        let result = sess.generate(
-                            &mut **model,
-                            &ids,
-                            CHAT_MAX_TOKENS,
-                            &mut sampler,
-                            0,
-                            None,
-                            &mut |id| {
-                                all.push(id);
-                                let full = tokenizer.decode_clean(&all).unwrap_or_default();
-                                let display = clean_reply(&full);
-                                if display.len() >= emitted.len() && display.starts_with(&emitted) {
-                                    let delta = display[emitted.len()..].to_string();
-                                    if !delta.is_empty() && !delta.ends_with('\u{FFFD}') {
-                                        emitted = display;
-                                        push(UiEvent::AssistantDelta(delta));
-                                    }
-                                } else if display.len() > emitted.len() {
-                                    // Non-monotonic (a stripped think/special span):
-                                    // only grow the bubble, never clear it mid-stream.
-                                    emitted = display.clone();
-                                    push(UiEvent::AssistantReset(display));
+                        let mut emit = |id| {
+                            all.push(id);
+                            let full = tokenizer.decode_clean(&all).unwrap_or_default();
+                            let display = clean_reply(&full);
+                            if display.len() >= emitted.len() && display.starts_with(&emitted) {
+                                let delta = display[emitted.len()..].to_string();
+                                if !delta.is_empty() && !delta.ends_with('\u{FFFD}') {
+                                    emitted = display;
+                                    push(UiEvent::AssistantDelta(delta));
                                 }
-                                Ok(())
-                            },
-                        );
+                            } else if display.len() > emitted.len() {
+                                // Non-monotonic (a stripped think/special span):
+                                // only grow the bubble, never clear it mid-stream.
+                                emitted = display.clone();
+                                push(UiEvent::AssistantReset(display));
+                            }
+                            Ok(())
+                        };
+                        let target_mtp = model.has_target_mtp();
+                        let use_mtp = target_mtp || (model.has_drafter() && sampler.greedy());
+                        let result = if use_mtp {
+                            let mtp_sampler = if target_mtp { Some(&mut sampler) } else { None };
+                            sess.generate_mtp_depth(
+                                &mut **model,
+                                &ids,
+                                CHAT_MAX_TOKENS,
+                                lisa_engine::core::session::MtpDepth::Auto,
+                                None,
+                                mtp_sampler,
+                                &mut emit,
+                            )
+                        } else {
+                            sess.generate(
+                                &mut **model,
+                                &ids,
+                                CHAT_MAX_TOKENS,
+                                &mut sampler,
+                                0,
+                                None,
+                                &mut emit,
+                            )
+                        };
                         if let Err(e) = result {
+                            // Rebuild from completed turns before another request;
+                            // a failed MTP transaction may have invalidated caches.
+                            session = None;
+                            turn = history.len();
                             push(UiEvent::AssistantDelta(format!("\n[error: {e}]")));
                         } else {
                             // Settle on the authoritative final text (the streaming
@@ -1826,18 +1945,20 @@ fn spawn_engine(rx: mpsc::Receiver<Command>, events: Arc<Mutex<Vec<UiEvent>>>) {
                                 let raw = tokenizer.decode_clean(&all).unwrap_or_default();
                                 let raw = raw.trim().to_string();
                                 if raw.is_empty() {
-                                    push(UiEvent::AssistantDelta(
-                                        "(no response)".to_string(),
-                                    ));
+                                    push(UiEvent::AssistantDelta("(no response)".to_string()));
                                 } else {
                                     push(UiEvent::AssistantReset(raw));
                                 }
                             }
                             // Record the turn so a later model swap replays it.
-                            let reply = if emitted.is_empty() { raw_display(&all, tokenizer) } else { emitted.clone() };
+                            let reply = if emitted.is_empty() {
+                                raw_display(&all, tokenizer)
+                            } else {
+                                emitted.clone()
+                            };
                             history.push((text.clone(), reply));
+                            turn += 1;
                         }
-                        turn += 1;
                         push(UiEvent::AssistantDone);
                     }
                     Command::StartServe { addr, stop } => {
@@ -1857,11 +1978,19 @@ fn spawn_engine(rx: mpsc::Receiver<Command>, events: Arc<Mutex<Vec<UiEvent>>>) {
                             top_k: Some(0),
                             min_p: Some(0.0),
                             rep_penalty: Some(1.0),
+                            mtp_exact_sampling: false,
                             gen_defaults: model_dir
                                 .as_deref()
                                 .map(lisa_serve::GenDefaults::from_model_dir)
                                 .unwrap_or_default(),
-                            depth: 0,
+                            depth: if model
+                                .as_ref()
+                                .is_some_and(|model| model.has_drafter() || model.has_target_mtp())
+                            {
+                                lisa_engine::core::round_cost::AUTO_DEPTH
+                            } else {
+                                0
+                            },
                             pld: 0,
                             prefix_cache: 2,
                             max_batch: 4,
@@ -3110,7 +3239,7 @@ impl AppDelegate {
     fn refresh_models(&self) {
         let local = discover_models();
         let remote = self.ivars().remote_ids.borrow().clone();
-        let threshold = (ram_total() as f64 * 0.9) as u64;
+        let threshold = model_ram_budget();
         let mut merged = local;
         for (id, size) in remote {
             if merged.iter().any(|m| m.repo_id == id) {

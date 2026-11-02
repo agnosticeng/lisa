@@ -265,6 +265,10 @@ static GDN_TWO_ROW: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLo
 /// The `T` scalar argument, cached per value (specs/08 item 3): rebuilding it
 /// per layer per step was a host-side graph-node reconstruction. `Array` is
 /// immutable and `Arc`-backed, so sharing one instance is safe.
+pub fn t_scalar_pub(t: i32) -> Array {
+    t_scalar(t)
+}
+
 fn t_scalar(t: i32) -> Array {
     static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<i32, Array>>> =
         std::sync::OnceLock::new();
