@@ -5,9 +5,10 @@ use crate::array::Array;
 use crate::error::Result;
 use crate::runtime::{ConstVal, Math};
 
-const MV_SOURCE: &str = include_str!("../shaders/common/matmul/glm53_affine_q8_mv_native.metal");
-const EXT_SOURCE: &str =
-    include_str!("../shaders/common/matmul/glm53_affine_q8_ext_small_native.metal");
+const MV_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("common/matmul/glm53_affine_q8_mv_native.metal");
+const EXT_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("common/matmul/glm53_affine_q8_ext_small_native.metal");
 
 /// Preserve upstream's M=1 block-dot and M=2..16 vector-dot dispatch gates.
 /// GLM chooses this path after the corresponding native fixture and complete

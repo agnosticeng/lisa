@@ -180,6 +180,7 @@ fn build_draft_shortlist(
 
 /// The full text tower.
 pub struct Tower {
+    vision: Option<crate::models::vision::Vision>,
     pub embed_tokens: QuantizedEmbedding,
     pub layers: Vec<DecoderLayer>,
     pub final_mixer: GatedResidual,
@@ -267,7 +268,9 @@ impl Tower {
         // `warm_kernels`), before the generic-shape warmup below.
         lisa_mlx::warm_kernels();
 
-        Self::from_weights(weights, config, ngram_table)
+        let mut tower = Self::from_weights(weights, config, ngram_table)?;
+        tower.vision = crate::models::vision::Vision::from_dir(dir, tower.rope.dimensions)?;
+        Ok(tower)
     }
 
     /// Build the tower from a materialized weight map.
@@ -409,6 +412,7 @@ impl Tower {
             mtp: Some(mtp),
             draft_head,
             draft_ids,
+            vision: None,
         };
         for layer in tower.layers.iter_mut() {
             if let Some(ple) = layer.ple.as_mut() {
@@ -509,10 +513,6 @@ impl Tower {
         let s = ids.dim(1) as usize;
         let token_rows = Self::token_rows(ids)?;
 
-        let hidden = self.embed_tokens.forward(ids)?;
-        let mut residual = ops::tile(&hidden, &[1, 1, self.config.hc_count as i32])
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-
         // The n-gram hash reads ids in order; the history carries across calls.
         let ctx_len = self.config.ngram_size - 1;
         let previous_context: Vec<Vec<i64>> = match &self.ngram_history {
@@ -555,6 +555,17 @@ impl Tower {
             }
             None => crate::core::norm::positions(offset, s)?,
         };
+
+        let positions = self
+            .vision
+            .as_ref()
+            .and_then(|v| v.positions(offset, s))
+            .unwrap_or(positions);
+        let mut hidden = self.embed_tokens.forward(ids)?;
+        if let Some(vision) = &self.vision {
+            hidden = vision.splice(hidden, offset)?;
+        }
+        let mut residual = ops::tile(&hidden, &[1, 1, self.config.hc_count as i32])?;
 
         // Prefill pipeline: the engine overlaps CPU graph construction with GPU
         // execution by `asyncEval`-ing in short chunks. Without it Lisa builds
@@ -707,6 +718,26 @@ fn last_row(mixed: &Array) -> Array {
 }
 
 impl crate::models::LanguageModel for Tower {
+    fn supports_images(&self) -> bool {
+        self.vision.is_some()
+    }
+    fn prepare_images(
+        &mut self,
+        tokens: &mut Vec<u32>,
+        images: &[image::RgbImage],
+    ) -> anyhow::Result<()> {
+        let limit = self.max_position_embeddings();
+        self.vision
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("checkpoint has no supported vision encoder"))?
+            .prepare(tokens, images, limit)
+    }
+    fn clear_images(&mut self) {
+        if let Some(v) = &mut self.vision {
+            v.clear();
+        }
+    }
+
     fn max_position_embeddings(&self) -> usize {
         self.config.max_position_embeddings
     }

@@ -34,15 +34,16 @@ pub(super) fn pad_rank(v: &[usize]) -> [u32; MAX_COPY_RANK] {
 
 /// `copy_gg` (concatenate slices): template kernels + per-type instantiations,
 /// prepended with the MLX utils preamble the helpers live in.
-pub(super) const COPY_GG_SOURCE: &str = include_str!("../shaders/common/data/copy_gg.metal");
+pub(super) const COPY_GG_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("common/data/copy_gg.metal");
 
 /// Strided -> strided copy body (`slice_assign` into a view).
-pub(super) const COPY2_STRIDED_SOURCE: &str =
-    include_str!("../shaders/common/data/copy2_strided.metal");
+pub(super) const COPY2_STRIDED_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("common/data/copy2_strided.metal");
 
 /// Strided -> contiguous materialisation of a view.
-pub(super) const COPY_STRIDED_SOURCE: &str =
-    include_str!("../shaders/common/data/copy_strided.metal");
+pub(super) const COPY_STRIDED_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("common/data/copy_strided.metal");
 
 /// Source for a `copy_gg_{ndim}` kernel of `dtype`: the preamble plus the static
 /// template file (which carries every explicit instantiation).

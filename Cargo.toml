@@ -1,5 +1,13 @@
 [workspace]
-members = ["crates/lisa-engine", "crates/lisa-serve", "crates/lisa-cli", "crates/lisa-bench", "crates/lisa-mlx", "crates/lisa-ui"]
+members = [
+    "crates/lisa-gguf",
+    "crates/lisa-engine",
+    "crates/lisa-serve",
+    "crates/lisa-cli",
+    "crates/lisa-bench",
+    "crates/lisa-mlx",
+    "crates/lisa-ui",
+]
 resolver = "3"
 
 [workspace.package]
@@ -9,6 +17,8 @@ license = "MIT"
 
 [workspace.dependencies]
 anyhow = "1.0.104"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 block2 = "0.6"
 clap = { version = "4.6.6", features = ["derive"] }
 half = "2.7.1"
@@ -25,6 +35,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.10"
 tokenizers = "0.23.2"
+lisa-gguf = { path = "crates/lisa-gguf" }
 lisa-engine = { path = "crates/lisa-engine" }
 lisa-mlx = { path = "crates/lisa-mlx" }
 lisa-serve = { path = "crates/lisa-serve" }
@@ -32,3 +43,19 @@ lisa-serve = { path = "crates/lisa-serve" }
 [profile.release]
 opt-level = 3
 lto = "thin"
+
+# Shipping builds keep source-level symbols outside the signed app bundle.
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+debug = 2
+split-debuginfo = "packed"
+
+# Presentation and template rendering favor compact code. Inference, sampling,
+# tokenization and the tensor runtime retain release optimization level 3.
+[profile.dist.package.lisa-ui]
+opt-level = "s"
+
+[profile.dist.package.minijinja]
+opt-level = "s"

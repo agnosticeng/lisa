@@ -95,11 +95,20 @@ pub fn clamped_swiglu(up: &Array, gate: &Array, limit: f32) -> anyhow::Result<Ar
 /// the original two-dispatch schedule available for controlled end-to-end
 /// measurements; it is selected once while loading the model.
 enum GateUpProjection {
-    Paired(QuantizedLinear),
+    Paired {
+        projection: QuantizedLinear,
+        gate: QuantizedLinear,
+        up: QuantizedLinear,
+    },
     Separate {
         gate: QuantizedLinear,
         up: QuantizedLinear,
     },
+}
+
+struct ActivatedProjection {
+    projections: Option<(Array, Array)>,
+    activated: Array,
 }
 
 impl GateUpProjection {
@@ -120,7 +129,13 @@ impl GateUpProjection {
         paired: bool,
     ) -> anyhow::Result<Self> {
         if paired {
-            Ok(Self::Paired(fuse_gate_up(&gate, &up)?))
+            let projection = fuse_gate_up(&gate, &up)?;
+            let (gate, up) = split_gate_up_linear(&projection, projection.dims_out() / 2)?;
+            Ok(Self::Paired {
+                projection,
+                gate,
+                up,
+            })
         } else {
             Ok(Self::Separate { gate, up })
         }
@@ -128,21 +143,20 @@ impl GateUpProjection {
 
     fn inter(&self) -> usize {
         match self {
-            Self::Paired(projection) => projection.dims_out() / 2,
+            Self::Paired { projection, .. } => projection.dims_out() / 2,
             Self::Separate { gate, .. } => gate.dims_out(),
         }
     }
 
-    fn split_linears(&self) -> anyhow::Result<(QuantizedLinear, QuantizedLinear)> {
+    fn split_linears(&self) -> (&QuantizedLinear, &QuantizedLinear) {
         match self {
-            Self::Paired(projection) => split_gate_up_linear(projection, self.inter()),
-            Self::Separate { gate, up } => Ok((gate.clone(), up.clone())),
+            Self::Paired { gate, up, .. } | Self::Separate { gate, up } => (gate, up),
         }
     }
 
     fn forward(&self, x: &Array) -> anyhow::Result<(Array, Array)> {
         match self {
-            Self::Paired(projection) => {
+            Self::Paired { projection, .. } => {
                 let output = projection.forward_glm53_prefill(x)?;
                 let inter = projection.dims_out() / 2;
                 let n = output.dim(-1) as usize;
@@ -160,7 +174,8 @@ impl GateUpProjection {
         &self,
         x: &Array,
         limit: f32,
-    ) -> anyhow::Result<Option<(Array, Array, Array)>> {
+        capture_projections: bool,
+    ) -> anyhow::Result<Option<ActivatedProjection>> {
         if !GLM53_Q8_GATE_UP_NATIVE.with(Cell::get) || matches!(self, Self::Separate { .. }) {
             return Ok(None);
         }
@@ -174,8 +189,8 @@ impl GateUpProjection {
         {
             return Ok(None);
         }
-        let (gate, up) = self.split_linears()?;
-        if [&gate, &up]
+        let (gate, up) = self.split_linears();
+        if [gate, up]
             .iter()
             .any(|projection| projection.bits != 8 || projection.group_size != 64)
         {
@@ -195,6 +210,25 @@ impl GateUpProjection {
         ] {
             tensor.eval_enqueue()?;
         }
+        let output_shape = [&shape[..shape.len() - 1], &[self.inter() as i32]].concat();
+        if !capture_projections {
+            let activated = lisa_mlx::jit::glm53_affine_q8_swiglu_native(
+                flat.t.device(),
+                &flat.t,
+                &gate.weight.t,
+                &gate.scales.t,
+                &gate.biases.t,
+                &up.weight.t,
+                &up.scales.t,
+                &up.biases.t,
+                limit,
+            )?;
+            let activated = Array::new(activated).reshape(&output_shape)?;
+            return Ok(Some(ActivatedProjection {
+                projections: None,
+                activated,
+            }));
+        }
         let (g, u, activated) = lisa_mlx::jit::glm53_affine_q8_gate_up_native(
             flat.t.device(),
             &flat.t,
@@ -206,12 +240,13 @@ impl GateUpProjection {
             &up.biases.t,
             limit,
         )?;
-        let output_shape = [&shape[..shape.len() - 1], &[self.inter() as i32]].concat();
-        Ok(Some((
-            Array::new(g).reshape(&output_shape)?,
-            Array::new(u).reshape(&output_shape)?,
-            Array::new(activated).reshape(&output_shape)?,
-        )))
+        Ok(Some(ActivatedProjection {
+            projections: Some((
+                Array::new(g).reshape(&output_shape)?,
+                Array::new(u).reshape(&output_shape)?,
+            )),
+            activated: Array::new(activated).reshape(&output_shape)?,
+        }))
     }
 }
 
@@ -226,7 +261,7 @@ pub struct DenseMlp {
 impl DenseMlp {
     /// The projection mode captured at load, independent of later environment changes.
     pub(super) fn paired_storage(&self) -> bool {
-        matches!(&self.gate_up, GateUpProjection::Paired(_))
+        matches!(&self.gate_up, GateUpProjection::Paired { .. })
     }
 
     pub fn load<S: TensorSource>(w: &mut S, prefix: &str, limit: f32) -> anyhow::Result<Self> {
@@ -272,21 +307,32 @@ impl DenseMlp {
         if let Some(capture) = capture {
             capture.store(&format!("L{layer}.dense_mlp_input"), x);
         }
-        let native = self.gate_up.forward_native_activated(x, self.limit)?;
-        let (gate, up, native_activated) = if let Some((gate, up, activated)) = native {
-            (gate, up, Some(activated))
+        // Logit-only captures must use the activation-only production path.
+        let projection_capture =
+            capture.filter(|capture| capture.accepts_key(&format!("L{layer}.dense_gate_up")));
+        let native =
+            self.gate_up
+                .forward_native_activated(x, self.limit, projection_capture.is_some())?;
+        let ActivatedProjection {
+            projections,
+            activated,
+        } = if let Some(native) = native {
+            native
         } else {
             let (gate, up) = self.gate_up.forward(x)?;
-            (gate, up, None)
+            let activated = clamped_swiglu(&up, &gate, self.limit)?;
+            ActivatedProjection {
+                projections: Some((gate, up)),
+                activated,
+            }
         };
-        if let Some(capture) = capture {
-            let gate_up = ops::concatenate(&[&gate, &up], -1)?;
+        if let Some(capture) = projection_capture {
+            let (gate, up) = projections
+                .as_ref()
+                .expect("capture requested projection outputs");
+            let gate_up = ops::concatenate(&[gate, up], -1)?;
             capture.store(&format!("L{layer}.dense_gate_up"), &gate_up);
         }
-        let activated = match native_activated {
-            Some(activated) => activated,
-            None => clamped_swiglu(&up, &gate, self.limit)?,
-        };
         if let Some(capture) = capture {
             capture.store(&format!("L{layer}.dense_swiglu"), &activated);
         }
@@ -2034,7 +2080,8 @@ impl MoE {
         const HIDDEN: usize = 4096;
         const EXPERTS: usize = 288;
         const TOP_K: usize = 8;
-        const FIXTURE: &[u8] = include_bytes!("fixtures/mtp_router_layer45_ds4.bin");
+        let external_fixture: &[u8] =
+            &crate::models::glm53::test_fixtures::read("mtp_router_layer45_ds4.bin");
         anyhow::ensure!(
             x.dim(x.rank() as i32 - 1) == HIDDEN as i32
                 && self.gate_w.shape() == [EXPERTS as i32, HIDDEN as i32]
@@ -2092,7 +2139,7 @@ impl MoE {
         const F32_BYTES: usize = (HIDDEN + EXPERTS * HIDDEN + 2 * EXPERTS + TOP_K) * 4;
         const SELECTED_BYTES: usize = TOP_K * 4;
         anyhow::ensure!(
-            FIXTURE.len() == F32_BYTES + SELECTED_BYTES,
+            external_fixture.len() == F32_BYTES + SELECTED_BYTES,
             "DS4 layer-45 MTP router fixture has an invalid size"
         );
         let mut offset = 0usize;
@@ -2100,14 +2147,14 @@ impl MoE {
         for count in [HIDDEN, EXPERTS * HIDDEN, EXPERTS, EXPERTS, TOP_K] {
             let end = offset + count * 4;
             expected_f32.push(
-                FIXTURE[offset..end]
+                external_fixture[offset..end]
                     .chunks_exact(4)
                     .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("F32 word")))
                     .collect::<Vec<_>>(),
             );
             offset = end;
         }
-        let expected_selected = FIXTURE[offset..]
+        let expected_selected = external_fixture[offset..]
             .chunks_exact(4)
             .map(|bytes| i32::from_le_bytes(bytes.try_into().expect("I32 id")))
             .collect::<Vec<_>>();
@@ -2157,13 +2204,14 @@ impl MoE {
         actual: &Array,
     ) -> anyhow::Result<()> {
         const HIDDEN: usize = 4096;
-        const FIXTURE: &[u8] = include_bytes!("fixtures/mtp_shared_layer45_ds4.bin");
+        let external_fixture: &[u8] =
+            &crate::models::glm53::test_fixtures::read("mtp_shared_layer45_ds4.bin");
         let shared = self
             .shared
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("GLM MTP shared expert is missing"))?;
         let inter = shared.gate_up.inter();
-        let (gate, up) = shared.gate_up.split_linears()?;
+        let (gate, up) = shared.gate_up.split_linears();
         let hidden = HIDDEN;
         let group = usize::try_from(gate.group_size)?;
         let bits = usize::try_from(gate.bits)?;
@@ -2247,10 +2295,11 @@ impl MoE {
         }
 
         anyhow::ensure!(
-            FIXTURE.len() == prefix.len() + hidden * 4 && FIXTURE.starts_with(&prefix),
+            external_fixture.len() == prefix.len() + hidden * 4
+                && external_fixture.starts_with(&prefix),
             "layer-45 MTP shared expert DS4 fixture inputs changed"
         );
-        let expected = FIXTURE[prefix.len()..]
+        let expected = external_fixture[prefix.len()..]
             .chunks_exact(4)
             .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("F32 output word")))
             .collect::<Vec<_>>();
@@ -2359,7 +2408,8 @@ impl MoE {
         const HIDDEN: usize = 4096;
         const INTER: usize = 2048;
         const TOP_K: usize = 8;
-        const FIXTURE: &[u8] = include_bytes!("fixtures/mtp_routed_layer45_ds4.bin");
+        let external_fixture: &[u8] =
+            &crate::models::glm53::test_fixtures::read("mtp_routed_layer45_ds4.bin");
         anyhow::ensure!(
             x.dim(x.rank() as i32 - 1) == HIDDEN as i32
                 && self.pools.inter == INTER
@@ -2458,10 +2508,10 @@ impl MoE {
 
         const SELECTED_BYTES: usize = TOP_K * 4;
         anyhow::ensure!(
-            FIXTURE.len() == SELECTED_BYTES + HIDDEN * 8,
+            external_fixture.len() == SELECTED_BYTES + HIDDEN * 8,
             "DS4 layer-45 MTP routed fixture has an invalid size"
         );
-        let expected_selected = FIXTURE[..SELECTED_BYTES]
+        let expected_selected = external_fixture[..SELECTED_BYTES]
             .chunks_exact(4)
             .map(|bytes| i32::from_le_bytes(bytes.try_into().expect("I32 expert id")))
             .collect::<Vec<_>>();
@@ -2470,7 +2520,7 @@ impl MoE {
             "layer-45 MTP routed expert ids differ from DS4 fixture"
         );
         let input_end = SELECTED_BYTES + HIDDEN * 4;
-        let expected_input = FIXTURE[SELECTED_BYTES..input_end]
+        let expected_input = external_fixture[SELECTED_BYTES..input_end]
             .chunks_exact(4)
             .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("F32 input word")))
             .collect::<Vec<_>>();
@@ -2481,7 +2531,7 @@ impl MoE {
                 .all(|(actual, expected)| actual.to_bits() == expected.to_bits()),
             "layer-45 MTP routed fixture input changed"
         );
-        let expected_output = FIXTURE[input_end..]
+        let expected_output = external_fixture[input_end..]
             .chunks_exact(4)
             .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("F32 output word")))
             .collect::<Vec<_>>();
@@ -2519,7 +2569,7 @@ fn encode_f32(values: &[f32]) -> Vec<u8> {
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "glm53-fixtures"))]
 fn encode_i32(values: &[i32]) -> Vec<u8> {
     values
         .iter()
@@ -2527,7 +2577,7 @@ fn encode_i32(values: &[i32]) -> Vec<u8> {
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "glm53-fixtures"))]
 fn encode_u32(values: &[u32]) -> Vec<u8> {
     values
         .iter()

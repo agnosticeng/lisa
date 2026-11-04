@@ -1,0 +1,15 @@
+{
+  "upstream": "https://github.com/antirez/ds4",
+  "revision": "b3f50180ec2c7324892be1f50bc83555ccb8d5e7",
+  "source": "metal/dsv4_misc.metal",
+  "notes": [
+    "Original Q8_0 helpers are verbatim. QK and indexed decode bind fixed GLM53 geometry and F16 caches; no RoPE.",
+    "Indexed decode score, softmax and latent loops reuse the existing DS4 port; final projection now reads split GGUF Q8_0 V rows."
+  ],
+  "sha256": {
+    "gguf_q8.h": "824c10073527adcf5459aa68723575c8cdb86bb18c94061075868290e631dc70",
+    "gguf_qk.metal": "22dd7c3a1064af1c4aa35d2763bd7dbcd7f910acbfac0204a5c2b6ab6994fbed",
+    "gguf_decode.metal": "7b522706a42331c1a4c3f3b62f9b1ae8501015e8d884c511c23d1aa837267419",
+    "gguf_value.metal": "170765524e9663fa024d4f9558e07bdc48450525e98a1c1ae8e42b034592e2b6"
+  }
+}

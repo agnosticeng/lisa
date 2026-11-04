@@ -22,9 +22,18 @@ fn require_qwen4_command(model: &std::path::Path, command: &str) -> anyhow::Resu
 
 fn tokenize(model: &std::path::Path, prompt: &str, raw: bool) -> anyhow::Result<()> {
     let tok = tokenizer::Tokenizer::load(model)?;
+    if lisa_engine::models::model_type_of(model)? == "deepseek41" {
+        let ids = if raw {
+            tok.encode_plain(prompt)?
+        } else {
+            tok.native_chat(None, prompt, 0)?
+        };
+        println!("ids: {:?}", &ids[..ids.len().min(40)]);
+        return Ok(());
+    }
     let is_glm = matches!(
         lisa_engine::models::model_type_of(model)?.as_str(),
-        "glm5_next" | "glm5_next_text"
+        "glm5_next" | "glm5_next_text" | "glm5-next"
     );
     let text = if raw {
         prompt.to_owned()
@@ -39,6 +48,8 @@ fn tokenize(model: &std::path::Path, prompt: &str, raw: bool) -> anyhow::Result<
     };
     let ids = if is_glm && !raw {
         tok.encode_special(&text)?
+    } else if raw {
+        tok.encode_plain(&text)?
     } else {
         tok.encode(&text, false)?
     };
@@ -133,10 +144,13 @@ enum Command {
         #[arg(long)]
         plan_only: bool,
     },
-    /// Load a model and print load-time diagnostics only.
+    /// Print checkpoint diagnostics; GGUF inspection does not load a GPU model.
     Inspect {
         #[arg(long)]
         model: ModelDir,
+        /// Inspect only the first GGUF header, without requiring other shards.
+        #[arg(long)]
+        header_only: bool,
     },
     /// Load a typed-decision model (e.g. Laya) and run it.
     Decide {
@@ -181,6 +195,27 @@ enum Command {
         #[arg(long)]
         top_k: Option<usize>,
     },
+    /// Generate a PNG with a local FLUX.2 or FLUX 3 Klein checkpoint.
+    Image {
+        #[arg(long, default_value = "mlx-community/flux2-klein-4b-4bit")]
+        model: ModelDir,
+        #[arg(long)]
+        prompt: String,
+        #[arg(long, default_value = "image.png")]
+        output: std::path::PathBuf,
+        #[arg(long, default_value_t = 512)]
+        width: u32,
+        #[arg(long, default_value_t = 512)]
+        height: u32,
+        /// Denoising steps (default: 4 for FLUX.2, 16 for FLUX 3).
+        #[arg(long)]
+        steps: Option<u32>,
+        /// Skip FLUX 3 prompt expansion when providing a complete scene caption.
+        #[arg(long)]
+        prompt_is_caption: bool,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+    },
     /// Load a model and generate.
     Run {
         #[arg(long)]
@@ -190,6 +225,9 @@ enum Command {
         ctx_size: Option<usize>,
         #[arg(long, default_value = "Explain what a MoE layer is in two sentences.")]
         prompt: String,
+        /// PNG, JPEG or WebP image; repeat for multiple images.
+        #[arg(long)]
+        image: Vec<std::path::PathBuf>,
         /// System message; GLM defaults to ds4's "You are a helpful assistant".
         #[arg(long)]
         system: Option<String>,
@@ -379,6 +417,66 @@ fn run() -> anyhow::Result<()> {
     if let Command::Tok { model, prompt, raw } = &cli.command {
         return tokenize(model, prompt, *raw);
     }
+    if let Command::Inspect { model, header_only } = &cli.command {
+        if model.is_file() {
+            use lisa_gguf::{Header, Package};
+            let header = Header::open(model)?;
+            println!("GGUF architecture: {}", header.architecture()?);
+            if header.architecture()? == "deepseek41" {
+                let config = lisa_engine::models::deepseek41::config::Config::from_header(&header)?;
+                let engram = lisa_engine::models::deepseek41::engram::Layout::from_header(&header)?;
+                println!(
+                    "{} layers, {} hidden, {}/{} active experts",
+                    config.layers, config.width, config.selected_experts, config.experts
+                );
+                println!("Engram rows: {:?} (disk lookup)", engram.rows);
+            }
+            if *header_only {
+                println!(
+                    "First-shard header: {} tensors; payloads and other shards not checked",
+                    header.tensors.len()
+                );
+            } else {
+                let package = Package::open(model)?;
+                println!("{}", package.summary()?);
+                if header.architecture()? == "glm5-next" {
+                    let c = lisa_engine::models::glm53::gguf::weights::validate(&package)?;
+                    println!(
+                        "{} trunk layers, {} hidden, {}/{} active experts; embedded MTP block",
+                        c.num_hidden_layers,
+                        c.hidden_size,
+                        c.num_experts_per_tok,
+                        c.n_routed_experts
+                    );
+                    println!(
+                        "GLM native GGUF: original Q2 payloads; serial prefill baseline. Full DS4 parity is not certified."
+                    );
+                }
+                if header.architecture()? == "deepseek41" {
+                    use lisa_engine::models::deepseek41::{
+                        config::Config, engram::Layout, weights::WeightPlan,
+                    };
+                    let plan = WeightPlan::inspect(
+                        &package,
+                        &Config::from_header(&header)?,
+                        &Layout::from_header(&header)?,
+                    )?;
+                    println!(
+                        "Resident payload: {:.2} GiB; disk-only Engram: {:.2} GiB",
+                        plan.resident_payload_bytes as f64 / (1u64 << 30) as f64,
+                        plan.disk_payload_bytes as f64 / (1u64 << 30) as f64
+                    );
+                }
+            }
+            if header.architecture()? == "deepseek41" {
+                println!(
+                    "DeepSeek GGUF: native scalar text inference; default context 4096, no draft head. DS4 parity is not yet certified."
+                );
+            }
+            return Ok(());
+        }
+        anyhow::ensure!(!header_only, "--header-only requires a local GGUF file");
+    }
     // Resolve the device backend: `LISA_DEVICE`, else Metal when present, else
     // CPU. Announce a non-default (CPU) selection.
     let backend = lisa_mlx::backend::Backend::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -459,7 +557,7 @@ fn run() -> anyhow::Result<()> {
                 Ok(())
             }
         }
-        Command::Inspect { model } => {
+        Command::Inspect { model, .. } => {
             let t0 = std::time::Instant::now();
             let _tower = lisa_engine::models::load_dir(&model)?;
             println!("loaded in {:.1}s", t0.elapsed().as_secs_f64());
@@ -665,8 +763,9 @@ fn run() -> anyhow::Result<()> {
                 gen_defaults: serve::GenDefaults::from_model_dir(&model),
                 depth: depth_us,
                 max_batch,
-                chat_template: std::fs::read_to_string(model.join("chat_template.jinja")).ok(),
+                chat_template: tokenizer::load_chat_template(&model)?,
                 model_id: serve::model_id_of(&model),
+                supports_images: false,
             };
             if let Some(t) = cfg.gen_defaults.thinking {
                 eprintln!(
@@ -694,12 +793,13 @@ fn run() -> anyhow::Result<()> {
                         eprintln!("loaded in {:.1}s", t0.elapsed().as_secs_f64());
                         return serve::run_decisions(m, cfg);
                     }
-                    lisa_engine::Loaded::Language(_) => unreachable!("model_type was laya"),
+                    _ => unreachable!("model_type was laya"),
                 }
             }
             let t0 = std::time::Instant::now();
             let mut tower = match lisa_engine::models::load_dir(&model)? {
                 lisa_engine::Loaded::Language(m) => m,
+                lisa_engine::Loaded::Image(pipeline) => return serve::images::run(pipeline, cfg),
                 lisa_engine::Loaded::Decision(_) => unreachable!("model_type was not laya"),
             };
             if let Some(capacity) = ctx_size {
@@ -725,10 +825,46 @@ fn run() -> anyhow::Result<()> {
             serve::run(tower.as_mut(), &tok, cfg)
         }
 
+        Command::Image {
+            model,
+            prompt,
+            output,
+            width,
+            height,
+            steps,
+            seed,
+            prompt_is_caption,
+        } => {
+            anyhow::ensure!(
+                backend == lisa_mlx::backend::Backend::Metal,
+                "image generation requires the Metal backend"
+            );
+            let pipeline = lisa_engine::models::image_generation::Pipeline::load(&model)?;
+            let options = lisa_engine::models::image_generation::Options {
+                width,
+                height,
+                steps,
+                seed,
+                prompt_is_caption,
+            };
+            let started = std::time::Instant::now();
+            let png = pipeline.generate(&prompt, &options, &mut |stage, i, n| {
+                eprintln!("{stage} {i}/{n}");
+                Ok(())
+            })?;
+            std::fs::write(&output, png)?;
+            println!(
+                "{} ({width}x{height}, {:.2}s, seed {seed})",
+                output.display(),
+                started.elapsed().as_secs_f64()
+            );
+            Ok(())
+        }
         Command::Run {
             model,
             ctx_size,
-            prompt,
+            mut prompt,
+            image,
             system,
             max_tokens,
             temperature,
@@ -757,8 +893,11 @@ fn run() -> anyhow::Result<()> {
             let t0 = std::time::Instant::now();
             let mut tower = match lisa_engine::models::load_dir(&model)? {
                 lisa_engine::models::Loaded::Language(m) => m,
-                lisa_engine::models::Loaded::Decision(_) => {
-                    anyhow::bail!("run expects a language model")
+                lisa_engine::models::Loaded::Image(_)
+                | lisa_engine::models::Loaded::Decision(_) => {
+                    anyhow::bail!(
+                        "run expects a language model; use lisa image for image generation"
+                    )
                 }
             };
             if let Some(capacity) = ctx_size {
@@ -782,13 +921,18 @@ fn run() -> anyhow::Result<()> {
             let is_glm = lisa_engine::models::model_type_of(&model)?
                 .as_str()
                 .starts_with("glm5");
+            let is_deepseek = lisa_engine::models::model_type_of(&model)? == "deepseek41";
+            anyhow::ensure!(
+                !is_deepseek || (pld == 0 && !router),
+                "DeepSeek GGUF currently supports serial generation; omit --pld and --router"
+            );
             anyhow::ensure!(
                 !mtp_exact_sampling || (is_glm && tower.has_target_mtp()),
                 "--mtp-exact-sampling requires a GLM model with target MTP"
             );
             anyhow::ensure!(
-                is_glm || (!think_max && !nothink && !think),
-                "--think, --think-max, and --nothink are GLM-only options"
+                is_glm || is_deepseek || (!think_max && !nothink && !think),
+                "--think, --think-max, and --nothink require GLM or DeepSeek"
             );
             let temperature = temperature.unwrap_or(if is_glm { 1.0 } else { 0.0 });
             let top_p = top_p.unwrap_or(if is_glm { 0.95 } else { 1.0 });
@@ -800,6 +944,22 @@ fn run() -> anyhow::Result<()> {
             } else {
                 tokenizer::GlmReasoning::High
             };
+            let images = image
+                .iter()
+                .map(|path| {
+                    let url = lisa_engine::models::vision::file_data_url(path)?;
+                    lisa_engine::models::vision::decode_data_url(&url)
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            if !images.is_empty() {
+                anyhow::ensure!(!raw, "--image cannot be combined with --raw");
+                let marker = if is_glm {
+                    "<|begin_of_image|><|image|><|end_of_image|>"
+                } else {
+                    "<|vision_start|><|image_pad|><|vision_end|>"
+                };
+                prompt = format!("{}{}", marker.repeat(images.len()), prompt);
+            }
             let (text, special) = if raw {
                 (prompt.clone(), false)
             } else if is_glm {
@@ -826,7 +986,25 @@ fn run() -> anyhow::Result<()> {
                 )
             };
             let t_enc = std::time::Instant::now();
-            let prompt_ids: Vec<u32> = if special {
+            let mut prompt_ids: Vec<u32> = if is_deepseek {
+                if raw {
+                    tok.encode_plain(&prompt)?
+                } else {
+                    tok.native_chat(
+                        system.as_deref(),
+                        &prompt,
+                        if think_max {
+                            100
+                        } else if think {
+                            75
+                        } else {
+                            0
+                        },
+                    )?
+                }
+            } else if raw {
+                tok.encode_plain(&text)?
+            } else if special {
                 tok.encode_special(&text)?
             } else {
                 tok.encode(&text, false)?
@@ -836,6 +1014,11 @@ fn run() -> anyhow::Result<()> {
                 prompt_ids.len(),
                 t_enc.elapsed().as_secs_f64()
             ));
+            if !images.is_empty() {
+                tower.prepare_images(&mut prompt_ids, &images)?;
+            }
+            let has_images = !images.is_empty();
+            drop(images);
             println!("prompt: {} tokens", prompt_ids.len());
 
             let mut sampler = build_sampler(temperature, top_k, top_p, min_p, rep_penalty, seed);
@@ -890,6 +1073,10 @@ fn run() -> anyhow::Result<()> {
                     }
                     mdepth = None;
                 }
+            }
+            if has_images {
+                mdepth = None;
+                pld = 0;
             }
             let (generated, stats) = if let Some(md) = mdepth {
                 let mut sess = session::Session::new(&mut *tower);

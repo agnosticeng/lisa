@@ -12,8 +12,8 @@ use super::{DType, Device, Tensor};
 use super::{MLX_SDPA_VECTOR_PREAMBLE, MLX_SOFTMAX_PREAMBLE, MLX_UTILS_PREAMBLE, NAX_ATTN_HEADER};
 use crate::error::Result;
 
-const DS4_FLASH_ATTN_SOURCE: &str =
-    include_str!("../shaders/common/attention/ds4_flash_attn.metal");
+const DS4_FLASH_ATTN_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("common/attention/ds4_flash_attn.metal");
 const DS4_FLASH_ATTN_PREAMBLE: &str = r#"
 #define N_SIMDWIDTH 32
 #define FOR_UNROLL(x) _Pragma("clang loop unroll(full)") for (x)

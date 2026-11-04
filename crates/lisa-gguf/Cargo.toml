@@ -1,0 +1,12 @@
+[package]
+name = "lisa-gguf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GGUF parsing, split packages, mapped storage and GGML block decoding"
+
+[dependencies]
+anyhow.workspace = true
+half.workspace = true
+libc.workspace = true
+memmap2.workspace = true

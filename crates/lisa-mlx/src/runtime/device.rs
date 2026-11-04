@@ -49,7 +49,8 @@ fn ordered_gpu_reuse_enabled() -> bool {
     ORDERED_GPU_REUSE_DEPTH.with(|depth| depth.get() != 0)
 }
 
-const ORDERED_GPU_ZERO_SOURCE: &str = include_str!("../shaders/common/data/ordered_zero.metal");
+const ORDERED_GPU_ZERO_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("common/data/ordered_zero.metal");
 
 // ───────────────────────────── runtime ─────────────────────────────
 
@@ -67,7 +68,7 @@ pub fn nax_available() -> bool {
 }
 
 /// Total number of Metal pipeline compilations performed (cache misses in
-/// [`MetalRuntime::compile_full`]). A stable value after model load means no
+/// `MetalRuntime::compile_full`). A stable value after model load means no
 /// JIT compilation happens at runtime.
 pub static JIT_COMPILES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -134,7 +135,12 @@ pub fn kernel_fingerprint() -> u64 {
 /// captured once and frozen.
 pub fn kernel_law() -> u64 {
     static LAW: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *LAW.get_or_init(kernel_fingerprint)
+    *LAW.get_or_init(|| {
+        // Binding arithmetic is part of the numerical law even when the
+        // shader source is unchanged. Reject persisted states produced before
+        // normalization and rotary views used byte offsets at the Metal API.
+        kernel_fingerprint() ^ fnv1a(b"lisa.tensor-byte-offset-bindings.v2")
+    })
 }
 
 /// Record a pipeline's source fingerprint — SLOW PATH ONLY (once per compile).
@@ -216,6 +222,7 @@ pub enum Math {
 pub enum ConstVal {
     Bool(bool),
     Int(i32),
+    Short(i16),
 }
 
 fn compile_options(math: Math, nax: bool) -> Retained<MTLCompileOptions> {
@@ -255,6 +262,7 @@ fn compile_options(math: Math, nax: bool) -> Retained<MTLCompileOptions> {
 
 impl MetalRuntime {
     pub fn new(per_buffer: usize) -> Result<Self> {
+        crate::shader_pack::initialize()?;
         let device: Retained<ProtocolObject<dyn MTLDevice>> =
             MTLCreateSystemDefaultDevice().ok_or_else(|| err("no Metal device"))?;
         let queue = device
@@ -491,7 +499,7 @@ impl MetalRuntime {
         self.compile_full(source, name, math, &[])
     }
 
-    /// Like [`compile_with`], specialising Metal bool function constants
+    /// Like [`Self::compile_with`], specialising Metal bool function constants
     /// (`[[function_constant(n)]]`), which ternary kernel uses to pick
     /// per-operand indexers.
     pub fn compile_with_constants(
@@ -547,6 +555,7 @@ impl MetalRuntime {
                 let (ptr, ty) = match v {
                     ConstVal::Bool(b) => (NonNull::from(b).cast(), MTLDataType::Bool),
                     ConstVal::Int(x) => (NonNull::from(x).cast(), MTLDataType::Int),
+                    ConstVal::Short(x) => (NonNull::from(x).cast(), MTLDataType::Short),
                 };
                 unsafe { cvs.setConstantValue_type_atIndex(ptr, ty, *i) };
             }

@@ -13,219 +13,17 @@ use objc2::{
 use objc2_app_kit::*;
 use objc2_foundation::*;
 
-use crate::ui;
-
-#[derive(Clone, Debug)]
-pub struct Model {
-    pub repo_id: String,
-    #[allow(dead_code)]
-    pub model_type: String,
-    pub path: String,
-    pub local: bool,
-    pub size: u64,
-    pub too_big: bool,
-}
-
-/// Model types the engine can load (mirrors `models::load_dir`).
-const SUPPORTED_MODEL_TYPES: &[&str] = &[
-    "qwen4_exp",
-    "qwen4_exp_text",
-    "qwen3_5",
-    "qwen3_5_text",
-    "glm5_next",
-    "glm5_next_text",
-    "laya",
-];
+use crate::models::{
+    Model, config_model_type, discover_models, display_name, fetch_remote_models, hf_blobs_size,
+    model_ram_budget,
+};
+use crate::{catalog, chats, ui};
 
 /// Slash commands offered in the chat input's "/" dropdown: `(name, help)`.
 const CHAT_COMMANDS: &[(&str, &str)] = &[
-    ("/clear", "Reset the conversation"),
+    ("/clear", "Start a new chat"),
     ("/help", "Show available commands"),
 ];
-
-fn config_model_type(dir: &std::path::Path) -> Option<String> {
-    let text = std::fs::read_to_string(dir.join("config.json")).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-    v.get("text_config")
-        .and_then(|t| t.get("model_type"))
-        .and_then(|m| m.as_str())
-        .map(str::to_string)
-        .or_else(|| {
-            v.get("model_type")
-                .and_then(|m| m.as_str())
-                .map(str::to_string)
-        })
-}
-
-fn display_name(repo_id: &str) -> &str {
-    repo_id.strip_prefix("agnosticeng/").unwrap_or(repo_id)
-}
-
-/// Scan the local Hugging Face hub cache for checkpoints the engine supports.
-fn discover_models() -> Vec<Model> {
-    let hub = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
-        .join(".cache/huggingface/hub");
-    let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(&hub) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        let Some(rest) = name.strip_prefix("models--") else {
-            continue;
-        };
-        let repo_id = rest.replacen("--", "/", 1);
-        let Ok(snaps) = std::fs::read_dir(entry.path().join("snapshots")) else {
-            continue;
-        };
-        for snap in snaps.flatten() {
-            let path = snap.path();
-            if !path.is_dir() {
-                continue;
-            }
-            if let Some(mt) = config_model_type(&path) {
-                if SUPPORTED_MODEL_TYPES.contains(&mt.as_str()) {
-                    let size = model_weight_size(&path, &mt);
-                    out.push(Model {
-                        repo_id: repo_id.clone(),
-                        model_type: mt,
-                        path: path.to_string_lossy().to_string(),
-                        local: true,
-                        size,
-                        too_big: false,
-                    });
-                    break;
-                }
-            }
-        }
-    }
-    out.sort_by(|a, b| a.repo_id.cmp(&b.repo_id));
-    out
-}
-
-fn model_weight_size(path: &std::path::Path, model_type: &str) -> u64 {
-    let resident = path.join(".lisa-resident");
-    if matches!(model_type, "glm5_next" | "glm5_next_text") && resident.join("index.json").is_file()
-    {
-        // Prepared GLM maps the resident copy. Counting original and prepared
-        // weights together would incorrectly disable a model that fits RAM.
-        dir_size(&resident)
-    } else {
-        dir_size(path)
-    }
-}
-
-/// Recursively total the bytes under `path` (following symlinks, e.g. the HF
-/// hub's snapshot links).
-fn dir_size(path: &std::path::Path) -> u64 {
-    let mut total = 0u64;
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return 0;
-    };
-    for e in entries.flatten() {
-        let p = e.path();
-        let Ok(md) = std::fs::metadata(&p) else {
-            continue;
-        };
-        if md.is_dir() {
-            total += dir_size(&p);
-        } else {
-            total += md.len();
-        }
-    }
-    total
-}
-
-/// Physical memory in bytes (`sysctl hw.memsize`).
-fn ram_total() -> u64 {
-    std::process::Command::new("sysctl")
-        .args(["-n", "hw.memsize"])
-        .output()
-        .ok()
-        .and_then(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .trim()
-                .parse::<u64>()
-                .ok()
-        })
-        .unwrap_or(0)
-}
-
-fn model_ram_budget() -> u64 {
-    std::env::var("LISA_RAM_CAP_GB")
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite() && *value > 0.0)
-        .map(|value| (value * (1u64 << 30) as f64) as u64)
-        .unwrap_or_else(|| ram_total().saturating_sub(8u64 << 30))
-}
-
-fn curl_json(url: &str) -> Option<serde_json::Value> {
-    let out = std::process::Command::new("curl")
-        .args(["-sSL", "--max-time", "20", url])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    serde_json::from_slice(&out.stdout).ok()
-}
-
-/// The Hub cache directory for a repo (`models--org--name`).
-fn hf_hub_dir(repo: &str) -> PathBuf {
-    let hub = match std::env::var_os("HF_HOME") {
-        Some(h) => PathBuf::from(h).join("hub"),
-        None => PathBuf::from(std::env::var("HOME").unwrap_or_default())
-            .join(".cache")
-            .join("huggingface")
-            .join("hub"),
-    };
-    hub.join(format!("models--{}", repo.replace('/', "--")))
-}
-
-/// Bytes already written for a repo's blobs (in-progress downloads included).
-fn hf_blobs_size(repo: &str) -> u64 {
-    dir_size(&hf_hub_dir(repo).join("blobs"))
-}
-
-/// Byte size of a Hub repo (sum of its files), 0 when unknown.
-fn remote_size(id: &str) -> u64 {
-    let url =
-        format!("https://huggingface.co/api/models/{id}/tree/main?recursive=true&expand=true");
-    let Some(v) = curl_json(&url) else {
-        return 0;
-    };
-    let Some(arr) = v.as_array() else {
-        return 0;
-    };
-    arr.iter()
-        .filter(|e| e.get("type").and_then(|t| t.as_str()) == Some("file"))
-        .filter_map(|e| e.get("size").and_then(|s| s.as_u64()))
-        .sum()
-}
-
-/// Fetch the agnosticeng models (id, size) from the Hugging Face Hub (`curl`,
-/// no HTTP dependency). Runs on a background thread; empty on failure.
-fn fetch_remote_models() -> Vec<(String, u64)> {
-    let Some(v) = curl_json("https://huggingface.co/api/models?author=agnosticeng&limit=200")
-    else {
-        return Vec::new();
-    };
-    let Some(arr) = v.as_array() else {
-        return Vec::new();
-    };
-    arr.iter()
-        .filter_map(|m| m.get("id").and_then(|x| x.as_str()).map(str::to_string))
-        .filter(|id| {
-            let l = id.to_lowercase();
-            !l.contains("gguf") && !l.contains("dataset")
-        })
-        .map(|id| {
-            let size = remote_size(&id);
-            (id, size)
-        })
-        .collect()
-}
 
 /// Commands sent from the UI to the engine thread.
 enum Command {
@@ -233,9 +31,14 @@ enum Command {
     Download(String),
     /// Reset the conversation (drop the session state; keep the model loaded).
     Clear,
+    Restore {
+        turns: Vec<chats::Turn>,
+        system: String,
+    },
     Chat {
         text: String,
         system: String,
+        images: Vec<PathBuf>,
     },
     /// Start the OpenAI-compatible server on the loaded model; runs until the
     /// shared `stop` flag is set, then the engine resumes handling commands.
@@ -250,14 +53,20 @@ enum Command {
 enum UiEvent {
     Log(String),
     UserMessage(String),
+    UserImages(Vec<PathBuf>),
+    AssistantImage(PathBuf),
+    ImageMode(Option<u32>),
     AssistantDelta(String),
     /// Replace the streaming assistant text wholesale (used when hidden
     /// reasoning is stripped and the visible reply no longer extends the
     /// previously emitted prefix).
     AssistantReset(String),
     AssistantDone,
+    /// The authoritative successful reply, safe to replay in a later session.
+    TurnCommitted(String),
     /// A model finished loading (true) or failed (false).
     Loaded(bool),
+    SupportsImages(bool),
     /// The serve endpoint is listening on the given URL.
     ServeStarted(String),
     /// The serve endpoint stopped.
@@ -358,22 +167,14 @@ fn append_plain(
 fn command_row_title(
     name: &str,
     desc: &str,
-    selected: bool,
+    _selected: bool,
 ) -> Retained<NSMutableAttributedString> {
     let font_key = NSString::from_str("NSFont");
     let color_key = NSString::from_str("NSColor");
     let name_font = NSFont::boldSystemFontOfSize(13.0);
     let desc_font = NSFont::systemFontOfSize(12.0);
-    let name_color = if selected {
-        NSColor::whiteColor()
-    } else {
-        NSColor::labelColor()
-    };
-    let desc_color = if selected {
-        NSColor::labelColor()
-    } else {
-        NSColor::secondaryLabelColor()
-    };
+    let name_color = NSColor::labelColor();
+    let desc_color = NSColor::secondaryLabelColor();
 
     let out = NSMutableAttributedString::initWithString(
         NSMutableAttributedString::alloc(),
@@ -1053,14 +854,23 @@ fn render_blocks(mtm: MainThreadMarker, stack: &NSStackView, text: &str, color: 
             Block::Heading(t) => {
                 let l = paragraph_label(mtm, &t, color, MdStyle::Heading);
                 stack.addArrangedSubview(&l);
+                l.widthAnchor()
+                    .constraintEqualToAnchor(&stack.widthAnchor())
+                    .setActive(true);
             }
             Block::Paragraph(t) => {
                 let l = paragraph_label(mtm, &t, color, MdStyle::Base);
                 stack.addArrangedSubview(&l);
+                l.widthAnchor()
+                    .constraintEqualToAnchor(&stack.widthAnchor())
+                    .setActive(true);
             }
             Block::Bullets(items) => {
                 let v = bullets_view(mtm, &items, color);
                 stack.addArrangedSubview(&v);
+                v.widthAnchor()
+                    .constraintEqualToAnchor(&stack.widthAnchor())
+                    .setActive(true);
             }
             Block::Rule => {
                 let v = LineView::new(mtm);
@@ -1084,6 +894,9 @@ fn render_blocks(mtm: MainThreadMarker, stack: &NSStackView, text: &str, color: 
             Block::Code(t) => {
                 let l = code_label(mtm, &t, color);
                 stack.addArrangedSubview(&l);
+                l.widthAnchor()
+                    .constraintEqualToAnchor(&stack.widthAnchor())
+                    .setActive(true);
             }
         }
     }
@@ -1095,7 +908,7 @@ fn paragraph_label(
     color: &NSColor,
     base_style: MdStyle,
 ) -> Retained<NSTextField> {
-    let label = NSTextField::wrappingLabelWithString(&NSString::from_str(""), mtm);
+    let label = ui::wrapping_label(mtm, "", BUBBLE_FONT_SIZE, color);
     label.setTranslatesAutoresizingMaskIntoConstraints(false);
     label.setMaximumNumberOfLines(0);
     label.setPreferredMaxLayoutWidth(BUBBLE_MAX_WIDTH - 30.0);
@@ -1113,7 +926,7 @@ fn paragraph_label(
 }
 
 fn code_label(mtm: MainThreadMarker, text: &str, color: &NSColor) -> Retained<NSTextField> {
-    let label = NSTextField::wrappingLabelWithString(&NSString::from_str(text), mtm);
+    let label = ui::wrapping_label(mtm, text, BUBBLE_FONT_SIZE, color);
     if let Some(font) = NSFont::userFixedPitchFontOfSize(BUBBLE_FONT_SIZE) {
         label.setFont(Some(&font));
     }
@@ -1135,6 +948,10 @@ fn bullets_view(mtm: MainThreadMarker, items: &[String], color: &NSColor) -> Ret
     for item in items {
         let label = paragraph_label(mtm, &format!("\u{2022}  {item}"), color, MdStyle::Base);
         stack.addArrangedSubview(&label);
+        label
+            .widthAnchor()
+            .constraintEqualToAnchor(&stack.widthAnchor())
+            .setActive(true);
     }
     stack
 }
@@ -1331,8 +1148,8 @@ fn clean_reply(s: &str) -> String {
 }
 
 const CHAT_MAX_TOKENS: usize = 2048;
-const BUBBLE_MAX_WIDTH: f64 = 640.0;
-const BUBBLE_FONT_SIZE: f64 = 13.0;
+const BUBBLE_MAX_WIDTH: f64 = 720.0;
+const BUBBLE_FONT_SIZE: f64 = 14.0;
 /// Poll interval; also the typing-indicator frame step.
 const TICK_DT: f64 = 0.03;
 const TABLE_GAP: f64 = 18.0;
@@ -1529,9 +1346,11 @@ fn chat_input_ids(
     system: Option<&str>,
     first: bool,
     is_glm: bool,
-    assistant_im_end: bool,
 ) -> anyhow::Result<Vec<u32>> {
     use lisa_engine::core::tokenizer::{self, GlmReasoning};
+    if let Some(ids) = tokenizer.native_chat_turn(system, text, first)? {
+        return Ok(ids);
+    }
     let prompt = if is_glm {
         if first {
             tokenizer::glm_generation_prompt(text, system, GlmReasoning::Disabled)
@@ -1541,7 +1360,12 @@ fn chat_input_ids(
     } else if first {
         tokenizer::chat_prompt_special_with_system(text, system, false)
     } else {
-        tokenizer::chat_turn_suffix_special(text, false, false, assistant_im_end)
+        // The previous response stops before EOS. Close it and use the same
+        // Qwen markers as the first turn and the checkpoint's chat template.
+        format!(
+            "<|im_end|>\n{}",
+            tokenizer::chat_prompt_special(text, false)
+        )
     };
     if is_glm {
         tokenizer.encode_special(&prompt)
@@ -1567,7 +1391,6 @@ fn replay_chat_history(
     history: &[(String, String)],
     system: &str,
     is_glm: bool,
-    assistant_im_end: bool,
 ) -> anyhow::Result<lisa_engine::core::session::Session> {
     let mut session = new_chat_session(model);
     let mut feed = |ids: &[u32]| -> anyhow::Result<()> {
@@ -1590,10 +1413,9 @@ fn replay_chat_history(
             Some(system).filter(|s| !s.trim().is_empty()),
             index == 0,
             is_glm,
-            assistant_im_end,
         )?;
         feed(&ids)?;
-        feed(&tokenizer.encode(reply, false)?)?;
+        feed(&tokenizer.encode_plain(reply)?)?;
     }
     Ok(session)
 }
@@ -1662,10 +1484,11 @@ fn spawn_engine(rx: mpsc::Receiver<Command>, events: Arc<Mutex<Vec<UiEvent>>>) {
             // replay the history into the new model's session and the chat
             // keeps its context across the switch.
             let mut history: Vec<(String, String)> = Vec::new();
+            let mut history_images: Vec<Vec<String>> = Vec::new();
+            let mut image_model: Option<Box<lisa_engine::models::image_generation::Pipeline>>=None;
+            let mut image_server: Option<lisa_serve::images::ImageServer>=None;
             let mut history_system = String::new();
-            // Whether the checkpoint's template closes assistant turns with
-            // `` (MiMo-style) rather than Qwen's bare newline.
-            let mut assistant_im_end = false;
+            let mut history_error: Option<String> = None;
             let mut is_glm = false;
             let mut contexts = EngineContexts::new();
 
@@ -1683,9 +1506,8 @@ fn spawn_engine(rx: mpsc::Receiver<Command>, events: Arc<Mutex<Vec<UiEvent>>>) {
                     Err(mpsc::TryRecvError::Empty) => {
                         if let Some(stop) = serve_stop.as_ref() {
                             if stop.load(Ordering::Relaxed) {
-                                if let Some(mut srv) = server.take() {
-                                    srv.shutdown();
-                                }
+                                if let Some(mut srv) = server.take() {srv.shutdown();}
+                                if let Some(mut srv) = image_server.take() {srv.shutdown();}
                                 serve_stop = None;
                                 push(UiEvent::ServeStopped);
                                 continue;
@@ -1700,6 +1522,9 @@ fn spawn_engine(rx: mpsc::Receiver<Command>, events: Arc<Mutex<Vec<UiEvent>>>) {
                                 continue;
                             }
                         }
+                        if let (Some(server),Some(model))=(&image_server,&image_model) {
+                            if server.step(model) {continue;}
+                        }
                         match rx.recv_timeout(std::time::Duration::from_millis(50)) {
                             Ok(c) => c,
                             Err(mpsc::RecvTimeoutError::Timeout) => continue,
@@ -1709,6 +1534,10 @@ fn spawn_engine(rx: mpsc::Receiver<Command>, events: Arc<Mutex<Vec<UiEvent>>>) {
                 };
                 match cmd {
                     Command::Load(path) => {
+                        let path = lisa_engine::models::hf::checkpoint_path(path);
+                        if let Some(mut srv)=image_server.take() {srv.shutdown();serve_stop=None;push(UiEvent::ServeStopped);}
+                        image_model=None;
+                        push(UiEvent::ImageMode(None));
                         // Swapping the model requires stopping any running server.
                         if let Some(mut srv) = server.take() {
                             srv.shutdown();
@@ -1725,6 +1554,16 @@ fn spawn_engine(rx: mpsc::Receiver<Command>, events: Arc<Mutex<Vec<UiEvent>>>) {
                             "loading {} …",
                             tilde(&path.to_string_lossy())
                         )));
+                        if matches!(config_model_type(&path).as_deref(), Some("glm5_next" | "glm5_next_text"))
+                            && !path.join(".lisa-resident/index.json").is_file()
+                        {
+                            push(UiEvent::Log("Preparing GLM weights for the first load. This uses extra disk space and may take several minutes.".into()));
+                            if let Err(e) = lisa_engine::core::prepare::prepare_model(&path, false) {
+                                push(UiEvent::Log(format!("preparation error: {e}")));
+                                push(UiEvent::Loaded(false));
+                                continue;
+                            }
+                        }
                         match lisa_engine::models::load_dir(&path) {
                             Ok(lisa_engine::models::Loaded::Language(m)) => {
                                 match lisa_engine::core::tokenizer::Tokenizer::load(&path) {
@@ -1736,16 +1575,11 @@ fn spawn_engine(rx: mpsc::Receiver<Command>, events: Arc<Mutex<Vec<UiEvent>>>) {
                                         tokenizer = Some(t);
                                         is_glm = matches!(
                                             config_model_type(&path).as_deref(),
-                                            Some("glm5_next" | "glm5_next_text")
+                                            Some("glm5_next" | "glm5_next_text" | "glm5-next")
                                         );
                                         model = Some(m);
                                         model_dir = Some(path.clone());
-                                        assistant_im_end = std::fs::read_to_string(
-                                            path.join("chat_template.jinja"),
-                                        )
-                                        .map(|t| t.contains("render_assistant_message"))
-                                        .unwrap_or(false);
-                                        if let Some(m) = model.as_mut() {
+                                        if let Some(m) = model.as_mut().filter(|_| history_images.iter().all(Vec::is_empty)) {
                                             // Prefill recorded turns without sampling. Qwen
                                             // also retains the hidden rows needed to prime MTP.
                                             match replay_chat_history(
@@ -1754,7 +1588,6 @@ fn spawn_engine(rx: mpsc::Receiver<Command>, events: Arc<Mutex<Vec<UiEvent>>>) {
                                                 &history,
                                                 &history_system,
                                                 is_glm,
-                                                assistant_im_end,
                                             ) {
                                                 Ok(replayed) => {
                                                     session = Some(replayed);
@@ -1769,12 +1602,13 @@ fn spawn_engine(rx: mpsc::Receiver<Command>, events: Arc<Mutex<Vec<UiEvent>>>) {
                                                     push(UiEvent::Log(format!(
                                                         "history replay failed: {error}"
                                                     )));
-                                                    session = Some(new_chat_session(&mut **m));
-                                                    turn = 0;
+                                                    session = None;
+                                                    turn = history.len();
                                                 }
                                             }
                                         }
                                         push(UiEvent::Log("model loaded".into()));
+                                        push(UiEvent::SupportsImages(model.as_ref().is_some_and(|m| m.supports_images())));
                                         push(UiEvent::Loaded(true));
                                     }
                                     Err(e) => {
@@ -1782,6 +1616,12 @@ fn spawn_engine(rx: mpsc::Receiver<Command>, events: Arc<Mutex<Vec<UiEvent>>>) {
                                         push(UiEvent::Loaded(false));
                                     }
                                 }
+                            }
+                            Ok(lisa_engine::models::Loaded::Image(pipeline)) => {
+                                let steps=pipeline.default_steps();
+                                image_model=Some(pipeline);model_dir=Some(path.clone());
+                                push(UiEvent::ImageMode(Some(steps)));push(UiEvent::Loaded(true));
+                                push(UiEvent::Log("Image model ready: enter a prompt to generate a 512×512 image.".into()));
                             }
                             Ok(lisa_engine::models::Loaded::Decision(_)) => {
                                 push(UiEvent::Log("decision models are not chattable".into()));
@@ -1794,6 +1634,11 @@ fn spawn_engine(rx: mpsc::Receiver<Command>, events: Arc<Mutex<Vec<UiEvent>>>) {
                         }
                     }
                     Command::Download(repo) => {
+                        if catalog::find(&repo).is_none() {
+                            push(UiEvent::Log(format!("{repo} is not in the curated download catalog")));
+                            push(UiEvent::ModelsChanged);
+                            continue;
+                        }
                         // Download on a side thread so the active model keeps
                         // serving chat, and don't swap models when it finishes.
                         push(UiEvent::Log(format!("downloading {repo} …")));
@@ -1804,7 +1649,7 @@ fn spawn_engine(rx: mpsc::Receiver<Command>, events: Arc<Mutex<Vec<UiEvent>>>) {
                                 .name("lisa-download".into())
                                 .spawn(move || {
                                     let push = |e: UiEvent| events.lock().unwrap().push(e);
-                                    match lisa_engine::models::resolve_model_dir(&repo2) {
+                                    match lisa_engine::models::hf::download_repo(&repo2) {
                                         Ok(_) => {
                                             push(UiEvent::Log(format!("downloaded {repo2}")));
                                             push(UiEvent::ModelsChanged);
@@ -1818,7 +1663,11 @@ fn spawn_engine(rx: mpsc::Receiver<Command>, events: Arc<Mutex<Vec<UiEvent>>>) {
                     }
                     Command::Clear => {
                         history.clear();
+                        history_images.clear();
                         history_system.clear();
+                        history_error = None;
+                        session = None;
+                        turn = 0;
                         if let Some(m) = model.as_mut() {
                             contexts.activate(EngineOwner::Chat, &mut **m);
                             session = Some(new_chat_session(&mut **m));
@@ -1826,13 +1675,122 @@ fn spawn_engine(rx: mpsc::Receiver<Command>, events: Arc<Mutex<Vec<UiEvent>>>) {
                         }
                         push(UiEvent::Log("conversation cleared".into()));
                     }
-                    Command::Chat { text, system } => {
+                    Command::Restore { turns, system } => {
+                        session = None;
+                        history.clear();
+                        history_images.clear();
+                        history_system = system;
+                        history_error = None;
+                        for saved in turns.into_iter().filter(|t| t.complete && t.generated_image.is_none()) {
+                            let images = saved.images.iter()
+                                .map(|path| lisa_engine::models::vision::file_data_url(path))
+                                .collect::<anyhow::Result<Vec<_>>>();
+                            match images {
+                                Ok(images) => {
+                                    history.push((saved.user, saved.assistant));
+                                    history_images.push(images);
+                                }
+                                Err(error) => {
+                                    history_error = Some(format!("A saved attachment could not be read: {error}. Restore the file or start a new chat."));
+                                    break;
+                                }
+                            }
+                        }
+                        turn = history.len();
+                        if let Some(m) = model.as_mut() {
+                            contexts.activate(EngineOwner::Chat, &mut **m);
+                            m.clear_images();
+                            m.drafter_reset();
+                        }
+                    }
+                    Command::Chat { text, system, images } => {
+                        push(UiEvent::UserMessage(text.clone()));
+                        if let Some(error) = &history_error {
+                            push(UiEvent::AssistantReset(error.clone()));
+                            push(UiEvent::AssistantDone);
+                            continue;
+                        }
+                        if let Some(pipeline)=&image_model {
+                            let result=(||->anyhow::Result<PathBuf> {
+                                anyhow::ensure!(images.is_empty(),"this image model currently supports text-to-image; remove attached images");
+                                let stamp=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+                                let options=lisa_engine::models::image_generation::Options {seed:stamp as u64,..Default::default()};
+                                let png=pipeline.generate(&text,&options,&mut |stage,i,n| {push(UiEvent::AssistantReset(format!("{stage} {i}/{n}")));Ok(())})?;
+                                let root=PathBuf::from(std::env::var_os("HOME").ok_or_else(||anyhow::anyhow!("HOME is not set"))?).join("Pictures/Lisa");
+                                std::fs::create_dir_all(&root)?;
+                                let path=root.join(format!("image-{stamp}.png"));std::fs::write(&path,png)?;Ok(path)
+                            })();
+                            match result {
+                                Ok(path)=> {push(UiEvent::Log(format!("Saved image: {}",path.display())));push(UiEvent::AssistantImage(path));push(UiEvent::TurnCommitted(String::new()));}
+                                Err(e)=>push(UiEvent::AssistantReset(format!("Image generation failed: {e}"))),
+                            }
+                            push(UiEvent::AssistantDone);continue;
+                        }
                         let (Some(model), Some(tokenizer)) = (model.as_mut(), tokenizer.as_ref())
                         else {
                             push(UiEvent::Log("no model loaded".into()));
+                            push(UiEvent::AssistantReset("Choose a model before sending a message.".into()));
+                            push(UiEvent::AssistantDone);
                             continue;
                         };
                         contexts.activate(EngineOwner::Chat, &mut **model);
+                        if !images.is_empty() || history_images.iter().any(|i|!i.is_empty()) {
+                            let result=(||->anyhow::Result<(String,Vec<String>)> {
+                                let urls=images.iter().map(|p|lisa_engine::models::vision::file_data_url(p)).collect::<anyhow::Result<Vec<_>>>()?;
+                                push(UiEvent::UserImages(images.clone()));
+                                let mut messages=Vec::new();
+                                let sys=if history.is_empty() {&system} else {&history_system};
+                                if !sys.trim().is_empty() {messages.push(serde_json::json!({"role":"system","content":sys}));}
+                                let user=|text:&str,urls:&[String]| {
+                                    let mut parts=urls.iter().map(|url|serde_json::json!({"type":"image_url","image_url":{"url":url}})).collect::<Vec<_>>();
+                                    parts.push(serde_json::json!({"type":"text","text":text}));
+                                    serde_json::json!({"role":"user","content":parts})
+                                };
+                                for (i,(text,reply)) in history.iter().enumerate() {
+                                    messages.push(user(text,history_images.get(i).map(Vec::as_slice).unwrap_or(&[])));
+                                    messages.push(serde_json::json!({"role":"assistant","content":reply}));
+                                }
+                                messages.push(user(&text,&urls));
+                                let body=serde_json::json!({"messages":messages});
+                                let decoded=lisa_engine::models::vision::decode_message_images(&body)?;
+                                let dir=model_dir.as_ref().ok_or_else(||anyhow::anyhow!("no model directory"))?;
+                                let template=lisa_serve::ChatTemplate::new(&std::fs::read_to_string(dir.join("chat_template.jinja"))?)?;
+                                let chat:Vec<lisa_serve::ChatMessage>=body["messages"].as_array().unwrap().iter().map(|m|lisa_serve::ChatMessage {
+                                    role:m["role"].as_str().unwrap().into(),content:m["content"].as_str().unwrap_or("").into(),
+                                    reasoning_content:None,tool_calls:Vec::new(),tool_call_id:None,parts:m["content"].as_array().cloned()
+                                }).collect();
+                                let prompt=template.render(&chat,true,&[],false)?;
+                                let mut ids=tokenizer.encode(&prompt,false)?;
+                                model.clear_images();
+                                model.prepare_images(&mut ids,&decoded)?;
+                                drop(decoded);
+                                let mut sess=new_chat_session(&mut **model);
+                                let mut decoder=lisa_engine::core::tokenizer::IncrementalDecoder::new(tokenizer,true);
+                                let output=sess.generate(&mut **model,&ids,CHAT_MAX_TOKENS,&mut sampler,0,None,&mut |id| {
+                                    decoder.push(id)?;
+                                    push(UiEvent::AssistantReset(clean_reply(decoder.stable_text())));
+                                    Ok(())
+                                })?;
+                                let reply=clean_reply(&tokenizer.decode_clean(&output)?);
+                                push(UiEvent::AssistantReset(reply.clone()));
+                                Ok((reply,urls))
+                            })();
+                            model.clear_images();session=None;
+                            match result {
+                                Ok((reply,urls))=> {
+                                    if history.is_empty() {history_system=system;}
+                                    history_images.resize(history.len(),Vec::new());
+                                    push(UiEvent::TurnCommitted(reply.clone()));
+                                    history_images.push(urls);history.push((text,reply));turn=history.len();
+                                }
+                                Err(e)=> {
+                                    push(UiEvent::Log(format!("image request failed: {e}")));
+                                    push(UiEvent::AssistantReset(format!("Image request failed: {e}")));
+                                }
+                            }
+                            push(UiEvent::AssistantDone);
+                            continue;
+                        }
                         if session.as_ref().is_none_or(|session| !session.is_valid()) {
                             match replay_chat_history(
                                 &mut **model,
@@ -1840,7 +1798,6 @@ fn spawn_engine(rx: mpsc::Receiver<Command>, events: Arc<Mutex<Vec<UiEvent>>>) {
                                 &history,
                                 &history_system,
                                 is_glm,
-                                assistant_im_end,
                             ) {
                                 Ok(replayed) => {
                                     session = Some(replayed);
@@ -1848,8 +1805,9 @@ fn spawn_engine(rx: mpsc::Receiver<Command>, events: Arc<Mutex<Vec<UiEvent>>>) {
                                 }
                                 Err(error) => {
                                     push(UiEvent::Log(format!("history replay failed: {error}")));
-                                    session = Some(new_chat_session(&mut **model));
-                                    turn = 0;
+                                    push(UiEvent::AssistantReset(format!("Could not restore this conversation: {error}")));
+                                    push(UiEvent::AssistantDone);
+                                    continue;
                                 }
                             }
                         }
@@ -1868,22 +1826,24 @@ fn spawn_engine(rx: mpsc::Receiver<Command>, events: Arc<Mutex<Vec<UiEvent>>>) {
                             sys,
                             turn == 0,
                             is_glm,
-                            assistant_im_end,
                         ) {
                             Ok(ids) => ids,
                             Err(e) => {
                                 push(UiEvent::Log(format!("encode error: {e}")));
+                                push(UiEvent::AssistantReset(format!("Could not prepare this message: {e}")));
+                                push(UiEvent::AssistantDone);
                                 continue;
                             }
                         };
-                        push(UiEvent::UserMessage(text.clone()));
                         let mut all = Vec::new();
                         let mut emitted = String::new();
                         let sess = session.as_mut().expect("session");
+                        let mut decoded =
+                            lisa_engine::core::tokenizer::IncrementalDecoder::new(tokenizer, true);
                         let mut emit = |id| {
                             all.push(id);
-                            let full = tokenizer.decode_clean(&all).unwrap_or_default();
-                            let display = clean_reply(&full);
+                            decoded.push(id)?;
+                            let display = clean_reply(decoded.stable_text());
                             if display.len() >= emitted.len() && display.starts_with(&emitted) {
                                 let delta = display[emitted.len()..].to_string();
                                 if !delta.is_empty() && !delta.ends_with('\u{FFFD}') {
@@ -1956,12 +1916,22 @@ fn spawn_engine(rx: mpsc::Receiver<Command>, events: Arc<Mutex<Vec<UiEvent>>>) {
                             } else {
                                 emitted.clone()
                             };
+                            history_images.push(Vec::new());
+                            push(UiEvent::TurnCommitted(reply.clone()));
                             history.push((text.clone(), reply));
                             turn += 1;
                         }
                         push(UiEvent::AssistantDone);
                     }
                     Command::StartServe { addr, stop } => {
+                        if image_model.is_some() {
+                            let id=model_dir.as_ref().map(|p|lisa_serve::model_id_of(p)).unwrap_or_else(||"flux2-klein".into());
+                            match lisa_serve::images::ImageServer::bind(&addr,&id,stop.clone()) {
+                                Ok(srv)=>{image_server=Some(srv);serve_stop=Some(stop);push(UiEvent::ServeStarted(format!("http://{addr}")));}
+                                Err(e)=>{push(UiEvent::Log(format!("serve failed: {e}")));push(UiEvent::ServeStopped);}
+                            }
+                            continue;
+                        }
                         if model.is_none() || tokenizer.is_none() {
                             push(UiEvent::Log("serve: no model loaded".into()));
                             push(UiEvent::ServeStopped);
@@ -1971,6 +1941,7 @@ fn spawn_engine(rx: mpsc::Receiver<Command>, events: Arc<Mutex<Vec<UiEvent>>>) {
                             std::fs::read_to_string(d.join("chat_template.jinja")).ok()
                         });
                         let cfg = lisa_serve::ServerConfig {
+                            supports_images: model.as_ref().is_some_and(|m|m.supports_images()),
                             addr: addr.clone(),
                             max_tokens: 2048,
                             temperature: Some(0.0),
@@ -2025,7 +1996,8 @@ pub struct AppDelegateIvars {
     logs_item: OnceCell<Retained<NSSplitViewItem>>,
     models: RefCell<Vec<Model>>,
     remote_ids: RefCell<Vec<(String, u64)>>,
-    models_table: OnceCell<Retained<NSTableView>>,
+    models_list: OnceCell<Retained<NSStackView>>,
+    models_scroll: OnceCell<Retained<NSScrollView>>,
     loading_row: RefCell<Option<usize>>,
     /// Repo id of the model currently loaded/active. Tracked by id (not row
     /// index) so list re-sorting never moves the active highlight.
@@ -2034,16 +2006,36 @@ pub struct AppDelegateIvars {
     download_progress: Cell<f64>,
     progress_tick: Cell<usize>,
     selected_row: RefCell<Option<usize>>,
-    updating_table: Cell<bool>,
     chat_stack: OnceCell<Retained<NSStackView>>,
     chat_scroll: OnceCell<Retained<NSScrollView>>,
-    chat_placeholder: OnceCell<Retained<NSTextField>>,
+    chat_placeholder: OnceCell<Retained<NSStackView>>,
+    welcome_title: OnceCell<Retained<NSTextField>>,
+    welcome_detail: OnceCell<Retained<NSTextField>>,
+    model_title: OnceCell<Retained<NSTextField>>,
+    model_status: OnceCell<Retained<NSTextField>>,
+    composer_hint: OnceCell<Retained<NSTextField>>,
+    new_chat: OnceCell<Retained<NSButton>>,
+    new_chat_row: OnceCell<Retained<ui::SidebarRow>>,
+    chat_store: chats::Store,
+    chats: RefCell<Vec<chats::Chat>>,
+    active_chat: RefCell<Option<String>>,
+    chat_list: OnceCell<Retained<NSStackView>>,
+    chat_list_height: OnceCell<Retained<NSLayoutConstraint>>,
+    chat_section: OnceCell<ui::SidebarSection>,
+    models_section: OnceCell<ui::SidebarSection>,
+    chat_buttons: RefCell<Vec<Retained<NSButton>>>,
+    busy: Cell<bool>,
     assistant_label: RefCell<Option<Retained<NSTextField>>>,
     assistant_stack: RefCell<Option<Retained<NSStackView>>>,
+    user_stack: RefCell<Option<Retained<NSStackView>>>,
     typing: Cell<bool>,
     typing_tick: Cell<usize>,
     chat_input: OnceCell<Retained<NSTextField>>,
     chat_send: OnceCell<Retained<NSButton>>,
+    chat_attach: OnceCell<Retained<NSButton>>,
+    attachment_clear: OnceCell<Retained<NSButton>>,
+    attachments: RefCell<Vec<PathBuf>>,
+    image_mode: Cell<Option<u32>>,
     cmd_menu: OnceCell<Retained<RoundedView>>,
     cmd_rows: RefCell<Vec<Retained<NSButton>>>,
     cmd_bgs: RefCell<Vec<Retained<RoundedView>>>,
@@ -2063,6 +2055,7 @@ pub struct AppDelegateIvars {
     /// Whether a model is currently loaded (chat is enabled once it is, and
     /// disabled while the in-process server is running).
     model_loaded: Cell<bool>,
+    supports_images: Cell<bool>,
 }
 
 define_class!(
@@ -2109,7 +2102,7 @@ define_class!(
         unsafe fn control_text_view_do_command_by_selector(
             &self,
             _control: &NSControl,
-            _text_view: &NSTextView,
+            text_view: &NSTextView,
             command_selector: Sel,
         ) -> Bool {
             if command_selector == sel!(moveDown:) {
@@ -2126,6 +2119,12 @@ define_class!(
                 return Bool::YES;
             }
             if command_selector == sel!(insertNewline:) {
+                if NSApplication::sharedApplication(self.mtm()).currentEvent()
+                    .is_some_and(|event| event.modifierFlags().contains(NSEventModifierFlags::Shift))
+                {
+                    unsafe { text_view.insertNewlineIgnoringFieldEditor(None) };
+                    return Bool::YES;
+                }
                 let open = self
                     .ivars()
                     .cmd_menu
@@ -2150,6 +2149,11 @@ define_class!(
     unsafe impl NSTextFieldDelegate for AppDelegate {}
 
     unsafe impl NSApplicationDelegate for AppDelegate {
+        #[unsafe(method(applicationWillTerminate:))]
+        fn will_terminate(&self, _notification: &NSNotification) {
+            self.save_chat_draft();
+        }
+
         #[unsafe(method(applicationDidFinishLaunching:))]
         fn did_finish_launching(&self, _notification: &NSNotification) {
             let mtm = self.mtm();
@@ -2166,18 +2170,14 @@ define_class!(
             let sidebar_vc = NSViewController::new(mtm);
             sidebar_vc.setView(&sidebar_view);
             let sidebar_item = NSSplitViewItem::splitViewItemWithViewController(&sidebar_vc);
-            sidebar_item.setMinimumThickness(250.0);
+            sidebar_item.setMinimumThickness(240.0);
+            sidebar_item.setCanCollapse(true);
+            sidebar_item.setCanCollapseFromWindowResize(true);
             sidebar_item.setMaximumThickness(300.0);
             sidebar_item.setPreferredThicknessFraction(0.09);
+            // Keep the chosen sidebar width when Settings changes the available space.
+            sidebar_item.setHoldingPriority(260.0);
             outer.addSplitViewItem(&sidebar_item);
-            sidebar_view
-                .widthAnchor()
-                .constraintGreaterThanOrEqualToConstant(250.0)
-                .setActive(true);
-            sidebar_view
-                .widthAnchor()
-                .constraintLessThanOrEqualToConstant(300.0)
-                .setActive(true);
             self.ivars().sidebar_item.set(sidebar_item).ok();
 
             // Content: a vertical split with the chat on top and the log panel
@@ -2202,6 +2202,7 @@ define_class!(
 
             let content_item = NSSplitViewItem::splitViewItemWithViewController(&content);
             content_item.setMinimumThickness(420.0);
+            content_item.setHoldingPriority(250.0);
             outer.addSplitViewItem(&content_item);
 
             // Right column: serve the loaded model over HTTP for other tools.
@@ -2211,11 +2212,11 @@ define_class!(
             let serve_item = NSSplitViewItem::splitViewItemWithViewController(&serve_vc);
             serve_item.setMinimumThickness(320.0);
             serve_item.setMaximumThickness(320.0);
+            serve_item.setCanCollapse(true);
+            // Resizing must preserve the user's choice to show or hide Settings.
+            serve_item.setCanCollapseFromWindowResize(false);
+            serve_item.setCollapsed(true);
             outer.addSplitViewItem(&serve_item);
-            serve_view
-                .widthAnchor()
-                .constraintEqualToConstant(320.0)
-                .setActive(true);
             self.ivars().serve_item.set(serve_item).ok();
 
             let split_view = outer.view();
@@ -2277,26 +2278,21 @@ define_class!(
             window.setBackgroundColor(Some(&NSColor::clearColor()));
             window.setMovableByWindowBackground(true);
             window.setContentViewController(Some(&container_vc));
-            window.setContentSize(NSSize::new(1360.0, 860.0));
-            window.setContentMinSize(NSSize::new(1000.0, 640.0));
+            window.setContentSize(NSSize::new(1180.0, 820.0));
+            window.setContentMinSize(NSSize::new(720.0, 560.0));
             window.setDelegate(Some(ProtocolObject::from_ref(self)));
             window.makeKeyAndOrderFront(None);
             window.setFrameOrigin(NSPoint::new(90.0, 150.0));
 
-            // Open with the serve panel at its 320pt minimum and the models
-            // panel at its 150pt minimum.
+            // Chat is the primary workspace; the inspector opens on demand.
             if let Some(content) = window.contentView() {
                 content.layoutSubtreeIfNeeded();
             }
-            let split = outer.splitView();
-            let total = split.frame().size.width;
-            if total > 320.0 {
-                split.setPosition_ofDividerAtIndex(total - 320.0, 1);
-            }
-            split.setPosition_ofDividerAtIndex(250.0, 0);
+            outer.splitView().setPosition_ofDividerAtIndex(260.0, 0);
 
             self.ivars().window.set(window).ok();
-            self.reload_models_table();
+            self.refresh_model_list();
+            self.refresh_chat_list();
 
             // Drain engine events (log / chat / loaded) on the main thread.
             unsafe {
@@ -2322,50 +2318,16 @@ define_class!(
         }
     }
 
-    unsafe impl NSTableViewDataSource for AppDelegate {
-        #[unsafe(method(numberOfRowsInTableView:))]
-        fn number_of_rows(&self, _table_view: &NSTableView) -> NSInteger {
-            self.ivars().models.borrow().len() as NSInteger
-        }
-    }
-
-    unsafe impl NSTableViewDelegate for AppDelegate {
-        #[unsafe(method_id(tableView:viewForTableColumn:row:))]
-        fn view_for_row(
-            &self,
-            _table_view: &NSTableView,
-            _table_column: Option<&NSTableColumn>,
-            row: NSInteger,
-        ) -> Option<Retained<NSView>> {
-            self.make_model_cell(row)
-        }
-
-        #[unsafe(method(tableViewSelectionDidChange:))]
-        fn selection_did_change(&self, _notification: &NSNotification) {
-            // Ignore selection changes caused by our own reloadData (which
-            // would otherwise recurse), and anything but a real mouse click.
-            if self.ivars().updating_table.get() {
+    impl AppDelegate {
+        #[unsafe(method(selectModel:))]
+        fn select_model(&self, sender: Option<&AnyObject>) {
+            if self.chat_locked() {
                 return;
             }
-            let is_click = NSApplication::sharedApplication(self.mtm())
-                .currentEvent()
-                .map(|e| {
-                    matches!(
-                        e.r#type(),
-                        NSEventType::LeftMouseDown | NSEventType::LeftMouseUp
-                    )
-                })
-                .unwrap_or(false);
-            if !is_click {
-                return;
-            }
-            let Some(table) = self.ivars().models_table.get() else {
+            let Some(button) = sender.and_then(|sender| sender.downcast_ref::<NSButton>()) else {
                 return;
             };
-            let row = table.selectedRow();
-            if row < 0 {
-                return;
-            }
+            let row = button.tag();
             let selected = {
                 let models = self.ivars().models.borrow();
                 models
@@ -2384,22 +2346,7 @@ define_class!(
                 if self.ivars().active_repo.borrow().as_deref() == Some(repo_id.as_str()) {
                     return;
                 }
-                if let Some(window) = self.ivars().window.get() {
-                    window.setTitle(&NSString::from_str(&format!(
-                        "Lisa — {}",
-                        display_name(&repo_id)
-                    )));
-                }
-                self.ivars().downloading.set(false);
-                *self.ivars().active_repo.borrow_mut() = Some(repo_id);
-                *self.ivars().loading_row.borrow_mut() = Some(row as usize);
-                *self.ivars().selected_row.borrow_mut() = Some(row as usize);
-                self.reload_models_table();
-                self.ivars().model_loaded.set(false);
-                self.set_chat_enabled(false);
-                if let Some(tx) = self.ivars().engine_tx.get() {
-                    let _ = tx.send(Command::Load(PathBuf::from(path)));
-                }
+                self.load_chat_model(repo_id, PathBuf::from(path), row as usize);
             } else {
                 // Download in the background and leave the current model
                 // loaded so the user can keep chatting meanwhile.
@@ -2411,7 +2358,7 @@ define_class!(
                 self.ivars().download_progress.set(0.0);
                 self.ivars().progress_tick.set(0);
                 *self.ivars().loading_row.borrow_mut() = Some(row as usize);
-                self.reload_models_table();
+                self.refresh_model_list();
                 if let Some(tx) = self.ivars().engine_tx.get() {
                     let _ = tx.send(Command::Download(repo_id));
                 }
@@ -2427,12 +2374,86 @@ define_class!(
             }
         }
 
+        #[unsafe(method(toggleChatSection:))]
+        fn toggle_chat_section(&self, _sender: Option<&AnyObject>) {
+            if let Some(section) = self.ivars().chat_section.get() {
+                section.toggle();
+            }
+        }
+
+        #[unsafe(method(toggleModelsSection:))]
+        fn toggle_models_section(&self, _sender: Option<&AnyObject>) {
+            if let Some(section) = self.ivars().models_section.get() {
+                section.toggle();
+            }
+        }
+
+        #[unsafe(method(newChat:))]
+        fn new_chat(&self, _sender: Option<&AnyObject>) {
+            if !self.chat_locked() {
+                self.run_chat_command("/clear");
+                self.update_chat_enabled();
+            }
+        }
+
+        #[unsafe(method(selectChat:))]
+        fn select_chat(&self, sender: &NSButton) {
+            if self.chat_locked() { return; }
+            let chat = self.ivars().chats.borrow().get(sender.tag() as usize).cloned();
+            if let Some(chat) = chat { self.open_chat(chat); }
+        }
+
+        #[unsafe(method(deleteChat:))]
+        fn delete_chat(&self, sender: &NSButton) {
+            self.confirm_delete_chat(sender.tag());
+        }
+
+        #[unsafe(method(deleteChatFromMenu:))]
+        fn delete_chat_from_menu(&self, sender: &NSMenuItem) {
+            self.confirm_delete_chat(sender.tag());
+        }
+
+        #[unsafe(method(validateMenuItem:))]
+        fn validate_menu_item(&self, item: &NSMenuItem) -> bool {
+            if item.action() == Some(sel!(deleteChatFromMenu:)) {
+                !self.chat_locked() && self.ivars().chats.borrow().get(item.tag() as usize).is_some()
+            } else {
+                true
+            }
+        }
+
+        #[unsafe(method(copyEndpoint:))]
+        fn copy_endpoint(&self, _sender: Option<&AnyObject>) {
+            let port = self.ivars().serve_port.get().map(|field|field.stringValue().to_string()).unwrap_or_else(||"5472".into());
+            if let Ok(port) = port.trim().parse::<u16>() {
+                let pasteboard = NSPasteboard::generalPasteboard();
+                pasteboard.clearContents();
+                unsafe { pasteboard.setString_forType(&NSString::from_str(&format!("http://127.0.0.1:{port}/v1")), NSPasteboardTypeString); }
+            }
+        }
+
+        #[unsafe(method(toggleInspector:))]
+        fn toggle_inspector(&self, _sender: Option<&AnyObject>) {
+            if let Some(item) = self.ivars().serve_item.get() {
+                let collapse = !item.isCollapsed();
+                if !collapse {
+                    if let Some(window) = self.ivars().window.get() {
+                        let frame = window.frame();
+                        if frame.size.width < 1120.0 {
+                            window.setContentSize(NSSize::new(1120.0, frame.size.height));
+                        }
+                    }
+                }
+                item.setCollapsed(collapse);
+            }
+        }
+
         #[unsafe(method(deleteModel:))]
-        fn delete_model(&self, _sender: Option<&AnyObject>) {
-            let Some(table) = self.ivars().models_table.get() else {
+        fn delete_model(&self, sender: Option<&AnyObject>) {
+            let Some(item) = sender.and_then(|sender| sender.downcast_ref::<NSMenuItem>()) else {
                 return;
             };
-            let row = table.clickedRow();
+            let row = item.tag();
             if row < 0 {
                 return;
             }
@@ -2493,6 +2514,7 @@ define_class!(
 
         #[unsafe(method(pollEngine:))]
         fn poll_engine(&self, _timer: &NSTimer) {
+            self.refresh_sidebar_hover();
             self.tick_typing();
             self.tick_download_progress();
             let Some(events) = self.ivars().engine_events.get() else {
@@ -2503,13 +2525,62 @@ define_class!(
                 match event {
                     UiEvent::Log(line) => self.append_engine_log(&line),
                     UiEvent::UserMessage(text) => self.add_user_message(&text),
-                    UiEvent::AssistantDelta(piece) => self.append_assistant_delta(&piece),
-                    UiEvent::AssistantReset(text) => self.set_assistant_text(&text),
-                    UiEvent::AssistantDone => self.finalize_assistant(),
+                    UiEvent::ImageMode(steps)=> {
+                        self.ivars().image_mode.set(steps);
+                        self.ivars().supports_images.set(false);
+                        let on=steps.is_some();
+                        if let Some(input)=self.ivars().chat_input.get() {
+                            input.setPlaceholderString(Some(if on {ns_string!("Describe an image to generate")} else {ns_string!("Message Lisa…")}));
+                        }
+                        self.ivars().attachments.borrow_mut().clear();
+                        if let Some(button)=self.ivars().chat_send.get() {button.setTitle(if on {ns_string!("Generate")} else {ns_string!("Send")});}
+                        if let Some(button)=self.ivars().chat_attach.get() {button.setTitle(ns_string!("Attach"));button.setEnabled(false);}
+                        self.refresh_chat_chrome();
+                    }
+                    UiEvent::SupportsImages(supported) => {
+                        self.ivars().supports_images.set(supported);
+                        self.update_chat_enabled();
+                    }
+                    UiEvent::AssistantImage(path)=> {
+                        self.update_saved_turn(|turn| {turn.assistant.clear();turn.generated_image=Some(path.clone());});
+                        self.add_generated_image(&path);
+                    }
+                    UiEvent::UserImages(paths) => {
+                        for path in paths {self.add_user_image(&path);}
+                    }
+                    UiEvent::AssistantDelta(piece) => {
+                        self.update_saved_turn(|turn| turn.assistant.push_str(&piece));
+                        self.append_assistant_delta(&piece);
+                    }
+                    UiEvent::AssistantReset(text) => {
+                        self.update_saved_turn(|turn| turn.assistant=text.clone());
+                        self.set_assistant_text(&text);
+                    }
+                    UiEvent::TurnCommitted(reply) => self.update_saved_turn(|turn| {
+                        turn.assistant=reply;turn.complete=true;
+                    }),
+                    UiEvent::AssistantDone => {
+                        self.finalize_assistant();
+                        self.ivars().busy.set(false);
+                        self.persist_active_chat();
+                        self.refresh_chat_list();
+                        self.update_chat_enabled();
+                    },
                     UiEvent::Loaded(ok) => {
                         *self.ivars().loading_row.borrow_mut() = None;
-                        self.reload_models_table();
+                        self.refresh_model_list();
                         self.ivars().model_loaded.set(ok);
+                        if ok {
+                            let model = self.ivars().active_repo.borrow().clone();
+                            self.update_saved_chat(|chat| chat.model=model);
+                            self.persist_active_chat();
+                        }
+                        if !ok {
+                            *self.ivars().active_repo.borrow_mut() = None;
+                            *self.ivars().selected_row.borrow_mut() = None;
+                            self.refresh_model_list();
+                            if let Some(item) = self.ivars().logs_item.get() { item.setCollapsed(false); }
+                        }
                         self.update_chat_enabled();
                     }
                     UiEvent::ServeStarted(url) => {
@@ -2578,6 +2649,33 @@ define_class!(
             self.run_chat_command(name);
         }
 
+        #[unsafe(method(removeAttachments:))]
+        fn remove_attachments(&self, _sender: Option<&AnyObject>) {
+            self.ivars().attachments.borrow_mut().clear();
+            if let Some(button) = self.ivars().chat_attach.get() {button.setTitle(ns_string!("Attach"));}
+            self.refresh_chat_chrome();
+        }
+
+        #[unsafe(method(attachImage:))]
+        fn attach_image(&self, _sender: Option<&AnyObject>) {
+            if !self.ivars().model_loaded.get() || !self.ivars().supports_images.get() {
+                return;
+            }
+            let panel=NSOpenPanel::openPanel(self.mtm());
+            panel.setCanChooseFiles(true);
+            panel.setCanChooseDirectories(false);
+            panel.setAllowsMultipleSelection(true);
+            #[allow(deprecated)]
+            panel.setAllowedFileTypes(Some(&NSArray::from_slice(&[ns_string!("png"),ns_string!("jpg"),ns_string!("jpeg"),ns_string!("webp")])));
+            if panel.runModal()==NSModalResponseOK {
+                let paths:Vec<PathBuf>=panel.URLs().iter().filter_map(|url|url.path().map(|p|PathBuf::from(p.to_string()))).collect();
+                if paths.len()>lisa_engine::models::vision::MAX_IMAGES {self.append_engine_log("Select at most eight images.");return;}
+                if let Some(button)=self.ivars().chat_attach.get() {button.setTitle(&NSString::from_str(&format!("{} {}",paths.len(),if paths.len()==1 {"image"} else {"images"})));}
+                *self.ivars().attachments.borrow_mut()=paths;
+                self.refresh_chat_chrome();
+            }
+        }
+
         #[unsafe(method(sendMessage:))]
         fn send_message(&self, _sender: Option<&AnyObject>) {
             self.send_current();
@@ -2590,29 +2688,55 @@ impl AppDelegate {
         let (tx, rx) = mpsc::channel::<Command>();
         let events: Arc<Mutex<Vec<UiEvent>>> = Arc::new(Mutex::new(Vec::new()));
         spawn_engine(rx, events.clone());
+        let chat_store = chats::Store::new();
+        let (saved_chats, errors) = chat_store.load();
+        for error in errors {
+            events.lock().unwrap().push(UiEvent::Log(error));
+        }
         let this = Self::alloc(mtm).set_ivars(AppDelegateIvars {
             window: OnceCell::new(),
             sidebar_item: OnceCell::new(),
             logs_item: OnceCell::new(),
-            models: RefCell::new(discover_models()),
+            models: RefCell::new(Vec::new()),
             remote_ids: RefCell::new(Vec::new()),
-            models_table: OnceCell::new(),
+            models_list: OnceCell::new(),
+            models_scroll: OnceCell::new(),
             loading_row: RefCell::new(None),
             active_repo: RefCell::new(None),
             downloading: Cell::new(false),
             download_progress: Cell::new(0.0),
             progress_tick: Cell::new(0),
             selected_row: RefCell::new(None),
-            updating_table: Cell::new(false),
             chat_stack: OnceCell::new(),
             chat_scroll: OnceCell::new(),
             chat_placeholder: OnceCell::new(),
+            welcome_title: OnceCell::new(),
+            welcome_detail: OnceCell::new(),
+            model_title: OnceCell::new(),
+            model_status: OnceCell::new(),
+            composer_hint: OnceCell::new(),
+            new_chat: OnceCell::new(),
+            new_chat_row: OnceCell::new(),
+            chat_store,
+            chats: RefCell::new(saved_chats),
+            active_chat: RefCell::new(None),
+            chat_list: OnceCell::new(),
+            chat_list_height: OnceCell::new(),
+            chat_section: OnceCell::new(),
+            models_section: OnceCell::new(),
+            chat_buttons: RefCell::new(Vec::new()),
+            busy: Cell::new(false),
             assistant_label: RefCell::new(None),
             assistant_stack: RefCell::new(None),
+            user_stack: RefCell::new(None),
             typing: Cell::new(false),
             typing_tick: Cell::new(0),
             chat_input: OnceCell::new(),
             chat_send: OnceCell::new(),
+            chat_attach: OnceCell::new(),
+            attachment_clear: OnceCell::new(),
+            attachments: RefCell::new(Vec::new()),
+            image_mode: Cell::new(None),
             cmd_menu: OnceCell::new(),
             cmd_rows: RefCell::new(Vec::new()),
             cmd_bgs: RefCell::new(Vec::new()),
@@ -2630,10 +2754,12 @@ impl AppDelegate {
             serve_stop: RefCell::new(None),
             serving: Cell::new(false),
             model_loaded: Cell::new(false),
+            supports_images: Cell::new(false),
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), init] };
         this.ivars().engine_tx.set(tx).ok();
         this.ivars().engine_events.set(events.clone()).ok();
+        this.refresh_models();
         {
             let events = events.clone();
             let _ = thread::Builder::new()
@@ -2646,25 +2772,516 @@ impl AppDelegate {
         this
     }
 
-    /// Send the current input: run a slash command locally, else hand the turn
-    /// to the engine worker thread.
+    fn chat_locked(&self) -> bool {
+        self.ivars().busy.get()
+            || (self.ivars().loading_row.borrow().is_some() && !self.ivars().downloading.get())
+    }
+
+    fn refresh_sidebar_hover(&self) {
+        // Button tracking and row replacement can swallow mouse-exit events.
+        // Reconcile on the existing UI tick even with a stationary pointer:
+        // scrolling, resizing and collapsing sections can move rows underneath it.
+        if let Some(row) = self.ivars().new_chat_row.get() {
+            row.refresh_hover();
+        }
+        if let Some(section) = self.ivars().chat_section.get() {
+            section.refresh_hover();
+        }
+        if let Some(section) = self.ivars().models_section.get() {
+            section.refresh_hover();
+        }
+        if let Some(list) = self.ivars().chat_list.get() {
+            for row in list.arrangedSubviews().iter() {
+                ui::refresh_sidebar_row(&row);
+            }
+        }
+        if let Some(list) = self.ivars().models_list.get() {
+            for row in list.arrangedSubviews().iter() {
+                ui::refresh_sidebar_row(&row);
+            }
+        }
+    }
+
+    fn confirm_delete_chat(&self, index: NSInteger) {
+        if self.chat_locked() {
+            return;
+        }
+        let chat = self.ivars().chats.borrow().get(index as usize).cloned();
+        let Some(chat) = chat else { return };
+        let alert = NSAlert::new(self.mtm());
+        alert.setAlertStyle(NSAlertStyle::Warning);
+        alert.setMessageText(ns_string!("Delete chat?"));
+        alert.setInformativeText(&NSString::from_str(&format!(
+            "\"{}\" will be permanently deleted, including its messages and attached copies. Images saved in Pictures will be kept.",
+            chat.title(),
+        )));
+        alert.addButtonWithTitle(ns_string!("Cancel"));
+        let delete = alert.addButtonWithTitle(ns_string!("Delete"));
+        delete.setHasDestructiveAction(true);
+        if alert.runModal() != NSAlertSecondButtonReturn || self.chat_locked() {
+            return;
+        }
+        let warning = match self.ivars().chat_store.delete(&chat.id) {
+            Ok(warning) => warning,
+            Err(error) => {
+                self.append_engine_log(&format!("Could not delete chat: {error:#}"));
+                let alert = NSAlert::new(self.mtm());
+                alert.setMessageText(ns_string!("Could not delete chat"));
+                alert.setInformativeText(&NSString::from_str(&format!(
+                    "Your chat is still available. {error:#}",
+                )));
+                alert.addButtonWithTitle(ns_string!("OK"));
+                alert.runModal();
+                return;
+            }
+        };
+        self.ivars()
+            .chats
+            .borrow_mut()
+            .retain(|record| record.id != chat.id);
+        if self.ivars().active_chat.borrow().as_ref() == Some(&chat.id) {
+            // Do not use /clear here: it saves the current draft before resetting.
+            self.reset_chat();
+        } else {
+            self.refresh_chat_list();
+        }
+        if let Some(warning) = warning {
+            self.append_engine_log(&warning);
+            let alert = NSAlert::new(self.mtm());
+            alert.setMessageText(ns_string!("Chat deleted"));
+            alert.setInformativeText(ns_string!(
+                "Some attachment copies could not be removed from disk. Open View > Toggle Logs Panel for details."
+            ));
+            alert.addButtonWithTitle(ns_string!("OK"));
+            alert.runModal();
+        }
+    }
+
+    /// Reset the visible chat and engine context without saving the old draft.
+    fn reset_chat(&self) {
+        *self.ivars().active_chat.borrow_mut() = None;
+        self.ivars().attachments.borrow_mut().clear();
+        if let Some(input) = self.ivars().chat_input.get() {
+            input.setStringValue(ns_string!(""));
+        }
+        if let Some(button) = self.ivars().chat_attach.get() {
+            button.setTitle(ns_string!("Attach"));
+        }
+        self.clear_chat();
+        if let Some(tx) = self.ivars().engine_tx.get() {
+            let _ = tx.send(Command::Clear);
+        }
+        self.refresh_chat_list();
+        self.update_command_menu();
+        self.update_chat_enabled();
+        self.focus_composer();
+    }
+
+    fn update_saved_chat(&self, update: impl FnOnce(&mut chats::Chat)) {
+        let id = self.ivars().active_chat.borrow().clone();
+        if let Some(chat) = self
+            .ivars()
+            .chats
+            .borrow_mut()
+            .iter_mut()
+            .find(|c| Some(&c.id) == id.as_ref())
+        {
+            update(chat);
+        }
+    }
+
+    fn update_saved_turn(&self, update: impl FnOnce(&mut chats::Turn)) {
+        self.update_saved_chat(|chat| {
+            if let Some(turn) = chat.turns.last_mut() {
+                update(turn);
+            }
+        });
+    }
+
+    fn persist_active_chat(&self) {
+        let id = self.ivars().active_chat.borrow().clone();
+        let chat = self
+            .ivars()
+            .chats
+            .borrow()
+            .iter()
+            .find(|c| Some(&c.id) == id.as_ref())
+            .cloned();
+        if let Some(chat) = chat {
+            if let Err(error) = self.ivars().chat_store.save(&chat) {
+                self.append_engine_log(&format!("Could not save chat: {error}"));
+                self.add_note("This chat could not be saved to disk. Keep Lisa open and open View > Toggle Logs Panel for details.");
+            }
+        }
+    }
+
+    fn save_chat_draft(&self) {
+        let draft = self
+            .ivars()
+            .chat_input
+            .get()
+            .map(|v| v.stringValue().to_string())
+            .unwrap_or_default();
+        if self.ivars().active_chat.borrow().is_none() && !draft.trim().is_empty() {
+            let system = self
+                .ivars()
+                .system_view
+                .get()
+                .map(|v| v.string().to_string())
+                .unwrap_or_default();
+            let mut chat = chats::Chat::new(self.ivars().active_repo.borrow().clone(), system);
+            chat.draft = draft;
+            *self.ivars().active_chat.borrow_mut() = Some(chat.id.clone());
+            self.ivars().chats.borrow_mut().insert(0, chat);
+        } else {
+            self.update_saved_chat(|chat| chat.draft = draft);
+        }
+        self.persist_active_chat();
+    }
+
+    fn begin_saved_turn(
+        &self,
+        text: &str,
+        system: &str,
+        images: &[PathBuf],
+    ) -> anyhow::Result<Vec<PathBuf>> {
+        let id = self.ivars().active_chat.borrow().clone();
+        let current = self
+            .ivars()
+            .chats
+            .borrow()
+            .iter()
+            .find(|c| Some(&c.id) == id.as_ref())
+            .cloned();
+        let mut chat = current.unwrap_or_else(|| {
+            chats::Chat::new(self.ivars().active_repo.borrow().clone(), system.into())
+        });
+        if chat.turns.is_empty() {
+            chat.system = system.into();
+        }
+        chat.model = self.ivars().active_repo.borrow().clone();
+        let images = self.ivars().chat_store.keep_images(&chat.id, images)?;
+        chat.turns.push(chats::Turn {
+            user: text.into(),
+            images: images.clone(),
+            ..Default::default()
+        });
+        chat.draft.clear();
+        chat.updated = chats::timestamp();
+        if let Err(error) = self.ivars().chat_store.save(&chat) {
+            for path in &images {
+                let _ = std::fs::remove_file(path);
+            }
+            return Err(error);
+        }
+        *self.ivars().active_chat.borrow_mut() = Some(chat.id.clone());
+        {
+            let mut records = self.ivars().chats.borrow_mut();
+            records.retain(|old| old.id != chat.id);
+            records.insert(0, chat);
+        }
+        self.refresh_chat_list();
+        Ok(images)
+    }
+
+    fn load_chat_model(&self, repo: String, path: PathBuf, row: usize) {
+        self.ivars().downloading.set(false);
+        *self.ivars().active_repo.borrow_mut() = Some(repo);
+        *self.ivars().loading_row.borrow_mut() = Some(row);
+        *self.ivars().selected_row.borrow_mut() = Some(row);
+        self.ivars().model_loaded.set(false);
+        self.refresh_model_list();
+        self.set_chat_enabled(false);
+        if let Some(tx) = self.ivars().engine_tx.get() {
+            let _ = tx.send(Command::Load(path));
+        }
+    }
+
+    fn open_chat(&self, chat: chats::Chat) {
+        if self.ivars().active_chat.borrow().as_ref() == Some(&chat.id) {
+            return;
+        }
+        self.save_chat_draft();
+        self.clear_chat();
+        *self.ivars().active_chat.borrow_mut() = Some(chat.id.clone());
+        self.ivars().attachments.borrow_mut().clear();
+        if let Some(button) = self.ivars().chat_attach.get() {
+            button.setTitle(ns_string!("Attach"));
+        }
+        if let Some(input) = self.ivars().chat_input.get() {
+            input.setStringValue(&NSString::from_str(&chat.draft));
+        }
+        if let Some(system) = self.ivars().system_view.get() {
+            system.setString(&NSString::from_str(&chat.system));
+        }
+        for turn in &chat.turns {
+            self.add_user_message(&turn.user);
+            for path in &turn.images {
+                self.add_user_image(path);
+            }
+            if let Some(path) = &turn.generated_image {
+                self.add_generated_image(path);
+            } else {
+                let text = if turn.complete {
+                    turn.assistant.clone()
+                } else {
+                    format!("{}\n\n*This response was not completed.*", turn.assistant)
+                        .trim()
+                        .to_string()
+                };
+                self.set_assistant_text(&text);
+            }
+            self.finalize_assistant();
+        }
+        if let Some(tx) = self.ivars().engine_tx.get() {
+            let _ = tx.send(Command::Restore {
+                turns: chat.turns,
+                system: chat.system,
+            });
+        }
+        if let Some(repo) = chat.model {
+            if self.ivars().active_repo.borrow().as_ref() != Some(&repo)
+                || !self.ivars().model_loaded.get()
+            {
+                let local = self
+                    .ivars()
+                    .models
+                    .borrow()
+                    .iter()
+                    .enumerate()
+                    .find(|(_, model)| model.repo_id == repo && model.local && !model.too_big)
+                    .map(|(row, model)| (row, PathBuf::from(&model.path)));
+                if let Some((row, path)) = local {
+                    self.load_chat_model(repo, path, row);
+                } else {
+                    *self.ivars().active_repo.borrow_mut() = None;
+                    *self.ivars().selected_row.borrow_mut() = None;
+                    self.ivars().model_loaded.set(false);
+                    self.refresh_model_list();
+                    self.add_note(
+                        "This chat's model is unavailable. Choose a local model to continue.",
+                    );
+                }
+            }
+        }
+        self.refresh_chat_list();
+        self.update_command_menu();
+        self.update_chat_enabled();
+        self.focus_composer();
+    }
+
+    fn refresh_chat_list(&self) {
+        let Some(list) = self.ivars().chat_list.get() else {
+            return;
+        };
+        for view in list.arrangedSubviews().iter() {
+            list.removeArrangedSubview(&view);
+            view.removeFromSuperview();
+        }
+        self.ivars().chat_buttons.borrow_mut().clear();
+        let records = self.ivars().chats.borrow();
+        let active = self.ivars().active_chat.borrow();
+        if records.is_empty() {
+            let empty = ui::label(
+                self.mtm(),
+                "Your chats will appear here",
+                12.0,
+                false,
+                &NSColor::tertiaryLabelColor(),
+            );
+            empty.setTranslatesAutoresizingMaskIntoConstraints(false);
+            list.addArrangedSubview(&empty);
+            empty
+                .heightAnchor()
+                .constraintEqualToConstant(32.0)
+                .setActive(true);
+        }
+        for (index, chat) in records.iter().enumerate() {
+            let selected = active.as_ref() == Some(&chat.id);
+            let title = chat.title();
+            let delete =
+                ui::symbol_button(self.mtm(), "", "trash", self.target(), sel!(deleteChat:));
+            delete.setTag(index as NSInteger);
+            delete.setImagePosition(NSCellImagePosition::ImageOnly);
+            delete.setSymbolConfiguration(Some(&ui::sidebar_symbol_configuration()));
+            delete.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
+            delete.setToolTip(Some(ns_string!("Delete chat")));
+            delete
+                .setAccessibilityLabel(Some(&NSString::from_str(&format!("Delete chat: {title}"))));
+            delete.setEnabled(!self.chat_locked());
+            let row = ui::chat_row(self.mtm(), selected, delete.clone());
+            let icon = if chat.turns.iter().any(|t| t.generated_image.is_some()) {
+                "photo"
+            } else {
+                "bubble.left"
+            };
+            let button =
+                ui::symbol_button(self.mtm(), &title, icon, self.target(), sel!(selectChat:));
+            button.setSymbolConfiguration(Some(&ui::sidebar_symbol_configuration()));
+            button.setImageScaling(objc2_app_kit::NSImageScaling::ScaleNone);
+            button.setTitle(&NSString::from_str(&format!("\u{2002}{title}")));
+            button.setTag(index as NSInteger);
+            button.setAlignment(NSTextAlignment::Left);
+            button.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+            let title_color = if selected {
+                NSColor::labelColor()
+            } else {
+                NSColor::secondaryLabelColor()
+            };
+            button.setContentTintColor(Some(&title_color));
+            button.setEnabled(!self.chat_locked());
+            button.setToolTip(Some(&NSString::from_str(&format!(
+                "{}\n{}",
+                title,
+                chat.model.as_deref().unwrap_or("Choose a model")
+            ))));
+            button.setAccessibilityLabel(Some(&NSString::from_str(&format!(
+                "{}{}",
+                title,
+                if selected { ", current chat" } else { "" }
+            ))));
+            if let Some(cell) = button.cell() {
+                cell.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+            }
+            button.setContentCompressionResistancePriority_forOrientation(
+                249.0,
+                NSLayoutConstraintOrientation::Horizontal,
+            );
+            let menu = NSMenu::initWithTitle(NSMenu::alloc(self.mtm()), ns_string!(""));
+            let delete_item = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(self.mtm()),
+                    ns_string!("Delete Chat…"),
+                    Some(sel!(deleteChatFromMenu:)),
+                    ns_string!(""),
+                )
+            };
+            delete_item.setTag(index as NSInteger);
+            unsafe {
+                delete_item.setTarget(Some(self.target()));
+                row.setMenu(Some(&menu));
+                button.setMenu(Some(&menu));
+            }
+            menu.addItem(&delete_item);
+            row.addSubview(&button);
+            row.addSubview(&delete);
+            list.addArrangedSubview(&row);
+            for constraint in [
+                row.widthAnchor()
+                    .constraintEqualToAnchor(&list.widthAnchor()),
+                row.heightAnchor().constraintEqualToConstant(34.0),
+                button
+                    .leadingAnchor()
+                    .constraintEqualToAnchor_constant(&row.leadingAnchor(), 10.0),
+                button
+                    .trailingAnchor()
+                    .constraintEqualToAnchor_constant(&delete.leadingAnchor(), -4.0),
+                button.topAnchor().constraintEqualToAnchor(&row.topAnchor()),
+                button
+                    .bottomAnchor()
+                    .constraintEqualToAnchor(&row.bottomAnchor()),
+                delete
+                    .trailingAnchor()
+                    .constraintEqualToAnchor_constant(&row.trailingAnchor(), -5.0),
+                delete
+                    .centerYAnchor()
+                    .constraintEqualToAnchor(&row.centerYAnchor()),
+                delete.widthAnchor().constraintEqualToConstant(26.0),
+                delete.heightAnchor().constraintEqualToConstant(26.0),
+            ] {
+                constraint.setActive(true);
+            }
+            self.ivars()
+                .chat_buttons
+                .borrow_mut()
+                .extend([button, delete]);
+        }
+        if let Some(height) = self.ivars().chat_list_height.get() {
+            height.setConstant((records.len().max(1) as f64 * 38.0).min(200.0));
+        }
+        list.layoutSubtreeIfNeeded();
+        self.refresh_sidebar_hover();
+    }
+
+    fn add_generated_image(&self, path: &std::path::Path) {
+        let Some(stack) = self.ivars().assistant_stack.borrow().clone() else {
+            return;
+        };
+        let Some(card) = crate::media::GeneratedImageCard::new(self.mtm(), path) else {
+            self.set_assistant_text("Your image was saved, but its preview could not be opened. You can find it in Pictures → Lisa.");
+            return;
+        };
+        if let Some(label) = self.ivars().assistant_label.borrow_mut().take() {
+            label.removeFromSuperview();
+        }
+        self.ivars().typing.set(false);
+        stack.addArrangedSubview(&card);
+        card.widthAnchor()
+            .constraintLessThanOrEqualToAnchor(&stack.widthAnchor())
+            .setActive(true);
+    }
+
+    /// Add attachments inside the user message that owns them.
+    fn add_user_image(&self, path: &std::path::Path) {
+        let stack = self.ivars().user_stack.borrow().clone();
+        let Some(stack) = stack else {
+            return;
+        };
+        let Some(image) = NSImage::initWithContentsOfFile(
+            NSImage::alloc(),
+            &NSString::from_str(&path.to_string_lossy()),
+        ) else {
+            return;
+        };
+        let view = NSImageView::new(self.mtm());
+        view.setImage(Some(&image));
+        view.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
+        view.setTranslatesAutoresizingMaskIntoConstraints(false);
+        stack.addArrangedSubview(&view);
+        let max_width = 220.0;
+        view.widthAnchor()
+            .constraintLessThanOrEqualToConstant(max_width)
+            .setActive(true);
+        view.widthAnchor()
+            .constraintLessThanOrEqualToAnchor(&stack.widthAnchor())
+            .setActive(true);
+        let preferred = view.widthAnchor().constraintEqualToConstant(max_width);
+        preferred.setPriority(NSLayoutPriorityDefaultLow);
+        preferred.setActive(true);
+        let size = image.size();
+        let aspect = if size.width > 0.0 {
+            size.height / size.width
+        } else {
+            1.0
+        };
+        view.heightAnchor()
+            .constraintEqualToAnchor_multiplier(&view.widthAnchor(), aspect)
+            .setActive(true);
+    }
+
+    /// Run a slash command locally or hand the current turn to the engine.
     fn send_current(&self) {
+        if self.chat_locked() {
+            return;
+        }
         let Some(input) = self.ivars().chat_input.get() else {
             return;
         };
         let text = input.stringValue().to_string();
         let text = text.trim().to_string();
-        if text.is_empty() {
+        if text.is_empty() && self.ivars().attachments.borrow().is_empty() {
             return;
         }
-        input.setStringValue(ns_string!(""));
-        self.update_command_menu();
         // Slash commands run locally instead of going to the model.
         if text.starts_with('/') && !text.contains(char::is_whitespace) {
             if let Some(&(name, _)) = CHAT_COMMANDS.iter().find(|(n, _)| *n == text) {
+                input.setStringValue(ns_string!(""));
                 self.run_chat_command(name);
                 return;
             }
+        }
+        if !self.ivars().model_loaded.get() {
+            return;
         }
         let system = self
             .ivars()
@@ -2672,8 +3289,41 @@ impl AppDelegate {
             .get()
             .map(|v| v.string().to_string())
             .unwrap_or_default();
+        let original_images = self.ivars().attachments.borrow().clone();
+        let images = match self.begin_saved_turn(&text, &system, &original_images) {
+            Ok(images) => images,
+            Err(error) => {
+                self.append_engine_log(&format!("Could not save chat: {error}"));
+                self.add_note(&format!(
+                    "Could not save this message: {error}. Your draft is still in the composer."
+                ));
+                return;
+            }
+        };
+        input.setStringValue(ns_string!(""));
+        self.update_command_menu();
+        self.ivars().busy.set(true);
+        self.refresh_chat_chrome();
         if let Some(tx) = self.ivars().engine_tx.get() {
-            let _ = tx.send(Command::Chat { text, system });
+            self.ivars().attachments.borrow_mut().clear();
+            if let Some(button) = self.ivars().chat_attach.get() {
+                button.setTitle(ns_string!("Attach"));
+            }
+            self.refresh_chat_chrome();
+            if tx
+                .send(Command::Chat {
+                    text,
+                    system,
+                    images,
+                })
+                .is_err()
+            {
+                self.ivars().busy.set(false);
+                self.update_chat_enabled();
+                self.add_note(
+                    "The inference engine stopped. Reopen Lisa to continue this saved chat.",
+                );
+            }
         }
     }
 
@@ -2686,142 +3336,176 @@ impl AppDelegate {
         let mtm = self.mtm();
         let models = self.ivars().models.borrow();
         let model = models.get(row as usize)?;
-
-        let cell = NSView::new(mtm);
-        cell.setFrame(NSRect::new(
-            NSPoint::new(0.0, 0.0),
-            NSSize::new(150.0, 30.0),
-        ));
-
-        // Custom highlight for the selected model (clear even when the table
-        // isn't focused).
-        if *self.ivars().selected_row.borrow() == Some(row as usize) {
-            let bg = NSBox::new(mtm);
-            bg.setBoxType(NSBoxType::Custom);
-            bg.setBorderWidth(0.0);
-            bg.setCornerRadius(6.0);
-            bg.setFillColor(&NSColor::controlAccentColor().colorWithAlphaComponent(0.22));
-            bg.setTranslatesAutoresizingMaskIntoConstraints(false);
-            cell.addSubview(&bg);
-            bg.leadingAnchor()
-                .constraintEqualToAnchor_constant(&cell.leadingAnchor(), 4.0)
-                .setActive(true);
-            bg.trailingAnchor()
-                .constraintEqualToAnchor_constant(&cell.trailingAnchor(), -4.0)
-                .setActive(true);
-            bg.topAnchor()
-                .constraintEqualToAnchor_constant(&cell.topAnchor(), 1.0)
-                .setActive(true);
-            bg.bottomAnchor()
-                .constraintEqualToAnchor_constant(&cell.bottomAnchor(), -1.0)
-                .setActive(true);
-        }
-
-        let symbol = if model.too_big {
-            ns_string!("nosign")
-        } else if model.local {
-            ns_string!("cube")
-        } else {
-            ns_string!("arrow.down.circle")
-        };
-        let icon = NSImageView::new(mtm);
-        if let Some(image) =
-            NSImage::imageWithSystemSymbolName_accessibilityDescription(symbol, None)
-        {
-            icon.setImage(Some(&image));
-        }
-        let name_color = if model.too_big {
+        let selected = *self.ivars().selected_row.borrow() == Some(row as usize);
+        let cell = ui::model_row(mtm, selected);
+        cell.setTranslatesAutoresizingMaskIntoConstraints(false);
+        cell.heightAnchor()
+            .constraintEqualToConstant(58.0)
+            .setActive(true);
+        let color = if model.too_big {
             NSColor::tertiaryLabelColor()
-        } else if model.local {
-            NSColor::labelColor()
         } else {
-            NSColor::secondaryLabelColor()
+            NSColor::labelColor()
         };
-        icon.setContentTintColor(Some(&name_color));
-        icon.setTranslatesAutoresizingMaskIntoConstraints(false);
-        cell.addSubview(&icon);
-
-        let name = ui::label(mtm, display_name(&model.repo_id), 13.0, false, &name_color);
-        name.setTranslatesAutoresizingMaskIntoConstraints(false);
-        let tip = if model.too_big {
+        let (symbol, model_kind) =
+            if lisa_engine::models::image_generation::is_model_type(&model.model_type) {
+                ("photo", "Image generation")
+            } else {
+                ("bubble.left", "Chat model")
+            };
+        let icon = NSImageView::new(mtm);
+        icon.setSymbolConfiguration(Some(&ui::sidebar_symbol_configuration()));
+        icon.setImageScaling(objc2_app_kit::NSImageScaling::ScaleNone);
+        icon.setImage(
+            NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                &NSString::from_str(symbol),
+                Some(&NSString::from_str(model_kind)),
+            )
+            .as_deref(),
+        );
+        icon.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
+        let curated = catalog::find(&model.repo_id);
+        let name = ui::label(
+            mtm,
+            curated.map_or_else(|| display_name(&model.repo_id), |entry| entry.name),
+            12.0,
+            selected,
+            &color,
+        );
+        let owner = model.repo_id.split('/').next().unwrap_or("Local");
+        let detail = if model.too_big {
+            "Exceeds available memory".to_string()
+        } else {
             format!(
-                "{} — too large for this Mac's memory ({:.0} GB)",
-                model.repo_id,
+                "{} · {:.1} GB",
+                curated.map_or(owner, |entry| entry.quantization),
                 model.size as f64 / 1e9
             )
-        } else if model.local {
-            model.repo_id.clone()
-        } else {
-            format!(
-                "{} — click to download from huggingface.co/agnosticeng",
-                model.repo_id
-            )
         };
-        name.setToolTip(Some(&NSString::from_str(&tip)));
-        if let Some(cell) = name.cell() {
-            cell.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
-            cell.setUsesSingleLineMode(true);
+        let subtitle = ui::label(mtm, &detail, 10.0, false, &NSColor::secondaryLabelColor());
+        cell.setToolTip(Some(&NSString::from_str(&format!(
+            "{}\n{}\n{}",
+            model.repo_id,
+            curated.map_or("Local checkpoint", |entry| entry.description),
+            detail
+        ))));
+        for label in [&name, &subtitle] {
+            if let Some(c) = label.cell() {
+                c.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+                c.setUsesSingleLineMode(true);
+            }
         }
-        cell.addSubview(&name);
-
-        icon.leadingAnchor()
-            .constraintEqualToAnchor_constant(&cell.leadingAnchor(), 10.0)
-            .setActive(true);
-        icon.centerYAnchor()
-            .constraintEqualToAnchor(&cell.centerYAnchor())
-            .setActive(true);
-        ui::size(&icon, 18.0, 18.0);
-
-        name.leadingAnchor()
-            .constraintEqualToAnchor_constant(&icon.trailingAnchor(), 10.0)
-            .setActive(true);
-        name.centerYAnchor()
-            .constraintEqualToAnchor(&cell.centerYAnchor())
-            .setActive(true);
-
-        if *self.ivars().loading_row.borrow() == Some(row as usize) {
-            if self.ivars().downloading.get() {
-                let ring = ProgressRing::new(mtm, self.ivars().download_progress.get());
-                ring.setTranslatesAutoresizingMaskIntoConstraints(false);
-                cell.addSubview(&ring);
-                ring.trailingAnchor()
-                    .constraintEqualToAnchor_constant(&cell.trailingAnchor(), -10.0)
-                    .setActive(true);
-                ring.centerYAnchor()
-                    .constraintEqualToAnchor(&cell.centerYAnchor())
-                    .setActive(true);
-                ui::size(&ring, 18.0, 18.0);
-                name.trailingAnchor()
-                    .constraintEqualToAnchor_constant(&ring.leadingAnchor(), -8.0)
-                    .setActive(true);
-            } else {
+        for view in [&*icon as &NSView, &*name, &*subtitle] {
+            view.setTranslatesAutoresizingMaskIntoConstraints(false);
+            cell.addSubview(view);
+        }
+        let loading = *self.ivars().loading_row.borrow() == Some(row as usize);
+        let show_status = loading || !model.local || model.too_big;
+        for c in [
+            icon.leadingAnchor().constraintEqualToAnchor_constant(
+                &cell.leadingAnchor(),
+                ui::MODEL_ROW_CONTENT_INSET,
+            ),
+            icon.topAnchor()
+                .constraintEqualToAnchor_constant(&cell.topAnchor(), 14.0),
+            icon.widthAnchor()
+                .constraintEqualToConstant(ui::SIDEBAR_ICON_SIZE),
+            icon.heightAnchor()
+                .constraintEqualToConstant(ui::SIDEBAR_ICON_SIZE),
+            name.leadingAnchor()
+                .constraintEqualToAnchor_constant(&icon.trailingAnchor(), 8.0),
+            name.topAnchor()
+                .constraintEqualToAnchor_constant(&cell.topAnchor(), 11.0),
+            name.trailingAnchor().constraintEqualToAnchor_constant(
+                &cell.trailingAnchor(),
+                -ui::MODEL_ROW_CONTENT_INSET - if show_status { 24.0 } else { 0.0 },
+            ),
+            subtitle
+                .leadingAnchor()
+                .constraintEqualToAnchor(&name.leadingAnchor()),
+            subtitle
+                .topAnchor()
+                .constraintEqualToAnchor_constant(&name.bottomAnchor(), 4.0),
+            subtitle
+                .trailingAnchor()
+                .constraintEqualToAnchor(&name.trailingAnchor()),
+        ] {
+            c.setActive(true);
+        }
+        if show_status {
+            let indicator: Retained<NSView> = if loading && self.ivars().downloading.get() {
+                ProgressRing::new(mtm, self.ivars().download_progress.get()).into_super()
+            } else if loading {
                 let spinner = NSProgressIndicator::new(mtm);
                 spinner.setStyle(NSProgressIndicatorStyle::Spinning);
-                spinner.setIndeterminate(true);
                 spinner.setControlSize(NSControlSize::Small);
-                spinner.setDisplayedWhenStopped(false);
-                spinner.setTranslatesAutoresizingMaskIntoConstraints(false);
+                spinner.setIndeterminate(true);
                 unsafe { spinner.startAnimation(None) };
-                cell.addSubview(&spinner);
-                spinner
-                    .trailingAnchor()
-                    .constraintEqualToAnchor_constant(&cell.trailingAnchor(), -10.0)
-                    .setActive(true);
-                spinner
-                    .centerYAnchor()
-                    .constraintEqualToAnchor(&cell.centerYAnchor())
-                    .setActive(true);
-                ui::size(&spinner, 16.0, 16.0);
-                name.trailingAnchor()
-                    .constraintEqualToAnchor_constant(&spinner.leadingAnchor(), -8.0)
-                    .setActive(true);
-            }
-        } else {
-            name.trailingAnchor()
-                .constraintEqualToAnchor_constant(&cell.trailingAnchor(), -10.0)
+                spinner.into_super()
+            } else {
+                let (symbol, description) = if model.too_big {
+                    ("nosign", "Exceeds available memory")
+                } else {
+                    ("arrow.down.circle", "Download model")
+                };
+                let status = NSImageView::new(mtm);
+                status.setImage(
+                    NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                        &NSString::from_str(symbol),
+                        Some(&NSString::from_str(description)),
+                    )
+                    .as_deref(),
+                );
+                status.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
+                status.setToolTip(Some(&NSString::from_str(description)));
+                status.into_super().into_super()
+            };
+            indicator.setTranslatesAutoresizingMaskIntoConstraints(false);
+            cell.addSubview(&indicator);
+            ui::size(&indicator, 16.0, 16.0);
+            indicator
+                .trailingAnchor()
+                .constraintEqualToAnchor_constant(
+                    &cell.trailingAnchor(),
+                    -ui::MODEL_ROW_CONTENT_INSET,
+                )
+                .setActive(true);
+            indicator
+                .centerYAnchor()
+                .constraintEqualToAnchor(&cell.centerYAnchor())
                 .setActive(true);
         }
-
+        let button = ui::button(mtm, "", Some(self.target()), Some(sel!(selectModel:)), false);
+        button.setTransparent(true);
+        button.setTag(row);
+        button.setAccessibilityLabel(Some(&NSString::from_str(&format!(
+            "{} · {}", name.stringValue(), detail,
+        ))));
+        button.setAccessibilitySelected(selected);
+        button.setTranslatesAutoresizingMaskIntoConstraints(false);
+        cell.addSubview(&button);
+        for constraint in [
+            button.leadingAnchor().constraintEqualToAnchor(&cell.leadingAnchor()),
+            button.trailingAnchor().constraintEqualToAnchor(&cell.trailingAnchor()),
+            button.topAnchor().constraintEqualToAnchor(&cell.topAnchor()),
+            button.bottomAnchor().constraintEqualToAnchor(&cell.bottomAnchor()),
+        ] {
+            constraint.setActive(true);
+        }
+        if model.local {
+            let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!(""));
+            let delete = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(mtm), ns_string!("Delete Model"), Some(sel!(deleteModel:)), ns_string!(""),
+                )
+            };
+            delete.setTag(row);
+            unsafe {
+                delete.setTarget(Some(self.target()));
+                button.setMenu(Some(&menu));
+            }
+            menu.addItem(&delete);
+        }
         Some(cell)
     }
 
@@ -2849,9 +3533,9 @@ impl AppDelegate {
         row.setTranslatesAutoresizingMaskIntoConstraints(false);
 
         let fill = if is_user {
-            NSColor::controlAccentColor()
+            NSColor::quaternaryLabelColor()
         } else {
-            NSColor::controlBackgroundColor()
+            NSColor::clearColor()
         };
         let bubble = BubbleView::new(mtm, &fill);
         bubble.setTranslatesAutoresizingMaskIntoConstraints(false);
@@ -2860,7 +3544,7 @@ impl AppDelegate {
         let content = NSStackView::new(mtm);
         content.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
         content.setAlignment(NSLayoutAttribute::Leading);
-        content.setSpacing(8.0);
+        content.setSpacing(12.0);
         content.setTranslatesAutoresizingMaskIntoConstraints(false);
         bubble.addSubview(&content);
 
@@ -2885,15 +3569,32 @@ impl AppDelegate {
             .widthAnchor()
             .constraintLessThanOrEqualToConstant(BUBBLE_MAX_WIDTH)
             .setActive(true);
+        bubble
+            .leadingAnchor()
+            .constraintGreaterThanOrEqualToAnchor(&row.leadingAnchor())
+            .setActive(true);
+        bubble
+            .trailingAnchor()
+            .constraintLessThanOrEqualToAnchor(&row.trailingAnchor())
+            .setActive(true);
         if is_user {
             bubble
                 .trailingAnchor()
-                .constraintEqualToAnchor_constant(&row.trailingAnchor(), -8.0)
+                .constraintEqualToAnchor(&row.trailingAnchor())
                 .setActive(true);
+            let preferred = bubble
+                .widthAnchor()
+                .constraintEqualToAnchor_multiplier(&row.widthAnchor(), 0.82);
+            preferred.setPriority(NSLayoutPriorityDefaultLow);
+            preferred.setActive(true);
         } else {
             bubble
                 .leadingAnchor()
-                .constraintEqualToAnchor_constant(&row.leadingAnchor(), 8.0)
+                .constraintEqualToAnchor(&row.leadingAnchor())
+                .setActive(true);
+            bubble
+                .trailingAnchor()
+                .constraintEqualToAnchor(&row.trailingAnchor())
                 .setActive(true);
         }
         bubble
@@ -2999,10 +3700,21 @@ impl AppDelegate {
     fn run_chat_command(&self, name: &str) {
         match name {
             "/clear" => {
-                self.clear_chat();
-                if let Some(tx) = self.ivars().engine_tx.get() {
-                    let _ = tx.send(Command::Clear);
+                if self.chat_locked() {
+                    return;
                 }
+                if let Some(input) = self.ivars().chat_input.get() {
+                    let text = input.stringValue().to_string();
+                    if text.starts_with('/')
+                        && CHAT_COMMANDS
+                            .iter()
+                            .any(|(command, _)| command.starts_with(text.trim()))
+                    {
+                        input.setStringValue(ns_string!(""));
+                    }
+                }
+                self.save_chat_draft();
+                self.reset_chat();
             }
             "/help" => self.show_command_help(),
             _ => {}
@@ -3011,6 +3723,7 @@ impl AppDelegate {
             input.setStringValue(ns_string!(""));
         }
         self.update_command_menu();
+        self.refresh_chat_chrome();
     }
 
     /// Append a locally-rendered note bubble (no model round-trip).
@@ -3036,7 +3749,7 @@ impl AppDelegate {
         self.add_note(md.trim_end());
     }
 
-    /// `/clear` — empty the transcript and restore the empty-state placeholder.
+    /// Empty the visible transcript; saved conversations remain in the sidebar.
     fn clear_chat(&self) {
         if let Some(chat) = self.ivars().chat_stack.get() {
             let rows = chat.arrangedSubviews();
@@ -3048,6 +3761,7 @@ impl AppDelegate {
         }
         *self.ivars().assistant_label.borrow_mut() = None;
         *self.ivars().assistant_stack.borrow_mut() = None;
+        *self.ivars().user_stack.borrow_mut() = None;
         self.ivars().typing.set(false);
         if let Some(placeholder) = self.ivars().chat_placeholder.get() {
             placeholder.setHidden(false);
@@ -3063,7 +3777,8 @@ impl AppDelegate {
             placeholder.setHidden(true);
         }
         let (row, content) = self.make_bubble(true);
-        render_blocks(self.mtm(), &content, text, &NSColor::whiteColor());
+        render_blocks(self.mtm(), &content, text, &NSColor::labelColor());
+        *self.ivars().user_stack.borrow_mut() = Some(content);
         chat.addArrangedSubview(&row);
 
         // Placeholder assistant bubble with an animated typing indicator.
@@ -3074,6 +3789,10 @@ impl AppDelegate {
         label.setPreferredMaxLayoutWidth(BUBBLE_MAX_WIDTH - 30.0);
         label.setAttributedStringValue(&typing_dots(self.mtm(), 0.0));
         content.addArrangedSubview(&label);
+        label
+            .widthAnchor()
+            .constraintEqualToAnchor(&content.widthAnchor())
+            .setActive(true);
         chat.addArrangedSubview(&row);
         *self.ivars().assistant_label.borrow_mut() = Some(label);
         *self.ivars().assistant_stack.borrow_mut() = Some(content);
@@ -3121,11 +3840,7 @@ impl AppDelegate {
             let progress = (done as f64 / total as f64).clamp(0.0, 1.0);
             self.ivars().download_progress.set(progress);
         }
-        if let Some(table) = self.ivars().models_table.get() {
-            let rows = NSIndexSet::indexSetWithIndex(row as NSUInteger);
-            let columns = NSIndexSet::indexSetWithIndex(0);
-            table.reloadDataForRowIndexes_columnIndexes(&rows, &columns);
-        }
+        self.refresh_model_row(row);
     }
 
     /// Stream a chunk into the active assistant bubble (plain while generating).
@@ -3212,54 +3927,98 @@ impl AppDelegate {
         self.set_chat_enabled(self.ivars().model_loaded.get());
     }
 
+    fn focus_composer(&self) {
+        let Some(input) = self
+            .ivars()
+            .chat_input
+            .get()
+            .filter(|input| input.isEnabled())
+        else {
+            return;
+        };
+        if let Some(window) = self.ivars().window.get() {
+            window.makeFirstResponder(Some(&**input));
+            if let Some(editor) = input.currentEditor() {
+                editor.setSelectedRange(NSRange::new(input.stringValue().length(), 0));
+            }
+        }
+    }
+
     /// Enable the chat input + Send button once a model is loaded (and focus
     /// the input). While no model is loaded the input is greyed and disabled.
     fn set_chat_enabled(&self, on: bool) {
+        if let Some(switch) = self.ivars().serve_switch.get() {
+            switch.setEnabled(self.ivars().serving.get() || (on && !self.ivars().busy.get()));
+        }
+        if let Some(button) = self.ivars().chat_attach.get() {
+            button.setEnabled(
+                on && self.ivars().supports_images.get() && self.ivars().image_mode.get().is_none(),
+            );
+        }
         if let Some(input) = self.ivars().chat_input.get() {
+            let newly_enabled = on && !input.isEnabled();
             input.setEnabled(on);
             let color = if on {
-                NSColor::whiteColor()
+                NSColor::labelColor()
             } else {
                 NSColor::tertiaryLabelColor()
             };
             input.setTextColor(Some(&color));
-            if on {
-                if let Some(window) = self.ivars().window.get() {
-                    window.makeFirstResponder(Some(&**input));
-                }
+            if newly_enabled {
+                self.focus_composer();
             }
         }
-        if let Some(send) = self.ivars().chat_send.get() {
-            send.setEnabled(on);
-        }
+        self.refresh_chat_chrome();
     }
 
-    /// Merge the local models with the remote (agnosticeng) ids, flag models
-    /// too large for RAM, and refresh the table.
+    /// Put downloaded checkpoints first, retaining curated order within each
+    /// group, and flag models too large for RAM.
     fn refresh_models(&self) {
         let local = discover_models();
         let remote = self.ivars().remote_ids.borrow().clone();
         let threshold = model_ram_budget();
+        let loading_repo = self.ivars().loading_row.borrow().and_then(|row| {
+            self.ivars()
+                .models
+                .borrow()
+                .get(row)
+                .map(|model| model.repo_id.clone())
+        });
         let mut merged = local;
-        for (id, size) in remote {
-            if merged.iter().any(|m| m.repo_id == id) {
+        for entry in catalog::MODELS {
+            if merged.iter().any(|m| m.repo_id == entry.repo_id) {
                 continue;
             }
+            let size = remote
+                .iter()
+                .find(|(id, _)| id == entry.repo_id)
+                .map_or(entry.download_bytes, |(_, size)| *size);
             merged.push(Model {
-                repo_id: id,
-                model_type: String::new(),
+                repo_id: entry.repo_id.into(),
+                model_type: entry.model_type.into(),
                 path: String::new(),
                 local: false,
                 size,
+                resident_bytes: entry.resident_bytes,
                 too_big: false,
             });
         }
         for m in &mut merged {
-            m.too_big = m.size > 0 && threshold > 0 && m.size > threshold;
+            let resident = m.resident_bytes.unwrap_or(m.size);
+            m.too_big = resident > 0 && threshold > 0 && resident > threshold;
         }
         merged.sort_by(|a, b| {
-            (a.too_big, !a.local, &a.repo_id).cmp(&(b.too_big, !b.local, &b.repo_id))
+            (!a.local, a.too_big, catalog::rank(&a.repo_id), &a.repo_id).cmp(&(
+                !b.local,
+                b.too_big,
+                catalog::rank(&b.repo_id),
+                &b.repo_id,
+            ))
         });
+        if let Some(repo) = loading_repo {
+            *self.ivars().loading_row.borrow_mut() =
+                merged.iter().position(|model| model.repo_id == repo);
+        }
         *self.ivars().models.borrow_mut() = merged;
         // Re-anchor the highlight to the active model after the re-sort.
         let active = self.ivars().active_repo.borrow().clone();
@@ -3271,22 +4030,55 @@ impl AppDelegate {
                 .position(|m| &m.repo_id == r)
         });
         *self.ivars().selected_row.borrow_mut() = index;
-        self.reload_models_table();
+        self.refresh_model_list();
     }
 
-    /// Reload the model list while keeping the selected row highlighted.
-    fn reload_models_table(&self) {
-        let Some(table) = self.ivars().models_table.get() else {
+    fn refresh_model_list(&self) {
+        let (Some(list), Some(scroll)) = (
+            self.ivars().models_list.get(),
+            self.ivars().models_scroll.get(),
+        ) else {
             return;
         };
-        let selected = *self.ivars().selected_row.borrow();
-        self.ivars().updating_table.set(true);
-        table.reloadData();
-        if let Some(row) = selected {
-            let index = NSIndexSet::indexSetWithIndex(row);
-            table.selectRowIndexes_byExtendingSelection(&index, false);
+        ui::preserve_scroll_position(scroll, || {
+            for row in list.arrangedSubviews().iter() {
+                list.removeArrangedSubview(&row);
+                row.removeFromSuperview();
+            }
+            for index in 0..self.ivars().models.borrow().len() {
+                if let Some(row) = self.make_model_cell(index as NSInteger) {
+                    list.addArrangedSubview(&row);
+                    row.widthAnchor()
+                        .constraintEqualToAnchor(&list.widthAnchor())
+                        .setActive(true);
+                }
+            }
+        });
+    }
+
+    fn refresh_model_row(&self, index: usize) {
+        let (Some(list), Some(scroll)) = (
+            self.ivars().models_list.get(),
+            self.ivars().models_scroll.get(),
+        ) else {
+            return;
+        };
+        let rows = list.arrangedSubviews();
+        if index >= rows.len() {
+            return;
         }
-        self.ivars().updating_table.set(false);
+        let Some(row) = self.make_model_cell(index as NSInteger) else {
+            return;
+        };
+        ui::preserve_scroll_position(scroll, || {
+            let old = rows.objectAtIndex(index);
+            list.removeArrangedSubview(&old);
+            old.removeFromSuperview();
+            list.insertArrangedSubview_atIndex(&row, index as NSInteger);
+            row.widthAnchor()
+                .constraintEqualToAnchor(&list.widthAnchor())
+                .setActive(true);
+        });
     }
 
     fn build_menu(&self, app: &NSApplication, mtm: MainThreadMarker) {
@@ -3300,15 +4092,51 @@ impl AppDelegate {
             )
         };
         let app_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("lisa"));
-        unsafe {
+        let quit = unsafe {
             app_menu.addItemWithTitle_action_keyEquivalent(
                 ns_string!("Quit Lisa"),
                 Some(sel!(terminate:)),
                 ns_string!("q"),
             )
         };
+        unsafe { quit.setTarget(Some(app)) };
+        let new_chat = unsafe {
+            app_menu.addItemWithTitle_action_keyEquivalent(
+                ns_string!("New Chat"),
+                Some(sel!(newChat:)),
+                ns_string!("n"),
+            )
+        };
+        unsafe { new_chat.setTarget(Some(self.target())) };
         app_item.setSubmenu(Some(&app_menu));
         menu.addItem(&app_item);
+
+        let edit_item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                ns_string!("Edit"),
+                None,
+                ns_string!(""),
+            )
+        };
+        let edit_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Edit"));
+        for (title, action, key) in [
+            ("Undo", sel!(undo:), "z"),
+            ("Cut", sel!(cut:), "x"),
+            ("Copy", sel!(copy:), "c"),
+            ("Paste", sel!(paste:), "v"),
+            ("Select All", sel!(selectAll:), "a"),
+        ] {
+            unsafe {
+                edit_menu.addItemWithTitle_action_keyEquivalent(
+                    &NSString::from_str(title),
+                    Some(action),
+                    &NSString::from_str(key),
+                );
+            }
+        }
+        edit_item.setSubmenu(Some(&edit_menu));
+        menu.addItem(&edit_item);
 
         let view_item = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
@@ -3322,6 +4150,7 @@ impl AppDelegate {
         let toggles = [
             ("Toggle Sidebar", sel!(toggleSidebar:), "s"),
             ("Toggle Logs Panel", sel!(toggleLogs:), "l"),
+            ("Model Settings", sel!(toggleInspector:), "i"),
         ];
         for (title, action, key) in toggles {
             let item = unsafe {
@@ -3351,121 +4180,328 @@ impl AppDelegate {
     }
 
     fn build_sidebar(&self, mtm: MainThreadMarker) -> Retained<NSView> {
-        let root = NSView::new(mtm);
-
-        let label = ui::label(mtm, "MODELS", 10.0, true, &NSColor::secondaryLabelColor());
-        label.setTranslatesAutoresizingMaskIntoConstraints(false);
-        root.addSubview(&label);
-
-        let table = NSTableView::new(mtm);
-        let column = NSTableColumn::new(mtm);
-        column.setWidth(150.0);
-        table.addTableColumn(&column);
-        table.setHeaderView(None);
-        table.setRowHeight(30.0);
-        table.setColumnAutoresizingStyle(
-            NSTableViewColumnAutoresizingStyle::LastColumnOnlyAutoresizingStyle,
+        let root = RoundedView::new(mtm, &NSColor::windowBackgroundColor(), 0.0);
+        let new_chat = ui::symbol_button(
+            mtm,
+            "New chat",
+            "square.and.pencil",
+            self.target(),
+            sel!(newChat:),
         );
-        table.setBackgroundColor(&NSColor::clearColor());
-        table.setSelectionHighlightStyle(NSTableViewSelectionHighlightStyle::None);
-        table.setIntercellSpacing(NSSize::new(0.0, 1.0));
-        unsafe { table.setDataSource(Some(ProtocolObject::from_ref(self))) };
-        unsafe { table.setDelegate(Some(ProtocolObject::from_ref(self))) };
-        let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!(""));
-        let delete_item = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                ns_string!("Delete Model"),
-                Some(sel!(deleteModel:)),
-                ns_string!(""),
-            )
-        };
-        unsafe { delete_item.setTarget(Some(self.target())) };
-        menu.addItem(&delete_item);
-        unsafe { table.setMenu(Some(&menu)) };
-        self.ivars().models_table.set(table.clone()).ok();
+        new_chat.setAlignment(NSTextAlignment::Left);
+        new_chat.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+        let new_bg = ui::sidebar_action(mtm);
+        let chats_label = ui::section_header(mtm, "Chats", self.target(), sel!(toggleChatSection:));
+        let label = ui::section_header(mtm, "Models", self.target(), sel!(toggleModelsSection:));
+        for view in [&*new_bg as &NSView, &*chats_label, &*label] {
+            view.setTranslatesAutoresizingMaskIntoConstraints(false);
+            root.addSubview(view);
+        }
+        new_bg.addSubview(&new_chat);
+        self.ivars().new_chat.set(new_chat.clone()).ok();
+        self.ivars().new_chat_row.set(new_bg.clone()).ok();
 
-        let scroll = ui::scroll(mtm, &table);
+        let history_document = FlippedView::new(mtm);
+        history_document.setTranslatesAutoresizingMaskIntoConstraints(false);
+        let history_list = ui::stack(
+            mtm,
+            NSUserInterfaceLayoutOrientation::Vertical,
+            4.0,
+            NSLayoutAttribute::Width,
+        );
+        history_document.addSubview(&history_list);
+        let history_scroll = ui::scroll(mtm, &history_document);
+        history_scroll.setAutomaticallyAdjustsContentInsets(false);
+        root.addSubview(&history_scroll);
+        for constraint in [
+            history_document
+                .widthAnchor()
+                .constraintEqualToAnchor(&history_scroll.contentView().widthAnchor()),
+            history_list
+                .leadingAnchor()
+                .constraintEqualToAnchor_constant(&history_document.leadingAnchor(), 4.0),
+            history_list
+                .trailingAnchor()
+                .constraintEqualToAnchor_constant(&history_document.trailingAnchor(), -4.0),
+            history_list
+                .topAnchor()
+                .constraintEqualToAnchor(&history_document.topAnchor()),
+            history_list
+                .bottomAnchor()
+                .constraintEqualToAnchor(&history_document.bottomAnchor()),
+        ] {
+            constraint.setActive(true);
+        }
+        let history_height = history_scroll
+            .heightAnchor()
+            .constraintEqualToConstant(38.0);
+        history_height.setPriority(NSLayoutPriorityDefaultLow);
+        self.ivars()
+            .chat_list_height
+            .set(history_height.clone())
+            .ok();
+        self.ivars().chat_list.set(history_list).ok();
+
+        let models_document = FlippedView::new(mtm);
+        models_document.setTranslatesAutoresizingMaskIntoConstraints(false);
+        let list = ui::stack(
+            mtm,
+            NSUserInterfaceLayoutOrientation::Vertical,
+            2.0,
+            NSLayoutAttribute::Width,
+        );
+        models_document.addSubview(&list);
+        let scroll = ui::sidebar_scroll(mtm, &models_document);
+        scroll.setAutomaticallyAdjustsContentInsets(false);
+        for constraint in [
+            models_document
+                .widthAnchor()
+                .constraintEqualToAnchor(&scroll.contentView().widthAnchor()),
+            list.leadingAnchor()
+                .constraintEqualToAnchor(&models_document.leadingAnchor()),
+            list.trailingAnchor()
+                .constraintEqualToAnchor(&models_document.trailingAnchor()),
+            list.topAnchor()
+                .constraintEqualToAnchor(&models_document.topAnchor()),
+            list.bottomAnchor()
+                .constraintEqualToAnchor_constant(&models_document.bottomAnchor(), -20.0),
+        ] {
+            constraint.setActive(true);
+        }
+        self.ivars().models_list.set(list).ok();
+        self.ivars().models_scroll.set(scroll.clone()).ok();
         root.addSubview(&scroll);
 
-        label
-            .leadingAnchor()
-            .constraintEqualToAnchor_constant(&root.leadingAnchor(), 16.0)
-            .setActive(true);
-        label
+        let history_top = history_scroll
             .topAnchor()
-            .constraintEqualToAnchor_constant(&root.topAnchor(), 44.0)
-            .setActive(true);
-
-        scroll
-            .leadingAnchor()
-            .constraintEqualToAnchor(&root.leadingAnchor())
-            .setActive(true);
-        scroll
-            .trailingAnchor()
-            .constraintEqualToAnchor(&root.trailingAnchor())
-            .setActive(true);
-        scroll
+            .constraintEqualToAnchor_constant(&chats_label.bottomAnchor(), 4.0);
+        let models_top = scroll
             .topAnchor()
-            .constraintEqualToAnchor_constant(&label.bottomAnchor(), 10.0)
-            .setActive(true);
-        scroll
-            .bottomAnchor()
-            .constraintEqualToAnchor(&root.bottomAnchor())
-            .setActive(true);
-
-        root
+            .constraintEqualToAnchor(&label.bottomAnchor());
+        self.ivars()
+            .chat_section
+            .set(ui::SidebarSection::new(
+                chats_label.clone(),
+                history_scroll.clone(),
+                vec![
+                    history_height,
+                    history_scroll
+                        .heightAnchor()
+                        .constraintGreaterThanOrEqualToConstant(32.0),
+                    history_scroll
+                        .heightAnchor()
+                        .constraintLessThanOrEqualToAnchor_multiplier(&root.heightAnchor(), 0.27),
+                ],
+                history_top.clone(),
+                "sidebar.chatsCollapsed",
+            ))
+            .ok();
+        self.ivars()
+            .models_section
+            .set(ui::SidebarSection::new(
+                label.clone(),
+                scroll.clone(),
+                vec![
+                    scroll
+                        .bottomAnchor()
+                        .constraintEqualToAnchor(&root.bottomAnchor()),
+                ],
+                models_top.clone(),
+                "sidebar.modelsCollapsed",
+            ))
+            .ok();
+        for c in [
+            new_bg
+                .leadingAnchor()
+                .constraintEqualToAnchor_constant(&root.leadingAnchor(), 14.0),
+            new_bg
+                .trailingAnchor()
+                .constraintEqualToAnchor_constant(&root.trailingAnchor(), -14.0),
+            new_bg
+                .topAnchor()
+                .constraintEqualToAnchor_constant(&root.topAnchor(), 52.0),
+            new_bg.heightAnchor().constraintEqualToConstant(36.0),
+            new_chat
+                .leadingAnchor()
+                .constraintEqualToAnchor_constant(&new_bg.leadingAnchor(), 10.0),
+            new_chat
+                .trailingAnchor()
+                .constraintEqualToAnchor_constant(&new_bg.trailingAnchor(), -10.0),
+            new_chat
+                .topAnchor()
+                .constraintEqualToAnchor(&new_bg.topAnchor()),
+            new_chat
+                .bottomAnchor()
+                .constraintEqualToAnchor(&new_bg.bottomAnchor()),
+            label
+                .leadingAnchor()
+                .constraintEqualToAnchor_constant(&root.leadingAnchor(), 22.0),
+            label
+                .trailingAnchor()
+                .constraintEqualToAnchor_constant(&root.trailingAnchor(), -18.0),
+            chats_label
+                .leadingAnchor()
+                .constraintEqualToAnchor_constant(&root.leadingAnchor(), 22.0),
+            chats_label
+                .trailingAnchor()
+                .constraintEqualToAnchor_constant(&root.trailingAnchor(), -18.0),
+            chats_label
+                .topAnchor()
+                .constraintEqualToAnchor_constant(&new_bg.bottomAnchor(), 22.0),
+            history_top,
+            history_scroll
+                .leadingAnchor()
+                .constraintEqualToAnchor_constant(&root.leadingAnchor(), 10.0),
+            history_scroll
+                .trailingAnchor()
+                .constraintEqualToAnchor_constant(&root.trailingAnchor(), -10.0),
+            label
+                .topAnchor()
+                .constraintEqualToAnchor_constant(&history_scroll.bottomAnchor(), 22.0),
+            scroll
+                .leadingAnchor()
+                .constraintEqualToAnchor_constant(&root.leadingAnchor(), 8.0),
+            scroll
+                .trailingAnchor()
+                .constraintEqualToAnchor_constant(&root.trailingAnchor(), -8.0),
+            models_top,
+        ] {
+            c.setActive(true);
+        }
+        root.into_super()
     }
 
     fn build_chat(&self, mtm: MainThreadMarker) -> Retained<NSView> {
-        let root = NSView::new(mtm);
+        let root = RoundedView::new(mtm, &NSColor::textBackgroundColor(), 0.0);
+        let header = NSView::new(mtm);
+        header.setTranslatesAutoresizingMaskIntoConstraints(false);
+        root.addSubview(&header);
+        let sidebar =
+            ui::symbol_button(mtm, "", "sidebar.left", self.target(), sel!(toggleSidebar:));
+        sidebar.setToolTip(Some(ns_string!("Toggle sidebar")));
+        let title = ui::label(mtm, "New chat", 13.0, true, &NSColor::labelColor());
+        let status = ui::label(
+            mtm,
+            "Choose a model to begin",
+            11.0,
+            false,
+            &NSColor::secondaryLabelColor(),
+        );
+        if let Some(cell) = title.cell() {
+            cell.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+        }
+        title.setContentCompressionResistancePriority_forOrientation(
+            NSLayoutPriorityDefaultLow,
+            NSLayoutConstraintOrientation::Horizontal,
+        );
+        status.setContentCompressionResistancePriority_forOrientation(
+            NSLayoutPriorityDefaultLow,
+            NSLayoutConstraintOrientation::Horizontal,
+        );
+        let settings = ui::symbol_button(
+            mtm,
+            "Settings",
+            "slider.horizontal.3",
+            self.target(),
+            sel!(toggleInspector:),
+        );
+        for view in [&*sidebar as &NSView, &*title, &*status, &*settings] {
+            view.setTranslatesAutoresizingMaskIntoConstraints(false);
+            header.addSubview(view);
+        }
+        self.ivars().model_title.set(title.clone()).ok();
+        self.ivars().model_status.set(status.clone()).ok();
+        for c in [
+            header
+                .leadingAnchor()
+                .constraintEqualToAnchor(&root.leadingAnchor()),
+            header
+                .trailingAnchor()
+                .constraintEqualToAnchor(&root.trailingAnchor()),
+            header
+                .topAnchor()
+                .constraintEqualToAnchor(&root.topAnchor()),
+            header.heightAnchor().constraintEqualToConstant(66.0),
+            sidebar
+                .leadingAnchor()
+                .constraintEqualToAnchor_constant(&header.leadingAnchor(), 20.0),
+            sidebar
+                .centerYAnchor()
+                .constraintEqualToAnchor(&header.centerYAnchor()),
+            sidebar.widthAnchor().constraintEqualToConstant(28.0),
+            sidebar.heightAnchor().constraintEqualToConstant(28.0),
+            title
+                .leadingAnchor()
+                .constraintEqualToAnchor_constant(&sidebar.trailingAnchor(), 12.0),
+            title
+                .topAnchor()
+                .constraintEqualToAnchor_constant(&header.topAnchor(), 17.0),
+            title
+                .trailingAnchor()
+                .constraintLessThanOrEqualToAnchor_constant(&settings.leadingAnchor(), -16.0),
+            status
+                .leadingAnchor()
+                .constraintEqualToAnchor(&title.leadingAnchor()),
+            status
+                .topAnchor()
+                .constraintEqualToAnchor_constant(&title.bottomAnchor(), 4.0),
+            status
+                .trailingAnchor()
+                .constraintLessThanOrEqualToAnchor_constant(&settings.leadingAnchor(), -16.0),
+            settings
+                .trailingAnchor()
+                .constraintEqualToAnchor_constant(&header.trailingAnchor(), -24.0),
+            settings
+                .centerYAnchor()
+                .constraintEqualToAnchor(&sidebar.centerYAnchor()),
+        ] {
+            c.setActive(true);
+        }
 
         let document = FlippedView::new(mtm);
         document.setTranslatesAutoresizingMaskIntoConstraints(false);
         let stack = ui::stack(
             mtm,
             NSUserInterfaceLayoutOrientation::Vertical,
-            10.0,
+            28.0,
             NSLayoutAttribute::Width,
         );
         stack.setEdgeInsets(NSEdgeInsets {
-            top: 22.0,
-            left: 16.0,
-            bottom: 90.0,
-            right: 16.0,
-        });
-        document.addSubview(&stack);
-        stack
-            .leadingAnchor()
-            .constraintEqualToAnchor(&document.leadingAnchor())
-            .setActive(true);
-        stack
-            .trailingAnchor()
-            .constraintEqualToAnchor(&document.trailingAnchor())
-            .setActive(true);
-        stack
-            .topAnchor()
-            .constraintEqualToAnchor(&document.topAnchor())
-            .setActive(true);
-        stack
-            .bottomAnchor()
-            .constraintEqualToAnchor(&document.bottomAnchor())
-            .setActive(true);
-        self.ivars().chat_stack.set(stack).ok();
-
-        let scroll = NSScrollView::new(mtm);
-        scroll.setDocumentView(Some(&document));
-        scroll.setHasVerticalScroller(true);
-        scroll.setDrawsBackground(false);
-        scroll.setBorderType(NSBorderType::NoBorder);
-        scroll.setTranslatesAutoresizingMaskIntoConstraints(false);
-        scroll.setAutomaticallyAdjustsContentInsets(false);
-        scroll.setContentInsets(NSEdgeInsets {
-            top: 0.0,
+            top: 24.0,
             left: 0.0,
-            bottom: 0.0,
+            bottom: 28.0,
             right: 0.0,
         });
+        document.addSubview(&stack);
+        for c in [
+            stack
+                .centerXAnchor()
+                .constraintEqualToAnchor(&document.centerXAnchor()),
+            stack
+                .widthAnchor()
+                .constraintLessThanOrEqualToConstant(BUBBLE_MAX_WIDTH),
+            stack
+                .widthAnchor()
+                .constraintLessThanOrEqualToAnchor_constant(&document.widthAnchor(), -48.0),
+            stack
+                .topAnchor()
+                .constraintEqualToAnchor(&document.topAnchor()),
+            stack
+                .bottomAnchor()
+                .constraintEqualToAnchor(&document.bottomAnchor()),
+        ] {
+            c.setActive(true);
+        }
+        // Keep visual width preferences below AppKit's window-size priority:
+        // a capped reading column must not cap the resizable window itself.
+        let preferred = stack
+            .widthAnchor()
+            .constraintEqualToAnchor_constant(&document.widthAnchor(), -48.0);
+        preferred.setPriority(NSLayoutPriorityDefaultLow);
+        preferred.setActive(true);
+        self.ivars().chat_stack.set(stack).ok();
+        let scroll = ui::scroll(mtm, &document);
+        scroll.setAutomaticallyAdjustsContentInsets(false);
         document
             .widthAnchor()
             .constraintEqualToAnchor(&scroll.contentView().widthAnchor())
@@ -3473,150 +4509,279 @@ impl AppDelegate {
         self.ivars().chat_scroll.set(scroll.clone()).ok();
         root.addSubview(&scroll);
 
-        // Empty-state placeholder, hidden once the first message arrives.
-        let placeholder = ui::label(
+        let welcome = ui::stack(
             mtm,
-            "Select a model and start chatting",
-            13.0,
-            false,
-            &NSColor::tertiaryLabelColor(),
+            NSUserInterfaceLayoutOrientation::Vertical,
+            14.0,
+            NSLayoutAttribute::CenterX,
         );
-        placeholder.setTranslatesAutoresizingMaskIntoConstraints(false);
-        root.addSubview(&placeholder);
-        placeholder
-            .centerXAnchor()
-            .constraintEqualToAnchor(&scroll.centerXAnchor())
+        let mark = NSImageView::new(mtm);
+        mark.setImage(
+            NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                ns_string!("sparkle"),
+                Some(ns_string!("Lisa")),
+            )
+            .as_deref(),
+        );
+        mark.setContentTintColor(Some(&NSColor::labelColor()));
+        ui::size(&mark, 36.0, 36.0);
+        welcome.addArrangedSubview(&mark);
+        let welcome_title = ui::label(
+            mtm,
+            "A little space to think.",
+            28.0,
+            true,
+            &NSColor::labelColor(),
+        );
+        welcome_title.setAlignment(NSTextAlignment::Center);
+        welcome.addArrangedSubview(&welcome_title);
+        let detail = ui::wrapping_label(
+            mtm,
+            "Choose a model in the sidebar, then make something of your ideas.",
+            13.0,
+            &NSColor::secondaryLabelColor(),
+        );
+        detail.setAlignment(NSTextAlignment::Center);
+        detail.setMaximumNumberOfLines(3);
+        detail.setTranslatesAutoresizingMaskIntoConstraints(false);
+        welcome.addArrangedSubview(&detail);
+        detail
+            .widthAnchor()
+            .constraintEqualToAnchor(&welcome.widthAnchor())
             .setActive(true);
-        placeholder
-            .centerYAnchor()
-            .constraintEqualToAnchor(&scroll.centerYAnchor())
-            .setActive(true);
-        self.ivars().chat_placeholder.set(placeholder).ok();
+        root.addSubview(&welcome);
+        for c in [
+            welcome
+                .centerXAnchor()
+                .constraintEqualToAnchor(&scroll.centerXAnchor()),
+            welcome
+                .centerYAnchor()
+                .constraintEqualToAnchor_constant(&scroll.centerYAnchor(), -24.0),
+            welcome
+                .widthAnchor()
+                .constraintLessThanOrEqualToConstant(460.0),
+            welcome
+                .widthAnchor()
+                .constraintLessThanOrEqualToAnchor_constant(&root.widthAnchor(), -48.0),
+        ] {
+            c.setActive(true);
+        }
+        let width = welcome.widthAnchor().constraintEqualToConstant(460.0);
+        width.setPriority(NSLayoutPriorityDefaultLow);
+        width.setActive(true);
+        self.ivars().chat_placeholder.set(welcome).ok();
+        self.ivars().welcome_title.set(welcome_title).ok();
+        self.ivars().welcome_detail.set(detail).ok();
 
-        let input_bg = NSBox::new(mtm);
-        input_bg.setBoxType(NSBoxType::Custom);
-        input_bg.setCornerRadius(10.0);
-        input_bg.setBorderWidth(0.0);
-        input_bg.setFillColor(&NSColor::colorWithSRGBRed_green_blue_alpha(
-            0.09, 0.09, 0.09, 0.85,
-        ));
-        input_bg.setTranslatesAutoresizingMaskIntoConstraints(false);
-        root.addSubview(&input_bg);
-
+        let composer = NSBox::new(mtm);
+        composer.setBoxType(NSBoxType::Custom);
+        composer.setCornerRadius(18.0);
+        composer.setBorderWidth(1.0);
+        composer.setBorderColor(&NSColor::separatorColor());
+        composer.setFillColor(&NSColor::controlBackgroundColor());
+        composer.setTranslatesAutoresizingMaskIntoConstraints(false);
+        root.addSubview(&composer);
         let input = NSTextField::textFieldWithString(ns_string!(""), mtm);
         input.setBezeled(false);
         input.setBordered(false);
         input.setDrawsBackground(false);
         input.setFocusRingType(NSFocusRingType::None);
-        input.setTextColor(Some(&NSColor::tertiaryLabelColor()));
+        input.setTextColor(Some(&NSColor::labelColor()));
         input.setEnabled(false);
-        input.setPlaceholderString(Some(ns_string!(
-            "Ask Lisa anything, or type / to run commands"
-        )));
-        input.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+        input.setPlaceholderString(Some(ns_string!("Message Lisa…")));
+        input.setFont(Some(&NSFont::systemFontOfSize(14.0)));
+        input.setMaximumNumberOfLines(3);
+        if let Some(cell) = input.cell() {
+            cell.setUsesSingleLineMode(false);
+            cell.setWraps(true);
+            cell.setScrollable(true);
+        }
         input.setTranslatesAutoresizingMaskIntoConstraints(false);
         unsafe {
-            input.setTarget(Some(self.target()));
-            input.setAction(Some(sel!(sendMessage:)));
+            input.setDelegate(Some(ProtocolObject::from_ref(self)));
         }
+        composer.addSubview(&input);
         self.ivars().chat_input.set(input.clone()).ok();
-        input_bg.addSubview(&input);
-
-        let send = ui::button(
+        let attach = ui::symbol_button(mtm, "Attach", "plus", self.target(), sel!(attachImage:));
+        attach.setEnabled(false);
+        composer.addSubview(&attach);
+        self.ivars().chat_attach.set(attach.clone()).ok();
+        let remove = ui::symbol_button(
+            mtm,
+            "",
+            "xmark.circle.fill",
+            self.target(),
+            sel!(removeAttachments:),
+        );
+        remove.setToolTip(Some(ns_string!("Remove attached images")));
+        remove.setHidden(true);
+        composer.addSubview(&remove);
+        self.ivars().attachment_clear.set(remove.clone()).ok();
+        let hint = ui::label(
+            mtm,
+            "Select a model to start",
+            11.0,
+            false,
+            &NSColor::secondaryLabelColor(),
+        );
+        hint.setTranslatesAutoresizingMaskIntoConstraints(false);
+        if let Some(cell) = hint.cell() {
+            cell.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+        }
+        composer.addSubview(&hint);
+        self.ivars().composer_hint.set(hint.clone()).ok();
+        let send = ui::symbol_button(
             mtm,
             "Send",
-            Some(self.target()),
-            Some(sel!(sendMessage:)),
-            true,
+            "arrow.up.circle.fill",
+            self.target(),
+            sel!(sendMessage:),
         );
-        send.setControlSize(NSControlSize::Large);
-        send.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+        send.setFont(Some(&NSFont::boldSystemFontOfSize(12.0)));
         send.setEnabled(false);
-        send.setBordered(false);
+        composer.addSubview(&send);
         self.ivars().chat_send.set(send.clone()).ok();
-        send.setTranslatesAutoresizingMaskIntoConstraints(false);
-        send.widthAnchor()
-            .constraintGreaterThanOrEqualToConstant(80.0)
-            .setActive(true);
-        send.heightAnchor()
-            .constraintEqualToConstant(32.0)
-            .setActive(true);
-
-        let send_bg = RoundedView::new(
+        let keyboard = ui::label(
             mtm,
-            &NSColor::colorWithSRGBRed_green_blue_alpha(0.24, 0.24, 0.24, 1.0),
+            "Return to send  ·  Shift Return for a new line",
             10.0,
+            false,
+            &NSColor::tertiaryLabelColor(),
         );
-        send_bg.setTranslatesAutoresizingMaskIntoConstraints(false);
-        root.addSubview(&send_bg);
-        root.addSubview(&send);
+        keyboard.setTranslatesAutoresizingMaskIntoConstraints(false);
+        root.addSubview(&keyboard);
+        for c in [
+            scroll
+                .leadingAnchor()
+                .constraintEqualToAnchor(&root.leadingAnchor()),
+            scroll
+                .trailingAnchor()
+                .constraintEqualToAnchor(&root.trailingAnchor()),
+            scroll
+                .topAnchor()
+                .constraintEqualToAnchor(&header.bottomAnchor()),
+            scroll
+                .bottomAnchor()
+                .constraintEqualToAnchor_constant(&composer.topAnchor(), -12.0),
+            composer
+                .centerXAnchor()
+                .constraintEqualToAnchor(&root.centerXAnchor()),
+            composer
+                .widthAnchor()
+                .constraintLessThanOrEqualToConstant(760.0),
+            composer
+                .widthAnchor()
+                .constraintLessThanOrEqualToAnchor_constant(&root.widthAnchor(), -48.0),
+            composer
+                .bottomAnchor()
+                .constraintEqualToAnchor_constant(&root.bottomAnchor(), -42.0),
+            composer.heightAnchor().constraintEqualToConstant(118.0),
+            input
+                .leadingAnchor()
+                .constraintEqualToAnchor_constant(&composer.leadingAnchor(), 18.0),
+            input
+                .trailingAnchor()
+                .constraintEqualToAnchor_constant(&composer.trailingAnchor(), -18.0),
+            input
+                .topAnchor()
+                .constraintEqualToAnchor_constant(&composer.topAnchor(), 16.0),
+            input.heightAnchor().constraintEqualToConstant(54.0),
+            attach
+                .leadingAnchor()
+                .constraintEqualToAnchor_constant(&composer.leadingAnchor(), 16.0),
+            attach
+                .bottomAnchor()
+                .constraintEqualToAnchor_constant(&composer.bottomAnchor(), -12.0),
+            attach.heightAnchor().constraintEqualToConstant(24.0),
+            remove
+                .leadingAnchor()
+                .constraintEqualToAnchor_constant(&attach.trailingAnchor(), 6.0),
+            remove
+                .centerYAnchor()
+                .constraintEqualToAnchor(&attach.centerYAnchor()),
+            remove.widthAnchor().constraintEqualToConstant(18.0),
+            hint.leadingAnchor()
+                .constraintEqualToAnchor_constant(&remove.trailingAnchor(), 10.0),
+            hint.centerYAnchor()
+                .constraintEqualToAnchor(&attach.centerYAnchor()),
+            hint.trailingAnchor()
+                .constraintLessThanOrEqualToAnchor_constant(&send.leadingAnchor(), -12.0),
+            send.trailingAnchor()
+                .constraintEqualToAnchor_constant(&composer.trailingAnchor(), -16.0),
+            send.centerYAnchor()
+                .constraintEqualToAnchor(&attach.centerYAnchor()),
+            send.heightAnchor().constraintEqualToConstant(28.0),
+            keyboard
+                .centerXAnchor()
+                .constraintEqualToAnchor(&composer.centerXAnchor()),
+            keyboard
+                .topAnchor()
+                .constraintEqualToAnchor_constant(&composer.bottomAnchor(), 12.0),
+        ] {
+            c.setActive(true);
+        }
+        let width = composer
+            .widthAnchor()
+            .constraintEqualToAnchor_constant(&root.widthAnchor(), -48.0);
+        width.setPriority(NSLayoutPriorityDefaultLow);
+        width.setActive(true);
 
-        // Slash-command dropdown, parked above the input and revealed by
-        // `update_command_menu` once the text starts with "/".
-        let cmd_menu = RoundedView::new(
-            mtm,
-            &NSColor::colorWithSRGBRed_green_blue_alpha(0.20, 0.20, 0.20, 1.0),
-            10.0,
-        );
+        let cmd_menu = RoundedView::new(mtm, &NSColor::controlBackgroundColor(), 12.0);
         cmd_menu.setTranslatesAutoresizingMaskIntoConstraints(false);
         cmd_menu.setHidden(true);
         root.addSubview(&cmd_menu);
-
         let cmd_stack = ui::stack(
             mtm,
             NSUserInterfaceLayoutOrientation::Vertical,
-            0.0,
-            NSLayoutAttribute::Leading,
+            2.0,
+            NSLayoutAttribute::Width,
         );
         cmd_stack.setEdgeInsets(NSEdgeInsets {
-            top: 10.0,
-            left: 12.0,
-            bottom: 10.0,
-            right: 12.0,
+            top: 8.0,
+            left: 8.0,
+            bottom: 8.0,
+            right: 8.0,
         });
         cmd_menu.addSubview(&cmd_stack);
-        cmd_stack
-            .leadingAnchor()
-            .constraintEqualToAnchor(&cmd_menu.leadingAnchor())
-            .setActive(true);
-        cmd_stack
-            .trailingAnchor()
-            .constraintEqualToAnchor(&cmd_menu.trailingAnchor())
-            .setActive(true);
-        cmd_stack
-            .topAnchor()
-            .constraintEqualToAnchor(&cmd_menu.topAnchor())
-            .setActive(true);
-        cmd_stack
-            .bottomAnchor()
-            .constraintEqualToAnchor(&cmd_menu.bottomAnchor())
-            .setActive(true);
-
-        let mut cmd_rows: Vec<Retained<NSButton>> = Vec::new();
-        let mut cmd_bgs: Vec<Retained<RoundedView>> = Vec::new();
-        for (i, (name, desc)) in CHAT_COMMANDS.iter().enumerate() {
+        for c in [
+            cmd_stack
+                .leadingAnchor()
+                .constraintEqualToAnchor(&cmd_menu.leadingAnchor()),
+            cmd_stack
+                .trailingAnchor()
+                .constraintEqualToAnchor(&cmd_menu.trailingAnchor()),
+            cmd_stack
+                .topAnchor()
+                .constraintEqualToAnchor(&cmd_menu.topAnchor()),
+            cmd_stack
+                .bottomAnchor()
+                .constraintEqualToAnchor(&cmd_menu.bottomAnchor()),
+            cmd_menu
+                .leadingAnchor()
+                .constraintEqualToAnchor(&composer.leadingAnchor()),
+            cmd_menu
+                .bottomAnchor()
+                .constraintEqualToAnchor_constant(&composer.topAnchor(), -8.0),
+            cmd_menu.widthAnchor().constraintEqualToConstant(320.0),
+        ] {
+            c.setActive(true);
+        }
+        let mut rows = Vec::new();
+        let mut backgrounds = Vec::new();
+        for (i, (name, description)) in CHAT_COMMANDS.iter().enumerate() {
             let row = NSView::new(mtm);
             row.setTranslatesAutoresizingMaskIntoConstraints(false);
-
-            let bg = RoundedView::new(
-                mtm,
-                &NSColor::controlAccentColor().colorWithAlphaComponent(0.35),
-                6.0,
-            );
+            let bg = RoundedView::new(mtm, &NSColor::quaternaryLabelColor(), 6.0);
             bg.setTranslatesAutoresizingMaskIntoConstraints(false);
             bg.setHidden(true);
             row.addSubview(&bg);
-
-            let btn = ui::button(mtm, "", Some(self.target()), Some(sel!(runCommand:)), false);
-            btn.setControlSize(NSControlSize::Regular);
-            btn.setBordered(false);
-            btn.setAlignment(NSTextAlignment::Left);
-            btn.setAttributedTitle(&command_row_title(name, desc, false));
-            btn.setTranslatesAutoresizingMaskIntoConstraints(false);
-            btn.setTag(i as NSInteger);
-            row.addSubview(&btn);
-
-            for constraint in [
+            let button = ui::button(mtm, "", Some(self.target()), Some(sel!(runCommand:)), false);
+            button.setTag(i as NSInteger);
+            button.setAlignment(NSTextAlignment::Left);
+            button.setAttributedTitle(&command_row_title(name, description, false));
+            button.setTranslatesAutoresizingMaskIntoConstraints(false);
+            row.addSubview(&button);
+            for c in [
                 bg.leadingAnchor()
                     .constraintEqualToAnchor(&row.leadingAnchor()),
                 bg.trailingAnchor()
@@ -3624,122 +4789,136 @@ impl AppDelegate {
                 bg.topAnchor().constraintEqualToAnchor(&row.topAnchor()),
                 bg.bottomAnchor()
                     .constraintEqualToAnchor(&row.bottomAnchor()),
-                btn.leadingAnchor()
-                    .constraintEqualToAnchor_constant(&row.leadingAnchor(), 10.0),
-                btn.trailingAnchor()
-                    .constraintEqualToAnchor_constant(&row.trailingAnchor(), -10.0),
-                btn.topAnchor().constraintEqualToAnchor(&row.topAnchor()),
-                btn.bottomAnchor()
+                button
+                    .leadingAnchor()
+                    .constraintEqualToAnchor_constant(&row.leadingAnchor(), 8.0),
+                button
+                    .trailingAnchor()
+                    .constraintEqualToAnchor_constant(&row.trailingAnchor(), -8.0),
+                button.topAnchor().constraintEqualToAnchor(&row.topAnchor()),
+                button
+                    .bottomAnchor()
                     .constraintEqualToAnchor(&row.bottomAnchor()),
+                row.heightAnchor().constraintEqualToConstant(32.0),
             ] {
-                constraint.setActive(true);
+                c.setActive(true);
             }
-
             cmd_stack.addArrangedSubview(&row);
-            row.widthAnchor()
-                .constraintEqualToAnchor_constant(&cmd_stack.widthAnchor(), -24.0)
-                .setActive(true);
-            row.heightAnchor()
-                .constraintEqualToConstant(26.0)
-                .setActive(true);
-            cmd_rows.push(btn);
-            cmd_bgs.push(bg);
+            rows.push(button);
+            backgrounds.push(bg);
         }
-        *self.ivars().cmd_rows.borrow_mut() = cmd_rows;
-        *self.ivars().cmd_bgs.borrow_mut() = cmd_bgs;
-        self.ivars().cmd_menu.set(cmd_menu.clone()).ok();
+        *self.ivars().cmd_rows.borrow_mut() = rows;
+        *self.ivars().cmd_bgs.borrow_mut() = backgrounds;
+        self.ivars().cmd_menu.set(cmd_menu).ok();
+        root.into_super()
+    }
 
-        cmd_menu
-            .leadingAnchor()
-            .constraintEqualToAnchor(&input_bg.leadingAnchor())
-            .setActive(true);
-        cmd_menu
-            .bottomAnchor()
-            .constraintEqualToAnchor_constant(&input_bg.topAnchor(), -8.0)
-            .setActive(true);
-        cmd_menu
-            .widthAnchor()
-            .constraintEqualToConstant(300.0)
-            .setActive(true);
-        cmd_menu
-            .widthAnchor()
-            .constraintLessThanOrEqualToAnchor(&input_bg.widthAnchor())
-            .setActive(true);
-
-        unsafe { input.setDelegate(Some(ProtocolObject::from_ref(self))) };
-
-        scroll
-            .leadingAnchor()
-            .constraintEqualToAnchor(&root.leadingAnchor())
-            .setActive(true);
-        scroll
-            .trailingAnchor()
-            .constraintEqualToAnchor(&root.trailingAnchor())
-            .setActive(true);
-        scroll
-            .topAnchor()
-            .constraintEqualToAnchor(&root.topAnchor())
-            .setActive(true);
-        scroll
-            .bottomAnchor()
-            .constraintEqualToAnchor(&root.bottomAnchor())
-            .setActive(true);
-
-        input_bg
-            .leadingAnchor()
-            .constraintEqualToAnchor_constant(&root.leadingAnchor(), 18.0)
-            .setActive(true);
-        input_bg
-            .trailingAnchor()
-            .constraintEqualToAnchor_constant(&send.leadingAnchor(), -10.0)
-            .setActive(true);
-        input_bg
-            .bottomAnchor()
-            .constraintEqualToAnchor_constant(&root.bottomAnchor(), -18.0)
-            .setActive(true);
-        input_bg
-            .heightAnchor()
-            .constraintEqualToAnchor(&send.heightAnchor())
-            .setActive(true);
-
-        input
-            .leadingAnchor()
-            .constraintEqualToAnchor_constant(&input_bg.leadingAnchor(), 14.0)
-            .setActive(true);
-        input
-            .trailingAnchor()
-            .constraintEqualToAnchor_constant(&input_bg.trailingAnchor(), -14.0)
-            .setActive(true);
-        input
-            .centerYAnchor()
-            .constraintEqualToAnchor(&input_bg.centerYAnchor())
-            .setActive(true);
-
-        send.trailingAnchor()
-            .constraintEqualToAnchor_constant(&root.trailingAnchor(), -18.0)
-            .setActive(true);
-        send.bottomAnchor()
-            .constraintEqualToAnchor(&input_bg.bottomAnchor())
-            .setActive(true);
-
-        send_bg
-            .leadingAnchor()
-            .constraintEqualToAnchor(&send.leadingAnchor())
-            .setActive(true);
-        send_bg
-            .trailingAnchor()
-            .constraintEqualToAnchor(&send.trailingAnchor())
-            .setActive(true);
-        send_bg
-            .topAnchor()
-            .constraintEqualToAnchor(&send.topAnchor())
-            .setActive(true);
-        send_bg
-            .bottomAnchor()
-            .constraintEqualToAnchor(&send.bottomAnchor())
-            .setActive(true);
-
-        root
+    fn refresh_chat_chrome(&self) {
+        let loaded = self.ivars().model_loaded.get();
+        let busy = self.ivars().busy.get();
+        if let Some(button) = self.ivars().attachment_clear.get() {
+            button.setHidden(self.ivars().attachments.borrow().is_empty());
+        }
+        let image_steps = self.ivars().image_mode.get();
+        let image = image_steps.is_some();
+        let active = self.ivars().active_repo.borrow();
+        let chat_id = self.ivars().active_chat.borrow().clone();
+        let chat_title = self
+            .ivars()
+            .chats
+            .borrow()
+            .iter()
+            .find(|chat| Some(&chat.id) == chat_id.as_ref())
+            .map(chats::Chat::title);
+        if let Some(title) = self.ivars().model_title.get() {
+            title.setStringValue(&NSString::from_str(
+                chat_title.as_deref().unwrap_or("New chat"),
+            ));
+            title.setToolTip(active.as_deref().map(NSString::from_str).as_deref());
+        }
+        let status = if busy {
+            if image {
+                "Generating an image…"
+            } else {
+                "Lisa is responding…"
+            }
+        } else if loaded {
+            if self.ivars().serving.get() {
+                "Local model · API running"
+            } else {
+                "Local model · Ready"
+            }
+        } else if active.is_some() {
+            "Loading model…"
+        } else {
+            "Choose a model to begin"
+        };
+        if let Some(label) = self.ivars().model_status.get() {
+            let status = active
+                .as_deref()
+                .map(|model| {
+                    format!(
+                        "{} · {status}",
+                        catalog::find(model)
+                            .map_or_else(|| display_name(model), |entry| entry.name,)
+                    )
+                })
+                .unwrap_or_else(|| status.into());
+            label.setStringValue(&NSString::from_str(&status));
+        }
+        if let Some(window) = self.ivars().window.get() {
+            window.setTitle(&NSString::from_str(
+                &chat_title
+                    .map(|title| format!("Lisa — {title}"))
+                    .unwrap_or_else(|| "Lisa".into()),
+            ));
+        }
+        if let Some(label) = self.ivars().composer_hint.get() {
+            let hint = if loaded {
+                if let Some(steps) = image_steps {
+                    format!("512 × 512 · {steps} steps")
+                } else {
+                    "On your Mac".into()
+                }
+            } else {
+                status.into()
+            };
+            label.setStringValue(&NSString::from_str(&hint));
+        }
+        if let Some(label) = self.ivars().welcome_title.get() {
+            label.setStringValue(&NSString::from_str(if image && loaded {
+                "Imagine something new."
+            } else {
+                "A little space to think."
+            }));
+        }
+        if let Some(label) = self.ivars().welcome_detail.get() {
+            label.setStringValue(&NSString::from_str(if !loaded {
+                "Choose a model in the sidebar, then make something of your ideas."
+            } else if image {
+                "Describe what you see in your mind. Lisa will create it here, on your Mac."
+            } else if !self.ivars().supports_images.get() {
+                "Ask a question, work through an idea, or write some code."
+            } else {
+                "Ask a question, work through an idea, or bring an image into the conversation."
+            }));
+        }
+        if let Some(send) = self.ivars().chat_send.get() {
+            send.setEnabled(loaded && !busy);
+            send.setTitle(&NSString::from_str(if busy {
+                "Working…"
+            } else if image {
+                "Generate"
+            } else {
+                "Send"
+            }));
+        }
+        if let Some(button) = self.ivars().new_chat.get() {
+            button.setEnabled(!self.chat_locked());
+        }
+        for button in self.ivars().chat_buttons.borrow().iter() {
+            button.setEnabled(!self.chat_locked());
+        }
     }
 
     fn set_serving(&self, on: bool, msg: &str) {
@@ -3779,7 +4958,30 @@ impl AppDelegate {
     }
 
     fn build_serve(&self, mtm: MainThreadMarker) -> Retained<NSView> {
-        let root = NSView::new(mtm);
+        let root = RoundedView::new(mtm, &NSColor::windowBackgroundColor(), 0.0);
+
+        let heading = ui::label(mtm, "Model settings", 13.0, true, &NSColor::labelColor());
+        heading.setTranslatesAutoresizingMaskIntoConstraints(false);
+        root.addSubview(&heading);
+        heading
+            .leadingAnchor()
+            .constraintEqualToAnchor_constant(&root.leadingAnchor(), 20.0)
+            .setActive(true);
+        heading
+            .topAnchor()
+            .constraintEqualToAnchor_constant(&root.topAnchor(), 40.0)
+            .setActive(true);
+        let close = ui::symbol_button(mtm, "", "xmark", self.target(), sel!(toggleInspector:));
+        close.setToolTip(Some(ns_string!("Close settings")));
+        root.addSubview(&close);
+        close
+            .trailingAnchor()
+            .constraintEqualToAnchor_constant(&root.trailingAnchor(), -20.0)
+            .setActive(true);
+        close
+            .centerYAnchor()
+            .constraintEqualToAnchor(&heading.centerYAnchor())
+            .setActive(true);
 
         let body = NSStackView::new(mtm);
         body.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
@@ -3852,6 +5054,7 @@ impl AppDelegate {
         row1.addSubview(&card_desc);
 
         let switch = NSSwitch::new(mtm);
+        switch.setEnabled(false);
         switch.setTranslatesAutoresizingMaskIntoConstraints(false);
         unsafe {
             switch.setTarget(Some(self.target()));
@@ -3999,6 +5202,28 @@ impl AppDelegate {
             .constraintEqualToAnchor(&inner.widthAnchor())
             .setActive(true);
 
+        let status = ui::wrapping_label(
+            mtm,
+            "Start the server to connect another app.",
+            11.0,
+            &NSColor::secondaryLabelColor(),
+        );
+        status.setTranslatesAutoresizingMaskIntoConstraints(false);
+        inner.addArrangedSubview(&status);
+        status
+            .widthAnchor()
+            .constraintEqualToAnchor(&inner.widthAnchor())
+            .setActive(true);
+        self.ivars().serve_status.set(status).ok();
+        let copy = ui::symbol_button(
+            mtm,
+            "Copy API URL",
+            "doc.on.doc",
+            self.target(),
+            sel!(copyEndpoint:),
+        );
+        inner.addArrangedSubview(&copy);
+
         let port_card = NSBox::new(mtm);
         port_card.setBoxType(NSBoxType::Custom);
         port_card.setBorderWidth(0.0);
@@ -4056,7 +5281,7 @@ impl AppDelegate {
             .constraintEqualToAnchor_constant(&root.trailingAnchor(), -18.0)
             .setActive(true);
 
-        let sys_label = ui::label(mtm, "System", 12.0, true, &NSColor::labelColor());
+        let sys_label = ui::label(mtm, "Instructions", 12.0, true, &NSColor::labelColor());
         sys_label.setTranslatesAutoresizingMaskIntoConstraints(false);
         sys_card.addSubview(&sys_label);
 
@@ -4115,14 +5340,14 @@ impl AppDelegate {
             .constraintEqualToAnchor_constant(&root.trailingAnchor(), -18.0)
             .setActive(true);
         body.topAnchor()
-            .constraintEqualToAnchor_constant(&root.topAnchor(), 20.0)
+            .constraintEqualToAnchor_constant(&root.topAnchor(), 86.0)
             .setActive(true);
 
-        root
+        root.into_super()
     }
 
     fn build_logs(&self, mtm: MainThreadMarker) -> Retained<NSView> {
-        let root = NSView::new(mtm);
+        let root = RoundedView::new(mtm, &NSColor::textBackgroundColor(), 0.0);
 
         let header = NSView::new(mtm);
         header.setTranslatesAutoresizingMaskIntoConstraints(false);
@@ -4209,6 +5434,6 @@ impl AppDelegate {
             .constraintEqualToAnchor(&root.bottomAnchor())
             .setActive(true);
 
-        root
+        root.into_super()
     }
 }

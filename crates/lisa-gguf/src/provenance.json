@@ -1,0 +1,20 @@
+{
+  "ggml": {
+    "repository": "https://github.com/ggml-org/llama.cpp",
+    "revision": "ca3d5a3e10d53f7ea672cb9b6178faca3e2807bc",
+    "sources": {
+      "ggml/src/ggml-common.h": "af255601767325f087313fa84b9435cb77aeec37df6b61b98d9ecc65f29fb4a0",
+      "ggml/src/ggml-quants.c": "07143d7068936ae46b3c528b2f3d4bbb666e74d88992165716174d243573965d"
+    }
+  },
+  "ds4": {
+    "repository": "https://github.com/antirez/ds4",
+    "revision": "b3f50180ec2c7324892be1f50bc83555ccb8d5e7"
+  },
+  "notes": "Original packed GGUF blocks are preserved. IQ1_M, IQ2_XS and IQ4_NL extend the pinned DS4 format coverage using GGML definitions; they are not DS4 performance parity claims.",
+  "glm_q2_q4_cpu": {
+    "revision": "7071ba378afa96dcd69c41e1ec2b4912364dbee4",
+    "source_sha256": "bcda33625707fdfcb1367cdd2bb1a2f017430162ec9623abc84ad17459698f73",
+    "oracle": "Unmodified dequantize_row_q2_K, dequantize_row_q4_K and get_scale_min_k4 bodies; clang -O2 -ffp-contract=off; 128 xorshift blocks each."
+  }
+}

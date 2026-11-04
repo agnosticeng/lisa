@@ -7,7 +7,8 @@ use super::common::EXACT_HEADER;
 /// `track_gated_rms` (split-z form): the output gated RMS over `Dv` per value/// head (the engine's butterfly reduction), then `sigmoid(z) * out` in one
 /// launch. `y`, `zproj` and `out` are flat `[rows, Hv, Dv]`, `zproj` is
 /// `[rows, Hv*Dv]`, `w` is `[Dv]`.
-const GATED_RMS_SOURCE: &str = include_str!("../../../shaders/qwen4/gated_rms.metal");
+const GATED_RMS_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("qwen4/gated_rms.metal");
 
 static GATED_RMS: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 
@@ -135,7 +136,7 @@ pub fn gated_rms_silu(
 ///
 /// `w`/`normed` are `[rows, HC*H]`, `inj` is `[rows, HC]` -> `input`
 /// `[rows, H]`, `inject` `[rows, HC]`.
-const HC_MIX_SOURCE: &str = include_str!("../../../shaders/qwen4/hc_mix.metal");
+const HC_MIX_SOURCE: &crate::shader_pack::Source = crate::kernel_source!("qwen4/hc_mix.metal");
 
 static HC_MIX: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 
@@ -208,7 +209,7 @@ pub fn hc_mix(
     Some((it.next()?, it.next()?))
 }
 /// `track_swiglu2`: `mlx_silu(gate) * up` over separate gate/up arrays, bf16.
-const SWIGLU2_SOURCE: &str = include_str!("../../../shaders/qwen4/swiglu2.metal");
+const SWIGLU2_SOURCE: &crate::shader_pack::Source = crate::kernel_source!("qwen4/swiglu2.metal");
 
 static SWIGLU2: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 
@@ -228,7 +229,8 @@ fn swiglu2_kernel() -> &'static Option<MetalKernel> {
 }
 
 /// `track_silu_head`: `mlx_silu` over the leading `LMIX` columns of `lo`.
-const SILU_HEAD_SOURCE: &str = include_str!("../../../shaders/qwen4/silu_head.metal");
+const SILU_HEAD_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("qwen4/silu_head.metal");
 
 static SILU_HEAD: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 
@@ -311,7 +313,8 @@ pub fn silu_head(lo: &Array, width: i32, stream: &Stream) -> Option<Array> {
 ///
 /// `residual` is `[rows, W]` (or `[rows, H]` when `TILE`), `out` `[rows, H]`,
 /// `inject` `[rows, HC]`, `scale` `[W]` -> `stream`/`normed` `[rows, W]`.
-const INJECT_NORM_SOURCE: &str = include_str!("../../../shaders/qwen4/inject_norm.metal");
+const INJECT_NORM_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("qwen4/inject_norm.metal");
 
 static INJECT_NORM: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 
@@ -385,7 +388,8 @@ pub fn inject_norm(
 }
 /// `track_p12_attn_prep_split_inputs`: q/k RMS + partial rope + v passthrough.
 /// Inputs: `qkv` = [q|gate] rows `[B,S,2*HQ*D]`, `kproj`/`vproj` `[B,S,HK*D]`.
-const ATTN_PREP_SPLIT_SOURCE: &str = include_str!("../../../shaders/qwen4/attn_prep_split.metal");
+const ATTN_PREP_SPLIT_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("qwen4/attn_prep_split.metal");
 
 static ATTN_PREP_SPLIT: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 fn attn_prep_split_kernel() -> &'static Option<MetalKernel> {
@@ -463,7 +467,8 @@ pub fn attn_prep_split(
     Some((it.next()?, it.next()?, it.next()?))
 }
 /// `track_attn_gate` (split-gate form): `out = att * sigmoid(gate)`.
-const ATTN_GATE_SOURCE: &str = include_str!("../../../shaders/qwen4/attn_gate.metal");
+const ATTN_GATE_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("qwen4/attn_gate.metal");
 
 static ATTN_GATE: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 fn attn_gate_kernel() -> &'static Option<MetalKernel> {

@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <title>Lisa</title>
+  <desc>A modern, minimal Lisa with an asymmetric ink bob, a coral hair clip and a lilac backdrop.</desc>
+  <defs>
+    <linearGradient id="tile" x1="230" y1="100" x2="785" y2="924" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#D8CAFF"/>
+      <stop offset="1" stop-color="#AA8BF4"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="512" y1="100" x2="512" y2="924" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF" stop-opacity=".55"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity=".08"/>
+    </linearGradient>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#tile)"/>
+  <rect x="102" y="102" width="820" height="820" rx="184" fill="none" stroke="url(#rim)" stroke-width="3"/>
+  <!-- Bold silhouettes keep the portrait readable at Dock sizes. -->
+  <path d="M270 492C270 333 358 231 507 231C653 231 738 333 738 480V691C738 753 688 793 619 793H372C294 793 249 744 262 680Z" fill="#252438"/>
+  <path d="M424 710L458 661H580L614 710C684 721 731 764 744 813H280C294 761 350 721 424 710Z" fill="#F7F2FF"/>
+  <path d="M459 618H579V700C579 731 459 731 459 700Z" fill="#FFD6BF"/>
+  <path d="M459 630C498 656 540 662 579 645V676C541 694 493 679 459 660Z" fill="#EEAE9B"/>
+  <path d="M372 441C372 361 429 311 519 311C610 311 669 365 669 452V524C669 611 601 676 528 676C452 676 389 620 380 541L371 484Z" fill="#FFD6BF"/>
+  <path d="M350 499C323 499 312 519 319 543C325 564 342 573 365 568L381 559L376 510Z" fill="#FFD6BF"/>
+  <path d="M288 455C297 322 379 245 510 245C631 245 705 326 711 432C657 429 612 409 581 369C551 424 475 468 392 480L392 635C392 685 370 720 332 737C347 662 327 580 340 505Z" fill="#252438"/>
+  <path d="M607 378L649 401" fill="none" stroke="#FF796F" stroke-width="22" stroke-linecap="round"/>
+  <ellipse cx="480" cy="527" rx="11" ry="14" fill="#252438"/>
+  <ellipse cx="598" cy="527" rx="11" ry="14" fill="#252438"/>
+  <path d="M519 586Q539 603 559 586" fill="none" stroke="#252438" stroke-width="11" stroke-linecap="round"/>
+</svg>

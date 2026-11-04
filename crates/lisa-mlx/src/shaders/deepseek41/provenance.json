@@ -1,0 +1,12 @@
+{
+  "repository": "https://github.com/antirez/ds4",
+  "revision": "b3f50180ec2c7324892be1f50bc83555ccb8d5e7",
+  "source": "metal/dsv41.metal",
+  "source_sha256": "070e2eb4c8494a28d6d172790977a24ce58fb54faddf3e404985894643e2b473",
+  "extracted_sections_sha256": [
+    "e1dcee69b5ad0dce60ce0209b43fb4abaca916613c59b2d0c902cf90f5334d51",
+    "d022ceddaf66aba653cd7be9a6beaa19f08336af364911785abef2bd4ffcd85a"
+  ],
+  "local_sha256": "7fdc05d34e5dbb7b93f7c3bfeadb3decb7de6d5d76f7a5067088f716f078a360",
+  "changes": "Only Metal standard-library preamble and extraction of self-contained BF16, router, RoPE and Engram sections; arithmetic bodies unchanged."
+}

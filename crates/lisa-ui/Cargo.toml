@@ -5,13 +5,16 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+lisa-gguf.workspace = true
 anyhow.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 lisa-engine.workspace = true
 lisa-serve.workspace = true
 objc2.workspace = true
 objc2-foundation = { workspace = true, features = [
     "NSObject",
+    "NSData",
     "NSString",
     "NSArray",
     "NSDictionary",
@@ -31,6 +34,7 @@ objc2-foundation = { workspace = true, features = [
     "NSProcessInfo",
     "NSRunLoop",
     "NSTimer",
+    "NSUserDefaults",
 ] }
 objc2-app-kit = { workspace = true, features = [
     "NSApplication",
@@ -38,8 +42,12 @@ objc2-app-kit = { workspace = true, features = [
     "NSWindowController",
     "NSPanel",
     "NSEvent",
+    "NSTrackingArea",
     "NSView",
     "NSGraphics",
+    "NSGraphicsContext",
+    "NSBezierPath",
+    "NSCursor",
     "NSGlassEffectView",
     "NSViewController",
     "NSSplitViewController",
@@ -68,8 +76,10 @@ objc2-app-kit = { workspace = true, features = [
     "NSBox",
     "NSColor",
     "NSFont",
+    "NSFontDescriptor",
     "NSImage",
     "NSImageView",
+    "NSWorkspace",
     "NSLayoutConstraint",
     "NSLayoutAnchor",
     "NSMenu",

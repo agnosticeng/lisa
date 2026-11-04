@@ -7,18 +7,18 @@ use super::compile::{type_string, type_to_name};
 use super::{DType, Device, Tensor};
 use super::{NAX_GEMM_HEADER, NAX_QUANT_HEADER};
 
-const GLM53_AFFINE_Q8_PREFILL_DS4_SOURCE: &str =
-    include_str!("../shaders/common/matmul/glm53_affine_q8_prefill_ds4.metal");
-const GLM53_AFFINE_Q2_MPP_DS4_SOURCE: &str =
-    include_str!("../shaders/common/matmul/glm53_affine_q2_mpp_ds4.metal");
-const GLM53_MOE_Q2_PAIR_GROUPED_DS4_SOURCE: &str =
-    include_str!("../shaders/common/matmul/glm53_moe_q2_pair_grouped_ds4.metal");
-const GLM53_MOE_Q2_MM_GROUPED_DS4_SOURCE: &str =
-    include_str!("../shaders/common/matmul/glm53_moe_q2_mm_grouped_ds4.metal");
-const GLM53_MOE_GROUPED_SWIGLU_WEIGHT_SOURCE: &str =
-    include_str!("../shaders/common/elementwise/glm53_moe_grouped_swiglu_weight.metal");
-const GLM53_MOE_Q2_DOWN_GROUPED_DS4_SOURCE: &str =
-    include_str!("../shaders/common/matmul/glm53_moe_q2_down_grouped_ds4.metal");
+const GLM53_AFFINE_Q8_PREFILL_DS4_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("common/matmul/glm53_affine_q8_prefill_ds4.metal");
+const GLM53_AFFINE_Q2_MPP_DS4_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("common/matmul/glm53_affine_q2_mpp_ds4.metal");
+const GLM53_MOE_Q2_PAIR_GROUPED_DS4_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("common/matmul/glm53_moe_q2_pair_grouped_ds4.metal");
+const GLM53_MOE_Q2_MM_GROUPED_DS4_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("common/matmul/glm53_moe_q2_mm_grouped_ds4.metal");
+const GLM53_MOE_GROUPED_SWIGLU_WEIGHT_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("common/elementwise/glm53_moe_grouped_swiglu_weight.metal");
+const GLM53_MOE_Q2_DOWN_GROUPED_DS4_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("common/matmul/glm53_moe_q2_down_grouped_ds4.metal");
 use crate::error::Result;
 
 /// MLX `steel_matmul_regular_axpby_nax` (`matmul.cpp:178`), no batch, no

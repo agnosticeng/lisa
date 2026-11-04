@@ -5,6 +5,57 @@
 use lisa_mlx::ops::indexing::{IndexMutOp, IndexOp};
 use lisa_mlx::{Array, Dtype, ops};
 
+/// Model-owned session state for architectures whose cache cannot be described
+/// as independent attention/GDN layers. Snapshots share immutable ownership;
+/// the model obtains a private GPU copy before its next in-place write.
+pub trait NativeState: std::any::Any + Send + Sync {
+    fn as_any(&self) -> &dyn std::any::Any;
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
+    fn copy_for_write(&self) -> anyhow::Result<std::sync::Arc<dyn NativeState>>;
+    fn position(&self) -> usize;
+}
+
+#[derive(Clone)]
+pub struct NativeCache {
+    state: std::sync::Arc<dyn NativeState>,
+    ple_conv: Option<Array>,
+    capture_ple_full: Option<Array>,
+}
+
+impl NativeCache {
+    pub fn new(state: impl NativeState) -> Self {
+        Self {
+            state: std::sync::Arc::new(state),
+            ple_conv: None,
+            capture_ple_full: None,
+        }
+    }
+    pub fn position(&self) -> usize {
+        self.state.position()
+    }
+    pub fn get<T: NativeState>(&self) -> anyhow::Result<&T> {
+        self.state.as_any().downcast_ref().ok_or_else(|| {
+            anyhow::anyhow!("native cache belongs to a different model architecture")
+        })
+    }
+    pub fn get_mut<T: NativeState>(&mut self) -> anyhow::Result<&mut T> {
+        anyhow::ensure!(
+            self.state.as_any().is::<T>(),
+            "native cache belongs to a different model architecture"
+        );
+        if std::sync::Arc::get_mut(&mut self.state).is_none() {
+            self.state = self.state.copy_for_write()?;
+        }
+        std::sync::Arc::get_mut(&mut self.state)
+            .ok_or_else(|| anyhow::anyhow!("native cache copy must return independent ownership"))?
+            .as_any_mut()
+            .downcast_mut()
+            .ok_or_else(|| {
+                anyhow::anyhow!("native cache belongs to a different model architecture")
+            })
+    }
+}
+
 pub struct IndexerTape {
     /// Raw per-token features `[B, cap, D]`, appended in place (doubling), so
     /// an append is O(s) rather than a whole-tape copy. GLM stores its raw
@@ -839,6 +890,7 @@ impl Default for GdnCache {
 pub enum LayerCache {
     Full(FullAttentionCache),
     Linear(GdnCache),
+    Native(NativeCache),
 }
 
 impl LayerCache {
@@ -846,6 +898,7 @@ impl LayerCache {
     #[allow(clippy::type_complexity)]
     pub fn ple_conv_mut(&mut self) -> (&mut Option<Array>, &mut Option<Array>) {
         match self {
+            LayerCache::Native(n) => (&mut n.ple_conv, &mut n.capture_ple_full),
             LayerCache::Full(f) => (&mut f.ple_conv, &mut f.capture_ple_full),
             LayerCache::Linear(g) => (&mut g.ple_conv, &mut g.capture_ple_full),
         }
@@ -857,6 +910,7 @@ impl LayerCache {
     /// `snapshot_state` way.
     pub fn snapshot_prefix(&self) -> LayerState {
         match self {
+            LayerCache::Native(n) => LayerState::Native(n.clone()),
             LayerCache::Full(f) => {
                 let keys = f
                     .keys
@@ -892,6 +946,7 @@ impl LayerCache {
     /// cloned by reference, as in prefix snapshots.
     pub fn snapshot_rollback(&self) -> LayerRollbackState {
         match self {
+            LayerCache::Native(n) => LayerRollbackState::Native(n.clone()),
             LayerCache::Full(f) => LayerRollbackState::Full {
                 offset: f.offset,
                 tape: f.indexer_tape.snapshot(),
@@ -914,6 +969,10 @@ impl LayerCache {
     /// the backing buffers and are overwritten by the next append.
     pub fn restore_rollback(&mut self, state: &LayerRollbackState) -> lisa_mlx::error::Result<()> {
         match (self, state) {
+            (LayerCache::Native(n), LayerRollbackState::Native(saved)) => {
+                *n = saved.clone();
+                Ok(())
+            }
             (
                 LayerCache::Full(f),
                 LayerRollbackState::Full {
@@ -955,6 +1014,7 @@ impl LayerCache {
     /// Install a prefix-cache entry's state into this (fresh) cache.
     pub fn restore_prefix(&mut self, s: &LayerState) {
         match (self, s) {
+            (LayerCache::Native(n), LayerState::Native(saved)) => *n = saved.clone(),
             (LayerCache::Full(f), LayerState::Full(st)) => {
                 f.keys = st.keys.clone();
                 f.values = st.values.clone();
@@ -997,10 +1057,12 @@ pub struct LinearPrefixState {
 pub enum LayerState {
     Full(FullPrefixState),
     Linear(LinearPrefixState),
+    Native(NativeCache),
 }
 
 /// Lightweight append-only cache checkpoint for speculative verification.
 pub enum LayerRollbackState {
+    Native(NativeCache),
     Full {
         offset: usize,
         tape: TapeSnapshot,
@@ -1149,6 +1211,9 @@ impl LayerState {
     pub fn encode(&self) -> anyhow::Result<Vec<u8>> {
         let mut out = Vec::new();
         match self {
+            LayerState::Native(_) => {
+                anyhow::bail!("this model's native cache has no SSD spill codec")
+            }
             LayerState::Full(s) => {
                 // Tag 3 adds the raw-tail base. Tags 0 and 2 remain readable
                 // for spill records written before raw-history compaction.
@@ -1294,9 +1359,9 @@ mod cache_state_tests {
         const DIM: usize = 512;
         const START: usize = 254;
         const REPLACED_ROW: usize = 3;
-        const FIXTURE: &[u8] =
-            include_bytes!("../models/glm53/fixtures/dsa_compact_cache_ds4_metal.bin");
-        assert_eq!(FIXTURE.len(), ROWS * DIM * 2);
+        let external_fixture: &[u8] =
+            &crate::models::glm53::test_fixtures::read("dsa_compact_cache_ds4_metal.bin");
+        assert_eq!(external_fixture.len(), ROWS * DIM * 2);
 
         fn row_values(row_index: usize) -> Vec<f32> {
             (0..DIM)
@@ -1328,7 +1393,7 @@ mod cache_state_tests {
             .reshape(&[(ROWS * DIM) as i32])?
             .to_vec1::<half::f16>()?;
         let actual_bits: Vec<u16> = actual.iter().map(|value| value.to_bits()).collect();
-        let expected_bits: Vec<u16> = FIXTURE
+        let expected_bits: Vec<u16> = external_fixture
             .chunks_exact(2)
             .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
             .collect();
@@ -1573,11 +1638,10 @@ mod cache_state_tests {
         const NORM_BYTES: usize = DIM * std::mem::size_of::<f32>();
         const APE_BYTES: usize = POOL_SIZE * DIM * std::mem::size_of::<u16>();
         const POOL_BYTES: usize = POOLS * DIM * std::mem::size_of::<u16>();
-        const FIXTURE: &[u8] = include_bytes!(
-            "../../../lisa-mlx/src/models/glm53/fixtures/indexer_pool_lifecycle_ds4.bin"
-        );
+        let external_fixture: &[u8] =
+            &crate::models::glm53::test_fixtures::read("indexer_pool_lifecycle_ds4.bin");
         assert_eq!(
-            FIXTURE.len(),
+            external_fixture.len(),
             ROW_BYTES + NORM_BYTES + ROW_BYTES + NORM_BYTES + APE_BYTES + POOL_BYTES
         );
 
@@ -1593,18 +1657,18 @@ mod cache_state_tests {
                 .map(|chunk| half::bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])))
                 .collect::<Vec<_>>()
         };
-        let expected: Vec<half::f16> = FIXTURE[FIXTURE.len() - POOL_BYTES..]
+        let expected: Vec<half::f16> = external_fixture[external_fixture.len() - POOL_BYTES..]
             .chunks_exact(std::mem::size_of::<u16>())
             .map(|chunk| half::f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])))
             .collect();
-        let raw = decode_f32(&FIXTURE[..ROW_BYTES]);
-        let norm_weight = decode_f32(&FIXTURE[ROW_BYTES..ROW_BYTES + NORM_BYTES]);
+        let raw = decode_f32(&external_fixture[..ROW_BYTES]);
+        let norm_weight = decode_f32(&external_fixture[ROW_BYTES..ROW_BYTES + NORM_BYTES]);
         let gate_start = ROW_BYTES + NORM_BYTES;
-        let gate = decode_f32(&FIXTURE[gate_start..gate_start + ROW_BYTES]);
+        let gate = decode_f32(&external_fixture[gate_start..gate_start + ROW_BYTES]);
         let bias_start = gate_start + ROW_BYTES;
-        let norm_bias = decode_f32(&FIXTURE[bias_start..bias_start + NORM_BYTES]);
+        let norm_bias = decode_f32(&external_fixture[bias_start..bias_start + NORM_BYTES]);
         let ape_start = bias_start + NORM_BYTES;
-        let ape = decode_bf16(&FIXTURE[ape_start..ape_start + APE_BYTES]);
+        let ape = decode_bf16(&external_fixture[ape_start..ape_start + APE_BYTES]);
 
         let append_rows = |tape: &mut IndexerTape,
                            start: usize,

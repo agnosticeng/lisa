@@ -4,25 +4,31 @@
 //! A model owns its config, its weights and its caches; the runtime owns
 //! sampling, scheduling and the HTTP surface.
 //!
-//! A model is addressed by a **local directory or a Hugging Face repo id**.
-//! [`resolve_model_dir`] maps either to a local directory, [`model_type_of`]
-//! reads the structure from its `config.json`, and [`load`] dispatches on that
-//! type to the right implementation. Qwen 3.8 Flash-Next ([`qwen4`]) is the
-//! first implementation; add a variant by registering its `model_type` in
-//! [`load`].
+//! A model is addressed by a local directory, supported GGUF file or Hub repo
+//! ID. [`resolve_model_dir`] resolves its checkpoint, [`model_type_of`] reads
+//! metadata, and [`ModelKind`] selects the implementation for [`load`].
 //!
 //! Device backends are a separate axis (see `lisa_mlx`): the runtime talks to
 //! an `Array`/`Stream` surface, and a backend supplies it.
 
+mod checkpoint;
+pub use checkpoint::{ModelKind, model_type_of, resolve_model_dir};
+
+pub mod deepseek41;
+pub mod flux2;
+pub mod flux3;
 pub mod gdn;
 pub mod glm53;
 pub mod hf;
+pub mod image_generation;
 pub mod laya;
+mod media_attention;
 pub mod qwen3_5;
 pub mod qwen4;
 pub mod speculate;
+pub mod vision;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use lisa_mlx::Array;
 use lisa_mlx::ops::indexing::IndexOp;
@@ -31,6 +37,26 @@ use crate::core::cache::{IndexerTape, LayerCache};
 
 /// The interface the runtime needs from a decoder-only text model.
 pub trait LanguageModel {
+    /// Reference sampler order/RNG is independent of whether a draft head is
+    /// present in this checkpoint.
+    fn uses_ds4_sampling(&self) -> bool {
+        self.has_target_mtp()
+    }
+    /// Whether the checkpoint has a supported native still-image encoder.
+    fn supports_images(&self) -> bool {
+        false
+    }
+    /// Prepare one complete image prompt. Callers use a fresh session, without
+    /// token-only prefix caching or speculative decoding, then clear this state.
+    fn prepare_images(
+        &mut self,
+        _tokens: &mut Vec<u32>,
+        _images: &[image::RgbImage],
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("this checkpoint does not support image input")
+    }
+    /// Remove request-local image embeddings and positional context.
+    fn clear_images(&mut self) {}
     /// Explicit arithmetic identity for cached model state, available before
     /// any lazy pipeline compilation. None preserves the runtime's legacy law.
     fn cache_numerical_law(&self) -> Option<u64> {
@@ -154,11 +180,7 @@ pub trait LanguageModel {
     /// Commit one generated token; returns its last hidden state. Models with
     /// a distinct generation graph override this without changing prompt or
     /// suffix prefill, including one-token prompt chunks.
-    fn decode_token(
-        &mut self,
-        token: u32,
-        caches: &mut Vec<LayerCache>,
-    ) -> anyhow::Result<Array> {
+    fn decode_token(&mut self, token: u32, caches: &mut Vec<LayerCache>) -> anyhow::Result<Array> {
         self.prefill(&[token], caches)
     }
     /// Prefill `tokens`; returns the last hidden state and the multi stream.
@@ -281,6 +303,8 @@ pub trait LanguageModel {
 pub enum Loaded {
     /// A decoder-only text model (generation, batching, speculative decode).
     Language(Box<dyn LanguageModel>),
+    /// A separate text-to-image model, driven by image generation requests.
+    Image(Box<image_generation::Pipeline>),
     /// A non-generative model with its own interface (e.g. typed decisions).
     Decision(Box<dyn DecisionModel>),
 }
@@ -328,153 +352,52 @@ pub fn load_dir(dir: &Path) -> anyhow::Result<Loaded> {
 
 /// Load a model from an already-resolved directory on an explicit backend.
 pub fn load_dir_with(dir: &Path, backend: lisa_mlx::backend::Backend) -> anyhow::Result<Loaded> {
-    // A caller switching models drops the previous one first; sweep the shared
-    // buffer pool so the old model's device buffers are actually released
-    // before the next model reserves its own (avoids stacking both in memory).
-    let _ = lisa_mlx::memory::clear_cache();
+    let path = hf::checkpoint_path(dir.to_path_buf());
+    let dir = path.as_path();
     let model_type = model_type_of(dir)?;
-    match model_type.as_str() {
-        // Qwen 3.8 Flash-Next (hybrid attention + GDN, sparse MoE, PLE, MTP).
-        "qwen4_exp" | "qwen4_exp_text" => {
+    let kind = ModelKind::from_model_type(&model_type)?;
+    anyhow::ensure!(
+        kind == ModelKind::Laya || backend == lisa_mlx::backend::Backend::Metal,
+        "{model_type} requires the Metal backend"
+    );
+    // Model switching drops the previous owner first; release its pooled
+    // buffers before the replacement reserves its resident weights. The CPU
+    // decision path must not initialize a Metal runtime just to sweep it.
+    if backend == lisa_mlx::backend::Backend::Metal {
+        lisa_mlx::memory::clear_cache();
+    }
+    Ok(match kind {
+        ModelKind::Glm53Gguf | ModelKind::DeepSeek41 => {
             anyhow::ensure!(
-                backend == lisa_mlx::backend::Backend::Metal,
-                "the qwen4 model requires the metal backend (got {})",
-                backend.name()
+                dir.is_file(),
+                "{model_type} requires a GGUF checkpoint file"
             );
+            Loaded::Language(match kind {
+                ModelKind::Glm53Gguf => Box::new(glm53::gguf::tower::Tower::load(dir)?),
+                _ => Box::new(deepseek41::tower::Tower::load(dir)?),
+            })
+        }
+        ModelKind::Flux2 | ModelKind::Flux3 => {
+            Loaded::Image(Box::new(image_generation::Pipeline::load(dir)?))
+        }
+        ModelKind::Qwen4 => {
             let config = qwen4::ModelConfig::from_json(&dir.join("config.json"))?;
-            Ok(Loaded::Language(Box::new(qwen4::Tower::load(dir, config)?)))
+            Loaded::Language(Box::new(qwen4::Tower::load(dir, config)?))
         }
-        // GLM-5.3 Flash (KDA + NoPE-MLA DSA, 288-expert MoE, mHC, MTP).
-        "glm5_next" | "glm5_next_text" => {
-            anyhow::ensure!(
-                backend == lisa_mlx::backend::Backend::Metal,
-                "the glm53 model requires the metal backend (got {})",
-                backend.name()
-            );
+        ModelKind::Glm53 => {
             let config = glm53::config::ModelConfig::from_json(&dir.join("config.json"))?;
-            Ok(Loaded::Language(Box::new(glm53::tower::Tower::load(
-                dir, config,
-            )?)))
+            Loaded::Language(Box::new(glm53::tower::Tower::load(dir, config)?))
         }
-        // Qwen 3.8 27B (dense hybrid GDN + full-attention, native MTP head).
-        "qwen3_5" | "qwen3_5_text" => {
-            anyhow::ensure!(
-                backend == lisa_mlx::backend::Backend::Metal,
-                "the qwen3_5 model requires the metal backend (got {})",
-                backend.name()
-            );
+        ModelKind::Qwen35 => {
             let config = qwen3_5::Qwen35Config::from_json(&dir.join("config.json"))?;
-            Ok(Loaded::Language(Box::new(qwen3_5::Qwen35Tower::load(
-                dir, config,
-            )?)))
+            Loaded::Language(Box::new(qwen3_5::Qwen35Tower::load(dir, config)?))
         }
-        // Laya (ModernBERT encoder + typed-decision head; non-generative).
-        "laya" => {
+        ModelKind::Laya => {
             let device = match backend {
                 lisa_mlx::backend::Backend::Metal => laya::LayaDevice::Metal,
                 lisa_mlx::backend::Backend::Cpu => laya::LayaDevice::Cpu,
             };
-            Ok(Loaded::Decision(Box::new(laya::Laya::load_device(
-                dir, device,
-            )?)))
+            Loaded::Decision(Box::new(laya::Laya::load_device(dir, device)?))
         }
-        other => anyhow::bail!(
-            "unsupported model_type {other:?} in {}; supported families: qwen4_exp, qwen3_5, glm5_next, laya",
-            dir.display()
-        ),
-    }
-}
-
-/// Resolve `target` to a local directory holding `config.json`.
-///
-/// A path that exists is used as-is. Otherwise `target` is treated as a
-/// Hugging Face repo id and resolved against the Hugging Face hub cache; if it
-/// is not cached, it is fetched with `hf download` into the same cache. These
-/// are the only two sources — there is no legacy fallback.
-pub fn resolve_model_dir(target: &str) -> anyhow::Result<PathBuf> {
-    let direct = Path::new(target);
-    if direct.is_dir() {
-        return Ok(direct.to_path_buf());
-    }
-    if direct.exists() {
-        anyhow::bail!("{} exists but is not a directory", direct.display());
-    }
-
-    anyhow::ensure!(
-        target.contains('/') && !target.starts_with('~') && !target.starts_with('/'),
-        "unknown model {target}: pass a local path or a Hugging Face repo id \
-         (models are cached in the HF hub cache)"
-    );
-
-    if let Some(dir) = hf_snapshot_dir(target) {
-        return Ok(dir);
-    }
-
-    // Not cached: download it into the hub cache with our own curl-based
-    // fetcher (no `huggingface_hub` dependency).
-    let dir = hf::download_repo(target)?;
-    anyhow::ensure!(
-        hf::is_model_dir(&dir),
-        "downloaded {target} but found no model config (is it a model repo?)"
-    );
-    Ok(dir)
-}
-
-/// The `model_type` string from `dir/config.json`. The nested
-/// `text_config.model_type` wins when present.
-pub fn model_type_of(dir: &Path) -> anyhow::Result<String> {
-    let path = dir.join("config.json");
-    if path.is_file() {
-        let data = std::fs::read_to_string(&path)?;
-        let v: serde_json::Value = serde_json::from_str(&data)?;
-        if let Some(t) = v
-            .get("text_config")
-            .and_then(|t| t.get("model_type"))
-            .and_then(|t| t.as_str())
-        {
-            return Ok(t.to_string());
-        }
-        if let Some(t) = v.get("model_type").and_then(|t| t.as_str()) {
-            return Ok(t.to_string());
-        }
-        anyhow::bail!("{} has no model_type", path.display());
-    }
-
-    // Configless checkpoints: Laya keeps its encoder config in `encoder/` and
-    // its decision-head config in `rl_agent_config.json`.
-    let enc = dir.join("encoder/config.json");
-    if enc.is_file() {
-        if dir.join("rl_agent_config.json").is_file() {
-            return Ok("laya".to_string());
-        }
-        let data = std::fs::read_to_string(&enc)?;
-        let v: serde_json::Value = serde_json::from_str(&data)?;
-        if let Some(t) = v.get("model_type").and_then(|t| t.as_str()) {
-            return Ok(t.to_string());
-        }
-    }
-
-    anyhow::bail!(
-        "no config.json or encoder/config.json under {}",
-        dir.display()
-    )
-}
-
-/// A snapshot directory in the Hugging Face hub cache that holds a `config.json`.
-fn hf_snapshot_dir(repo: &str) -> Option<PathBuf> {
-    let snapshots = hf::repo_dir(repo).join("snapshots");
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(&snapshots)
-        .ok()?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            // An in-progress download (`<rev>.lisa-partial`) is not a snapshot.
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| !n.contains(".lisa-partial"))
-                .unwrap_or(false)
-                && hf::is_model_dir(p)
-        })
-        .collect();
-    entries.sort();
-    entries.pop()
+    })
 }

@@ -1,0 +1,13 @@
+{
+  "upstream": "https://github.com/antirez/ds4",
+  "revision": "b3f50180ec2c7324892be1f50bc83555ccb8d5e7",
+  "checkpoint": {
+    "repository": "antirez/glm-5.3-flash-gguf",
+    "revision": "b2fa29d7a6b410db11221c904973967b80b760f5",
+    "file": "GLM-5.3-Flash-Q2.gguf",
+    "bytes": 96505816384,
+    "sha256": "e81fd6241c6e55a64e1e14e47a3eab61a173fa8d7e4b5c1d1848827119705b32"
+  },
+  "status": "Experimental native packed serial graph with embedded MTP. No requantization. Wide prefill/verify and complete DS4 arithmetic/performance equivalence remain open.",
+  "tokenizer": "core/gguf_tokenizer.rs shares leftmost-minimum-rank BPE; core/gguf_glm4.rs ports the original explicit Unicode classes and GLM4 splits."
+}

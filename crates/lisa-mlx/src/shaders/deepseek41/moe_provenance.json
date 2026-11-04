@@ -1,0 +1,17 @@
+{
+  "repository": "https://github.com/antirez/ds4",
+  "revision": "b3f50180ec2c7324892be1f50bc83555ccb8d5e7",
+  "source": "metal/moe.metal",
+  "source_sha256": "c5f5d968be87ade2a48697b78efa99581fab8412943bbac1d8f26e02090cf5b7",
+  "section_sha256": "403a172fb0c6748bd816bb1e3b17a87341526bc5404c6bb7d27d3210d0bdcd42",
+  "local_sha256": "79848ca60674e99bd34f58e203d89dddf35274445a3ee0b6320cc84ae6b4111a",
+  "changes": "Standard-library preamble; original standalone routed activation and sum-six bodies retained.",
+  "shared_activation_source": {
+    "path": "metal/glu.metal",
+    "sha256": "59281e30a27cc2eb618800b6e53a57e234f65f1a1e680d6267d9139e1a06b627",
+    "section_sha256": [
+      "fe2afba7b803f83d51be214e2ed8a2be79ea9b026c4bcb89814615023b07a0ea",
+      "b07567111c0de1711997860207e084e035b8b78f07511dabc77536590d9ee6d9"
+    ]
+  }
+}

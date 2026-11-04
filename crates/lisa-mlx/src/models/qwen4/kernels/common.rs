@@ -4,13 +4,15 @@ use lisa_mlx::{Array, Dtype, Stream, ops};
 
 /// Shared helpers for the fused elementwise kernels, ported verbatim from the
 /// engine's `TrackFastKernels.exactHeader`.
-pub const EXACT_HEADER: &str = include_str!("../../../shaders/common/exact_header.metal");
+pub const EXACT_HEADER: &crate::shader_pack::Source =
+    crate::kernel_source!("common/exact_header.metal");
 /// `track_copy_rows_into`: append `src` `[R, s, D]` into `dst` `[R, cap, D]` at
 /// row offset `off`, touching only the `s` appended rows. Replaces the
 /// `slice_assign` (O(cap)) in the KV cache and the indexer tape.
-const COPY_ROWS_SOURCE: &str = include_str!("../../../shaders/common/data/copy_rows.metal");
-const COPY_ROWS_CONCAT_SOURCE: &str =
-    include_str!("../../../shaders/common/data/copy_rows_concat.metal");
+const COPY_ROWS_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("common/data/copy_rows.metal");
+const COPY_ROWS_CONCAT_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("common/data/copy_rows_concat.metal");
 
 static COPY_ROWS: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 static COPY_ROWS_CONCAT: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
@@ -344,7 +346,7 @@ mod copy_rows_tests {
             .count();
         assert_eq!(mism, 0, "strided-src copy differs from contiguous-src copy");
         // And the rows actually landed at `off` (dst [b, hk, cap, d]).
-        let base = (0 * cap * d + off * d) as usize;
+        let base = (off * d) as usize;
         assert!(!va[base].to_f32().is_nan());
     }
 }

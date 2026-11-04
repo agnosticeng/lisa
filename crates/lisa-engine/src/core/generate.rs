@@ -124,7 +124,7 @@ pub fn pld_decode(
 ) -> anyhow::Result<(Vec<u32>, PldStats)> {
     use lisa_mlx::ops::indexing::{IndexOp, argmax_axis};
 
-    let depth = depth.clamp(1, 8);
+    let depth = depth.clamp(1, crate::cli::PLD_DEPTH_MAX);
     let mut generated: Vec<u32> = Vec::new();
     let mut stats = PldStats::default();
     let ctx_len = tower.context_window();
@@ -264,6 +264,9 @@ pub fn pld_decode(
                     match c {
                         LayerCache::Full(f) => f.trim(advance - keep),
                         LayerCache::Linear(g) => g.rollback_to(keep, CONV_KERNEL)?,
+                        LayerCache::Native(_) => anyhow::bail!(
+                            "native cache speculative rollback requires a model-specific verifier"
+                        ),
                     }
                 }
                 if eos_seen || emitted < a + 1 {
@@ -320,7 +323,7 @@ pub fn generate(
     let t0 = Instant::now();
     let last = tower.prefill(prompt, &mut caches)?;
     let logits = tower.head(&last)?;
-    let token = if tower.has_target_mtp() {
+    let token = if tower.uses_ds4_sampling() {
         sampler.draw_ds4(&logits, prompt)?
     } else {
         sampler.draw(&logits, prompt)?
@@ -382,7 +385,7 @@ pub fn generate(
         let logits = tower.head(&last)?;
         let mut history: Vec<u32> = prompt.to_vec();
         history.extend_from_slice(&generated);
-        let token = if tower.has_target_mtp() {
+        let token = if tower.uses_ds4_sampling() {
             sampler.draw_ds4(&logits, &history)?
         } else {
             sampler.draw(&logits, &history)?

@@ -524,17 +524,20 @@ impl Array {
 }
 
 /// binary kernel, vendored verbatim (see NOTICE).
-const ELEMENTWISE_BINARY: &str =
-    include_str!("../shaders/common/elementwise/elementwise_binary.metal");
+const ELEMENTWISE_BINARY: &crate::shader_pack::Source =
+    crate::kernel_source!("common/elementwise/elementwise_binary.metal");
 /// cast kernel, vendored verbatim (see NOTICE).
-const CAST_KERNEL: &str = include_str!("../shaders/common/elementwise/cast.metal");
+const CAST_KERNEL: &crate::shader_pack::Source =
+    crate::kernel_source!("common/elementwise/cast.metal");
 
 /// ternary (`where`) kernel, vendored verbatim (see NOTICE).
-const SELECT_KERNEL: &str = include_str!("../shaders/common/elementwise/select.metal");
+const SELECT_KERNEL: &crate::shader_pack::Source =
+    crate::kernel_source!("common/elementwise/select.metal");
 
 /// indexing kernels (gather / index_select / scatter), vendored
 /// verbatim (see NOTICE).
-const INDEXING_KERNEL: &str = include_str!("../shaders/common/data/indexing.metal");
+const INDEXING_KERNEL: &crate::shader_pack::Source =
+    crate::kernel_source!("common/data/indexing.metal");
 
 impl Array {
     /// The Metal tag for an index/value dtype in kernel names.

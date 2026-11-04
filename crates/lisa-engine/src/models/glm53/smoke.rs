@@ -37,6 +37,7 @@ fn capture_glm53_cache_state(
     for (layer, cache) in caches.iter().enumerate() {
         let prefix = format!("glm53.cache.layer_{layer:02}");
         match cache {
+            LayerCache::Native(_) => panic!("GLM smoke received a native cache"),
             LayerCache::Full(full) => {
                 let tape = &full.indexer_tape;
                 metadata.extend_from_slice(&[

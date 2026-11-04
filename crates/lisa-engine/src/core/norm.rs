@@ -264,6 +264,17 @@ impl Rotary {
         let emb = ops::concatenate(&[&freqs, &freqs], -1)?;
         Ok((ops::cos(&emb)?, ops::sin(&emb)?))
     }
+
+    /// The final axis selects a temporal, height or width position for each
+    /// rotary frequency. All other arithmetic matches the scalar text path.
+    pub fn cos_sin_multimodal(&self, positions: &Array) -> lisa_mlx::error::Result<(Array, Array)> {
+        let even: Vec<f32> = (0..self.dimensions).step_by(2).map(|i| i as f32).collect();
+        let even = Array::from_slice(&even, &[even.len() as i32]);
+        let inv_freq = ops::exp(&(even * (-self.base.ln() / self.dimensions as f32)))?;
+        let freqs = positions.as_dtype(Dtype::Float32)?.multiply(&inv_freq)?;
+        let emb = ops::concatenate(&[&freqs, &freqs], -1)?;
+        Ok((ops::cos(&emb)?, ops::sin(&emb)?))
+    }
 }
 
 /// Rotate only the leading `cos.dim(-1)` entries of the last axis.

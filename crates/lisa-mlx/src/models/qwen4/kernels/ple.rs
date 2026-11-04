@@ -4,17 +4,19 @@ use lisa_mlx::{Array, Dtype, Stream};
 use super::common::EXACT_HEADER;
 
 /// PLE helper header (adds `mlx_maximum`/`mlx_sign`/abs/sqrt).
-const PLE_HEADER_EXTRA: &str = include_str!("../../../shaders/qwen4/ple_header_extra.metal");
+const PLE_HEADER_EXTRA: &crate::shader_pack::Source =
+    crate::kernel_source!("qwen4/ple_header_extra.metal");
 
 /// `track_ple_prod`: `norm_key(keyFlat) * norm_query(stream)` with the engine's
 /// butterfly RMS on both, in one launch.
-const PLE_PROD_SOURCE: &str = include_str!("../../../shaders/qwen4/ple_prod.metal");
+const PLE_PROD_SOURCE: &crate::shader_pack::Source = crate::kernel_source!("qwen4/ple_prod.metal");
 
 /// `track_ple_gated`: the gate scalar chain, the gated value, norm_conv.
-const PLE_GATED_SOURCE: &str = include_str!("../../../shaders/qwen4/ple_gated.metal");
+const PLE_GATED_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("qwen4/ple_gated.metal");
 
 /// `track_ple_conv`: dilated depthwise conv + silu + residual add.
-const PLE_CONV_SOURCE: &str = include_str!("../../../shaders/qwen4/ple_conv.metal");
+const PLE_CONV_SOURCE: &crate::shader_pack::Source = crate::kernel_source!("qwen4/ple_conv.metal");
 
 static PLE_PROD: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 static PLE_GATED: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
@@ -192,11 +194,14 @@ pub fn ple_conv(
 /// `track_swiglu`: `mlx_silu(gate) * up` over a fused `[.., 2F]` gate|up array.
 // --- PLE S=1 fusion: track_ple_prepare_fuse2 + track_ple_convolution_fuse2 ---
 
-const PLE_FUSE_HEADER: &str = include_str!("../../../shaders/qwen4/ple_fuse_header.metal");
+const PLE_FUSE_HEADER: &crate::shader_pack::Source =
+    crate::kernel_source!("qwen4/ple_fuse_header.metal");
 
-const PLE_PREPARE_SOURCE: &str = include_str!("../../../shaders/qwen4/ple_prepare.metal");
+const PLE_PREPARE_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("qwen4/ple_prepare.metal");
 
-const PLE_CONV_FUSE_SOURCE: &str = include_str!("../../../shaders/qwen4/ple_conv_fuse.metal");
+const PLE_CONV_FUSE_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("qwen4/ple_conv_fuse.metal");
 
 static PLE_PREPARE: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 static PLE_CONV_FUSE: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();

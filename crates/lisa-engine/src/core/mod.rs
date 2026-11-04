@@ -8,6 +8,7 @@ pub mod cache;
 pub mod capture;
 pub mod copy_draft;
 pub mod generate;
+pub mod gguf_resident;
 pub mod loader;
 pub mod mem;
 pub mod norm;
@@ -21,3 +22,5 @@ pub mod sched;
 pub mod session;
 pub mod tokenizer;
 mod weight_arena;
+
+pub mod gguf_tokenizer;

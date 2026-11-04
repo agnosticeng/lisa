@@ -173,20 +173,22 @@ fn ds4_dsa_verify_fixture_layer_index(layer: usize) -> Option<usize> {
 }
 
 #[cfg(all(test, feature = "glm53-fixtures"))]
-fn ds4_dsa_verify_stages_fixture(layer: usize) -> Option<&'static [u8]> {
+fn ds4_dsa_verify_stages_fixture(layer: usize) -> Option<Vec<u8>> {
     const PER_LAYER: usize = 655_360;
-    const FIXTURE: &[u8] =
-        include_bytes!("fixtures/dsa_verify_target_mtp_all_layers_stages_ds4.bin");
+    let external_fixture: &[u8] = &crate::models::glm53::test_fixtures::read(
+        "dsa_verify_target_mtp_all_layers_stages_ds4.bin",
+    );
     let index = ds4_dsa_verify_fixture_layer_index(layer)?;
-    Some(&FIXTURE[index * PER_LAYER..(index + 1) * PER_LAYER])
+    Some(external_fixture[index * PER_LAYER..(index + 1) * PER_LAYER].to_vec())
 }
 
 #[cfg(all(test, feature = "glm53-fixtures"))]
-fn ds4_dsa_verify_kv_a_fixture(layer: usize) -> Option<&'static [u8]> {
+fn ds4_dsa_verify_kv_a_fixture(layer: usize) -> Option<Vec<u8>> {
     const PER_LAYER: usize = 10_240;
-    const FIXTURE: &[u8] = include_bytes!("fixtures/dsa_verify_target_mtp_all_layers_kv_a_ds4.bin");
+    let external_fixture: &[u8] =
+        &crate::models::glm53::test_fixtures::read("dsa_verify_target_mtp_all_layers_kv_a_ds4.bin");
     let index = ds4_dsa_verify_fixture_layer_index(layer)?;
-    Some(&FIXTURE[index * PER_LAYER..(index + 1) * PER_LAYER])
+    Some(external_fixture[index * PER_LAYER..(index + 1) * PER_LAYER].to_vec())
 }
 
 #[cfg(all(test, feature = "glm53-fixtures"))]
@@ -626,9 +628,9 @@ fn assert_mtp_dsa_compact_cache_ds4_fixture(
     compact: &Array,
 ) -> anyhow::Result<()> {
     let fixture: &[u8] = if mtp_real_target_fixtures_enabled() {
-        include_bytes!("fixtures/mtp_dsa_compact_cache_natural_target_ds4.bin")
+        &crate::models::glm53::test_fixtures::read("mtp_dsa_compact_cache_natural_target_ds4.bin")
     } else {
-        include_bytes!("fixtures/mtp_dsa_compact_cache_layer45_ds4.bin")
+        &crate::models::glm53::test_fixtures::read("mtp_dsa_compact_cache_layer45_ds4.bin")
     };
     const STAGE_BYTES: usize = 5 * 512 * std::mem::size_of::<f32>();
     const CACHE_BYTES: usize = 5 * 512 * std::mem::size_of::<u16>();
@@ -708,7 +710,8 @@ fn assert_mtp_dsa_kv_a_row_ds4_fixture(
     const ROW_BYTES: usize = WIDTH * std::mem::size_of::<f32>();
     const STAGE_BYTES: usize = 5 * ROW_BYTES;
     const CACHE_BYTES: usize = 5 * WIDTH * std::mem::size_of::<u16>();
-    let fixture = include_bytes!("fixtures/mtp_dsa_compact_cache_natural_target_ds4.bin");
+    let fixture =
+        &crate::models::glm53::test_fixtures::read("mtp_dsa_compact_cache_natural_target_ds4.bin");
     anyhow::ensure!(
         row < 5,
         "MTP DSA fixture row is outside its five-row window"
@@ -743,9 +746,9 @@ fn assert_mtp_dsa_kv_a_row_ds4_fixture(
 #[cfg(all(test, feature = "glm53-fixtures"))]
 fn assert_mtp_dsa_ds4_fixture(q_low: &Array, lora: &Array, value: &Array) -> anyhow::Result<()> {
     let fixture: &[u8] = if mtp_real_target_fixtures_enabled() {
-        include_bytes!("fixtures/dsa_absorbed_mtp_natural_target_ds4.bin")
+        &crate::models::glm53::test_fixtures::read("dsa_absorbed_mtp_natural_target_ds4.bin")
     } else {
-        include_bytes!("fixtures/dsa_absorbed_mtp_layer45_ds4.bin")
+        &crate::models::glm53::test_fixtures::read("dsa_absorbed_mtp_layer45_ds4.bin")
     };
     const LOW_BYTES: usize = 64 * 512 * std::mem::size_of::<f32>();
     const LORA_BYTES: usize = 64 * 512 * std::mem::size_of::<f32>();
@@ -838,11 +841,11 @@ fn assert_mtp_dsa_window_ds4_fixture(
     let cache_bytes = tokens * WIDTH * 2;
     let selected_bytes = tokens * 4;
     let fixture: &[u8] = if mtp_real_target_fixtures_enabled() && position == 6 {
-        include_bytes!("fixtures/mtp_dsa_window_natural_target_step6_ds4.bin")
+        &crate::models::glm53::test_fixtures::read("mtp_dsa_window_natural_target_step6_ds4.bin")
     } else if mtp_real_target_fixtures_enabled() {
-        include_bytes!("fixtures/mtp_dsa_window_natural_target_ds4.bin")
+        &crate::models::glm53::test_fixtures::read("mtp_dsa_window_natural_target_ds4.bin")
     } else {
-        include_bytes!("fixtures/mtp_dsa_window_layer45_ds4.bin")
+        &crate::models::glm53::test_fixtures::read("mtp_dsa_window_layer45_ds4.bin")
     };
     anyhow::ensure!(
         position >= min_position
@@ -1051,11 +1054,11 @@ fn assert_mtp_dsa_o_project_ds4_fixture(input: &Array, output: &Array) -> anyhow
     assert_mtp_dsa_o_project_fixture(
         input,
         output,
-        if mtp_real_target_fixtures_enabled() {
-            include_bytes!("fixtures/dsa_o_project_mtp_natural_target_ds4.bin")
+        &crate::models::glm53::test_fixtures::read(if mtp_real_target_fixtures_enabled() {
+            "dsa_o_project_mtp_natural_target_ds4.bin"
         } else {
-            include_bytes!("fixtures/dsa_o_project_mtp_layer45_ds4.bin")
-        },
+            "dsa_o_project_mtp_layer45_ds4.bin"
+        }),
         if mtp_real_target_fixtures_enabled() {
             "layer-45 MTP natural target"
         } else {
@@ -1073,13 +1076,15 @@ fn assert_mtp_dsa_o_project_window_ds4_fixture(
     assert_mtp_dsa_o_project_fixture(
         input,
         output,
-        if mtp_real_target_fixtures_enabled() && position == 6 {
-            include_bytes!("fixtures/dsa_o_project_mtp_natural_target_step6_ds4.bin")
-        } else if mtp_real_target_fixtures_enabled() {
-            include_bytes!("fixtures/dsa_o_project_mtp_natural_target_window_ds4.bin")
-        } else {
-            include_bytes!("fixtures/dsa_o_project_mtp_window_layer45_ds4.bin")
-        },
+        &crate::models::glm53::test_fixtures::read(
+            if mtp_real_target_fixtures_enabled() && position == 6 {
+                "dsa_o_project_mtp_natural_target_step6_ds4.bin"
+            } else if mtp_real_target_fixtures_enabled() {
+                "dsa_o_project_mtp_natural_target_window_ds4.bin"
+            } else {
+                "dsa_o_project_mtp_window_layer45_ds4.bin"
+            },
+        ),
         if mtp_real_target_fixtures_enabled() && position == 6 {
             "layer-45 MTP natural-target generated-step window"
         } else if mtp_real_target_fixtures_enabled() {
@@ -3095,3 +3100,7 @@ pub fn layer_norm(x: &Array, w: &Array, b: &Array, eps: f32) -> anyhow::Result<A
 #[cfg(test)]
 #[path = "sparse_tests.rs"]
 mod tests;
+
+#[path = "gguf/attention.rs"]
+mod gguf_attention;
+pub(crate) use gguf_attention::GgufDsa;

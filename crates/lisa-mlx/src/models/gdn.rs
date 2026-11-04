@@ -9,7 +9,8 @@ use crate::kernels::EXACT_HEADER;
 /// Inputs: q [B,T,Hk,Dk], k [B,T,Hk,Dk], v [B,T,Hv,Dv], g [B,T,Hv] f32,
 /// beta [B,T,Hv] f32, state_in [B,Hv,Dv,Dk], T scalar i32.
 /// Outputs: y [B,T,Hv,Dv] (activation dtype), state_out [B,Hv,Dv,Dk] (StT).
-const GATED_DELTA_SOURCE: &str = include_str!("../shaders/gdn/gated_delta.metal");
+const GATED_DELTA_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("gdn/gated_delta.metal");
 
 /// `track_p12_gdn_prep_split_inputs`: the causal depthwise conv + silu, the q/k
 /// RMS norms with their scales, and the decay/beta gates in ONE launch. The two
@@ -21,7 +22,7 @@ const GATED_DELTA_SOURCE: &str = include_str!("../shaders/gdn/gated_delta.metal"
 /// `b_gate [B,T,Hv]`, `a_gate [B,T,Hv]`.
 /// Outputs: `qn [B,T,Hk,Dk]`, `kn [B,T,Hk,Dk]`, `vv [B,T,Hv,Dv]`,
 /// `g [B,T,Hv] f32`, `beta [B,T,Hv] f32`, `conv_out [B,KC-1,CONV_DIM]`.
-const GDN_PREP_SOURCE: &str = include_str!("../shaders/gdn/gdn_prep.metal");
+const GDN_PREP_SOURCE: &crate::shader_pack::Source = crate::kernel_source!("gdn/gdn_prep.metal");
 
 static GDN_PREP: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 
@@ -144,7 +145,8 @@ pub fn gdn_prep(
 ///
 /// Inputs: `proj [B,T,PROJ_W]`, `conv_state [B,KC-1,CONV_DIM]`,
 /// `conv_w [CONV_DIM,KC,1]`, `neg_exp_alog [Hv] f32`, `dt_bias [Hv]`.
-const GDN_PREP_FUSED_SOURCE: &str = include_str!("../shaders/gdn/gdn_prep_fused.metal");
+const GDN_PREP_FUSED_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("gdn/gdn_prep_fused.metal");
 
 static GDN_PREP_FUSED: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 
@@ -255,9 +257,10 @@ pub fn gdn_prep_fused(
 }
 /// `track_gdn_lean_two_row`: the decode recurrence with two value rows per
 /// simdgroup. The kernel body is static (see `kernels/models/qwen4/`).
-const GDN_LEAN_TWO_ROW_SOURCE: &str = include_str!("../shaders/gdn/gdn_lean_two_row.metal");
+const GDN_LEAN_TWO_ROW_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("gdn/gdn_lean_two_row.metal");
 /// `track_gdn_rows`: the prefill recurrence with four value rows per simdgroup.
-const GDN_ROWS_SOURCE: &str = include_str!("../shaders/gdn/gdn_rows.metal");
+const GDN_ROWS_SOURCE: &crate::shader_pack::Source = crate::kernel_source!("gdn/gdn_rows.metal");
 
 static GDN_ROWS: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 static GDN_TWO_ROW: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
@@ -503,8 +506,8 @@ pub fn gdn_kernel_available() -> bool {
 
 /// The gated delta scan via the custom Metal kernel.
 ///
-/// q/k: [B,T,Hk,Dk] (activation dtype), v: [B,T,Hv,Dv] (activation dtype),
-/// g/beta: [B,T,Hv] f32, state: [B,Hv,Dv,Dk] f32.
+/// q/k: `[B,T,Hk,Dk]` (activation dtype), v: `[B,T,Hv,Dv]` (activation dtype),
+/// g/beta: `[B,T,Hv]` f32, state: `[B,Hv,Dv,Dk]` f32.
 ///
 /// `capture` writes the state after every position instead of only the last,
 /// so `state_out` is `[B*T, Hv, Dv, Dk]` (slot `b*T + t`); the return value is
@@ -715,11 +718,12 @@ pub fn gated_delta_ops_capture(
 }
 /// `track_gdn_decode_complete`: the S=1 GDN (causal conv + q/k l2norm + the
 /// gated delta rule + gated RMS) in one launch. Ported verbatim from
-/// `reference/Runner/FastModel/TrackFastGDNDecode.swift`.
+/// upstream `Runner/FastModel/TrackFastGDNDecode.swift`.
 ///
 /// `proj` is the concatenated `[qkv | z | b | a]` projection (one GEMM); the
 /// kernel reads z/b/a from their offsets in it.
-const GDN_DECODE_COMPLETE_SOURCE: &str = include_str!("../shaders/gdn/gdn_decode_complete.metal");
+const GDN_DECODE_COMPLETE_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("gdn/gdn_decode_complete.metal");
 
 static GDN_DECODE_COMPLETE: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 

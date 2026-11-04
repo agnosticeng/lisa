@@ -20,7 +20,11 @@ pub mod jit;
 pub mod models;
 pub mod ops;
 pub mod runtime;
+#[doc(hidden)]
+pub mod shader_pack;
 pub mod trace;
+
+include!(concat!(env!("OUT_DIR"), "/kernel_index.rs"));
 
 // Compat: the device module used to live at `backend`; keep
 // `lisa_mlx::backend::Backend` working for external callers.

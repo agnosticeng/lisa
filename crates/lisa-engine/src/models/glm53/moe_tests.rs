@@ -456,7 +456,8 @@ fn glm53_shared_q8_mlp_matches_separate_ds4_path_real_mtp_weights() -> anyhow::R
         eprintln!("[glm53-shared-q8-real] skipping: LISA_GLM53_MODEL is unset");
         return Ok(());
     };
-    const FIXTURE: &[u8] = include_bytes!("fixtures/mtp_shared_layer45_ds4.bin");
+    let external_fixture: &[u8] =
+        &crate::models::glm53::test_fixtures::read("mtp_shared_layer45_ds4.bin");
     let dir = std::path::Path::new(&model_dir);
     let config = super::super::config::ModelConfig::from_json(&dir.join("config.json"))?;
     let store = LazyTensorStore::open(dir)?;
@@ -469,18 +470,19 @@ fn glm53_shared_q8_mlp_matches_separate_ds4_path_real_mtp_weights() -> anyhow::R
         }
     }
     let mlp = DenseMlp::load_shared::<Weights>(&mut weights, prefix, config.swiglu_limit)?;
-    let (gate, up) = mlp.gate_up.split_linears()?;
+    let (gate, up) = mlp.gate_up.split_linears();
     let hidden = config.hidden_size;
     anyhow::ensure!(
-        FIXTURE.len() >= 16 + hidden * 4,
+        external_fixture.len() >= 16 + hidden * 4,
         "invalid MTP shared fixture"
     );
-    let fixture_hidden = u32::from_le_bytes(FIXTURE[0..4].try_into().expect("hidden width"));
+    let fixture_hidden =
+        u32::from_le_bytes(external_fixture[0..4].try_into().expect("hidden width"));
     anyhow::ensure!(
         fixture_hidden as usize == hidden,
         "MTP fixture hidden width changed"
     );
-    let input = FIXTURE[16..16 + hidden * 4]
+    let input = external_fixture[16..16 + hidden * 4]
         .chunks_exact(4)
         .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("F32 input word")))
         .collect::<Vec<_>>();
@@ -1338,7 +1340,7 @@ fn glm53_layer3_routed_moe_capture_for_ds4() -> anyhow::Result<()> {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("layer-3 shared expert is missing"))?;
         let projection = match &shared.gate_up {
-            GateUpProjection::Paired(projection) => projection,
+            GateUpProjection::Paired { projection, .. } => projection,
             GateUpProjection::Separate { .. } => {
                 anyhow::bail!("DS4 shared-kernel capture requires paired gate/up weights")
             }
@@ -1445,7 +1447,7 @@ fn glm53_layer3_routed_moe_capture_for_ds4() -> anyhow::Result<()> {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("layer-3 shared expert is missing"))?;
         let projection = match &shared.gate_up {
-            GateUpProjection::Paired(projection) => projection,
+            GateUpProjection::Paired { projection, .. } => projection,
             GateUpProjection::Separate { .. } => {
                 anyhow::bail!("NAX capture requires the paired gate/up schedule")
             }
@@ -1487,7 +1489,7 @@ fn glm53_layer3_routed_moe_capture_for_ds4() -> anyhow::Result<()> {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("layer-3 shared expert is missing"))?;
         let projection = match &shared.gate_up {
-            GateUpProjection::Paired(projection) => projection,
+            GateUpProjection::Paired { projection, .. } => projection,
             GateUpProjection::Separate { .. } => {
                 anyhow::bail!("stock affine capture requires the paired gate/up schedule")
             }

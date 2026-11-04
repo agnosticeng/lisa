@@ -4,23 +4,27 @@ use crate::ffi::{MetalKernel, TemplateArg};
 use crate::{Array, Dtype, Stream};
 
 /// Shared exact-arithmetic helpers (`mlx_sigmoid`, `mlx_silu`, ...).
-pub const EXACT_HEADER: &str = include_str!("../../shaders/common/exact_header.metal");
+pub const EXACT_HEADER: &crate::shader_pack::Source =
+    crate::kernel_source!("common/exact_header.metal");
 
 /// `track_sigmoid_mul`: `mlx_sigmoid(gate) * up` over separate bf16 arrays.
 /// Replaces the attention output-gate tail (`ops::sigmoid(g)` then
 /// `a.multiply(&sig)`) — one dispatch instead of two, same rounding: the
 /// sigmoid rounds bf16 exactly as the separate kernel would have stored it,
 /// then the product rounds bf16.
-const SIGMOID_MUL_SOURCE: &str = include_str!("../../shaders/qwen35/sigmoid_mul.metal");
+const SIGMOID_MUL_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("qwen35/sigmoid_mul.metal");
 
 /// `track_swiglu2_packed`: `mlx_silu(gu[i]) * gu[F + i]` over ONE packed
 /// `[B, 2F]` gate|up buffer (the merged gate|up qmv output). Bit-identical to
 /// `track_swiglu2` on the split arrays: same exact_header silu, and the second
 /// half of the packed qmv output IS the up projection, row-exact.
-const SWIGLU2_PACKED_SOURCE: &str = include_str!("../../shaders/qwen35/swiglu2_packed.metal");
+const SWIGLU2_PACKED_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("qwen35/swiglu2_packed.metal");
 
 /// Source of `track_sigmoid_mul_tail` (see [`sigmoid_mul_tail`]).
-const SIGMOID_MUL_TAIL_SOURCE: &str = include_str!("../../shaders/qwen35/sigmoid_mul_tail.metal");
+const SIGMOID_MUL_TAIL_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("qwen35/sigmoid_mul_tail.metal");
 
 static SWIGLU2_PACKED: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 
@@ -202,11 +206,13 @@ pub fn sigmoid_mul(gate: &Array, up: &Array, stream: &Stream) -> Option<Array> {
 /// layout SDPA consumes (the transposes vanish). Bit-exact vs the composed
 /// `RmsNorm::forward` → transpose → `rope_partial` chain (see shader header);
 /// pinned by `qk_norm_rope_matches_composed`.
-const QK_NORM_ROPE_SOURCE: &str = include_str!("../../shaders/qwen35/qk_norm_rope.metal");
+const QK_NORM_ROPE_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("qwen35/qk_norm_rope.metal");
 
 static QK_NORM_ROPE: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 
-const QK_NORM_ROPE_ROWS_SOURCE: &str = include_str!("../../shaders/qwen35/qk_norm_rope_rows.metal");
+const QK_NORM_ROPE_ROWS_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("qwen35/qk_norm_rope_rows.metal");
 
 static QK_NORM_ROPE_ROWS: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 
@@ -302,7 +308,7 @@ pub fn qk_norm_rope(
 
 /// Run `track_qk_norm_rope_rows` at s in 2..=8 (the MTP verify block, b==1,
 /// no keep mask). `qg` is the stock interleaved q|gate projection `[S, HQ*2*HD]`
-/// (layout [head][2][hd]); `k` the contiguous key rows `[S, HK*HD]`; `cos`/`sin`
+/// (layout `[head][2][hd]`); `k` the contiguous key rows `[S, HK*HD]`; `cos`/`sin`
 /// the bf16-cast angle block `[S, RD]` (one row per verify row). Returns
 /// head-major `(oq [1,hq,S,256], ok [1,hk,S,256])` plus the raw de-interleaved
 /// gate `[S, HQ*HD]` for the sigmoid-gate tail.
@@ -377,7 +383,8 @@ pub fn qk_norm_rope_rows(
 /// 0-dim f32 scalar, `seed_lo`/`seed_hi`/`pos_i` 0-dim i32 scalars holding
 /// the u64 seed (low, high) and the absolute position. Returns the `[1]`
 /// i32 token array — the caller reads back 4 bytes.
-const KEYED_SAMPLE_SOURCE: &str = include_str!("../../shaders/qwen35/keyed_sample.metal");
+const KEYED_SAMPLE_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("qwen35/keyed_sample.metal");
 
 static KEYED_SAMPLE: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 

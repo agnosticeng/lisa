@@ -406,7 +406,7 @@ pub fn affine_qmv_fast_addnorm(
         if !wl.is_contiguous() {
             crate::bail!("addnorm qmv: non-contiguous norm weight");
         }
-        enc.set_input(5, Some(ms), wl.start_offset());
+        enc.set_input(5, Some(ms), wl.offset * norm_weight.dtype().size_of());
         let stride: u32 = if norm_weight.rank() == 1 {
             wl.stride()[0] as u32
         } else {
@@ -542,7 +542,7 @@ pub fn affine_qmv_fast_addnorm_tu(
         if !wl.is_contiguous() {
             crate::bail!("addnorm-tu qmv: non-contiguous norm weight");
         }
-        enc.set_input(5, Some(ms), wl.start_offset());
+        enc.set_input(5, Some(ms), wl.offset * norm_weight.dtype().size_of());
         let stride: u32 = if norm_weight.rank() == 1 {
             wl.stride()[0] as u32
         } else {
@@ -1029,8 +1029,10 @@ pub fn affine_qmv_splitk(
 /// `mlx_gemm.metal` / `gemv.metal` (Apple MLX steel kernels vendored
 /// through the kernels crate; see NOTICE). The general `matmul` path uses
 /// these so its accumulation is MLX-bit-exact.
-const DENSE_GEMM: &str = include_str!("../shaders/common/matmul/dense_gemm.metal");
-const DENSE_GEMV: &str = include_str!("../shaders/common/matmul/dense_gemv.metal");
+const DENSE_GEMM: &crate::shader_pack::Source =
+    crate::kernel_source!("common/matmul/dense_gemm.metal");
+const DENSE_GEMV: &crate::shader_pack::Source =
+    crate::kernel_source!("common/matmul/dense_gemv.metal");
 
 /// The huge-N (lm_head class) lane gate, the msg arm: M 2..=7, N >= 100000
 /// (the msg threshold — our qwen3_5 lm_head N = 151936 qualifies natively),
@@ -1149,14 +1151,14 @@ pub fn affine_verify_qmm_msg(
 /// qmv_fast numerics with the input-row grid axis collapsed into the
 /// threadgroup — one weight stream for the whole verify width. See the
 /// kernel header for the split-K provenance.
-pub(crate) const VERIFY_QMM_SOURCE: &str =
-    include_str!("../shaders/common/matmul/verify_qmm.metal");
+pub(crate) const VERIFY_QMM_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("common/matmul/verify_qmm.metal");
 
 /// The NAX m16 verify tile (`affine_verify_qmm_nax_m16`): the dedicated
 /// M 8..=16 lane for M5-class matrix units. See the kernel header for the
 /// verbatim-port provenance and the numerics class.
-pub(crate) const VERIFY_QMM_NAX_M16_SOURCE: &str =
-    include_str!("../shaders/common/matmul/verify_qmm_nax_m16.metal");
+pub(crate) const VERIFY_QMM_NAX_M16_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("common/matmul/verify_qmm_nax_m16.metal");
 
 /// The m16 lane gate, mirroring the reference's lane table: the NAX m16 tile
 /// takes M 8..=16 by default (past the plain-SIMD region, below the tiled

@@ -159,10 +159,7 @@ fn glm53_kda_layer21_multirow_projections_match_direct_ds4_fixtures() -> anyhow:
         let input_values: Vec<f32> = (0..rows * config.hidden_size)
             .map(|i| (((i * 37 + 13) % 251) as f32 - 125.0) * 0.0004)
             .collect();
-        let input = Array::from_slice(
-            &input_values,
-            &[rows as i32, 1, config.hidden_size as i32],
-        );
+        let input = Array::from_slice(&input_values, &[rows as i32, 1, config.hidden_size as i32]);
         let (q, k, v, fa, ga, beta) = kda.input_projections(&input)?;
         let outputs = vec![
             q.to_vec1::<f32>()?,

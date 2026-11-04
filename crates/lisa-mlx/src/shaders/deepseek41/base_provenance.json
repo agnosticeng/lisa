@@ -1,0 +1,30 @@
+{
+  "repository": "https://github.com/antirez/ds4",
+  "revision": "b3f50180ec2c7324892be1f50bc83555ccb8d5e7",
+  "source_sha256": {
+    "dense.metal": "eaf88d4c95b76be123329feef5a88d038e908f22b27c108d77e7b42d0bbc81dc",
+    "norm.metal": "5eb901f77830400b40149be8a86eb4937ec18cea3c692ef7a714f936b0b2a8cb",
+    "dsv4_kv.metal": "65e6e12ac3266fdf72b1e9c69bfbd07ea7324e930a8117b63b651b5016b1b5f6",
+    "dsv41.metal": "070e2eb4c8494a28d6d172790977a24ce58fb54faddf3e404985894643e2b473",
+    "dsv4_hc.metal": "d29693d5a7ec30c5fa014bfeb8d1e1e2761423a5127d176297988adcd820a39c",
+    "moe.metal": "c5f5d968be87ade2a48697b78efa99581fab8412943bbac1d8f26e02090cf5b7"
+  },
+  "section_sha256": [
+    "752acb4be0981f6705e89c3265ed85f1a7038859aa8a9cfb3fb96cdbc9bd119a",
+    "067ef01d17d1bb21640e5dcff47789964242de2d0b2d11594658941af44508f4",
+    "e57380b5f4a252278e7706d4b3e78b0738793ced2f9c5268db15808ac308c2af",
+    "388da374288505d7197bcc14f2252fbe24edf1e9b0f1b73a4cbfce2a4ed2f76b",
+    "6b868c105c0e82d72310c780c0c26ebf33e85f9cf2f9d26057a8f47fe0c6a6c7",
+    "13da47ac39391af86bb44b01d58677a5116239391b4fd5cefc55009e91ee8c7d",
+    "953f919cda6891a97cf2f5bf75bb17ad5bae52d30a484e0dd1c6545fb3bc854e",
+    "a5c578ed55d4c127679dd83856f783470cc857d4fb0670c2b6b78db5c2bee394",
+    "1e6797b7ec8a45d31788e58f0e093f5d62b12231a7a2fe2a15bc5496e1581753",
+    "3951f47574d6002fb5d0df20693b1043d085ead7c977cda1728169e78ec15c02",
+    "373b347fbbad6a8fc6566102affe6a99085366f9ede8611642110c8fab87031a",
+    "0a349e5badd0598d8ccff1e2c216525575d32cc61f00967644c6e9d36aa7c4f0",
+    "63fd487b2e53cf9c056c1a5637d84e5d73ac8798a2ee0ea5595f368cf8081c6f",
+    "cc1c1430f68150ba501bbe34361fd393a38288048194c3699babf882160ecdc6"
+  ],
+  "local_sha256": "bd617cb7ca4a9d835765c54ad4a8e3b4b85ee95e729c1ace027f74e9d6824a27",
+  "changes": "Standard-library preamble and self-contained section extraction; arithmetic bodies retained. Define DS4_METAL_HC_STABLE=1 to match the default DS4 library compilation options at the pinned revision. Includes the original fused RoPE/quantization/cache-store body with its original fast divisions. Original RoPE coefficient table and fused index-query kernel."
+}

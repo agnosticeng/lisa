@@ -9,6 +9,7 @@ use lisa_engine::models::{self, Loaded};
 use lisa_engine::{generate, sampler, sched, session, tokenizer};
 use lisa_mlx::ops::indexing::IndexOp;
 
+mod deepseek41_run;
 mod glm53_run;
 
 #[derive(Parser)]
@@ -23,6 +24,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Exercise the native DeepSeek V4.1 GGUF scalar graph (diagnostic).
+    Deepseek41Run(deepseek41_run::Args),
     /// Time one production GLM serial/MTP generation and save token IDs as JSON.
     Glm53Run(glm53_run::Args),
     /// Verify the compute stack: quantized matmul, fast ops, custom kernels.
@@ -56,10 +59,19 @@ enum Command {
         #[arg(long, default_value_t = false)]
         capture: bool,
     },
-    /// Diff layer-0 intermediates against reference dumps.
+    /// Diff Qwen4 layer intermediates against explicitly selected reference dumps.
     LayerDiff {
         #[arg(long)]
         model: ModelDir,
+        /// Directory containing reference F32 .bin arrays.
+        #[arg(long)]
+        reference: std::path::PathBuf,
+        /// Golden JSON containing the prompt_tokens used by the reference.
+        #[arg(long)]
+        golden: std::path::PathBuf,
+        /// Directory for LISA's rs_*.bin arrays.
+        #[arg(long)]
+        output: std::path::PathBuf,
     },
     /// Print top-8 first-token logits for a prompt; optionally dump the full vector as JSON.
     Logits {
@@ -274,9 +286,15 @@ fn run() -> anyhow::Result<()> {
     // overlap the CPU graph build. Committing at ~16 recovers ~2 ms of the
     // draft (d5 round 69.6 -> 67.4 ms); the boundary does not change results.
     match cli.command {
+        Command::Deepseek41Run(args) => deepseek41_run::run(args),
         Command::Glm53Run(args) => glm53_run::run(args),
         Command::Smoke => smoke::run_all(),
-        Command::LayerDiff { model } => layerdiff::run(&model),
+        Command::LayerDiff {
+            model,
+            reference,
+            golden,
+            output,
+        } => layerdiff::run(&model, &reference, &golden, &output),
         Command::Logits {
             model,
             prompt,
@@ -285,6 +303,9 @@ fn run() -> anyhow::Result<()> {
         } => {
             let mut tower = match models::load_dir(&model)? {
                 Loaded::Language(tower) => tower,
+                Loaded::Image(_) => {
+                    anyhow::bail!("this command requires a language or decision model")
+                }
                 Loaded::Decision(model) => {
                     anyhow::bail!("logits are unavailable for decision model {}", model.name())
                 }
@@ -379,6 +400,9 @@ fn run() -> anyhow::Result<()> {
             anyhow::ensure!(prompt.len() > 256, "prompt too short for a prefix test");
             let mut tower = match lisa_engine::models::load_dir(&model)? {
                 lisa_engine::models::Loaded::Language(m) => m,
+                lisa_engine::models::Loaded::Image(_) => {
+                    anyhow::bail!("this command requires a language or decision model")
+                }
                 lisa_engine::models::Loaded::Decision(_) => {
                     anyhow::bail!("prefix-check expects a language model")
                 }
@@ -485,6 +509,9 @@ fn run() -> anyhow::Result<()> {
             // the 27B does not ship, which locked cbatch to Flash-Next.
             let mut tower = match lisa_engine::models::load_dir(&model)? {
                 lisa_engine::Loaded::Language(m) => m,
+                lisa_engine::Loaded::Image(_) => {
+                    anyhow::bail!("this command requires a language or decision model")
+                }
                 lisa_engine::Loaded::Decision(_) => {
                     anyhow::bail!("cbatch needs a generative language model")
                 }
@@ -579,6 +606,9 @@ fn run() -> anyhow::Result<()> {
             };
             let mut tower = match lisa_engine::models::load_dir(&model)? {
                 lisa_engine::models::Loaded::Language(m) => m,
+                lisa_engine::models::Loaded::Image(_) => {
+                    anyhow::bail!("this command requires a language or decision model")
+                }
                 lisa_engine::models::Loaded::Decision(_) => {
                     anyhow::bail!("serial-audit expects a language model")
                 }
@@ -860,6 +890,9 @@ fn run() -> anyhow::Result<()> {
             use lisa_mlx::{runtime_dispatch_count, runtime_label_counts, runtime_label_gpu_ms};
             let mut tower = match lisa_engine::models::load_dir(&model)? {
                 lisa_engine::models::Loaded::Language(m) => m,
+                lisa_engine::models::Loaded::Image(_) => {
+                    anyhow::bail!("this command requires a language or decision model")
+                }
                 lisa_engine::models::Loaded::Decision(_) => {
                     anyhow::bail!("verify-audit expects a language model")
                 }
@@ -886,12 +919,7 @@ fn run() -> anyhow::Result<()> {
                 let snaps: Vec<_> = sess
                     .caches
                     .iter()
-                    .map(|c| match c {
-                        lisa_engine::core::cache::LayerCache::Full(f) => (Some(f.offset), None),
-                        lisa_engine::core::cache::LayerCache::Linear(g) => {
-                            (None, Some(g.snapshot_state()))
-                        }
-                    })
+                    .map(lisa_engine::core::cache::LayerCache::snapshot_rollback)
                     .collect();
                 tower.set_context_tails(vec![
                     sess.fed[sess.fed.len().saturating_sub(ctx_len)..]
@@ -910,15 +938,7 @@ fn run() -> anyhow::Result<()> {
                 let dt = t0.elapsed().as_secs_f64() * 1e3;
                 drop(_splitk);
                 for (c, sn) in sess.caches.iter_mut().zip(snaps.iter()) {
-                    match (c, sn) {
-                        (lisa_engine::core::cache::LayerCache::Full(f), (Some(off), _)) => {
-                            f.trim(f.offset - off)
-                        }
-                        (lisa_engine::core::cache::LayerCache::Linear(g), (_, Some(st))) => {
-                            g.restore_state(st)
-                        }
-                        _ => {}
-                    }
+                    c.restore_rollback(sn)?;
                 }
                 Ok(dt)
             };
@@ -991,6 +1011,9 @@ fn run() -> anyhow::Result<()> {
             };
             let mut tower = match lisa_engine::models::load_dir(&model)? {
                 lisa_engine::models::Loaded::Language(m) => m,
+                lisa_engine::models::Loaded::Image(_) => {
+                    anyhow::bail!("this command requires a language or decision model")
+                }
                 lisa_engine::models::Loaded::Decision(_) => {
                     anyhow::bail!("round-cost expects a language model")
                 }
@@ -1136,6 +1159,9 @@ fn run() -> anyhow::Result<()> {
             let t0 = std::time::Instant::now();
             let mut tower = match models::load_dir(&model)? {
                 Loaded::Language(tower) => tower,
+                Loaded::Image(_) => {
+                    anyhow::bail!("this command requires a language or decision model")
+                }
                 Loaded::Decision(model) => {
                     anyhow::bail!(
                         "prefill-bench requires a language model, got {}",
@@ -1731,16 +1757,10 @@ fn resolve_cached_model(target: &str) -> anyhow::Result<std::path::PathBuf> {
         return Ok(direct.to_path_buf());
     }
     anyhow::ensure!(
-        target.contains('/') && !target.starts_with('~') && !target.starts_with('/'),
+        hf::is_repo_id(target),
         "unknown model {target:?}: pass a local path or a Hugging Face repo id"
     );
-    let snapshots = hf::repo_dir(target).join("snapshots");
-    if let Some(dir) = std::fs::read_dir(&snapshots).ok().and_then(|entries| {
-        entries
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| hf::is_model_dir(p))
-            .max()
-    }) {
+    if let Some(dir) = hf::cached_snapshot(target) {
         return Ok(dir);
     }
     anyhow::bail!(
@@ -1753,7 +1773,7 @@ fn resolve_cached_model(target: &str) -> anyhow::Result<std::path::PathBuf> {
 /// compile time so `lisa-bench golden` is self-contained against a cached model).
 const QWEN4_GOLDEN: &str = include_str!("../golden/qwen4.json");
 
-/// Capture the qwen4 golden baseline: greedy tokens over cases[0]'s `prompt`
+/// Capture the qwen4 golden baseline: greedy tokens over `cases[0]`'s `prompt`
 /// (raw-encoded, no chat wrapper), written back as `prompt_tokens` /
 /// `expected_tokens` into the explicit --golden path.
 fn golden_qwen4_capture(
@@ -1846,6 +1866,9 @@ fn golden_qwen35(
     }
     let mut tower = match lisa_engine::models::load_dir(model)? {
         lisa_engine::models::Loaded::Language(m) => m,
+        lisa_engine::models::Loaded::Image(_) => {
+            anyhow::bail!("this command requires a language or decision model")
+        }
         lisa_engine::models::Loaded::Decision(_) => {
             anyhow::bail!("golden expects a language model")
         }

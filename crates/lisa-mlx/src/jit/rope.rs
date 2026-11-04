@@ -92,12 +92,12 @@ pub fn rope(
     enc.set_pipeline(&pipeline);
     {
         let (ms, l) = x.buffer_and_layout();
-        enc.set_input(0, Some(ms), l.start_offset());
+        enc.set_input(0, Some(ms), l.offset * x.dtype().size_of());
     }
     enc.set_output(1, Some(&obuf), 0);
     {
         let (ms, l) = offset.buffer_and_layout();
-        enc.set_input(2, Some(ms), l.start_offset());
+        enc.set_input(2, Some(ms), l.offset * offset.dtype().size_of());
     }
     enc.set_bytes(3, &scale);
 

@@ -375,7 +375,8 @@ fn capture_or_assert_mtp_residual_ds4(
 ) -> anyhow::Result<()> {
     const WIDTH: usize = 4096;
     const PART_BYTES: usize = WIDTH * std::mem::size_of::<f32>();
-    const FIXTURE: &[u8] = include_bytes!("fixtures/mtp_residual_layer45_ds4.bin");
+    let external_fixture: &[u8] =
+        &crate::models::glm53::test_fixtures::read("mtp_residual_layer45_ds4.bin");
     let values = [
         x.to_vec1::<f32>()?,
         attended.to_vec1::<f32>()?,
@@ -416,12 +417,12 @@ fn capture_or_assert_mtp_residual_ds4(
     }
 
     anyhow::ensure!(
-        FIXTURE.len() == payload.len(),
+        external_fixture.len() == payload.len(),
         "DS4 MTP residual fixture has an invalid size"
     );
     for (index, (actual, expected)) in payload
         .chunks_exact(4)
-        .zip(FIXTURE.chunks_exact(4))
+        .zip(external_fixture.chunks_exact(4))
         .enumerate()
     {
         anyhow::ensure!(
@@ -445,7 +446,8 @@ fn capture_or_assert_mtp_tail_ds4(
 ) -> anyhow::Result<()> {
     const WIDTH: usize = 4096;
     const PART_BYTES: usize = WIDTH * std::mem::size_of::<f32>();
-    const FIXTURE: &[u8] = include_bytes!("fixtures/mtp_tail_layer45_ds4.bin");
+    let external_fixture: &[u8] =
+        &crate::models::glm53::test_fixtures::read("mtp_tail_layer45_ds4.bin");
     let values = [
         residual.to_vec1::<f32>()?,
         routed.to_vec1::<f32>()?,
@@ -488,12 +490,12 @@ fn capture_or_assert_mtp_tail_ds4(
     }
 
     anyhow::ensure!(
-        FIXTURE.len() == payload.len(),
+        external_fixture.len() == payload.len(),
         "DS4 MTP tail fixture has an invalid size"
     );
     for (index, (actual, expected)) in payload
         .chunks_exact(4)
-        .zip(FIXTURE.chunks_exact(4))
+        .zip(external_fixture.chunks_exact(4))
         .enumerate()
     {
         anyhow::ensure!(
@@ -514,11 +516,11 @@ fn capture_or_assert_mtp_lm_head_ds4(
 ) -> anyhow::Result<()> {
     const HIDDEN: usize = 4096;
     let fixture: &[u8] = if super::sparse::mtp_real_target_fixtures_enabled() && position == 6 {
-        include_bytes!("fixtures/mtp_composed_natural_target_step6_ds4.bin")
+        &crate::models::glm53::test_fixtures::read("mtp_composed_natural_target_step6_ds4.bin")
     } else if super::sparse::mtp_real_target_fixtures_enabled() {
-        include_bytes!("fixtures/mtp_composed_natural_target_ds4.bin")
+        &crate::models::glm53::test_fixtures::read("mtp_composed_natural_target_ds4.bin")
     } else {
-        include_bytes!("fixtures/mtp_lm_head_layer45_ds4.bin")
+        &crate::models::glm53::test_fixtures::read("mtp_lm_head_layer45_ds4.bin")
     };
     let vocab = lm_head.dims_out();
     anyhow::ensure!(
@@ -659,6 +661,7 @@ fn capture_or_assert_mtp_lm_head_ds4(
 }
 
 pub struct Tower {
+    vision: Option<crate::models::vision::Vision>,
     config: ModelConfig,
     context_capacity: usize,
     pub(crate) capture: Option<Capture>,
@@ -749,6 +752,7 @@ impl Tower {
         let mut tower =
             Self::from_weights_with_lazy_experts(weights, config, Some(store.clone()), true, true)?;
         tower._resident_memory = Some(reservation);
+        tower.vision = crate::models::vision::Vision::from_dir(dir, 0)?;
         eprintln!(
             "[glm53-loader] resident MLX model: {:.2} GiB, {} shared views, GPU expert routing",
             weight_bytes as f64 / (1u64 << 30) as f64,
@@ -1146,6 +1150,7 @@ impl Tower {
             );
         }
         Ok(Self {
+            vision: None,
             config,
             context_capacity,
             capture: Capture::from_env(),
@@ -1237,7 +1242,7 @@ impl Tower {
             .flat_map(|row| row.iter())
             .filter_map(|cache| match cache {
                 LayerCache::Full(cache) => Some(cache.offset),
-                LayerCache::Linear(_) => None,
+                LayerCache::Linear(_) | LayerCache::Native(_) => None,
             })
             .max()
             .unwrap_or(0);
@@ -1449,7 +1454,7 @@ impl Tower {
             .then(lisa_mlx::runtime::enter_ordered_gpu_reuse_scope);
         let forward_position = caches.iter().find_map(|cache| match cache {
             LayerCache::Full(cache) => Some(cache.offset),
-            LayerCache::Linear(_) => None,
+            LayerCache::Linear(_) | LayerCache::Native(_) => None,
         });
         #[cfg(test)]
         let mtp_layer_capture = if b == 1 && s == 2 {
@@ -1483,7 +1488,7 @@ impl Tower {
                 std::sync::OnceLock::new();
             let position = caches.iter().find_map(|cache| match cache {
                 LayerCache::Full(cache) => Some(cache.offset),
-                LayerCache::Linear(_) => None,
+                LayerCache::Linear(_) | LayerCache::Native(_) => None,
             });
             std::env::var_os("LISA_GLM53_MTP_LAYER_CAPTURE_PREFIX").and_then(|prefix| {
                 let requested_positions = REQUESTED_POSITIONS.get_or_init(|| {
@@ -1534,7 +1539,12 @@ impl Tower {
 
         let x = {
             let _trace_embed = lisa_mlx::trace::span("glm53.embed");
-            self.embed.forward(ids)?.as_dtype(Dtype::Float32)? // [B,S,H]
+            let x = self.embed.forward(ids)?.as_dtype(Dtype::Float32)?;
+            if let Some(v) = &self.vision {
+                v.splice(x, forward_position.unwrap_or(0))?
+            } else {
+                x
+            } // [B,S,H]
         };
         if let Some(c) = &self.capture {
             c.store("embed_out", &x);
@@ -2033,7 +2043,7 @@ impl Tower {
             .iter()
             .find_map(|cache| match cache {
                 LayerCache::Full(cache) => Some(cache.offset),
-                LayerCache::Linear(_) => None,
+                LayerCache::Linear(_) | LayerCache::Native(_) => None,
             })
             .unwrap_or(0);
         let work_capacity = self.context_capacity.min(4096);
@@ -2087,6 +2097,26 @@ mod loaded_pairing_law_tests {
 }
 
 impl crate::models::LanguageModel for Tower {
+    fn supports_images(&self) -> bool {
+        self.vision.is_some()
+    }
+    fn prepare_images(
+        &mut self,
+        tokens: &mut Vec<u32>,
+        images: &[image::RgbImage],
+    ) -> anyhow::Result<()> {
+        let limit = self.max_position_embeddings();
+        self.vision
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("checkpoint has no supported vision encoder"))?
+            .prepare(tokens, images, limit)
+    }
+    fn clear_images(&mut self) {
+        if let Some(v) = &mut self.vision {
+            v.clear();
+        }
+    }
+
     fn cache_numerical_law(&self) -> Option<u64> {
         // Read the projection modes retained by the loaded model. The separate
         // diagnostic schedule must not share caches with native paired fusion.
@@ -2311,7 +2341,7 @@ impl crate::models::LanguageModel for Tower {
             .flat_map(|row| row.iter())
             .filter_map(|cache| match cache {
                 LayerCache::Full(cache) => Some(cache.offset),
-                LayerCache::Linear(_) => None,
+                LayerCache::Linear(_) | LayerCache::Native(_) => None,
             })
             .max()
             .unwrap_or(0);

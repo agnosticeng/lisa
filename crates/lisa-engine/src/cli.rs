@@ -6,8 +6,8 @@ use std::path::PathBuf;
 
 use crate::sampler;
 
-/// `--model`: a local model directory or a Hugging Face repo id, resolved to a
-/// local directory when the arguments are parsed.
+/// `--model`: a local checkpoint directory, GGUF file or Hugging Face repo id,
+/// resolved to a local path when the arguments are parsed.
 #[derive(Clone)]
 pub struct ModelDir(pub PathBuf);
 

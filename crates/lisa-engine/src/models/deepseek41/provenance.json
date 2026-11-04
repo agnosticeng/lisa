@@ -1,0 +1,40 @@
+{
+  "ds4": {
+    "repository": "https://github.com/antirez/ds4",
+    "revision": "b3f50180ec2c7324892be1f50bc83555ccb8d5e7",
+    "engram_source_sha256": "48c020d4cc113caeb43addb5e892e6dc0a6d133396a6c4ea0265c24279c745a3"
+  },
+  "standard_gguf_layout": {
+    "repository": "https://github.com/ggml-org/llama.cpp",
+    "revision": "7071ba378afa96dcd69c41e1ec2b4912364dbee4",
+    "sources": {
+      "conversion/deepseek41.py": "b099089b2618a857d6bf7878d2484dc9392f18882e4a3edd675c2000ca41ec19",
+      "src/models/deepseek41.cpp": "1f8e5679f5ee0ff68fe03875f0890b4329ab783db8f682ed8ccaf9b94fde72ef"
+    }
+  },
+  "checkpoint": {
+    "repository": "ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-GGUF",
+    "revision": "54229d38d588a66d1c6cff08af7b281b9326c656"
+  },
+  "status": "Native GGUF text inference with bounded eight-row layer-major prefill and original mixed weights with disk-only Engram. Pinned adapted DS4 comparison passes all 4045 stage arrays over eight steps, repeated twice, final logits after a 149-token real prompt (twice), and final/decode logits after an 8199-token real prompt. Stable HC compile default, fused RoPE/cache stores, shared RoPE table, transforming attention reduction, fused index query and split Engram reduction match the reference. Wide grouped GEMM prefill and broader context/throughput certification remain open.",
+  "tokenizer_oracle": {
+    "ds4_revision": "b3f50180ec2c7324892be1f50bc83555ccb8d5e7",
+    "ds4_c_sha256": "c471a2fc003e91555b4aac4d262b2d685603258486bacacaaee7582096cd8764",
+    "oracle_c_sha256": "9c4a793cee619f3f112bf6d94cefba287b4b492eb92ca081f849124e86708938",
+    "cases": 16,
+    "tokens": 131
+  },
+  "whole_model_oracle": {
+    "path": "crates/lisa-bench/reference/deepseek41",
+    "ds4_revision": "b3f50180ec2c7324892be1f50bc83555ccb8d5e7",
+    "shared_format_kernels": true,
+    "host_build": "Clang O1 for full ds4.c; O3 other translation units; original Metal options",
+    "stage_arrays": 4045,
+    "repeated": 2,
+    "checkpoint_requantized": false,
+    "real_prompt_tokens": [
+      149,
+      8199
+    ]
+  }
+}

@@ -1,17 +1,15 @@
 //! Minimal OpenAI-compatible serving layer.
 //!
-//! No async runtime: a `TcpListener` accept thread parses each HTTP request and
-//! hands it to the worker (the thread that owns the [`Tower`] — MLX arrays are
-//! thread-affine) over an `mpsc` channel. The worker runs one completion at a
-//! time and streams tokens back to the connection thread, which frames them as
-//! SSE (chunked) or collects them into a single JSON response.
+//! No async runtime: an accept thread creates connection handlers that parse
+//! HTTP requests and enqueue jobs over an `mpsc` channel. One worker owns the
+//! [`LanguageModel`] and its thread-affine arrays, processing eligible request
+//! waves or serial completions. Connection handlers frame replies as chunked
+//! SSE or collect them into JSON responses.
 //!
-//! Requests are stateless: each one prefills its own prompt from scratch. (A
-//! `session_id`-keyed cache would reuse prefixes, but the scheduler/batch
-//! machinery for that is a separate step.)
+//! Requests can reuse prompt snapshots or an explicit `session_id`. Models
+//! without batch decode support use the serial, cache-aware completion path.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -19,12 +17,27 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
+mod api_state;
+mod http;
+pub mod images;
+mod responses;
+use api_state::ApiState;
+use http::{read_request, write_response};
+#[cfg(test)]
+use responses::{ReplyData, prompt_tokens_details_json, usage_json};
+use responses::{
+    collect_choices, collect_surface, drain_reply, empty_response_resource,
+    responses_payload_with_id, store_conversation, stream_surface,
+};
+mod deepseek41;
+mod streaming;
+
 use lisa_engine::DecisionModel;
 use lisa_engine::core::generate::is_eos;
 use lisa_engine::core::prefix_cache::PrefixCache;
-use lisa_engine::core::sampler::Sampler;
+use lisa_engine::core::sampler::{Sampler, token_logprob};
 use lisa_engine::core::session::{MtpDepth, Session, TargetMtpEosPolicy, TargetMtpSamplingMode};
-use lisa_engine::core::tokenizer::{self, Tokenizer};
+use lisa_engine::core::tokenizer::{self, IncrementalDecoder, Tokenizer};
 use lisa_engine::models::LanguageModel;
 
 pub struct ServerConfig {
@@ -58,6 +71,8 @@ pub struct ServerConfig {
     /// response payloads. Derived from the resolved checkpoint (never a
     /// hardcoded placeholder).
     pub model_id: String,
+    /// Whether the loaded language checkpoint includes a native vision tower.
+    pub supports_images: bool,
 }
 
 /// The id of the model loaded from `dir`: the Hugging Face repo id when the
@@ -67,7 +82,7 @@ pub fn model_id_of(dir: &std::path::Path) -> String {
     for anc in dir.ancestors() {
         if let Some(name) = anc.file_name().and_then(|n| n.to_str()) {
             if let Some(rest) = name.strip_prefix("models--") {
-                return rest.replace("--", "/");
+                return rest.replacen("--", "/", 1);
             }
         }
     }
@@ -76,15 +91,6 @@ pub fn model_id_of(dir: &std::path::Path) -> String {
         .unwrap_or("unknown")
         .to_string()
 }
-
-/// The advertised model id for response payloads. Set once at server start
-/// from [`ServerConfig::model_id`] (payload helpers run deep in call sites
-/// with no config in scope); falls back to the checkpoint-derived default.
-fn model_id() -> &'static str {
-    MODEL_ID.get().map(|s| s.as_str()).unwrap_or("unknown")
-}
-
-static MODEL_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// The checkpoint's own defaults, from `generation_config.json`. `None` fields
 /// fall through to the hardcoded greedy defaults. `thinking` is
@@ -246,7 +252,7 @@ pub struct Server {
 
 impl Server {
     pub fn start(cfg: ServerConfig, stop: std::sync::Arc<AtomicBool>) -> anyhow::Result<Server> {
-        let _ = MODEL_ID.set(cfg.model_id.clone());
+        let api = ApiState::new(cfg.model_id.clone());
         let listener =
             TcpListener::bind(&cfg.addr).map_err(|e| anyhow::anyhow!("bind {}: {e}", cfg.addr))?;
         listener.set_nonblocking(true)?;
@@ -277,8 +283,9 @@ impl Server {
                             let _ = stream.set_nonblocking(false);
                             let tx = tx.clone();
                             let cfg = cfg.clone();
+                            let api = api.clone();
                             std::thread::spawn(move || {
-                                if let Err(e) = handle_conn(stream, tx, &cfg) {
+                                if let Err(e) = handle_conn(&api, stream, tx, &cfg) {
                                     eprintln!("[serve] connection error: {e}");
                                 }
                             });
@@ -332,6 +339,17 @@ impl Server {
             match self.jobs.try_recv() {
                 Ok(j) => wave.push(j),
                 Err(_) => break,
+            }
+        }
+
+        // Auto speculation is a capability choice. A checkpoint without a
+        // draft head uses serial generation; an explicitly requested fixed
+        // depth still receives the existing unsupported-head error.
+        if !tower.has_drafter() && !tower.has_target_mtp() {
+            for job in &mut wave {
+                if depth_for(job, &self.cfg) == lisa_engine::core::round_cost::AUTO_DEPTH {
+                    job.body["depth"] = json!(0);
+                }
             }
         }
 
@@ -407,7 +425,7 @@ impl Server {
             // (`maximumSpeculativeBatch == 1`), so N concurrent streams pay N
             // sequential prefill+decode passes. Batching them trades per-stream
             // speculation for shared work: measured at equal steps (4 streams
-            // x 64 engine steps, 3 interleaved pairs, `tools/4stream.py`)
+            // x 64 engine steps, 3 interleaved pairs)
             // batched 3.44 s vs serialized MTP 4.71 s = **1.37x**, and ~3x on
             // the worst TTFT (2183 vs 6569 ms). GLM target-MTP uses its own
             // one-cycle-per-session wave path below.
@@ -417,7 +435,7 @@ impl Server {
             // serial paths (tools, stops, logprobs) stay serial either way.
             //
             // Crossover measured on BOTH sides (4 streams x 64 engine steps,
-            // medians of 3 interleaved pairs, `tools/4stream.py`): B=1 MTP
+            // medians of 3 interleaved pairs): B=1 MTP
             // 1.11 s; B=2 MTP 2.22 s vs batched 2.81 s (MTP wins); B=4 MTP
             // 4.71 s vs batched 3.91 s (batched wins). B=3 was measured batched
             // only (3.07 s), so the threshold is 4 BY MEASUREMENT, not by
@@ -425,23 +443,28 @@ impl Server {
             // speculative one (near-tie class, AGENTS.md §9.6).
             const BATCH_WAVE_MIN: usize = 4;
             let target_mtp_model = tower.has_target_mtp();
-            let (spec, wave_jobs): (Vec<Job>, Vec<Job>) = if target_mtp_model {
-                // GLM target-MTP has a one-step drafter. Preserve it for
-                // eligible multi-request waves and let the scheduler
-                // interleave one verified target-MTP round per stream.
-                batch_jobs
-                    .into_iter()
-                    .partition(|job| !is_target_mtp_wave_eligible(job, depth_for(job, &cfg)))
-            } else if batch_jobs.len() >= BATCH_WAVE_MIN {
-                eprintln!(
-                    "[batched] wave of {} jobs -> continuous batch \
+            let (spec, wave_jobs): (Vec<Job>, Vec<Job>) =
+                if !tower.batch_decode_ok() && !target_mtp_model {
+                    // A single-stream tower gains no batching work. Use the
+                    // completion path so its native prefix snapshots are reused.
+                    (batch_jobs, Vec::new())
+                } else if target_mtp_model {
+                    // Preserve GLM's two-draft target-MTP cycle for eligible
+                    // multi-request waves, interleaving one verified round
+                    // per stream.
+                    batch_jobs
+                        .into_iter()
+                        .partition(|job| !is_target_mtp_wave_eligible(job, depth_for(job, &cfg)))
+                } else if batch_jobs.len() >= BATCH_WAVE_MIN {
+                    eprintln!(
+                        "[batched] wave of {} jobs -> continuous batch \
                          (per-stream speculation dropped, maximumSpeculativeBatch == 1)",
-                    batch_jobs.len()
-                );
-                batch_jobs.into_iter().partition(|j| !is_wave_eligible(j))
-            } else {
-                batch_jobs.into_iter().partition(|j| !is_plain_job(j, &cfg))
-            };
+                        batch_jobs.len()
+                    );
+                    batch_jobs.into_iter().partition(|j| !is_wave_eligible(j))
+                } else {
+                    batch_jobs.into_iter().partition(|j| !is_plain_job(j, &cfg))
+                };
             for job in &spec {
                 let why = if depth_for(job, &cfg) > 0 {
                     format!("mtp depth={}", depth_for(job, &cfg))
@@ -451,15 +474,16 @@ impl Server {
                     "stop sequences".to_string()
                 } else if wants_logprobs(&job.body) {
                     "logprobs".to_string()
+                } else if !tower.batch_decode_ok() {
+                    "single-stream model".to_string()
                 } else {
                     "non-chat surface".to_string()
                 };
                 eprintln!("[batched] job serial: {why}");
-                let job = job;
                 let r = if job.surface == Surface::CountTokens {
                     count_tokens_job(tok, &job, chat_tmpl, &cfg)
                 } else if job.surface == Surface::Embeddings {
-                    run_embeddings(tower, tok, &job)
+                    run_embeddings(&self.cfg.model_id, tower, tok, &job)
                 } else {
                     complete(tower, tok, &job, &cfg, &mut self.prefix, chat_tmpl)
                 };
@@ -494,7 +518,7 @@ impl Server {
                     let r = if job.surface == Surface::CountTokens {
                         count_tokens_job(tok, &job, chat_tmpl, &cfg)
                     } else if job.surface == Surface::Embeddings {
-                        run_embeddings(tower, tok, &job)
+                        run_embeddings(&self.cfg.model_id, tower, tok, &job)
                     } else {
                         complete(tower, tok, &job, &cfg, &mut self.prefix, chat_tmpl)
                     };
@@ -509,10 +533,8 @@ impl Server {
                     let _ = job.reply.send(Reply::Error(e.to_string()));
                 }
             } else if !mtp_wave.is_empty() {
-                // GLM's target-conditioned MTP depth is a single verify
-                // opportunity; the requested numeric depth does not alter its
-                // model path. A fixed supported depth keeps this wave on the
-                // speculative scheduler while each request retains its own
+                // GLM uses a fixed two-draft cycle. A supported positive depth
+                // selects this model path while each request retains its own
                 // sampler and output budget.
                 let mut leftover = Vec::new();
                 if let Err(e) = run_wave(
@@ -522,13 +544,22 @@ impl Server {
                     &cfg,
                     chat_tmpl,
                     2,
-                    None,
+                    // The admission ledger currently reserves the initial
+                    // wave as a unit. Defer late requests when it is armed.
+                    self.admission.is_none().then_some(&self.jobs),
                     &mut leftover,
                 ) {
                     eprintln!("[serve] GLM MTP wave error: {e}");
                 }
                 for job in leftover {
-                    if let Err(e) = complete(tower, tok, &job, &cfg, &mut self.prefix, chat_tmpl) {
+                    let result = if job.surface == Surface::CountTokens {
+                        count_tokens_job(tok, &job, chat_tmpl, &cfg)
+                    } else if job.surface == Surface::Embeddings {
+                        run_embeddings(&self.cfg.model_id, tower, tok, &job)
+                    } else {
+                        complete(tower, tok, &job, &cfg, &mut self.prefix, chat_tmpl)
+                    };
+                    if let Err(e) = result {
                         let _ = job.reply.send(Reply::Error(e.to_string()));
                     }
                 }
@@ -556,9 +587,10 @@ impl Server {
 pub fn run_with_stop(
     tower: &mut dyn LanguageModel,
     tok: &Tokenizer,
-    cfg: ServerConfig,
+    mut cfg: ServerConfig,
     stop: std::sync::Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
+    cfg.supports_images = tower.supports_images();
     lisa_engine::core::generate::set_eos_ids_for_model(tok.im_end_ids.clone(), tower);
     let mut server = Server::start(cfg, stop.clone())?;
     println!("lisa serve listening on http://{}", server.local_addr());
@@ -638,7 +670,7 @@ fn build_request(
 
 /// Whether a job can use a stateless scheduler wave: a plain chat completion
 /// that needs none of the features only the serial paths implement (stop
-/// sequences, per-token logprobs, and tool calls).
+/// sequences, per-token logprobs, tool calls and structured output).
 fn is_plain_job(job: &Job, cfg: &ServerConfig) -> bool {
     depth_for(job, cfg) == 0 && is_wave_eligible(job)
 }
@@ -658,14 +690,16 @@ fn is_target_mtp_wave_eligible(job: &Job, depth: usize) -> bool {
 
 /// Everything [`is_plain_job`] requires EXCEPT the depth clause: the features
 /// that genuinely need the serial paths (tool calls, stop sequences, per-token
-/// logprobs, non-chat surfaces, persistent sessions). The wave-level batching
+/// logprobs, structured output, non-chat surfaces, persistent sessions). The wave-level batching
 /// policy may drop a request's SPECULATION, but never these.
 fn is_wave_eligible(job: &Job) -> bool {
-    !has_tools(job)
+    !lisa_engine::models::vision::messages_have_images(&job.body)
+        && !has_tools(job)
         && job.surface == Surface::Chat
         && job.session_id.is_none()
         && request_stops(job).is_empty()
         && !wants_logprobs(&job.body)
+        && response_format_of(&job.body).is_none()
 }
 
 /// Whether a request asked for per-token logprobs.
@@ -713,8 +747,8 @@ fn run_wave(
     }
     let n = jobs.len();
     let mut plens: Vec<usize> = vec![0; n];
-    for (i, r) in reqs.iter().enumerate() {
-        plens[i] = r.prompt.len();
+    for r in &reqs {
+        plens[r.id] = r.prompt.len();
     }
     // Shared between the token callback and the late-arrival poll (which both
     // run inside the scheduler loop) — RefCell keeps the borrows disjoint.
@@ -742,14 +776,25 @@ fn run_wave(
     let replies: Vec<Sender<Reply>> = jobs.iter().map(|j| j.reply.clone()).collect();
     let replies: std::cell::RefCell<Vec<Sender<Reply>>> = std::cell::RefCell::new(replies);
     let jobs: std::cell::RefCell<Vec<Job>> = std::cell::RefCell::new(jobs);
-    let dead: std::cell::RefCell<Vec<bool>> = std::cell::RefCell::new(vec![false; n]);
+    let dead: std::cell::RefCell<Vec<bool>> = std::cell::RefCell::new(dead);
     let plens: std::cell::RefCell<Vec<usize>> = std::cell::RefCell::new(plens);
 
     // A job is admissible to the batch when it is a plain stateless chat
     // completion (see `is_plain_job`); anything else takes a serial path.
-    let is_plain = |job: &Job| is_plain_job(job, cfg);
+    let is_plain = |job: &Job| {
+        if depth > 0 {
+            depth_for(job, cfg) > 0 && is_target_mtp_wave_eligible(job, depth_for(job, cfg))
+        } else {
+            is_plain_job(job, cfg)
+        }
+    };
 
     // Late-arrival poll: pull plain jobs into the batch mid-wave, defer the rest.
+    let decoded = std::cell::RefCell::new(
+        (0..n)
+            .map(|_| IncrementalDecoder::new(tok, false))
+            .collect::<Vec<_>>(),
+    );
     let mut next = || -> Option<lisa_engine::core::sched::Request> {
         let rx = late?;
         loop {
@@ -760,6 +805,9 @@ fn run_wave(
                     Ok(r) => {
                         plens.borrow_mut().push(r.prompt.len());
                         acc.borrow_mut().push(Vec::new());
+                        decoded
+                            .borrow_mut()
+                            .push(IncrementalDecoder::new(tok, false));
                         stopped.borrow_mut().push(false);
                         last.borrow_mut().push(String::new());
                         last_reasoning.borrow_mut().push(String::new());
@@ -798,7 +846,9 @@ fn run_wave(
         }
         acc.borrow_mut()[id].push(t);
         if stream_flags.borrow()[id] {
-            let text = tok.decode(&acc.borrow()[id])?;
+            let mut decoded = decoded.borrow_mut();
+            decoded[id].push(t)?;
+            let text = decoded[id].stable_text();
             let thinking = request_thinking(&jobs.borrow()[id].body, cfg);
             let (reasoning, content) = streaming_sections(&text, thinking);
             let reasoning = reasoning.to_string();
@@ -820,7 +870,14 @@ fn run_wave(
     if depth == 0 {
         lisa_engine::core::sched::run_streaming(tower, reqs, cfg.max_batch, &mut emit, &mut next)?;
     } else {
-        lisa_engine::core::sched::run(tower, reqs, cfg.max_batch, depth, &mut emit)?;
+        lisa_engine::core::sched::run_speculative_streaming(
+            tower,
+            reqs,
+            cfg.max_batch,
+            depth,
+            &mut emit,
+            &mut next,
+        )?;
     }
 
     let n = jobs.borrow().len();
@@ -928,7 +985,9 @@ fn run_session(
     // String-suffix path (canonical template only): feed only the messages
     // after the shared prefix. On divergence, rewind the recurrent state to the
     // snapshot taken at that message boundary first.
-    let string_suffix: Option<Vec<u32>> = if tmpl.is_some() && k > 0 {
+    // Native DeepSeek uses exact token-prefix matching below: its EOS closes
+    // the prior assistant, and the final emitted token may still be unfed.
+    let string_suffix: Option<Vec<u32>> = if tmpl.is_some_and(|t| !t.deepseek41) && k > 0 {
         if diverges && sess.restore_snapshot(tower, k).is_none() {
             let mut s = Session::new(tower);
             s.enable_snapshots();
@@ -986,7 +1045,8 @@ fn run_session(
     let max_tokens = request_max_tokens(job, cfg);
     let mut sampler = sampler_from(&job.body, cfg);
     let greedy = !tower.has_target_mtp() && sampler.greedy() && !sampler.mtp_exact_sampling;
-    let dsml_tools = !tools.is_empty() && tower.has_target_mtp();
+    let native_dsml = tmpl.is_some_and(|t| t.deepseek41);
+    let dsml_tools = !tools.is_empty() && (tower.has_target_mtp() || native_dsml);
     let streaming = job.stream;
     if streaming {
         let _ = job.reply.send(Reply::Start {
@@ -1008,16 +1068,20 @@ fn run_session(
         .unwrap_or(false);
     let _eos_scope = ignore_eos.then(lisa_engine::core::generate::ignore_eos_scope);
     let mut acc: Vec<u32> = Vec::new();
+    let mut decoded = IncrementalDecoder::new(tok, false);
     let mut last = String::new();
     let mut last_reasoning = String::new();
     let hit_stop = std::cell::Cell::new(false);
+    let tool_mode = std::cell::Cell::new(TargetMtpSamplingMode::Configured);
+    let mut tool_parser = streaming::DsmlParser::for_template(thinking, native_dsml);
     let mut emit = |t: u32| -> anyhow::Result<()> {
         if is_eos(t) {
             return Ok(());
         }
         acc.push(t);
+        decoded.push(t)?;
+        let text = decoded.text();
         if !stops.is_empty() {
-            let text = tok.decode(&acc)?;
             if stops
                 .iter()
                 .any(|s| !s.is_empty() && text.contains(s.as_str()))
@@ -1044,13 +1108,10 @@ fn run_session(
             }
         }
         if streaming {
-            let text = tok.decode(&acc)?;
-            let safe_len = streaming_stop_safe_len(&text, &stops);
-            let (reasoning, answer) = streaming_sections(&text[..safe_len], thinking);
-            let shown = match tool_call_start(answer) {
-                Some(i) => answer[..i].to_string(),
-                None => answer.to_string(),
-            };
+            let stable = decoded.stable_text();
+            let safe_len = streaming_stop_safe_len(stable, &stops);
+            let (reasoning, answer) = streaming_sections(&stable[..safe_len], thinking);
+            let shown = answer[..deepseek41::visible_end(answer)].to_string();
             let content_delta = stream_delta(&last, &shown);
             let reasoning_delta = stream_delta(&last_reasoning, reasoning);
             if content_delta.is_some() || reasoning_delta.is_some() {
@@ -1063,9 +1124,17 @@ fn run_session(
             last = shown;
             last_reasoning = reasoning.to_string();
         }
-        if dsml_tools && dsml_decode_state(&tok.decode(&acc)?, thinking) == DsmlDecodeState::Done {
-            hit_stop.set(true);
-            return Err(anyhow::anyhow!("tool call complete"));
+        if dsml_tools {
+            let state = tool_parser.update(text);
+            tool_mode.set(if state == DsmlDecodeState::Greedy {
+                TargetMtpSamplingMode::Greedy
+            } else {
+                TargetMtpSamplingMode::Configured
+            });
+            if state == DsmlDecodeState::Done {
+                hit_stop.set(true);
+                return Err(anyhow::anyhow!("tool call complete"));
+            }
         }
         Ok(())
     };
@@ -1079,12 +1148,9 @@ fn run_session(
     let generated = if depth > 0 {
         let md = mtp_depth(depth, tower);
         if dsml_tools {
-            let mut sampling_tokens = Vec::new();
             let mut on_token_with_mode = |token| {
                 emit(token)?;
-                sampling_tokens.push(token);
-                let output = tok.decode(&sampling_tokens)?;
-                Ok(dsml_sampling_mode(&output, thinking))
+                Ok(tool_mode.get())
             };
             sess.generate_mtp_depth_with_sampling_mode(
                 tower,
@@ -1107,12 +1173,9 @@ fn run_session(
             )
         }
     } else if dsml_tools {
-        let mut sampling_tokens = Vec::new();
         let mut on_token_with_mode = |token| {
             emit(token)?;
-            sampling_tokens.push(token);
-            let output = tok.decode(&sampling_tokens)?;
-            Ok(dsml_sampling_mode(&output, thinking))
+            Ok(tool_mode.get())
         };
         sess.generate_with_sampling_mode(
             tower,
@@ -1218,7 +1281,7 @@ fn common_prefix(a: &[u32], b: &[u32]) -> usize {
     i
 }
 
-fn models_payload(id: &str) -> Value {
+fn models_payload(id: &str, supports_images: bool) -> Value {
     json!({
         "object": "list",
         "data": [{
@@ -1226,14 +1289,19 @@ fn models_payload(id: &str) -> Value {
             "object": "model",
             "owned_by": "lisa",
             "architecture": {
-                "input_modalities": ["text"],
+                "input_modalities": if supports_images { json!(["text", "image"]) } else { json!(["text"]) },
                 "output_modalities": ["text"]
             }
         }]
     })
 }
 
-fn handle_conn(mut stream: TcpStream, tx: Sender<Job>, cfg: &ServerConfig) -> anyhow::Result<()> {
+fn handle_conn(
+    api: &ApiState,
+    mut stream: TcpStream,
+    tx: Sender<Job>,
+    cfg: &ServerConfig,
+) -> anyhow::Result<()> {
     let req = match read_request(&mut stream) {
         Ok(Some(r)) => r,
         Ok(None) => return Ok(()),
@@ -1245,7 +1313,6 @@ fn handle_conn(mut stream: TcpStream, tx: Sender<Job>, cfg: &ServerConfig) -> an
                 "400 Bad Request",
                 "application/json",
                 payload.to_string().as_bytes(),
-                "",
             );
             return Ok(());
         }
@@ -1258,17 +1325,15 @@ fn handle_conn(mut stream: TcpStream, tx: Sender<Job>, cfg: &ServerConfig) -> an
             "200 OK",
             "application/json",
             payload.to_string().as_bytes(),
-            "",
         );
     }
     if method == "GET" && path.starts_with("/v1/models") {
-        let payload = models_payload(model_id());
+        let payload = models_payload(&cfg.model_id, cfg.supports_images);
         return write_response(
             &mut stream,
             "200 OK",
             "application/json",
             payload.to_string().as_bytes(),
-            "",
         );
     }
     if method == "POST" && (path == "/v1/chat/completions" || path == "/v1/completions") {
@@ -1277,31 +1342,36 @@ fn handle_conn(mut stream: TcpStream, tx: Sender<Job>, cfg: &ServerConfig) -> an
         } else {
             Surface::Chat
         };
-        return dispatch_or_400(&mut stream, &body, tx, cfg, surface);
+        return dispatch_or_400(api, &mut stream, &body, tx, cfg, surface);
     }
     if method == "POST" && path == "/v1/messages" {
-        return dispatch_or_400(&mut stream, &body, tx, cfg, Surface::Messages);
+        return dispatch_or_400(api, &mut stream, &body, tx, cfg, Surface::Messages);
     }
     if method == "POST" && path == "/v1/messages/count_tokens" {
-        return dispatch_or_400(&mut stream, &body, tx, cfg, Surface::CountTokens);
+        return dispatch_or_400(api, &mut stream, &body, tx, cfg, Surface::CountTokens);
     }
     if method == "POST" && path == "/v1/responses" {
-        return dispatch_or_400(&mut stream, &body, tx, cfg, Surface::Responses);
+        return dispatch_or_400(api, &mut stream, &body, tx, cfg, Surface::Responses);
     }
     if method == "POST" && path == "/v1/embeddings" {
-        return dispatch_or_400(&mut stream, &body, tx, cfg, Surface::Embeddings);
+        return dispatch_or_400(api, &mut stream, &body, tx, cfg, Surface::Embeddings);
     }
     if method == "GET" && path.starts_with("/v1/responses/") {
         let id = path.trim_start_matches("/v1/responses/").to_string();
-        let payload = stored_response(&id).unwrap_or_else(
+        let stored = api.response(&id);
+        let status = if stored.is_some() {
+            "200 OK"
+        } else {
+            "404 Not Found"
+        };
+        let payload = stored.unwrap_or_else(
             || json!({"error": {"message": "response not found", "type": "invalid_request_error"}}),
         );
         return write_response(
             &mut stream,
-            "200 OK",
+            status,
             "application/json",
             payload.to_string().as_bytes(),
-            "",
         );
     }
 
@@ -1310,21 +1380,6 @@ fn handle_conn(mut stream: TcpStream, tx: Sender<Job>, cfg: &ServerConfig) -> an
         "404 Not Found",
         "application/json",
         br#"{"error":{"message":"not found"}}"#,
-        "",
-    )
-}
-
-/// Rate/quota headers advertised on every response (llmprobe's frontier
-/// rate-limit check, and honest for a single-stream server).
-fn rate_headers() -> String {
-    static SERVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    const LIMIT: u64 = 100_000;
-    let n = SERVED.fetch_add(1, Ordering::Relaxed);
-    let remaining = LIMIT.saturating_sub(n + 1);
-    format!(
-        "X-RateLimit-Limit-Requests: {LIMIT}\r\n\
-         X-RateLimit-Remaining-Requests: {remaining}\r\n\
-         X-RateLimit-Reset-Requests: 1s"
     )
 }
 
@@ -1348,13 +1403,14 @@ fn normalize_completion_prompt(body: &mut Value) {
 
 /// Run a completion handler, turning client-shape errors into a 400.
 fn dispatch_or_400(
+    api: &ApiState,
     stream: &mut TcpStream,
     body: &[u8],
     tx: Sender<Job>,
     cfg: &ServerConfig,
     surface: Surface,
 ) -> anyhow::Result<()> {
-    if let Err(e) = dispatch_completion(stream, body, tx, cfg, surface) {
+    if let Err(e) = dispatch_completion(api, stream, body, tx, cfg, surface) {
         let payload = if surface == Surface::Messages {
             json!({"type": "error", "error": {"type": "invalid_request_error", "message": e.to_string()}})
         } else {
@@ -1365,21 +1421,22 @@ fn dispatch_or_400(
             "400 Bad Request",
             "application/json",
             payload.to_string().as_bytes(),
-            "",
         );
     }
     Ok(())
 }
 
 fn dispatch_completion(
+    api: &ApiState,
     stream: &mut TcpStream,
     body: &[u8],
     tx: Sender<Job>,
-    _cfg: &ServerConfig,
+    cfg: &ServerConfig,
     surface: Surface,
 ) -> anyhow::Result<()> {
     let mut body: Value =
         serde_json::from_slice(body).map_err(|e| anyhow::anyhow!("invalid JSON body: {e}"))?;
+    anyhow::ensure!(body.is_object(), "request body must be a JSON object");
     match surface {
         Surface::Completions => normalize_completion_prompt(&mut body),
         Surface::Messages | Surface::CountTokens => normalize_messages_body(&mut body),
@@ -1388,7 +1445,7 @@ fn dispatch_completion(
         Surface::Embeddings => {}
     }
     if surface == Surface::Responses {
-        apply_previous_response(&mut body);
+        api.extend_conversation(&mut body)?;
     }
     if surface == Surface::Messages && body.get("max_tokens").is_none() {
         // Anthropic's spec makes `max_tokens` required.
@@ -1398,8 +1455,43 @@ fn dispatch_completion(
         // Validate the request shape up front so client errors are 400s, not 500s.
         parse_messages(&body)?;
     }
-    // `background: true` runs the job off the request (llmprobe checks the
-    // immediate status is queued/in_progress).
+    anyhow::ensure!(
+        response_format_of(&body).is_none()
+            || body.get("session_id").and_then(Value::as_str).is_none(),
+        "structured output does not support session_id; send complete message history"
+    );
+    if lisa_engine::models::vision::messages_have_images(&body) {
+        anyhow::ensure!(
+            cfg.supports_images,
+            "the loaded checkpoint does not support image input"
+        );
+        anyhow::ensure!(
+            body.get("session_id").is_none(),
+            "image requests must include full message history and omit session_id"
+        );
+        anyhow::ensure!(
+            surface != Surface::CountTokens,
+            "image token counting requires the vision encoder; use completion usage"
+        );
+        lisa_engine::models::vision::decode_message_images(&body)?;
+    }
+    let stream_mode = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let n = match body.get("n") {
+        None => 1,
+        Some(value) => value
+            .as_u64()
+            .filter(|n| (1..=16).contains(n))
+            .ok_or_else(|| anyhow::anyhow!("n must be an integer between 1 and 16"))?
+            as usize,
+    };
+    anyhow::ensure!(
+        n == 1 || (!stream_mode && matches!(surface, Surface::Chat | Surface::Completions)),
+        "multiple choices require non-streaming chat or completions"
+    );
+    // Background Responses return a queued resource and retain the final result.
     if surface == Surface::Responses
         && body
             .get("background")
@@ -1407,47 +1499,41 @@ fn dispatch_completion(
             .unwrap_or(false)
     {
         let id = response_id();
+        let mut payload = empty_response_resource(api, &id, "queued");
+        payload["background"] = json!(true);
         let (rtx, rrx) = mpsc::channel::<Reply>();
-        if tx
-            .send(Job {
-                body,
-                stream: false,
-                session_id: None,
-                surface,
-                reply: rtx,
-            })
-            .is_err()
-        {
-            anyhow::bail!("engine worker is gone");
-        }
+        tx.send(Job {
+            body: body.clone(),
+            stream: false,
+            session_id: None,
+            surface,
+            reply: rtx,
+        })
+        .map_err(|_| anyhow::anyhow!("engine worker is gone"))?;
+        api.store(&id, payload.clone(), None);
         let key = id.clone();
-        std::thread::spawn(move || {
-            if let Ok(d) = drain_reply(rrx) {
-                store_response(&key, responses_payload_with_id(&d, &key));
+        let background_api = api.clone();
+        std::thread::spawn(move || match drain_reply(rrx) {
+            Ok(d) => {
+                let mut payload = responses_payload_with_id(&background_api, &d, &key);
+                payload["background"] = json!(true);
+                store_conversation(&background_api, &key, &body, &d, &payload);
             }
-        });
-        let payload = json!({
-            "id": id,
-            "object": "response",
-            "created_at": now(),
-            "status": "queued",
-            "model": model_id(),
-            "output": [],
-            "output_text": "",
-            "usage": Value::Null,
+            Err(error) => {
+                let mut payload = empty_response_resource(&background_api, &key, "failed");
+                payload["background"] = json!(true);
+                payload["error"] =
+                    json!({"code": "engine_error", "message": error_message_for(&error)});
+                background_api.store(&key, payload, None);
+            }
         });
         return write_response(
             stream,
             "200 OK",
             "application/json",
             payload.to_string().as_bytes(),
-            "",
         );
     }
-    let stream_mode = body
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
     let include_usage = body
         .get("stream_options")
         .and_then(|v| v.get("include_usage"))
@@ -1457,10 +1543,8 @@ fn dispatch_completion(
         .get("session_id")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let n = body.get("n").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as usize;
-
-    if n > 1 && !stream_mode && (surface == Surface::Chat || surface == Surface::Completions) {
-        return collect_choices(stream, &body, tx, n, surface);
+    if n > 1 {
+        return collect_choices(api, stream, &body, tx, n, surface);
     }
 
     let (rtx, rrx) = mpsc::channel::<Reply>();
@@ -1477,1140 +1561,12 @@ fn dispatch_completion(
         return collect_count_tokens(stream, rrx);
     }
     if stream_mode {
-        stream_surface(stream, rrx, include_usage, surface, &body)
+        stream_surface(api, stream, rrx, include_usage, surface, &body)
     } else {
-        collect_surface(stream, rrx, surface, &body)
+        collect_surface(api, stream, rrx, surface, &body)
     }
 }
 
-/// A fully-collected engine reply.
-struct ReplyData {
-    content: String,
-    reasoning: Option<String>,
-    tool_calls: Vec<Value>,
-    prompt_tokens: usize,
-    completion_tokens: usize,
-    cached_tokens: usize,
-    finish: String,
-    logprobs: Option<Value>,
-    stop_sequence: Option<String>,
-}
-
-fn drain_reply(rx: Receiver<Reply>) -> anyhow::Result<ReplyData> {
-    let mut content = String::new();
-    loop {
-        match rx.recv() {
-            Ok(Reply::Start { .. }) => {}
-            Ok(Reply::Delta { text, .. }) => content.push_str(&text),
-            Ok(Reply::Done {
-                content: c,
-                reasoning,
-                tool_calls,
-                prompt_tokens,
-                completion_tokens,
-                cached_tokens,
-                finish,
-                logprobs,
-                stop_sequence,
-            }) => {
-                return Ok(ReplyData {
-                    content: c,
-                    reasoning,
-                    tool_calls,
-                    prompt_tokens,
-                    completion_tokens,
-                    cached_tokens,
-                    finish,
-                    logprobs,
-                    stop_sequence,
-                });
-            }
-            Ok(Reply::Error(e)) => anyhow::bail!("{e}"),
-            Ok(Reply::Refused {
-                retry_after_s,
-                reason,
-            }) => anyhow::bail!("{REFUSED_MARKER}retry-after={retry_after_s}; {reason}"),
-            Err(_) => anyhow::bail!("engine worker dropped the request"),
-        }
-    }
-}
-
-/// Log-softmax probability of `token` under `logits` — re-exported from
-/// lisa-engine's sampler so this crate doesn't depend on the tensor runtime.
-use lisa_engine::sampler::token_logprob;
-
-fn prompt_tokens_details_json(prompt_tokens: usize, cached_tokens: usize) -> Value {
-    let cached_tokens = cached_tokens.min(prompt_tokens);
-    let cache_write_tokens = prompt_tokens.saturating_sub(cached_tokens);
-    json!({
-        "cached_tokens": cached_tokens,
-        "cache_write_tokens": cache_write_tokens,
-    })
-}
-
-fn usage_json(prompt_tokens: usize, completion_tokens: usize, cached_tokens: usize) -> Value {
-    json!({
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        // Match DS4's cache accounting and expose prefix-cache hits to clients.
-        "prompt_tokens_details": prompt_tokens_details_json(prompt_tokens, cached_tokens),
-        "total_tokens": prompt_tokens + completion_tokens,
-    })
-}
-
-fn chat_message(d: &ReplyData) -> Value {
-    let mut message = json!({ "role": "assistant", "content": d.content });
-    if let Some(r) = &d.reasoning {
-        message["reasoning_content"] = json!(r);
-    }
-    if !d.tool_calls.is_empty() {
-        message["tool_calls"] = json!(d.tool_calls);
-    }
-    message
-}
-
-fn chat_choice(d: &ReplyData, index: usize) -> Value {
-    let mut choice = json!({
-        "index": index,
-        "message": chat_message(d),
-        "finish_reason": d.finish,
-    });
-    if let Some(lp) = &d.logprobs {
-        choice["logprobs"] = lp.clone();
-    }
-    choice
-}
-
-fn completion_choice(d: &ReplyData, index: usize) -> Value {
-    json!({
-        "index": index,
-        "text": d.content,
-        "logprobs": d.logprobs,
-        "finish_reason": d.finish,
-    })
-}
-
-fn single_payload(d: &ReplyData, surface: Surface) -> Value {
-    let object = if surface == Surface::Completions {
-        "text_completion"
-    } else {
-        "chat.completion"
-    };
-    let choice = if surface == Surface::Completions {
-        completion_choice(d, 0)
-    } else {
-        chat_choice(d, 0)
-    };
-    json!({
-        "id": completion_id(),
-        "object": object,
-        "created": now(),
-        "model": model_id(),
-        "choices": [choice],
-        "usage": usage_json(d.prompt_tokens, d.completion_tokens, d.cached_tokens),
-    })
-}
-
-fn collect_surface(
-    stream: &mut TcpStream,
-    rx: Receiver<Reply>,
-    surface: Surface,
-    req_body: &Value,
-) -> anyhow::Result<()> {
-    let d = match drain_reply(rx) {
-        Ok(d) => d,
-        Err(e) => {
-            let payload =
-                json!({"error": {"message": error_message_for(&e), "type": "engine_error"}});
-            return write_response(
-                stream,
-                http_status_for(&e),
-                "application/json",
-                payload.to_string().as_bytes(),
-                &rate_headers(),
-            );
-        }
-    };
-    let payload = match surface {
-        Surface::Messages => messages_payload(&d),
-        Surface::Responses => {
-            let id = response_id();
-            let p = responses_payload_with_id(&d, &id);
-            store_conversation(&id, req_body, &d, &p);
-            p
-        }
-        // The embeddings job serializes its whole OpenAI payload itself.
-        Surface::Embeddings => serde_json::from_str(&d.content)
-            .unwrap_or_else(|_| json!({"error": {"message": "embedding payload corrupt"}})),
-        _ => single_payload(&d, surface),
-    };
-    write_response(
-        stream,
-        "200 OK",
-        "application/json",
-        payload.to_string().as_bytes(),
-        &rate_headers(),
-    )
-}
-
-/// Anthropic Messages response body.
-fn messages_payload(d: &ReplyData) -> Value {
-    let mut content: Vec<Value> = Vec::new();
-    if let Some(r) = &d.reasoning {
-        if !r.is_empty() {
-            content.push(json!({ "type": "thinking", "thinking": r, "signature": "" }));
-        }
-    }
-    if !d.content.is_empty() {
-        content.push(json!({ "type": "text", "text": d.content }));
-    }
-    for c in &d.tool_calls {
-        let name = c
-            .get("function")
-            .and_then(|f| f.get("name"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let args = c
-            .get("function")
-            .and_then(|f| f.get("arguments"))
-            .map(|a| match a {
-                Value::String(s) => serde_json::from_str::<Value>(s).unwrap_or(json!({})),
-                other => other.clone(),
-            })
-            .unwrap_or(json!({}));
-        content.push(json!({
-            "type": "tool_use",
-            "id": c.get("id").cloned().unwrap_or(json!("")),
-            "name": name,
-            "input": args,
-        }));
-    }
-    let (stop_reason, stop_sequence) = if let Some(sq) = &d.stop_sequence {
-        ("stop_sequence", json!(sq))
-    } else {
-        (
-            match d.finish.as_str() {
-                "tool_calls" => "tool_use",
-                "length" => "max_tokens",
-                _ => "end_turn",
-            },
-            Value::Null,
-        )
-    };
-    json!({
-        "id": format!("msg_{:x}{:x}", now(), SEQ.fetch_add(1, Ordering::Relaxed)),
-        "type": "message",
-        "role": "assistant",
-        "model": model_id(),
-        "content": content,
-        "stop_reason": stop_reason,
-        "stop_sequence": stop_sequence,
-        "usage": {
-            "input_tokens": d.prompt_tokens,
-            "output_tokens": d.completion_tokens,
-        },
-    })
-}
-
-/// OpenAI Responses resource.
-fn empty_response_resource(id: &str, status: &str) -> Value {
-    json!({
-        "id": id,
-        "object": "response",
-        "created_at": now(),
-        "completed_at": Value::Null,
-        "status": status,
-        "incomplete_details": Value::Null,
-        "model": model_id(),
-        "previous_response_id": Value::Null,
-        "instructions": Value::Null,
-        "output": [],
-        "error": Value::Null,
-        "tools": [],
-        "tool_choice": "auto",
-        "truncation": "disabled",
-        "parallel_tool_calls": true,
-        "text": { "format": { "type": "text" } },
-        "top_p": 1.0,
-        "presence_penalty": 0.0,
-        "frequency_penalty": 0.0,
-        "top_logprobs": 0,
-        "temperature": 1.0,
-        "reasoning": Value::Null,
-        "usage": Value::Null,
-        "max_output_tokens": Value::Null,
-        "max_tool_calls": Value::Null,
-        "store": true,
-        "background": false,
-        "service_tier": "default",
-        "metadata": {},
-        "safety_identifier": Value::Null,
-        "prompt_cache_key": Value::Null,
-    })
-}
-
-fn responses_payload_with_id(d: &ReplyData, id: &str) -> Value {
-    let mut output: Vec<Value> = Vec::new();
-    if let Some(r) = &d.reasoning {
-        if !r.is_empty() {
-            output.push(json!({
-                "type": "reasoning",
-                "id": format!("rs_{:x}", now()),
-                "summary": [{ "type": "summary_text", "text": r }],
-            }));
-        }
-    }
-    if !d.content.is_empty() {
-        output.push(json!({
-            "type": "message",
-            "id": format!("msg_{:x}", now()),
-            "status": "completed",
-            "role": "assistant",
-            "content": [{ "type": "output_text", "text": d.content, "annotations": [] }],
-        }));
-    }
-    for c in &d.tool_calls {
-        output.push(json!({
-            "type": "function_call",
-            "id": format!("fc_{:x}", now()),
-            "call_id": c.get("id").cloned().unwrap_or(json!("")),
-            "name": c.get("function").and_then(|f| f.get("name")).cloned().unwrap_or(json!("")),
-            "arguments": c.get("function").and_then(|f| f.get("arguments")).cloned().unwrap_or(json!("")),
-            "status": "completed",
-        }));
-    }
-    let incomplete = d.finish == "length";
-    let mut resp = empty_response_resource(
-        id,
-        if incomplete {
-            "incomplete"
-        } else {
-            "completed"
-        },
-    );
-    resp["completed_at"] = if incomplete {
-        Value::Null
-    } else {
-        json!(now())
-    };
-    resp["output"] = Value::Array(output);
-    resp["output_text"] = json!(d.content);
-    resp["usage"] = json!({
-        "input_tokens": d.prompt_tokens,
-        "output_tokens": d.completion_tokens,
-        "total_tokens": d.prompt_tokens + d.completion_tokens,
-        "input_tokens_details": prompt_tokens_details_json(d.prompt_tokens, d.cached_tokens),
-        "output_tokens_details": { "reasoning_tokens": 0 },
-    });
-    if incomplete {
-        resp["incomplete_details"] = json!({ "reason": "max_output_tokens" });
-    }
-    resp
-}
-
-/// `n > 1`: run `n` independent generations (distinct seeds) and merge them into
-/// one choices array.
-fn collect_choices(
-    stream: &mut TcpStream,
-    body: &Value,
-    tx: Sender<Job>,
-    n: usize,
-    surface: Surface,
-) -> anyhow::Result<()> {
-    let base = body
-        .get("seed")
-        .and_then(|v| v.as_u64())
-        .filter(|&v| v != 0)
-        .unwrap_or(0x9E37_79B9_7F4A_7C15);
-    let mut choices = Vec::with_capacity(n);
-    let mut prompt_tokens = 0;
-    let mut completion_tokens = 0;
-    let mut cached_tokens = 0;
-    for i in 0..n {
-        let mut b = body.clone();
-        b["seed"] = json!(base.wrapping_add(i as u64));
-        let (rtx, rrx) = mpsc::channel::<Reply>();
-        tx.send(Job {
-            body: b,
-            stream: false,
-            session_id: None,
-            surface,
-            reply: rtx,
-        })
-        .map_err(|_| anyhow::anyhow!("engine worker is gone"))?;
-        let d = match drain_reply(rrx) {
-            Ok(d) => d,
-            Err(e) => {
-                let payload =
-                    json!({"error": {"message": error_message_for(&e), "type": "engine_error"}});
-                return write_response(
-                    stream,
-                    http_status_for(&e),
-                    "application/json",
-                    payload.to_string().as_bytes(),
-                    &rate_headers(),
-                );
-            }
-        };
-        prompt_tokens = d.prompt_tokens;
-        cached_tokens = d.cached_tokens;
-        completion_tokens += d.completion_tokens;
-        choices.push(if surface == Surface::Completions {
-            completion_choice(&d, i)
-        } else {
-            chat_choice(&d, i)
-        });
-    }
-    let object = if surface == Surface::Completions {
-        "text_completion"
-    } else {
-        "chat.completion"
-    };
-    let payload = json!({
-        "id": completion_id(),
-        "object": object,
-        "created": now(),
-        "model": model_id(),
-        "choices": choices,
-        "usage": usage_json(prompt_tokens, completion_tokens, cached_tokens),
-    });
-    write_response(
-        stream,
-        "200 OK",
-        "application/json",
-        payload.to_string().as_bytes(),
-        &rate_headers(),
-    )
-}
-
-fn stream_surface(
-    stream: &mut TcpStream,
-    rx: Receiver<Reply>,
-    include_usage: bool,
-    surface: Surface,
-    req_body: &Value,
-) -> anyhow::Result<()> {
-    let mut head = String::from(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n",
-    );
-    head.push_str(&rate_headers());
-    head.push_str("\r\n\r\n");
-    stream.write_all(head.as_bytes())?;
-    match surface {
-        Surface::Completions => stream_completions(stream, rx, include_usage),
-        Surface::Messages => stream_messages(stream, rx),
-        Surface::Responses => stream_responses(stream, rx, req_body),
-        _ => stream_chat(stream, rx, include_usage),
-    }
-}
-
-fn stream_chunk(object: &str, id: &str, choice: Value) -> Value {
-    json!({
-        "id": id,
-        "object": object,
-        "created": now(),
-        "model": model_id(),
-        "choices": [choice],
-    })
-}
-
-fn stream_chat(
-    stream: &mut TcpStream,
-    rx: Receiver<Reply>,
-    include_usage: bool,
-) -> anyhow::Result<()> {
-    let id = completion_id();
-    let chunk = |delta: Value, finish: Value, logprobs: Option<Value>| {
-        let mut choice = json!({ "index": 0, "delta": delta, "finish_reason": finish });
-        if let Some(lp) = logprobs {
-            choice["logprobs"] = lp;
-        }
-        stream_chunk("chat.completion.chunk", &id, choice)
-    };
-    write_sse(
-        stream,
-        &chunk(json!({"role": "assistant"}), Value::Null, None),
-    )?;
-
-    for reply in rx {
-        match reply {
-            Reply::Start { .. } => {}
-            Reply::Delta {
-                text,
-                reasoning,
-                logprobs,
-            } => {
-                let mut delta = json!({});
-                if !text.is_empty() || logprobs.is_some() {
-                    delta["content"] = json!(text);
-                }
-                if let Some(reasoning) = reasoning {
-                    delta["reasoning_content"] = json!(reasoning);
-                }
-                if !delta.as_object().map_or(true, |object| object.is_empty()) {
-                    write_sse(stream, &chunk(delta, Value::Null, logprobs))?;
-                }
-            }
-            Reply::Done {
-                finish,
-                tool_calls,
-                prompt_tokens,
-                completion_tokens,
-                cached_tokens,
-                ..
-            } => {
-                if !tool_calls.is_empty() {
-                    let deltas: Vec<Value> = tool_calls
-                        .iter()
-                        .enumerate()
-                        .map(|(i, c)| {
-                            json!({
-                                "index": i,
-                                "id": c.get("id"),
-                                "type": "function",
-                                "function": c.get("function"),
-                            })
-                        })
-                        .collect();
-                    write_sse(
-                        stream,
-                        &chunk(json!({"tool_calls": deltas}), Value::Null, None),
-                    )?;
-                }
-                write_sse(stream, &chunk(json!({}), json!(finish), None))?;
-                if include_usage {
-                    let usage = json!({
-                        "id": id,
-                        "object": "chat.completion.chunk",
-                        "created": now(),
-                        "model": model_id(),
-                        "choices": [],
-                        "usage": usage_json(prompt_tokens, completion_tokens, cached_tokens),
-                    });
-                    write_sse(stream, &usage)?;
-                }
-                write_chunk(stream, b"data: [DONE]\n\n")?;
-                write_chunk(stream, b"")?;
-                break;
-            }
-            Reply::Refused {
-                retry_after_s,
-                reason,
-            } => {
-                write_sse(
-                    stream,
-                    &json!({"error": {"message": reason, "type": "insufficient_memory", "retry_after_s": retry_after_s}}),
-                )?;
-                write_chunk(stream, b"")?;
-                break;
-            }
-            Reply::Error(e) => {
-                write_sse(stream, &json!({"error": {"message": e}}))?;
-                write_chunk(stream, b"")?;
-                break;
-            }
-        }
-    }
-    stream.flush().ok();
-    Ok(())
-}
-
-fn stream_completions(
-    stream: &mut TcpStream,
-    rx: Receiver<Reply>,
-    include_usage: bool,
-) -> anyhow::Result<()> {
-    let id = completion_id();
-    for reply in rx {
-        match reply {
-            Reply::Start { .. } => {}
-            Reply::Delta { text, .. } => {
-                write_sse(
-                    stream,
-                    &stream_chunk(
-                        "text_completion",
-                        &id,
-                        json!({ "index": 0, "text": text, "finish_reason": Value::Null }),
-                    ),
-                )?;
-            }
-            Reply::Done {
-                finish,
-                prompt_tokens,
-                completion_tokens,
-                cached_tokens,
-                ..
-            } => {
-                write_sse(
-                    stream,
-                    &stream_chunk(
-                        "text_completion",
-                        &id,
-                        json!({ "index": 0, "text": "", "finish_reason": finish }),
-                    ),
-                )?;
-                if include_usage {
-                    let usage = json!({
-                        "id": id,
-                        "object": "text_completion",
-                        "created": now(),
-                        "model": model_id(),
-                        "choices": [],
-                        "usage": usage_json(prompt_tokens, completion_tokens, cached_tokens),
-                    });
-                    write_sse(stream, &usage)?;
-                }
-                write_chunk(stream, b"data: [DONE]\n\n")?;
-                write_chunk(stream, b"")?;
-                break;
-            }
-            Reply::Refused {
-                retry_after_s,
-                reason,
-            } => {
-                write_sse(
-                    stream,
-                    &json!({"error": {"message": reason, "type": "insufficient_memory", "retry_after_s": retry_after_s}}),
-                )?;
-                write_chunk(stream, b"")?;
-                break;
-            }
-            Reply::Error(e) => {
-                write_sse(stream, &json!({"error": {"message": e}}))?;
-                write_chunk(stream, b"")?;
-                break;
-            }
-        }
-    }
-    stream.flush().ok();
-    Ok(())
-}
-
-/// Write one SSE event (`event:` line optional) with a JSON `data:` payload.
-fn sse_event(stream: &mut TcpStream, event: Option<&str>, payload: &Value) -> std::io::Result<()> {
-    let mut body = String::new();
-    if let Some(e) = event {
-        body.push_str("event: ");
-        body.push_str(e);
-        body.push('\n');
-    }
-    body.push_str("data: ");
-    body.push_str(&payload.to_string());
-    body.push_str("\n\n");
-    write_chunk(stream, body.as_bytes())
-}
-
-fn stream_messages(stream: &mut TcpStream, rx: Receiver<Reply>) -> anyhow::Result<()> {
-    let id = format!("msg_{:x}{:x}", now(), SEQ.fetch_add(1, Ordering::Relaxed));
-    let mut started = false;
-    let mut block_index = 0usize;
-    let mut text_started = false;
-    let mut thinking_started = false;
-    for reply in rx {
-        match reply {
-            Reply::Start { prompt_tokens } => {
-                if !started {
-                    started = true;
-                    sse_event(
-                        stream,
-                        Some("message_start"),
-                        &json!({
-                            "type": "message_start",
-                            "message": {
-                                "id": id,
-                                "type": "message",
-                                "role": "assistant",
-                                "model": model_id(),
-                                "content": [],
-                                "stop_reason": Value::Null,
-                                "stop_sequence": Value::Null,
-                                "usage": { "input_tokens": prompt_tokens, "output_tokens": 0 },
-                            }
-                        }),
-                    )?;
-                }
-            }
-            Reply::Delta {
-                text, reasoning, ..
-            } => {
-                if let Some(reasoning) = reasoning.filter(|r| !r.is_empty()) {
-                    if text_started {
-                        sse_event(
-                            stream,
-                            Some("content_block_stop"),
-                            &json!({ "type": "content_block_stop", "index": block_index }),
-                        )?;
-                        block_index += 1;
-                        text_started = false;
-                    }
-                    if !thinking_started {
-                        sse_event(
-                            stream,
-                            Some("content_block_start"),
-                            &json!({
-                                "type": "content_block_start",
-                                "index": block_index,
-                                "content_block": { "type": "thinking", "thinking": "" },
-                            }),
-                        )?;
-                        thinking_started = true;
-                    }
-                    sse_event(
-                        stream,
-                        Some("content_block_delta"),
-                        &json!({
-                            "type": "content_block_delta",
-                            "index": block_index,
-                            "delta": { "type": "thinking_delta", "thinking": reasoning },
-                        }),
-                    )?;
-                }
-                if !text.is_empty() {
-                    if thinking_started {
-                        sse_event(
-                            stream,
-                            Some("content_block_stop"),
-                            &json!({ "type": "content_block_stop", "index": block_index }),
-                        )?;
-                        block_index += 1;
-                        thinking_started = false;
-                    }
-                    if !text_started {
-                        sse_event(
-                            stream,
-                            Some("content_block_start"),
-                            &json!({
-                                "type": "content_block_start",
-                                "index": block_index,
-                                "content_block": { "type": "text", "text": "" },
-                            }),
-                        )?;
-                        text_started = true;
-                    }
-                    sse_event(
-                        stream,
-                        Some("content_block_delta"),
-                        &json!({
-                            "type": "content_block_delta",
-                            "index": block_index,
-                            "delta": { "type": "text_delta", "text": text },
-                        }),
-                    )?;
-                }
-            }
-            Reply::Done {
-                finish,
-                tool_calls,
-                completion_tokens,
-                ..
-            } => {
-                if text_started || thinking_started {
-                    sse_event(
-                        stream,
-                        Some("content_block_stop"),
-                        &json!({ "type": "content_block_stop", "index": block_index }),
-                    )?;
-                    block_index += 1;
-                }
-                for c in &tool_calls {
-                    let cid = c.get("id").cloned().unwrap_or(json!(""));
-                    let name = c
-                        .get("function")
-                        .and_then(|f| f.get("name"))
-                        .cloned()
-                        .unwrap_or(json!(""));
-                    let args = c
-                        .get("function")
-                        .and_then(|f| f.get("arguments"))
-                        .and_then(|a| a.as_str())
-                        .unwrap_or("{}")
-                        .to_string();
-                    sse_event(
-                        stream,
-                        Some("content_block_start"),
-                        &json!({
-                            "type": "content_block_start",
-                            "index": block_index,
-                            "content_block": {
-                                "type": "tool_use", "id": cid, "name": name, "input": {}
-                            },
-                        }),
-                    )?;
-                    sse_event(
-                        stream,
-                        Some("content_block_delta"),
-                        &json!({
-                            "type": "content_block_delta",
-                            "index": block_index,
-                            "delta": { "type": "input_json_delta", "partial_json": args },
-                        }),
-                    )?;
-                    sse_event(
-                        stream,
-                        Some("content_block_stop"),
-                        &json!({ "type": "content_block_stop", "index": block_index }),
-                    )?;
-                    block_index += 1;
-                }
-                let stop_reason = match finish.as_str() {
-                    "tool_calls" => "tool_use",
-                    "length" => "max_tokens",
-                    _ => "end_turn",
-                };
-                sse_event(
-                    stream,
-                    Some("message_delta"),
-                    &json!({
-                        "type": "message_delta",
-                        "delta": { "stop_reason": stop_reason, "stop_sequence": Value::Null },
-                        "usage": { "output_tokens": completion_tokens },
-                    }),
-                )?;
-                sse_event(
-                    stream,
-                    Some("message_stop"),
-                    &json!({ "type": "message_stop" }),
-                )?;
-                write_chunk(stream, b"")?;
-                break;
-            }
-            Reply::Refused {
-                retry_after_s,
-                reason,
-            } => {
-                sse_event(
-                    stream,
-                    Some("error"),
-                    &json!({ "type": "error", "error": { "type": "insufficient_memory", "message": reason, "retry_after_s": retry_after_s } }),
-                )?;
-                write_chunk(stream, b"")?;
-                break;
-            }
-            Reply::Error(e) => {
-                sse_event(
-                    stream,
-                    Some("error"),
-                    &json!({ "type": "error", "error": { "type": "engine_error", "message": e } }),
-                )?;
-                write_chunk(stream, b"")?;
-                break;
-            }
-        }
-    }
-    stream.flush().ok();
-    Ok(())
-}
-
-fn stream_responses(
-    stream: &mut TcpStream,
-    rx: Receiver<Reply>,
-    req_body: &Value,
-) -> anyhow::Result<()> {
-    let id = response_id();
-    let mut seq = 0u64;
-    let mut next_seq = || {
-        let s = seq;
-        seq += 1;
-        s
-    };
-    sse_event(
-        stream,
-        None,
-        &json!({
-            "type": "response.created",
-            "sequence_number": next_seq(),
-            "response": empty_response_resource(&id, "in_progress"),
-        }),
-    )?;
-    let item_id = format!("msg_{:x}", now());
-    let reasoning_item_id = format!("rs_{:x}", now());
-    let mut reasoning_started = false;
-    let mut text_started = false;
-    for reply in rx {
-        match reply {
-            Reply::Start { .. } => {}
-            Reply::Delta {
-                text, reasoning, ..
-            } => {
-                if let Some(reasoning) = reasoning.filter(|r| !r.is_empty()) {
-                    if !reasoning_started {
-                        reasoning_started = true;
-                        sse_event(
-                            stream,
-                            None,
-                            &json!({
-                                "type": "response.output_item.added",
-                                "sequence_number": next_seq(),
-                                "output_index": 0,
-                                "item": {
-                                    "type": "reasoning", "id": reasoning_item_id,
-                                    "status": "in_progress", "summary": []
-                                }
-                            }),
-                        )?;
-                        sse_event(
-                            stream,
-                            None,
-                            &json!({
-                                "type": "response.reasoning_summary_part.added",
-                                "sequence_number": next_seq(),
-                                "item_id": reasoning_item_id, "output_index": 0,
-                                "summary_index": 0,
-                                "part": { "type": "summary_text", "text": "" }
-                            }),
-                        )?;
-                    }
-                    sse_event(
-                        stream,
-                        None,
-                        &json!({
-                            "type": "response.reasoning_summary_text.delta",
-                            "sequence_number": next_seq(),
-                            "item_id": reasoning_item_id, "output_index": 0,
-                            "summary_index": 0, "delta": reasoning
-                        }),
-                    )?;
-                }
-                if text.is_empty() {
-                    continue;
-                }
-                if !text_started {
-                    text_started = true;
-                    sse_event(
-                        stream,
-                        None,
-                        &json!({
-                            "type": "response.output_item.added",
-                            "sequence_number": next_seq(),
-                            "output_index": usize::from(reasoning_started),
-                            "item": {
-                                "type": "message", "id": item_id, "status": "in_progress",
-                                "role": "assistant", "content": []
-                            }
-                        }),
-                    )?;
-                    sse_event(
-                        stream,
-                        None,
-                        &json!({
-                            "type": "response.content_part.added",
-                            "sequence_number": next_seq(),
-                            "item_id": item_id, "output_index": usize::from(reasoning_started), "content_index": 0,
-                            "part": { "type": "output_text", "text": "", "annotations": [] }
-                        }),
-                    )?;
-                }
-                sse_event(
-                    stream,
-                    None,
-                    &json!({
-                        "type": "response.output_text.delta",
-                        "sequence_number": next_seq(),
-                        "item_id": item_id, "output_index": usize::from(reasoning_started), "content_index": 0,
-                        "delta": text
-                    }),
-                )?;
-            }
-            Reply::Done {
-                content,
-                reasoning,
-                tool_calls,
-                prompt_tokens,
-                completion_tokens,
-                cached_tokens,
-                finish,
-                logprobs,
-                stop_sequence,
-            } => {
-                let d = ReplyData {
-                    content: content.clone(),
-                    reasoning: reasoning.clone(),
-                    tool_calls: tool_calls.clone(),
-                    prompt_tokens,
-                    completion_tokens,
-                    cached_tokens,
-                    finish: finish.clone(),
-                    logprobs,
-                    stop_sequence,
-                };
-                if reasoning_started {
-                    let text = reasoning.as_deref().unwrap_or("");
-                    sse_event(
-                        stream,
-                        None,
-                        &json!({
-                            "type": "response.reasoning_summary_text.done",
-                            "sequence_number": next_seq(),
-                            "item_id": reasoning_item_id, "output_index": 0,
-                            "summary_index": 0, "text": text
-                        }),
-                    )?;
-                    sse_event(
-                        stream,
-                        None,
-                        &json!({
-                            "type": "response.reasoning_summary_part.done",
-                            "sequence_number": next_seq(),
-                            "item_id": reasoning_item_id, "output_index": 0,
-                            "summary_index": 0,
-                            "part": { "type": "summary_text", "text": text }
-                        }),
-                    )?;
-                    sse_event(
-                        stream,
-                        None,
-                        &json!({
-                            "type": "response.output_item.done",
-                            "sequence_number": next_seq(),
-                            "output_index": 0,
-                            "item": {
-                                "type": "reasoning", "id": reasoning_item_id,
-                                "status": "completed",
-                                "summary": [{ "type": "summary_text", "text": text }]
-                            }
-                        }),
-                    )?;
-                }
-                if text_started {
-                    sse_event(
-                        stream,
-                        None,
-                        &json!({
-                            "type": "response.output_text.done",
-                            "sequence_number": next_seq(),
-                            "item_id": item_id, "output_index": usize::from(reasoning_started), "content_index": 0,
-                            "text": content
-                        }),
-                    )?;
-                    sse_event(
-                        stream,
-                        None,
-                        &json!({
-                            "type": "response.content_part.done",
-                            "sequence_number": next_seq(),
-                            "item_id": item_id, "output_index": usize::from(reasoning_started), "content_index": 0,
-                            "part": { "type": "output_text", "text": content, "annotations": [] }
-                        }),
-                    )?;
-                    sse_event(
-                        stream,
-                        None,
-                        &json!({
-                            "type": "response.output_item.done",
-                            "sequence_number": next_seq(),
-                            "output_index": usize::from(reasoning_started),
-                            "item": {
-                                "type": "message", "id": item_id, "status": "completed",
-                                "role": "assistant",
-                                "content": [{ "type": "output_text", "text": content, "annotations": [] }]
-                            }
-                        }),
-                    )?;
-                }
-                let base = usize::from(reasoning_started) + usize::from(text_started);
-                for (i, c) in tool_calls.iter().enumerate() {
-                    let idx = base + i;
-                    let call_id = c.get("id").cloned().unwrap_or(json!(""));
-                    let name = c
-                        .get("function")
-                        .and_then(|f| f.get("name"))
-                        .cloned()
-                        .unwrap_or(json!(""));
-                    let args = c
-                        .get("function")
-                        .and_then(|f| f.get("arguments"))
-                        .and_then(|a| a.as_str())
-                        .unwrap_or("{}")
-                        .to_string();
-                    let fc_id = format!("fc_{:x}", now());
-                    sse_event(
-                        stream,
-                        None,
-                        &json!({
-                            "type": "response.output_item.added",
-                            "sequence_number": next_seq(),
-                            "output_index": idx,
-                            "item": {
-                                "type": "function_call", "id": fc_id, "call_id": call_id,
-                                "name": name, "arguments": "", "status": "in_progress"
-                            }
-                        }),
-                    )?;
-                    sse_event(
-                        stream,
-                        None,
-                        &json!({
-                            "type": "response.function_call_arguments.delta",
-                            "sequence_number": next_seq(),
-                            "item_id": fc_id,
-                            "output_index": idx,
-                            "delta": args
-                        }),
-                    )?;
-                    sse_event(
-                        stream,
-                        None,
-                        &json!({
-                            "type": "response.output_item.done",
-                            "sequence_number": next_seq(),
-                            "output_index": idx,
-                            "item": {
-                                "type": "function_call", "id": fc_id, "call_id": call_id,
-                                "name": name, "arguments": args, "status": "completed"
-                            }
-                        }),
-                    )?;
-                }
-                let payload = responses_payload_with_id(&d, &id);
-                store_conversation(&id, req_body, &d, &payload);
-                let terminal = if finish == "length" {
-                    "response.incomplete"
-                } else {
-                    "response.completed"
-                };
-                sse_event(
-                    stream,
-                    None,
-                    &json!({
-                        "type": terminal,
-                        "sequence_number": next_seq(),
-                        "response": payload
-                    }),
-                )?;
-                write_chunk(stream, b"data: [DONE]\n\n")?;
-                write_chunk(stream, b"")?;
-                break;
-            }
-            Reply::Refused {
-                retry_after_s,
-                reason,
-            } => {
-                sse_event(
-                    stream,
-                    None,
-                    &json!({ "type": "error", "error": { "type": "insufficient_memory", "message": reason, "retry_after_s": retry_after_s } }),
-                )?;
-                write_chunk(stream, b"")?;
-                break;
-            }
-            Reply::Error(e) => {
-                sse_event(
-                    stream,
-                    None,
-                    &json!({ "type": "error", "error": { "type": "engine_error", "message": e } }),
-                )?;
-                write_chunk(stream, b"")?;
-                break;
-            }
-        }
-    }
-    stream.flush().ok();
-    Ok(())
-}
-
-// ─────────────────────── Anthropic Messages ───────────────────────
-
-/// Flatten an Anthropic `system` field (string or array of text blocks).
 fn anthropic_system_text(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
@@ -2661,6 +1617,7 @@ fn normalize_messages_body(body: &mut Value) {
                     let mut reasoning = String::new();
                     let mut tool_calls: Vec<Value> = Vec::new();
                     let mut parts: Vec<Value> = Vec::new();
+                    let mut has_image = false;
                     let mut only_tool_results = !blocks.is_empty();
                     for b in blocks {
                         let ty = b.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -2668,6 +1625,7 @@ fn normalize_messages_body(body: &mut Value) {
                             "text" => {
                                 only_tool_results = false;
                                 text.push_str(b.get("text").and_then(|t| t.as_str()).unwrap_or(""));
+                                parts.push(b.clone());
                             }
                             "thinking" => {
                                 only_tool_results = false;
@@ -2699,17 +1657,16 @@ fn normalize_messages_body(body: &mut Value) {
                             }
                             "image" => {
                                 only_tool_results = false;
-                                parts.push(json!({ "type": "image" }));
+                                has_image = true;
+                                parts.push(b.clone());
                             }
                             _ => {}
                         }
                     }
                     if !only_tool_results {
                         let mut msg = json!({ "role": role, "content": text });
-                        if !parts.is_empty() {
-                            let mut arr = vec![json!({ "type": "text", "text": text })];
-                            arr.extend(parts.iter().cloned());
-                            msg["content"] = Value::Array(arr);
+                        if has_image {
+                            msg["content"] = Value::Array(parts);
                         }
                         if !reasoning.is_empty() {
                             msg["reasoning_content"] = json!(reasoning);
@@ -2818,25 +1775,30 @@ fn normalize_responses_body(body: &mut Value) {
                         let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("user");
                         let mut text = String::new();
                         let mut image = false;
+                        let mut content_parts = Vec::new();
                         if let Some(parts) = item.get("content").and_then(|v| v.as_array()) {
                             for p in parts {
                                 match p.get("type").and_then(|t| t.as_str()) {
                                     Some("input_text") | Some("output_text") => {
-                                        text.push_str(
-                                            p.get("text").and_then(|t| t.as_str()).unwrap_or(""),
-                                        );
+                                        let part_text =
+                                            p.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                                        text.push_str(part_text);
+                                        content_parts
+                                            .push(json!({"type": "text", "text": part_text}));
                                     }
-                                    Some("input_image") | Some("image") => image = true,
+                                    Some("input_image") | Some("image") => {
+                                        image = true;
+                                        let mut part = p.clone();
+                                        part["type"] = json!("image");
+                                        content_parts.push(part);
+                                    }
                                     _ => {}
                                 }
                             }
                         }
                         let mut msg = json!({ "role": role, "content": text });
                         if image {
-                            msg["content"] = json!([
-                                { "type": "text", "text": text },
-                                { "type": "image" }
-                            ]);
+                            msg["content"] = Value::Array(content_parts);
                         }
                         out.push(msg);
                     }
@@ -2912,64 +1874,6 @@ fn response_id() -> String {
     format!("resp_{:x}{:x}", now(), n)
 }
 
-fn store_conversation(id: &str, req_body: &Value, d: &ReplyData, payload: &Value) {
-    let mut conv = req_body
-        .get("messages")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let mut assistant = json!({ "role": "assistant", "content": d.content });
-    if let Some(r) = &d.reasoning {
-        assistant["reasoning_content"] = json!(r);
-    }
-    if !d.tool_calls.is_empty() {
-        assistant["tool_calls"] = json!(d.tool_calls);
-    }
-    conv.push(assistant);
-    conv_store().lock().unwrap().insert(id.to_string(), conv);
-    payload_store()
-        .lock()
-        .unwrap()
-        .insert(id.to_string(), payload.clone());
-}
-
-fn conv_store() -> &'static std::sync::Mutex<std::collections::HashMap<String, Vec<Value>>> {
-    static S: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Vec<Value>>>> =
-        std::sync::OnceLock::new();
-    S.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-}
-
-fn payload_store() -> &'static std::sync::Mutex<std::collections::HashMap<String, Value>> {
-    static S: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Value>>> =
-        std::sync::OnceLock::new();
-    S.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-}
-
-fn store_response(id: &str, payload: Value) {
-    payload_store()
-        .lock()
-        .unwrap()
-        .insert(id.to_string(), payload);
-}
-
-fn stored_response(id: &str) -> Option<Value> {
-    payload_store().lock().unwrap().get(id).cloned()
-}
-
-/// Prepend a chained response's conversation when `previous_response_id` is set.
-fn apply_previous_response(body: &mut Value) {
-    let Some(prev) = body.get("previous_response_id").and_then(|v| v.as_str()) else {
-        return;
-    };
-    let prior = conv_store().lock().unwrap().get(prev).cloned();
-    if let Some(mut prior) = prior {
-        if let Some(arr) = body.get("messages").and_then(|v| v.as_array()) {
-            prior.extend(arr.iter().cloned());
-            body["messages"] = Value::Array(prior);
-        }
-    }
-}
-
 // ─────────────────────── token counting ───────────────────────
 
 /// Worker-side `messages/count_tokens`: render the prompt and count its tokens.
@@ -3007,7 +1911,6 @@ fn collect_count_tokens(stream: &mut TcpStream, rx: Receiver<Reply>) -> anyhow::
                 http_status_for(&e),
                 "application/json",
                 payload.to_string().as_bytes(),
-                "",
             );
         }
     };
@@ -3017,7 +1920,6 @@ fn collect_count_tokens(stream: &mut TcpStream, rx: Receiver<Reply>) -> anyhow::
         "200 OK",
         "application/json",
         payload.to_string().as_bytes(),
-        "",
     )
 }
 
@@ -3032,6 +1934,20 @@ fn unfed_prefix(ids: &[u32], resumed: Option<&usize>, prefeed: &Option<Vec<u32>>
 }
 
 fn complete(
+    tower: &mut dyn LanguageModel,
+    tok: &Tokenizer,
+    job: &Job,
+    cfg: &ServerConfig,
+    prefix: &mut PrefixCache,
+    tmpl: Option<&ChatTemplate>,
+) -> anyhow::Result<()> {
+    tower.clear_images();
+    let result = complete_inner(tower, tok, job, cfg, prefix, tmpl);
+    tower.clear_images();
+    result
+}
+
+fn complete_inner(
     tower: &mut dyn LanguageModel,
     tok: &Tokenizer,
     job: &Job,
@@ -3090,7 +2006,17 @@ fn complete(
     } else {
         render_prompt(tmpl, &messages, true, &tools, thinking)?
     };
-    let ids = tok.encode(&prompt, false)?;
+    let mut ids = tok.encode(&prompt, false)?;
+    let images = lisa_engine::models::vision::decode_message_images(&job.body)?;
+    let has_images = !images.is_empty();
+    if has_images {
+        anyhow::ensure!(
+            tmpl.is_some(),
+            "image input requires the checkpoint chat template"
+        );
+        tower.prepare_images(&mut ids, &images)?;
+    }
+    drop(images);
 
     let max_tokens = request_max_tokens(job, cfg);
     let depth = match resolve_depth(job, cfg) {
@@ -3100,9 +2026,11 @@ fn complete(
             return Ok(());
         }
     };
+    let depth = if has_images { 0 } else { depth };
     let mut sampler = sampler_from(&job.body, cfg);
     let greedy = !tower.has_target_mtp() && sampler.greedy() && !sampler.mtp_exact_sampling;
-    let dsml_tools = !tools.is_empty() && tower.has_target_mtp();
+    let native_dsml = tmpl.is_some_and(|t| t.deepseek41);
+    let dsml_tools = !tools.is_empty() && (tower.has_target_mtp() || native_dsml);
     let streaming = job.stream;
     if streaming {
         let _ = job.reply.send(Reply::Start {
@@ -3122,17 +2050,20 @@ fn complete(
             .unwrap_or(0)
             > 0;
     let mut collected: Vec<u32> = Vec::new();
+    let mut decoded = IncrementalDecoder::new(tok, false);
     let mut last_text = String::new();
     let mut last_reasoning = String::new();
     let reply = job.reply.clone();
     let hit_stop = std::cell::Cell::new(false);
+    let tool_mode = std::cell::Cell::new(TargetMtpSamplingMode::Configured);
+    let mut tool_parser = streaming::DsmlParser::for_template(thinking, native_dsml);
     let mut lp_entries: Vec<Value> = Vec::new();
 
     // Cross-request prefix cache: resume at a cached prompt boundary when the
     // prompt extends it token-exactly; otherwise prefill in stages so a
     // mid-prompt boundary (the shared system-prefix cell) gets snapshotted.
     let mut resumed: Option<usize> = None;
-    let mut session = if prefix.enabled() {
+    let mut session = if !has_images && prefix.enabled() {
         match prefix.restore_session(tower, &ids) {
             Some((l, s)) => {
                 eprintln!("[serve] prefix-cache resume {l}/{}", ids.len());
@@ -3156,7 +2087,10 @@ fn complete(
     // (8.5 s vs 6.5 s): every warm request re-prefilled the whole prompt AND
     // paid the snapshot clone. One token short, a warm repeat IS a strict
     // extension: it resumes at the boundary and prefills exactly one token.
-    if prefix.enabled() && ids.len() > lisa_engine::core::prefix_cache::MIN_PREFIX_TOKENS {
+    if !has_images
+        && prefix.enabled()
+        && ids.len() > lisa_engine::core::prefix_cache::MIN_PREFIX_TOKENS
+    {
         let split = ids.len() - 1;
         let pos = resumed.unwrap_or(0);
         if pos < split {
@@ -3196,8 +2130,8 @@ fn complete(
             let eos = is_eos(t);
             if !eos {
                 collected.push(t);
+                let text = decoded.push(t)?;
                 if !stops.is_empty() {
-                    let text = tok.decode(&collected)?;
                     if stops
                         .iter()
                         .any(|s| !s.is_empty() && text.contains(s.as_str()))
@@ -3227,14 +2161,11 @@ fn complete(
                 }
             }
             if streaming && json_schema.is_none() {
-                let text = tok.decode(&collected)?;
+                let text = decoded.stable_text();
                 let safe_len = streaming_stop_safe_len(&text, &stops);
                 let (reasoning, answer) = streaming_sections(&text[..safe_len], thinking);
                 // Past a `<tool_call>` the text is not assistant content; don't stream it.
-                let shown = match tool_call_start(answer) {
-                    Some(i) => answer[..i].to_string(),
-                    None => answer.to_string(),
-                };
+                let shown = answer[..deepseek41::visible_end(answer)].to_string();
                 let delta = stream_delta(&last_text, &shown);
                 let reasoning_delta = stream_delta(&last_reasoning, reasoning);
                 last_text = shown;
@@ -3249,11 +2180,17 @@ fn complete(
                     });
                 }
             }
-            if dsml_tools
-                && dsml_decode_state(&tok.decode(&collected)?, thinking) == DsmlDecodeState::Done
-            {
-                hit_stop.set(true);
-                return Err(anyhow::anyhow!("tool call complete"));
+            if dsml_tools {
+                let state = tool_parser.update(decoded.text());
+                tool_mode.set(if state == DsmlDecodeState::Greedy {
+                    TargetMtpSamplingMode::Greedy
+                } else {
+                    TargetMtpSamplingMode::Configured
+                });
+                if state == DsmlDecodeState::Done {
+                    hit_stop.set(true);
+                    return Err(anyhow::anyhow!("tool call complete"));
+                }
             }
             Ok(())
         };
@@ -3267,7 +2204,7 @@ fn complete(
             while out.len() < max_tokens {
                 let t = if dsml_tools && sampling_mode == TargetMtpSamplingMode::Greedy {
                     Sampler::default().draw_ds4(&logits, &[])?
-                } else if tower.has_target_mtp() {
+                } else if tower.uses_ds4_sampling() {
                     sampler.draw_ds4(&logits, &session.fed)?
                 } else {
                     sampler.draw(&logits, &session.fed)?
@@ -3285,7 +2222,7 @@ fn complete(
                 }
                 out.push(t);
                 if dsml_tools {
-                    sampling_mode = dsml_sampling_mode(&tok.decode(&out)?, thinking);
+                    sampling_mode = tool_mode.get();
                 }
                 if out.len() >= max_tokens || is_eos(t) {
                     break;
@@ -3298,7 +2235,6 @@ fn complete(
             anyhow::ensure!(!gen_ids.is_empty(), "request has no new tokens");
             let md = mtp_depth(depth, tower);
             if dsml_tools {
-                let mut sampling_tokens = Vec::new();
                 session.generate_mtp_depth_with_sampling_mode(
                     tower,
                     &gen_ids,
@@ -3308,8 +2244,7 @@ fn complete(
                     Some(&mut sampler),
                     &mut |token| {
                         emit(token, None)?;
-                        sampling_tokens.push(token);
-                        Ok(dsml_sampling_mode(&tok.decode(&sampling_tokens)?, thinking))
+                        Ok(tool_mode.get())
                     },
                 )
             } else {
@@ -3327,7 +2262,6 @@ fn complete(
             let gen_ids = unfed_prefix(&ids, resumed.as_ref(), &prefeed);
             anyhow::ensure!(!gen_ids.is_empty(), "request has no new tokens");
             if dsml_tools {
-                let mut sampling_tokens = Vec::new();
                 session.generate_with_sampling_mode(
                     tower,
                     &gen_ids,
@@ -3336,8 +2270,7 @@ fn complete(
                     None,
                     &mut |token| {
                         emit(token, None)?;
-                        sampling_tokens.push(token);
-                        Ok(dsml_sampling_mode(&tok.decode(&sampling_tokens)?, thinking))
+                        Ok(tool_mode.get())
                     },
                 )
             } else {
@@ -3346,7 +2279,7 @@ fn complete(
                     &gen_ids,
                     max_tokens,
                     &mut sampler,
-                    cfg.pld,
+                    if has_images { 0 } else { cfg.pld },
                     None,
                     &mut |t| emit(t, None),
                 )
@@ -3388,8 +2321,8 @@ fn complete(
         // so a reply that still violates the schema after repair gets ONE
         // corrective turn — the failed output plus the violations are fed back
         // and the model regenerates. The second attempt goes through the same
-        // extract/repair/validate pipeline (it wins even if imperfect: the
-        // first attempt already failed validation).
+        // extract/repair/validate pipeline. Exhausting validation returns an
+        // engine error instead of presenting invalid content as success.
         if !errors.is_empty() && !content.trim().is_empty() {
             eprintln!("[serve] json-schema retry: {}", errors.join("; "));
             let corrective = format!(
@@ -3423,12 +2356,11 @@ fn complete(
                 }
             }
         }
-        if !errors.is_empty() {
-            eprintln!(
-                "[serve] json-schema still invalid after retry: {}",
-                errors.join("; ")
-            );
-        }
+        anyhow::ensure!(
+            errors.is_empty(),
+            "generated output does not satisfy the requested JSON schema after repair/retry: {}",
+            errors.join("; ")
+        );
         (content, None, Vec::new())
     } else {
         shape_reply(&full, &tools, parallel, &stops, thinking)
@@ -3462,9 +2394,7 @@ fn complete(
     };
     let finish = if !tool_calls.is_empty() {
         "tool_calls"
-    } else if hit_stop.get() {
-        "stop"
-    } else if generated.last().map(|&t| is_eos(t)).unwrap_or(false) {
+    } else if hit_stop.get() || generated.last().is_some_and(|&t| is_eos(t)) {
         "stop"
     } else {
         "length"
@@ -3487,7 +2417,12 @@ fn complete(
 /// trunk, mean-pool the last hidden states over the sequence, L2-normalize.
 /// The OpenAI payload is serialized into `Reply::Done.content` (the surface
 /// writer hands it straight through).
-fn run_embeddings(tower: &mut dyn LanguageModel, tok: &Tokenizer, job: &Job) -> anyhow::Result<()> {
+fn run_embeddings(
+    model_id: &str,
+    tower: &mut dyn LanguageModel,
+    tok: &Tokenizer,
+    job: &Job,
+) -> anyhow::Result<()> {
     use lisa_mlx::Array as MlxArray;
     let inputs: Vec<String> = match job.body.get("input") {
         Some(Value::String(s)) => vec![s.clone()],
@@ -3536,7 +2471,7 @@ fn run_embeddings(tower: &mut dyn LanguageModel, tok: &Tokenizer, job: &Job) -> 
     let payload = json!({
         "object": "list",
         "data": embeddings,
-        "model": model_id(),
+        "model": model_id,
         "usage": { "prompt_tokens": total_tokens, "total_tokens": total_tokens },
     });
     let _ = job.reply.send(Reply::Done {
@@ -3574,13 +2509,17 @@ pub struct ChatMessage {
 /// `transformers.apply_chat_template` output.
 pub struct ChatTemplate {
     inner: hf_chat_template::ChatTemplate,
+    deepseek41: bool,
 }
 
 impl ChatTemplate {
     pub fn new(src: &str) -> anyhow::Result<Self> {
         let inner = hf_chat_template::ChatTemplate::from_str(src)
             .map_err(|e| anyhow::anyhow!("chat template parse: {e}"))?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            deepseek41: src.contains("<｜System｜>") && src.contains("reasoning_effort"),
+        })
     }
 
     pub fn render(
@@ -3590,6 +2529,9 @@ impl ChatTemplate {
         tools: &[Value],
         thinking: bool,
     ) -> anyhow::Result<String> {
+        if self.deepseek41 {
+            return deepseek41::render(messages, add_generation_prompt, tools, thinking);
+        }
         let mut input = hf_chat_template::RenderInput {
             add_generation_prompt,
             ..Default::default()
@@ -3627,9 +2569,10 @@ impl ChatTemplate {
         input
             .extra
             .insert("enable_thinking".to_string(), json!(thinking));
-        input
-            .extra
-            .insert("reasoning_effort".to_string(), json!("xhigh"));
+        input.extra.insert(
+            "reasoning_effort".to_string(),
+            json!(if self.deepseek41 { "high" } else { "xhigh" }),
+        );
         input
             .extra
             .insert("preserve_thinking".to_string(), json!(true));
@@ -3756,7 +2699,7 @@ fn split_reasoning(text: &str) -> (Option<String>, String) {
     // Markers are ` thinking` / `` — the ASCII forms the checkpoint emits.
     const OPEN: &str = "\u{3c}think\u{3e}";
     const CLOSE: &str = "\u{3c}/think\u{3e}";
-    if let Some(idx) = text.find(CLOSE) {
+    if let Some(idx) = deepseek41::think_end(text) {
         let raw = &text[..idx];
         let raw = raw.strip_prefix(OPEN).unwrap_or(raw);
         let reasoning = raw.trim().to_string();
@@ -3785,7 +2728,7 @@ fn streaming_sections(text: &str, thinking_enabled: bool) -> (&str, &str) {
     if !thinking_enabled {
         return ("", text);
     }
-    if let Some(idx) = text.find(CLOSE) {
+    if let Some(idx) = deepseek41::think_end(text) {
         let raw = &text[..idx];
         let reasoning = raw.strip_prefix(OPEN).unwrap_or(raw);
         return (reasoning, &text[idx + CLOSE.len()..]);
@@ -3807,7 +2750,7 @@ fn streaming_reply_sections(
     let text = strip_stops(full, stops);
     let (reasoning, answer) = streaming_sections(text, thinking_enabled);
     let content = match tool_call_start(answer) {
-        Some(i) => &answer[..i],
+        Some(i) => answer[..i].trim_end_matches(|ch: char| ch.is_ascii_whitespace()),
         None => answer,
     };
     (reasoning.to_string(), content.to_string())
@@ -3816,7 +2759,7 @@ fn streaming_reply_sections(
 /// Split a completed response according to the requested thinking mode.
 /// An unclosed thinking block is reasoning, never user-visible answer text.
 fn split_reasoning_for_request(text: &str, thinking_enabled: bool) -> (Option<String>, String) {
-    if thinking_enabled && !text.contains("</think>") {
+    if thinking_enabled && deepseek41::think_end(text).is_none() {
         let reasoning = text.strip_prefix("<think>").unwrap_or(text);
         return (Some(reasoning.trim().to_string()), String::new());
     }
@@ -3828,6 +2771,9 @@ fn split_reasoning_for_request(text: &str, thinking_enabled: bool) -> (Option<St
 /// split across tokens), so this diffs against the longest common prefix rather
 /// than assuming `prev` is a prefix of `cur`. `None` when nothing new.
 fn stream_delta(prev: &str, cur: &str) -> Option<String> {
+    if let Some(delta) = cur.strip_prefix(prev) {
+        return (!delta.is_empty()).then(|| delta.to_string());
+    }
     if cur.len() <= prev.len() {
         return None;
     }
@@ -3866,6 +2812,9 @@ fn streaming_stop_safe_len(text: &str, stops: &[String]) -> usize {
 /// Any reasoning block is stripped first.
 fn extract_tool_calls(text: &str, tools: &[Value]) -> (String, Vec<Value>) {
     let (_, answer) = split_reasoning(text);
+    if let Some(result) = deepseek41::extract(&answer) {
+        return result.unwrap_or_else(|_| (answer, Vec::new()));
+    }
     const OPEN: &str = "<tool_call>";
     const CLOSE: &str = "</tool_call>";
     let Some(start) = answer.find(OPEN) else {
@@ -4282,10 +3231,14 @@ fn tool_call_id() -> String {
 /// must not be streamed as assistant content).
 fn tool_call_start(text: &str) -> Option<usize> {
     text.find("<tool_call>")
+        .into_iter()
+        .chain(deepseek41::start(text))
+        .min()
 }
 
 /// Match ds4's live GLM/Qwen DSML sampling boundary. Structural tool syntax is
 /// sampled greedily; parameter bodies use the request's configured sampler.
+#[cfg(test)]
 fn dsml_sampling_mode(output: &str, thinking_enabled: bool) -> TargetMtpSamplingMode {
     match dsml_decode_state(output, thinking_enabled) {
         DsmlDecodeState::Greedy => TargetMtpSamplingMode::Greedy,
@@ -4300,6 +3253,7 @@ enum DsmlDecodeState {
     Done,
 }
 
+#[cfg(test)]
 fn dsml_decode_state(output: &str, thinking_enabled: bool) -> DsmlDecodeState {
     const THINK_END: &str = "</think>";
     const TOOL_OPEN: &str = "<tool_call>";
@@ -4897,77 +3851,6 @@ fn request_thinking(body: &Value, cfg: &ServerConfig) -> bool {
     cfg.gen_defaults.thinking.unwrap_or(false)
 }
 
-fn read_request(stream: &mut TcpStream) -> anyhow::Result<Option<(String, String, Vec<u8>)>> {
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let mut line = String::new();
-    if reader.read_line(&mut line)? == 0 {
-        return Ok(None);
-    }
-    let mut parts = line.split_whitespace();
-    let method = parts.next().unwrap_or("").to_string();
-    let path = parts.next().unwrap_or("").to_string();
-
-    let mut content_length = 0usize;
-    loop {
-        let mut header = String::new();
-        if reader.read_line(&mut header)? == 0 {
-            break;
-        }
-        if header == "\r\n" || header == "\n" {
-            break;
-        }
-        let lower = header.to_ascii_lowercase();
-        if let Some(v) = lower.strip_prefix("content-length:") {
-            content_length = v.trim().parse().unwrap_or(0);
-        }
-    }
-    const MAX_BODY: usize = 8 << 20;
-    anyhow::ensure!(
-        content_length <= MAX_BODY,
-        "request body too large ({content_length} bytes)"
-    );
-    let mut body = vec![0u8; content_length];
-    if content_length > 0 {
-        reader.read_exact(&mut body)?;
-    }
-    Ok(Some((method, path, body)))
-}
-fn write_response(
-    stream: &mut TcpStream,
-    status: &str,
-    content_type: &str,
-    body: &[u8],
-    extra: &str,
-) -> anyhow::Result<()> {
-    let mut head = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n",
-        body.len()
-    );
-    if !extra.is_empty() {
-        head.push_str(extra);
-        head.push_str("\r\n");
-    }
-    head.push_str("\r\n");
-    stream.write_all(head.as_bytes())?;
-    stream.write_all(body)?;
-    stream.flush()?;
-    Ok(())
-}
-
-fn write_chunk(stream: &mut TcpStream, data: &[u8]) -> std::io::Result<()> {
-    if data.is_empty() {
-        stream.write_all(b"0\r\n\r\n")
-    } else {
-        stream.write_all(format!("{:x}\r\n", data.len()).as_bytes())?;
-        stream.write_all(data)?;
-        stream.write_all(b"\r\n")
-    }
-}
-
-fn write_sse(stream: &mut TcpStream, value: &Value) -> std::io::Result<()> {
-    write_chunk(stream, format!("data: {value}\n\n").as_bytes())
-}
-
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -5017,7 +3900,6 @@ fn handle_decision_conn(mut stream: TcpStream, model: &dyn DecisionModel) -> any
             "200 OK",
             "application/json",
             br#"{"status":"ok"}"#,
-            "",
         );
     }
     if method == "GET" && path.starts_with("/v1/models") {
@@ -5027,7 +3909,6 @@ fn handle_decision_conn(mut stream: TcpStream, model: &dyn DecisionModel) -> any
             "200 OK",
             "application/json",
             payload.to_string().as_bytes(),
-            "",
         );
     }
     if method == "POST" && path == "/v1/decisions" {
@@ -5043,7 +3924,6 @@ fn handle_decision_conn(mut stream: TcpStream, model: &dyn DecisionModel) -> any
                 "200 OK",
                 "application/json",
                 ans.to_string().as_bytes(),
-                "",
             ),
             Err(e) => bad_request(&mut stream, e.to_string()),
         };
@@ -5053,7 +3933,6 @@ fn handle_decision_conn(mut stream: TcpStream, model: &dyn DecisionModel) -> any
         "404 Not Found",
         "application/json",
         br#"{"error":{"message":"not found"}}"#,
-        "",
     )
 }
 
@@ -5064,524 +3943,9 @@ fn bad_request(stream: &mut TcpStream, msg: String) -> anyhow::Result<()> {
         "400 Bad Request",
         "application/json",
         body.as_bytes(),
-        "",
     )
 }
 
 #[cfg(test)]
-mod render_test {
-    use super::{
-        ChatMessage, ChatTemplate, Job, ReplyData, Surface, dsml_sampling_mode, extract_tool_calls,
-        is_target_mtp_wave_eligible, models_payload, normalize_glm_tool_prompt,
-        prompt_tokens_details_json, responses_payload_with_id, session_suffix_text,
-        split_reasoning_for_request, stream_delta, streaming_reply_sections, streaming_sections,
-        streaming_stop_safe_len, usage_json,
-    };
-    use lisa_engine::core::session::TargetMtpSamplingMode;
-    use serde_json::json;
-
-    #[test]
-    fn model_list_reports_text_only_modalities_for_loaded_model() {
-        let payload = models_payload("org/glm53-flash");
-        assert_eq!(payload["object"], "list");
-        assert_eq!(payload["data"][0]["id"], "org/glm53-flash");
-        assert_eq!(
-            payload["data"][0]["architecture"]["input_modalities"],
-            json!(["text"])
-        );
-        assert_eq!(
-            payload["data"][0]["architecture"]["output_modalities"],
-            json!(["text"])
-        );
-    }
-
-    #[test]
-    fn parses_tool_calls() {
-        let text = "Sure.\n<tool_call>\n<function=get_weather>\n<parameter=city>Paris</parameter>\n<parameter=units>metric</parameter>\n</function>\n</tool_call>";
-        let (content, calls) = extract_tool_calls(text, &[]);
-        assert_eq!(content, "Sure.");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0]["type"], "function");
-        assert_eq!(calls[0]["function"]["name"], "get_weather");
-        let args: serde_json::Value =
-            serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
-        assert_eq!(args["city"], "Paris");
-        assert_eq!(args["units"], "metric");
-    }
-
-    #[test]
-    fn parses_ds4_glm_arg_key_value_tool_calls() {
-        let text = "Before.\n<tool_call>bash<arg_key>command</arg_key><arg_value>pwd</arg_value></tool_call>";
-        let (content, calls) = extract_tool_calls(text, &[]);
-        assert_eq!(content, "Before.");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0]["function"]["name"], "bash");
-        let args: serde_json::Value =
-            serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
-        assert_eq!(args["command"], "pwd");
-    }
-
-    #[test]
-    fn dsml_sampling_switches_at_glm_and_qwen_payload_boundaries() {
-        use TargetMtpSamplingMode::{Configured, Greedy};
-
-        assert_eq!(dsml_sampling_mode("ordinary answer", false), Configured);
-        assert_eq!(
-            dsml_sampling_mode("<tool_call>bash<arg_key>command</arg_key>", false),
-            Greedy
-        );
-        assert_eq!(
-            dsml_sampling_mode(
-                "<tool_call>bash<arg_key>command</arg_key><arg_value>printf ok",
-                false
-            ),
-            Configured
-        );
-        assert_eq!(
-            dsml_sampling_mode(
-                "<tool_call>bash<arg_key>command</arg_key><arg_value>printf ok</ar",
-                false
-            ),
-            Greedy
-        );
-        assert_eq!(
-            dsml_sampling_mode(
-                "<tool_call>bash<arg_key>command</arg_key><arg_value>printf ok</arg_value></tool_call>",
-                false
-            ),
-            Configured
-        );
-        assert_eq!(
-            dsml_sampling_mode("<tool_call><function=search><parameter=query>hello", false),
-            Configured
-        );
-        assert_eq!(
-            dsml_sampling_mode("<tool_call><function=search><parameter=query", false),
-            Greedy
-        );
-        assert_eq!(
-            dsml_sampling_mode("<think>drafting <tool_call>ignored", true),
-            Configured
-        );
-        assert_eq!(
-            dsml_sampling_mode(
-                "<think>drafting <tool_call>ignored</think><tool_call>bash<arg_key>command",
-                true
-            ),
-            Greedy
-        );
-    }
-
-    #[test]
-    fn glm_target_mtp_wave_preserves_serial_only_request_modes() {
-        let make_job = |body: serde_json::Value| {
-            let (reply, _receiver) = std::sync::mpsc::channel();
-            Job {
-                body,
-                stream: false,
-                session_id: None,
-                surface: Surface::Chat,
-                reply,
-            }
-        };
-
-        assert!(is_target_mtp_wave_eligible(&make_job(json!({})), 2));
-        assert!(!is_target_mtp_wave_eligible(
-            &make_job(json!({"depth": 1})),
-            1
-        ));
-        assert!(!is_target_mtp_wave_eligible(
-            &make_job(json!({"ignore_eos": true})),
-            2
-        ));
-        assert!(!is_target_mtp_wave_eligible(
-            &make_job(json!({"tools": [{"type": "function"}]})),
-            2
-        ));
-    }
-
-    #[test]
-    fn streaming_thinking_matches_open_prompt_and_unclosed_final_state() {
-        assert_eq!(
-            streaming_sections("private scratchpad", true),
-            ("private scratchpad", "")
-        );
-        assert_eq!(
-            streaming_sections("private scratchpad</think><tool_call>x", true),
-            ("private scratchpad", "<tool_call>x")
-        );
-        assert_eq!(
-            streaming_sections("direct response", false),
-            ("", "direct response")
-        );
-        assert_eq!(
-            streaming_sections("private scratchpad</think>tool call", false),
-            ("", "private scratchpad</think>tool call")
-        );
-        assert_eq!(
-            streaming_reply_sections(
-                "private scratchpad</think><tool_call>bash</tool_call>",
-                false,
-                &[],
-            ),
-            (String::new(), "private scratchpad</think>".into())
-        );
-        assert_eq!(
-            streaming_reply_sections(
-                "<think>private scratchpad</think><tool_call>bash</tool_call>",
-                true,
-                &[],
-            ),
-            ("private scratchpad".into(), String::new())
-        );
-        assert_eq!(
-            split_reasoning_for_request("unfinished private scratchpad", true),
-            (Some("unfinished private scratchpad".into()), String::new())
-        );
-        assert_eq!(
-            split_reasoning_for_request("private scratchpad</think>visible answer", true),
-            (Some("private scratchpad".into()), "visible answer".into())
-        );
-    }
-
-    #[test]
-    fn streaming_stop_tail_holds_cross_token_prefix_and_flushes_only_safe_text() {
-        let stops = vec![" gamma delta".to_string()];
-        let partial = "alpha beta gamma";
-        let safe_len = streaming_stop_safe_len(partial, &stops);
-        assert_eq!(&partial[..safe_len], "alpha");
-
-        // The next token completes the stop string. Final response shaping
-        // flushes the safe prefix that was held back but never exposes the
-        // stop sequence itself.
-        let complete = "alpha beta gamma delta epsilon";
-        let (_, final_content) = streaming_reply_sections(complete, false, &stops);
-        assert_eq!(final_content, "alpha beta");
-        assert_eq!(
-            stream_delta(&partial[..safe_len], &final_content).as_deref(),
-            Some(" beta")
-        );
-
-        // Holdback is measured in UTF-8 bytes but may only slice at a valid
-        // character boundary.
-        let unicode_stop = vec!["☃".to_string()];
-        let unicode_text = "A☃";
-        let unicode_safe_len = streaming_stop_safe_len(unicode_text, &unicode_stop);
-        assert_eq!(&unicode_text[..unicode_safe_len], "A");
-        assert_eq!(streaming_stop_safe_len("complete", &[]), "complete".len());
-    }
-
-    #[test]
-    fn openai_usage_reports_ds4_cache_read_and_write_counts() {
-        assert_eq!(
-            usage_json(19, 4, 0),
-            json!({
-                "prompt_tokens": 19,
-                "completion_tokens": 4,
-                "prompt_tokens_details": {
-                    "cached_tokens": 0,
-                    "cache_write_tokens": 19
-                },
-                "total_tokens": 23
-            })
-        );
-        assert_eq!(
-            usage_json(19, 4, 7)["prompt_tokens_details"],
-            json!({"cached_tokens": 7, "cache_write_tokens": 12})
-        );
-        assert_eq!(
-            prompt_tokens_details_json(19, 25),
-            json!({"cached_tokens": 19, "cache_write_tokens": 0})
-        );
-    }
-
-    #[test]
-    fn responses_usage_reports_ds4_cache_read_and_write_counts() {
-        let data = ReplyData {
-            content: String::new(),
-            reasoning: None,
-            tool_calls: Vec::new(),
-            prompt_tokens: 19,
-            completion_tokens: 4,
-            cached_tokens: 7,
-            finish: "stop".to_string(),
-            logprobs: None,
-            stop_sequence: None,
-        };
-        let payload = responses_payload_with_id(&data, "resp_test");
-        assert_eq!(
-            payload["usage"]["input_tokens_details"],
-            json!({"cached_tokens": 7, "cache_write_tokens": 12})
-        );
-    }
-
-    #[test]
-    fn parses_json_form_tool_calls() {
-        let t1 =
-            "<tool_call><function=run_command>{\"command\":\"npm test\"}</function></tool_call>";
-        let (_, c1) = extract_tool_calls(t1, &[]);
-        assert_eq!(c1.len(), 1);
-        assert_eq!(c1[0]["function"]["name"], "run_command");
-        let a1: serde_json::Value =
-            serde_json::from_str(c1[0]["function"]["arguments"].as_str().unwrap()).unwrap();
-        assert_eq!(a1["command"], "npm test");
-
-        // Missing closing brace, plus a stray tag — must still yield `command`.
-        // Unquoted keys/values (`{path:"README.md"}`) must still parse.
-        let t1b = "<tool_call><function=read_file>{path:\"README.md\"}</function></tool_call>";
-        let (_, c1b) = extract_tool_calls(t1b, &[]);
-        let a1b: serde_json::Value =
-            serde_json::from_str(c1b[0]["function"]["arguments"].as_str().unwrap()).unwrap();
-        assert_eq!(a1b["path"], "README.md");
-
-        let t2 = "<tool_call><function=run_command>{\"command\":\"node -e \\\"x\\\"\"</parameter></function></tool_call>";
-        let (_, c2) = extract_tool_calls(t2, &[]);
-        let a2: serde_json::Value =
-            serde_json::from_str(c2[0]["function"]["arguments"].as_str().unwrap()).unwrap();
-        assert_eq!(a2["command"], "node -e \"x\"");
-    }
-
-    #[test]
-    fn salvages_truncated_calls() {
-        // Truncated mid-value, no closing tags at all.
-        let t = "<tool_call><function=write_file>{\"path\":\"src/defaults.js\",\"content\":\"module.exports = { timeoutMs: 10000, retries: 2 };\n";
-        let (_, c) = extract_tool_calls(t, &[]);
-        let a: serde_json::Value =
-            serde_json::from_str(c[0]["function"]["arguments"].as_str().unwrap()).unwrap();
-        assert_eq!(a["path"], "src/defaults.js");
-
-        // Missing final brace, stray closing tag.
-        let t2 = "<tool_call><function=run_command>{\"command\":\"node -e \\\"const {slugify}=x\\\"\"</parameter></function></tool_call>";
-        let (_, c2) = extract_tool_calls(t2, &[]);
-        let a2: serde_json::Value =
-            serde_json::from_str(c2[0]["function"]["arguments"].as_str().unwrap()).unwrap();
-        assert_eq!(a2["command"], "node -e \"const {slugify}=x\"");
-    }
-
-    #[test]
-    fn parses_slugify_call() {
-        let t = "<tool_call><function=run_command>{\"command\":\"node -e \\\"const {slugify}=require('./src/slug'); console.log(slugify('Hello World'));\\\"\"</parameter></function></tool_call>";
-        let (_, c) = extract_tool_calls(t, &[]);
-        eprintln!("c={c:?}");
-        let a: serde_json::Value =
-            serde_json::from_str(c[0]["function"]["arguments"].as_str().unwrap()).unwrap();
-        assert!(a["command"].as_str().unwrap().contains("slugify"));
-    }
-
-    #[test]
-    fn parses_u_call() {
-        let t = "<think></think><tool_call><function=run_command>{\"command\":\"node -e \\\"const u=require('./src/user'); console.log(u.getInitials({first:'Ada',last:'Lovelace'}));\\\" && npm test 2>&1 | tail -20\"</}</function></tool_call>";
-        let (_, c) = extract_tool_calls(t, &[]);
-        assert!(!c.is_empty());
-        let a: serde_json::Value =
-            serde_json::from_str(c[0]["function"]["arguments"].as_str().unwrap()).unwrap();
-        assert!(a["command"].as_str().unwrap().contains("npm test"));
-    }
-
-    #[test]
-    fn supports_generation_markers() {
-        // MiMo-style template block that minijinja does not understand.
-        let src = "{%- macro m(x) -%}\n{%- generation -%}hello {{ x }}{%- endgeneration -%}\n{%- endmacro -%}{{ m(1) }}";
-        let t = ChatTemplate::new(src).expect("template parse");
-        let out = t.render(&[], false, &[], true).expect("render");
-        assert!(out.contains("hello 1"), "got {out:?}");
-    }
-
-    #[test]
-    fn glm_no_thinking_prompt_omits_default_max_effort_message() {
-        let src = "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>hello<|assistant|><think>";
-        let t = ChatTemplate::new(src).expect("template parse");
-
-        let direct = t
-            .render(&[], true, &[], false)
-            .expect("render direct prompt");
-        assert_eq!(
-            direct,
-            "[gMASK]<sop><|user|>hello<|assistant|><think></think>"
-        );
-
-        let thinking = t
-            .render(&[], true, &[], true)
-            .expect("render thinking prompt");
-        assert_eq!(thinking, src);
-
-        let partial = t
-            .render(&[], false, &[], false)
-            .expect("render partial prompt");
-        assert_eq!(partial, "[gMASK]<sop><|user|>hello<|assistant|><think>");
-    }
-
-    #[test]
-    fn glm_session_suffix_preserves_ds4_turn_boundary() {
-        let full = "[gMASK]<sop><|user|>first<|assistant|><think></think>BLUE<|user|>second";
-        let rest = "<|user|>second";
-        assert_eq!(session_suffix_text(full, rest), rest);
-        assert_eq!(
-            session_suffix_text("<|im_start|>assistant", rest),
-            "\n<|user|>second"
-        );
-    }
-
-    #[test]
-    fn glm_tool_prompt_matches_ds4_json_and_whitespace() {
-        let tools = vec![json!({
-            "type": "function",
-            "function": {
-                "name": "bash",
-                "description": "Run a shell command.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"command": {"type": "string"}},
-                    "required": ["command"],
-                    "additionalProperties": false
-                },
-                "strict": true,
-                "defer_loading": false
-            }
-        })];
-        let mut rendered = "You are provided with signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"bash\", \"parameters\": { \"type\": \"object\" }}\n</tools>\n\nFor each function call".to_string();
-        normalize_glm_tool_prompt(&mut rendered, &tools);
-        assert_eq!(
-            rendered,
-            "You are provided with signatures within <tools></tools> XML tags:\n<tools>\n\n{\"name\": \"bash\", \"description\": \"Run a shell command.\", \"parameters\": {\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}},\"required\":[\"command\"],\"additionalProperties\":false}}\n\n\n</tools>\n\nFor each function call"
-        );
-    }
-
-    #[test]
-    fn glm_tool_prompt_matches_ds4_multiple_and_deferred_tools() {
-        let tools = vec![
-            json!({"type":"function", "function":{"name":"first", "parameters":{"type":"object"}}}),
-            json!({"type":"function", "function":{"name":"hidden", "defer_loading":true}}),
-            json!({"type":"function", "function":{"name":"last", "parameters":{"type":"array"}}}),
-        ];
-        let mut rendered = "<tools>\nfirst and last\n</tools>".to_string();
-        normalize_glm_tool_prompt(&mut rendered, &tools);
-        assert_eq!(
-            rendered,
-            "<tools>\n\n{\"name\": \"first\", \"parameters\": {\"type\":\"object\"}}\n\n\n{\"name\": \"last\", \"parameters\": {\"type\":\"array\"}}\n\n\n</tools>"
-        );
-
-        let deferred_only = vec![json!({
-            "type": "function",
-            "function": {"name": "hidden", "defer_loading": true}
-        })];
-        let mut rendered = "<tools>\n</tools>".to_string();
-        normalize_glm_tool_prompt(&mut rendered, &deferred_only);
-        assert_eq!(rendered, "<tools>\n\n\n</tools>");
-    }
-
-    #[test]
-    #[ignore]
-    fn render_mimo_tools_and_parts() {
-        let dir = match lisa_engine::models::resolve_model_dir(
-            "agnosticeng/MiMo-V2.6-Distill-Qwen-9B-4bit",
-        ) {
-            Ok(d) => d,
-            Err(_) => return,
-        };
-        let src = match std::fs::read_to_string(dir.join("chat_template.jinja")) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        // Exercise the branches our text-only ChatMessage wrapper never feeds:
-        // tools, tool_calls, tool results, and multimodal content parts.
-        let t = hf_chat_template::ChatTemplate::from_str(&src).expect("template parse");
-        let mut input = hf_chat_template::RenderInput {
-            add_generation_prompt: true,
-            ..Default::default()
-        };
-        input.tools.push(json!({
-            "type": "function",
-            "function": { "name": "get_weather", "parameters": { "type": "object" } }
-        }));
-        input
-            .messages
-            .push(hf_chat_template::Message::user("weather in Paris?"));
-        let mut call = hf_chat_template::Message::assistant("");
-        call.tool_calls.push(json!({
-            "function": { "name": "get_weather", "arguments": { "city": "Paris" } }
-        }));
-        input.messages.push(call);
-        input
-            .messages
-            .push(hf_chat_template::Message::tool("sunny, 21C"));
-        let mut img = hf_chat_template::Message::user("");
-        img.content = Some(hf_chat_template::Content::Parts(vec![
-            json!({"type": "image"}),
-            json!({"type": "text", "text": "describe"}),
-        ]));
-        input.messages.push(img);
-        input.extra.insert("enable_thinking".into(), json!(false));
-        let out = t.render(&input).expect("render");
-        eprintln!("---RENDER---\n{out}\n---END---");
-    }
-
-    #[test]
-    #[ignore]
-    fn render_mimo_template() {
-        let dir = match lisa_engine::models::resolve_model_dir(
-            "agnosticeng/MiMo-V2.6-Distill-Qwen-9B-4bit",
-        ) {
-            Ok(d) => d,
-            Err(_) => return,
-        };
-        let src = match std::fs::read_to_string(dir.join("chat_template.jinja")) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        let t = ChatTemplate::new(&src).expect("template parse");
-        let msgs = vec![ChatMessage {
-            role: "user".into(),
-            content: "Name three colors.".into(),
-            reasoning_content: None,
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-            parts: None,
-        }];
-        let out = t.render(&msgs, true, &[], true).expect("render");
-        eprintln!("---RENDER---\n{out}\n---END---");
-    }
-
-    #[test]
-    #[ignore]
-    fn render_real_template() {
-        let dir =
-            match lisa_engine::models::resolve_model_dir("agnosticeng/Qwen3.8-Flash-Next-4bit") {
-                Ok(d) => d,
-                Err(_) => return,
-            };
-        let src = match std::fs::read_to_string(dir.join("chat_template.jinja")) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        let t = ChatTemplate::new(&src).expect("template parse");
-        let msgs = vec![
-            ChatMessage {
-                role: "user".into(),
-                content: "Name three colors.".into(),
-                reasoning_content: None,
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-                parts: None,
-            },
-            ChatMessage {
-                role: "assistant".into(),
-                content: "Red, green, blue.".into(),
-                reasoning_content: Some("Thinking about colors.".into()),
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-                parts: None,
-            },
-            ChatMessage {
-                role: "user".into(),
-                content: "Which is warmest?".into(),
-                reasoning_content: None,
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-                parts: None,
-            },
-        ];
-        let out = t.render(&msgs, true, &[], true).expect("render");
-        eprintln!("---RENDER---\n{out}\n---END---");
-    }
-}
+#[path = "tests.rs"]
+mod render_test;

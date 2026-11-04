@@ -1,9 +1,5 @@
-//! O3: byte-level admission control.
-//!
-//! The only pre-batch gate today is a token-ratio pad-waste check; nothing sums
-//! the bytes an in-flight request will hold. This is that missing byte budget
-//! for live generation state (invariant
-//! `admission.budget <= prompt_memory.budget` and `admission.used == held`).
+//! Byte-level admission for live generation state, alongside the independent
+//! batch padding limit. The server enables this gate with `LISA_RAM_CAP_GB`.
 //!
 //! The rule is refuse-don't-attempt: state beyond the budget is refused (a 503
 //! upstream), never allocated and hoped for.

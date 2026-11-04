@@ -57,7 +57,7 @@ impl Capture {
         self.preserve_dispatch
     }
 
-    fn accepts_key(&self, key: &str) -> bool {
+    pub(crate) fn accepts_key(&self, key: &str) -> bool {
         !self.flushed.load(std::sync::atomic::Ordering::Relaxed)
             && (self.key_filters.is_empty()
                 || self.key_filters.iter().any(|filter| key.contains(filter)))
