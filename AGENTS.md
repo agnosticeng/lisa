@@ -14,16 +14,24 @@ adjacent licenses and [NOTICE](NOTICE) when changing them.
 | --- | --- | --- |
 | `qwen4_exp`, `qwen4_exp_text` | `qwen4` | Qwen 3.8 Flash-Next, hybrid GDN + MoE + MTP |
 | `qwen3_5`, `qwen3_5_text` | `qwen3_5` | Qwen 3.8 27B, dense hybrid GDN/attention |
-| `glm5_next`, `glm5_next_text` | `glm53` | GLM-5.3 Flash, KDA + sparse attention + MoE + MTP |
+| `glm5_next`, `glm5_next_text`, GGUF `glm5-next` | `glm53` | GLM-5.3 Flash, KDA + sparse attention + MoE + MTP |
+| GGUF `general.architecture=deepseek41` | `deepseek41` | DeepSeek V4.1 Flash Coder, mixed IQ GGUF, experimental |
+| `flux2-klein`, `flux3-klein` | `flux2`, `flux3` | Local image generation |
 | `laya` | `laya` | Decision model |
 
 These identifiers are checkpoint contracts; do not rename them to match product
-names. Model resolution accepts local directories and Hugging Face repository
-IDs. Metal is the LLM backend; a CPU path exists for Laya.
+names. Model resolution accepts local directories, supported GGUF files and
+Hugging Face repository IDs. Metal is the LLM backend; a CPU path exists for Laya.
+
+DeepSeek's validated six-file GGUF package preserves packed weights and reads
+its Engram table from disk. It has no draft head. The pinned DS4 reference,
+format adapters, measured checks and remaining parity work are recorded in
+`specs/models/deepseek41.md`. A working reply does not certify DS4 equivalence.
 
 | Crate | Responsibility |
 | --- | --- |
 | `lisa-mlx` | Tensor runtime, allocation, JIT dispatch and Metal shaders |
+| `lisa-gguf` | GGUF parsing, split packages, mapped storage and CPU block decoding |
 | `lisa-engine` | Model implementations and shared generation/session logic |
 | `lisa-serve` | HTTP APIs and request handling |
 | `lisa-cli` | `lisa` CLI |
@@ -35,13 +43,23 @@ under `jit/` or `models/`. Shared architecture code such as GDN belongs at the
 models root. Keep model-specific logic out of `lisa-engine/src/core/` when it
 can be expressed through `LanguageModel`.
 
+Keep `lisa-gguf` independent of the engine and Metal runtime. The engine's
+`core::gguf_resident` adapter owns GPU weight views and RAM admission.
+
 Keep self-contained test fixtures with the owning crate. Large model-dependent
 captures are external data selected through `LISA_GLM53_FIXTURE_DIR`; retain
-their filenames, sizes and hashes in the crate's fixture manifest. An enabled
-test must fail if required data is missing. Keep durable contracts, provenance
+their filenames, sizes, hashes and reference identity in a durable external
+capture inventory. Legacy GLM's old tracked manifest was removed; rebuilding
+that inventory is recorded in `specs/roadmap.md`. An enabled test must fail if
+required data is missing. Keep durable contracts, provenance
 and result summaries in `specs/`, `docs/` or alongside source.
 
 ## Build and validation
+
+Cargo builds generate a matching `kernels.bin` beside the executables. Preserve
+it when copying standalone binaries; the app bundle places it in Resources.
+`sh crates/lisa-ui/bundle.sh` builds the size-limited `dist` bundle and retains
+the matching dSYM outside it. See [desktop packaging](specs/desktop.md).
 
 Before committing, run the following sequence with the machine-safety checks
 below.
@@ -90,7 +108,7 @@ data do not certify those cases.
 ## Numerical contracts
 
 Follow the current task instructions and these constraints when older campaign
-text conflicts. [Standing contracts](specs/00-contracts.md) provide additional
+text conflicts. [Standing contracts](specs/contracts.md) provide additional
 detail, but historical permission to recapture goldens does not authorize
 weakening the strict requirements below.
 
@@ -120,11 +138,15 @@ weakening the strict requirements below.
 
 - Use the pinned [DS4](https://github.com/antirez/ds4) implementation as the
   execution reference. Record upstream revision and adapter identity in the
-  [GLM campaign](specs/11-glm53-flash.md); refresh the reference before
+  [GLM status](specs/models/glm53.md); refresh the reference before
   applying upstream changes. Specs do not override observed reference code.
-- Preserve original MLX tensor payloads, metadata precision, scales, biases and
-  quantization groups. No requantization to make the port easier.
-- Production loading requires a prepared `.lisa-resident/index.json` inside
+- The curated GLM checkpoint is DS4's `antirez/glm-5.3-flash-gguf`, file
+  `GLM-5.3-Flash-Q2.gguf`. Preserve its original Q8_0/Q4_K/IQ2_XXS/Q2_K
+  payloads and embedded MTP block. The native path is experimental; current
+  evidence and remaining numerical/scheduling gaps are in `specs/models/glm53.md`.
+- Legacy MLX loading preserves tensor payloads, metadata precision, scales,
+  biases and quantization groups. No requantization to make the port easier.
+- Legacy MLX loading requires a prepared `.lisa-resident/index.json` inside
   the model directory. Use `lisa prepare --model <local-directory>`; its
   `--plan-only` mode reports disk needs without writing weights. Preparation
   preserves original bytes and refuses to overwrite existing output.
@@ -133,7 +155,8 @@ weakening the strict requirements below.
 - Keep expert addresses and residency stable. Resident decode must not
   reintroduce selected-expert CPU readback, staging joins or address-table
   rebuilding. Bound temporary memory independently of layer count.
-- Native Q8, DSA and supported fused gate/up schedules are defaults. Preserve
+- Legacy MLX Q8, DSA and supported fused gate/up schedules are defaults.
+  The GGUF path still executes prefill/target-verify rows serially. Preserve
   DS4's shape gates, dense/sparse boundaries, value-projection slice sizes,
   submission cadence and encoder boundaries when changing dispatch.
 - `LISA_GLM53_Q8_GATE_UP=separate` retains separate projections. Its loaded mode
@@ -143,7 +166,7 @@ weakening the strict requirements below.
   state or snapshot equivalence.
 - Same-weight DS4 adapter agreement, independent kernel validation and native
   upstream performance are separate claims. The full acceptance matrix remains
-  open; see the GLM campaign for measured cases and gaps.
+  open; see the GLM status for measured cases and gaps.
 - [Sushi](https://github.com/beamivalice/sushi) is an optimization reference.
   Refresh its source before using it; DS4 remains the GLM parity oracle.
 
@@ -166,9 +189,8 @@ weakening the strict requirements below.
 - Preserve the Qwen PLD depth clamp at six (verify width seven). Kernel tile
   width is not draft depth; GLM's two-draft MTP is a separate contract.
 - Consult prior findings before reopening AOT, paged-KV decode, norm-inside-qmv,
-  tree verification, ANE/GPU prefill or MTP-head grafting. See the
-  [serial](specs/07-serial-final.md), [tree](specs/08-tree-draft.md) and
-  [catalogue](specs/10-catalogue.md) reports.
+  tree verification, ANE/GPU prefill or MTP-head grafting. See
+  [performance dispositions](specs/performance.md#historical-conclusions-to-preserve).
 
 ## Diagnostics and documentation
 
@@ -185,12 +207,15 @@ Selected controls; model tests have additional capture hooks in their source:
 | `LISA_GLM53_CAPTURE_PRESERVE_DISPATCH` | Preserve production dispatch during captures; some intermediates need shadow replay |
 | `LISA_GLM53_Q8_GATE_UP` | `paired` (default) or `separate`, selected at load |
 | `LISA_GLM53_MODEL`, `LISA_GLM53_FIXTURE_DIR` | Checkpoint and external captures for explicitly enabled model integration tests |
+| `LISA_GLM53_DUMP` | Explicit file path for legacy GLM layer-0 KDA input capture; diagnostic only, excluded from timing |
 
 Do not restore removed controls (`LISA_KEEP`, `LISA_DUMP_TOKENS`, `LISA_TOPK`,
 `LISA_GDN_OPS`, `LISA_METALLIB`) without a documented requirement.
 
 - [README](README.md): user setup and entry points.
-- [Standing contracts](specs/00-contracts.md): serving, state and memory rules.
-- [Campaign specs](specs/): scoped measurements and previous decisions.
-- [GLM campaign](specs/11-glm53-flash.md): status and numerical details.
+- [Standing contracts](specs/contracts.md): serving, state and memory rules.
+- [Specification index](specs/README.md): current architecture and capability status.
+- [Performance](specs/performance.md): scoped results and measurement rules.
+- [Roadmap](specs/roadmap.md): remaining work and acceptance conditions.
+- [GLM status](specs/models/glm53.md): status and numerical details.
   Historical results do not certify newly changed paths.

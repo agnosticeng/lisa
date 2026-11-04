@@ -1274,7 +1274,9 @@ fn glm53_capture_dsa_indexer_from_saved_layer_state() -> anyhow::Result<()> {
     let mut caches = tower.new_caches();
     let cache = match &mut caches[layer] {
         LayerCache::Full(cache) => cache,
-        LayerCache::Linear(_) => anyhow::bail!("DSA cache mismatch at layer {layer}"),
+        LayerCache::Linear(_) | LayerCache::Native(_) => {
+            anyhow::bail!("DSA cache mismatch at layer {layer}")
+        }
     };
     let _ = dsa.forward(&x, cache, Some(capture), layer, true)?;
     capture.flush(
@@ -1530,7 +1532,7 @@ fn capture_real_16k_dsa_decode_selector_inputs_for_ds4() -> anyhow::Result<()> {
             };
             let cache = match &mut caches[target_layer] {
                 LayerCache::Full(cache) => cache,
-                LayerCache::Linear(_) => {
+                LayerCache::Linear(_) | LayerCache::Native(_) => {
                     anyhow::bail!("GLM layer-{target_layer} cache is not DSA")
                 }
             };
@@ -1547,7 +1549,9 @@ fn capture_real_16k_dsa_decode_selector_inputs_for_ds4() -> anyhow::Result<()> {
     }
     let target_cache_len = match &caches[target_layer] {
         LayerCache::Full(cache) => cache.indexer_tape.total,
-        LayerCache::Linear(_) => anyhow::bail!("GLM layer-{target_layer} cache is not DSA"),
+        LayerCache::Linear(_) | LayerCache::Native(_) => {
+            anyhow::bail!("GLM layer-{target_layer} cache is not DSA")
+        }
     };
     anyhow::ensure!(
         target_cache_len == HISTORY,
@@ -1568,7 +1572,9 @@ fn capture_real_16k_dsa_decode_selector_inputs_for_ds4() -> anyhow::Result<()> {
                     .ok_or_else(|| anyhow::anyhow!("KDA layer {layer_id} has no SSM prefix"))?
                     .to_vec1::<f32>()?,
             ),
-            LayerCache::Full(_) => anyhow::bail!("KDA layer {layer_id} has a DSA cache"),
+            LayerCache::Full(_) | LayerCache::Native(_) => {
+                anyhow::bail!("KDA layer {layer_id} has an incompatible cache")
+            }
         };
         let weights = match &tower.layers[layer_id].attn {
             Attn::Kda(kda) => kda.ds4_decode_weights_for_capture()?,
@@ -1757,7 +1763,9 @@ fn capture_real_16k_dsa_decode_selector_inputs_for_ds4() -> anyhow::Result<()> {
     };
     let cache = match &mut caches[target_layer] {
         LayerCache::Full(cache) => cache,
-        LayerCache::Linear(_) => anyhow::bail!("GLM layer-{target_layer} cache is not DSA"),
+        LayerCache::Linear(_) | LayerCache::Native(_) => {
+            anyhow::bail!("GLM layer-{target_layer} cache is not DSA")
+        }
     };
     let loaded_prefill_fixture: &[u8] =
         &crate::models::glm53::test_fixtures::read("indexer_prefill_projection_model_long_ds4.bin");
@@ -2024,15 +2032,14 @@ fn capture_real_16k_dsa_decode_selector_inputs_for_ds4() -> anyhow::Result<()> {
     anyhow::ensure!(projected_key.len() == 128 && projected_gate.len() == 128);
     anyhow::ensure!(query_full.len() == 64 * 256 && q_low.len() == 64 * 512);
     anyhow::ensure!(lora.len() == 64 * 512 && selected.len() == 2051);
-    const PROJECTION_FIXTURE: &[u8] = include_bytes!(
-        "../../../../lisa-mlx/src/models/glm53/fixtures/indexer_projection_model_long_ds4.bin"
-    );
+    let external_projection_fixture: &[u8] =
+        &crate::models::glm53::test_fixtures::read("indexer_projection_model_long_ds4.bin");
     const PROJECTION_HEADER_BYTES: usize = 4 * std::mem::size_of::<u32>();
     const PROJECTION_OUTPUT_START: usize = PROJECTION_HEADER_BYTES
         + 4096 * std::mem::size_of::<f32>()
         + 2 * 128 * 4096 * std::mem::size_of::<u16>();
     let projection_fixture = match target_layer {
-        3 => Some(PROJECTION_FIXTURE.to_vec()),
+        3 => Some(external_projection_fixture.to_vec()),
         43 => Some(crate::models::glm53::test_fixtures::read(
             "indexer_projection_layer43_model_long_ds4.bin",
         )),

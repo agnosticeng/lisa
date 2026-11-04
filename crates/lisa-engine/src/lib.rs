@@ -1,10 +1,10 @@
-//! Native Rust inference for Qwen, GLM and Laya models.
+//! Native Rust inference for language, image and decision models.
 //!
 //! - [`core`] provides shared loading, quantization, norm/rope primitives,
 //!   the layer caches, sampling, tokenization, and the generation / batching /
 //!   scheduling loops.
 //! - [`models`] holds the model implementations. The runtime drives them
-//!   through [`models::LanguageModel`] or [`models::DecisionModel`].
+//!   through [`models::LanguageModel`], [`models::DecisionModel`] or the image pipeline.
 
 pub mod cli;
 pub mod core;
@@ -32,4 +32,6 @@ pub fn ttft_mark(label: &str) {
 
 // Convenience re-exports for the common entry points.
 pub use core::{batch, generate, loader, mem, norm, quant, sampler, sched, session, tokenizer};
+/// Load and validate the packaged Metal sources without allocating GPU resources.
+pub use lisa_mlx::shader_pack::initialize as initialize_kernels;
 pub use models::{DecisionModel, LanguageModel, Loaded, laya, qwen4};

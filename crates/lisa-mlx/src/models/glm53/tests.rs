@@ -163,11 +163,12 @@ fn glm53_dsa_qkv_project_pair_matches_separate_mlx_and_ds4_paths() {
         eprintln!("[glm53-dsa-qkv-pair] skipping: no Metal device available");
         return;
     }
-    const BATCH_FIXTURE: &[u8] = include_bytes!("fixtures/dsa_qkv_batch_ds4_f32.bin");
+    let external_batch_fixture: &[u8] =
+        &crate::models::glm53::test_fixtures::read("dsa_qkv_batch_ds4_f32.bin");
     const IN: usize = 4096;
     const Q_ROWS: usize = 1536;
     const KV_ROWS: usize = 512;
-    let batch_fixture: Vec<f32> = BATCH_FIXTURE
+    let batch_fixture: Vec<f32> = external_batch_fixture
         .chunks_exact(std::mem::size_of::<f32>())
         .map(|bytes| f32::from_ne_bytes(bytes.try_into().expect("fixture float width")))
         .collect();
@@ -321,13 +322,14 @@ fn glm53_dsa_value_project_matches_ds4_f32_mv4_fixture() {
         eprintln!("[glm53-dsa-value] skipping: no Metal device available");
         return;
     }
-    const FIXTURE: &[u8] = include_bytes!("fixtures/dsa_value_project_ds4_f32_mv4.bin");
+    let external_fixture: &[u8] =
+        &crate::models::glm53::test_fixtures::read("dsa_value_project_ds4_f32_mv4.bin");
     const INPUT_BYTES: usize = 2 * 512 * std::mem::size_of::<f32>();
     const WEIGHT_BYTES: usize = 2 * 512 * 128 * std::mem::size_of::<u32>();
     const AFFINE_BYTES: usize = 2 * 512 * 8 * std::mem::size_of::<u16>();
     const OUTPUT_BYTES: usize = 2 * 256 * std::mem::size_of::<f32>();
     assert_eq!(
-        FIXTURE.len(),
+        external_fixture.len(),
         INPUT_BYTES + WEIGHT_BYTES + 2 * AFFINE_BYTES + OUTPUT_BYTES
     );
 
@@ -337,10 +339,10 @@ fn glm53_dsa_value_project_matches_ds4_f32_mv4_fixture() {
             .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("F32 fixture word")))
             .collect::<Vec<_>>()
     };
-    let input = f32s(&FIXTURE[..INPUT_BYTES]);
+    let input = f32s(&external_fixture[..INPUT_BYTES]);
     let weights_start = INPUT_BYTES;
     let weights_end = weights_start + WEIGHT_BYTES;
-    let weights = FIXTURE[weights_start..weights_end]
+    let weights = external_fixture[weights_start..weights_end]
         .chunks_exact(4)
         .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("U32 fixture word")))
         .collect::<Vec<_>>();
@@ -355,11 +357,11 @@ fn glm53_dsa_value_project_matches_ds4_f32_mv4_fixture() {
             })
             .collect::<Vec<_>>()
     };
-    let scales = expand_bf16(&FIXTURE[scales_start..scales_end]);
+    let scales = expand_bf16(&external_fixture[scales_start..scales_end]);
     let biases_start = scales_end;
     let biases_end = biases_start + AFFINE_BYTES;
-    let biases = expand_bf16(&FIXTURE[biases_start..biases_end]);
-    let expected = f32s(&FIXTURE[biases_end..biases_end + OUTPUT_BYTES]);
+    let biases = expand_bf16(&external_fixture[biases_start..biases_end]);
+    let expected = f32s(&external_fixture[biases_end..biases_end + OUTPUT_BYTES]);
 
     let input = Array::from_slice(&input, &[2, 512]);
     let weights = Array::from_slice(&weights, &[1024, 128]);
@@ -1260,8 +1262,9 @@ fn glm53_dsa_norms_match_ds4_metal_fixture() {
     const KV_DIM: usize = 512;
     const Q_COUNT: usize = ROWS * Q_DIM;
     const KV_COUNT: usize = ROWS * KV_DIM;
-    const FIXTURE: &[u8] = include_bytes!("fixtures/dsa_norm_ds4_metal.bin");
-    assert_eq!(FIXTURE.len(), (Q_COUNT + KV_COUNT) * 4);
+    let external_fixture: &[u8] =
+        &crate::models::glm53::test_fixtures::read("dsa_norm_ds4_metal.bin");
+    assert_eq!(external_fixture.len(), (Q_COUNT + KV_COUNT) * 4);
 
     let q_input: Vec<f32> = (0..Q_COUNT)
         .map(|i| (((i * 37 + 13) % 251) as f32 - 125.0) * 0.000244140625)
@@ -1290,7 +1293,7 @@ fn glm53_dsa_norms_match_ds4_metal_fixture() {
         .to_vec1::<f32>()
         .expect("read KV-LoRA RMSNorm output");
 
-    let expected_q = FIXTURE[..Q_COUNT * 4]
+    let expected_q = external_fixture[..Q_COUNT * 4]
         .chunks_exact(4)
         .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("f32 fixture")));
     for (index, (actual, expected)) in actual_q.iter().zip(expected_q).enumerate() {
@@ -1300,7 +1303,7 @@ fn glm53_dsa_norms_match_ds4_metal_fixture() {
             "weighted q_a RMSNorm differs from DS4 at {index}: {actual} vs {expected}"
         );
     }
-    let expected_kv = FIXTURE[Q_COUNT * 4..]
+    let expected_kv = external_fixture[Q_COUNT * 4..]
         .chunks_exact(4)
         .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("f32 fixture")));
     for (index, (actual, expected)) in actual_kv.iter().zip(expected_kv).enumerate() {
@@ -1325,8 +1328,9 @@ fn glm53_qkv_norm_fusion_matches_ds4_fused_qkv_norm_store_fixture() {
     const Q_COUNT: usize = ROWS * Q_DIM;
     const KV_COUNT: usize = ROWS * KV_DIM;
     const Q_BYTES: usize = Q_COUNT * 4;
-    const FIXTURE: &[u8] = include_bytes!("fixtures/qkv_norm_store_ds4_metal.bin");
-    assert_eq!(FIXTURE.len(), Q_BYTES + KV_COUNT * 2);
+    let external_fixture: &[u8] =
+        &crate::models::glm53::test_fixtures::read("qkv_norm_store_ds4_metal.bin");
+    assert_eq!(external_fixture.len(), Q_BYTES + KV_COUNT * 2);
 
     let q_input: Vec<f32> = (0..Q_COUNT)
         .map(|i| (((i * 37 + 13) % 251) as f32 - 125.0) * 0.000244140625)
@@ -1367,7 +1371,7 @@ fn glm53_qkv_norm_fusion_matches_ds4_fused_qkv_norm_store_fixture() {
     for (index, actual) in actual_q.iter().enumerate() {
         let start = index * 4;
         let expected = f32::from_le_bytes(
-            FIXTURE[start..start + 4]
+            external_fixture[start..start + 4]
                 .try_into()
                 .expect("f32 fixture value"),
         );
@@ -1384,7 +1388,7 @@ fn glm53_qkv_norm_fusion_matches_ds4_fused_qkv_norm_store_fixture() {
     }
     for (index, actual) in actual_kv.iter().enumerate() {
         let start = Q_BYTES + index * 2;
-        let expected = u16::from_le_bytes([FIXTURE[start], FIXTURE[start + 1]]);
+        let expected = u16::from_le_bytes([external_fixture[start], external_fixture[start + 1]]);
         assert_eq!(
             actual.to_bits(),
             expected,
@@ -1427,7 +1431,7 @@ fn glm53_qkv_norm_fusion_matches_ds4_fused_qkv_norm_store_fixture() {
     for (index, actual) in direct_q.iter().enumerate() {
         let start = index * 4;
         let expected = f32::from_le_bytes(
-            FIXTURE[start..start + 4]
+            external_fixture[start..start + 4]
                 .try_into()
                 .expect("f32 fixture value"),
         );
@@ -1439,8 +1443,10 @@ fn glm53_qkv_norm_fusion_matches_ds4_fused_qkv_norm_store_fixture() {
             if (CACHE_POS..CACHE_POS + ROWS).contains(&row) {
                 let latent_index = (row - CACHE_POS) * KV_DIM + col;
                 let fixture_index = Q_BYTES + latent_index * 2;
-                let expected =
-                    u16::from_le_bytes([FIXTURE[fixture_index], FIXTURE[fixture_index + 1]]);
+                let expected = u16::from_le_bytes([
+                    external_fixture[fixture_index],
+                    external_fixture[fixture_index + 1],
+                ]);
                 assert_eq!(
                     direct_cache[index].to_bits(),
                     expected,
@@ -2281,9 +2287,10 @@ fn glm53_shared_affine_q8_matches_ds4_q8_0_schedule_fixture() {
     const IN: usize = 64;
     const OUT: usize = 2;
     const GROUP: usize = 64;
-    const FIXTURE: &[u8] = include_bytes!("fixtures/shared_q8_swiglu_ds4.bin");
-    assert_eq!(FIXTURE.len(), 6 * std::mem::size_of::<f32>());
-    let expected: Vec<f32> = FIXTURE
+    let external_fixture: &[u8] =
+        &crate::models::glm53::test_fixtures::read("shared_q8_swiglu_ds4.bin");
+    assert_eq!(external_fixture.len(), 6 * std::mem::size_of::<f32>());
+    let expected: Vec<f32> = external_fixture
         .chunks_exact(4)
         .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("fixture f32")))
         .collect();
@@ -2409,9 +2416,13 @@ fn glm53_affine_q8_nax_prefill_matches_ds4_q8_0_tensor_fixture() {
     const OUT: usize = 4096;
     const TOKENS: usize = 96;
     const GROUP: usize = 64;
-    const FIXTURE: &[u8] = include_bytes!("fixtures/q8_prefill_ds4_m96_k4096_n4096.bin");
-    assert_eq!(FIXTURE.len(), TOKENS * OUT * std::mem::size_of::<f32>());
-    let expected: Vec<f32> = FIXTURE
+    let external_fixture: &[u8] =
+        &crate::models::glm53::test_fixtures::read("q8_prefill_ds4_m96_k4096_n4096.bin");
+    assert_eq!(
+        external_fixture.len(),
+        TOKENS * OUT * std::mem::size_of::<f32>()
+    );
+    let expected: Vec<f32> = external_fixture
         .chunks_exact(4)
         .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("fixture f32")))
         .collect();
@@ -2842,9 +2853,13 @@ fn glm53_affine_q8_mpp_prefill_matches_ds4_with_half_weight_rounding() {
     const TOKENS: usize = 96;
     const GROUP: usize = 64;
     const SCALE: f32 = 0.333251953125; // half bits 0x3555
-    const FIXTURE: &[u8] = include_bytes!("fixtures/q8_prefill_ds4_m96_k4096_n4096_scale3555.bin");
-    assert_eq!(FIXTURE.len(), TOKENS * OUT * std::mem::size_of::<f32>());
-    let expected: Vec<f32> = FIXTURE
+    let external_fixture: &[u8] =
+        &crate::models::glm53::test_fixtures::read("q8_prefill_ds4_m96_k4096_n4096_scale3555.bin");
+    assert_eq!(
+        external_fixture.len(),
+        TOKENS * OUT * std::mem::size_of::<f32>()
+    );
+    let expected: Vec<f32> = external_fixture
         .chunks_exact(4)
         .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("fixture f32")))
         .collect();
@@ -2946,14 +2961,18 @@ fn glm53_affine_q8_mpp_prefill_matches_ds4_wide_token_tiles() {
     const OUT: usize = 4096;
     const GROUP: usize = 64;
     const SCALE: f32 = 0.333251953125;
-    const FIXTURES: &[(usize, &[u8])] = &[
+    let external_fixtures: &[(usize, &[u8])] = &[
         (
             64,
-            include_bytes!("fixtures/q8_prefill_ds4_m64_k4096_n4096_scale3555.bin"),
+            &crate::models::glm53::test_fixtures::read(
+                "q8_prefill_ds4_m64_k4096_n4096_scale3555.bin",
+            ),
         ),
         (
             128,
-            include_bytes!("fixtures/q8_prefill_ds4_m128_k4096_n4096_scale3555.bin"),
+            &crate::models::glm53::test_fixtures::read(
+                "q8_prefill_ds4_m128_k4096_n4096_scale3555.bin",
+            ),
         ),
     ];
     let mut packed = Vec::with_capacity(OUT * IN / 4);
@@ -2980,7 +2999,7 @@ fn glm53_affine_q8_mpp_prefill_matches_ds4_wide_token_tiles() {
         &[OUT as i32, (IN / GROUP) as i32],
     );
     let weights = Array::from_slice(&packed, &[OUT as i32, (IN / 4) as i32]);
-    for (tokens, fixture) in FIXTURES {
+    for (tokens, fixture) in external_fixtures {
         assert_eq!(fixture.len(), tokens * OUT * std::mem::size_of::<f32>());
         let expected: Vec<f32> = fixture
             .chunks_exact(4)
@@ -3277,7 +3296,7 @@ fn glm53_mhc_expand_layer21_capture_matches_ds4_fixture() {
     const POST_VALUES: usize = ROWS * STREAMS;
     const COMB_VALUES: usize = ROWS * STREAMS * STREAMS;
     const OUTPUT_VALUES: usize = RESIDUAL_VALUES;
-    let fixture = include_bytes!("fixtures/mhc_expand_ds4_layer21_ids1234.f32");
+    let fixture = &crate::models::glm53::test_fixtures::read("mhc_expand_ds4_layer21_ids1234.f32");
     let values = fixture
         .chunks_exact(std::mem::size_of::<f32>())
         .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four-byte float")))
@@ -3338,7 +3357,8 @@ fn glm53_mhc_ffn_expand_layer21_capture_matches_ds4_fixture() {
     const POST_VALUES: usize = ROWS * STREAMS;
     const COMB_VALUES: usize = ROWS * STREAMS * STREAMS;
     const OUTPUT_VALUES: usize = RESIDUAL_VALUES;
-    let fixture = include_bytes!("fixtures/mhc_ffn_expand_ds4_layer21_ids1234.f32");
+    let fixture =
+        &crate::models::glm53::test_fixtures::read("mhc_ffn_expand_ds4_layer21_ids1234.f32");
     let values = fixture
         .chunks_exact(std::mem::size_of::<f32>())
         .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four-byte float")))
@@ -3434,7 +3454,8 @@ fn glm53_mhc_mix_rms_layer21_capture_matches_ds4_fixture() {
     const ROWS: usize = 4;
     const WIDTH: usize = 4 * 4096;
     const VALUES: usize = ROWS * WIDTH;
-    let fixture = include_bytes!("fixtures/mhc_mix_norm_ds4_layer21_ids1234.f32");
+    let fixture =
+        &crate::models::glm53::test_fixtures::read("mhc_mix_norm_ds4_layer21_ids1234.f32");
     assert_eq!(fixture.len(), VALUES * 4 * std::mem::size_of::<f32>());
     let values = fixture
         .chunks_exact(std::mem::size_of::<f32>())
@@ -3476,8 +3497,10 @@ fn glm53_mhc_mix_projection_layer21_capture_matches_ds4_fixture() {
     const MIXES: usize = ROWS * 24;
     const WEIGHT_BYTES: usize = 24 * WIDTH * std::mem::size_of::<u16>();
     const OUTPUT_BYTES: usize = MIXES * std::mem::size_of::<f32>();
-    let norm_fixture = include_bytes!("fixtures/mhc_mix_norm_ds4_layer21_ids1234.f32");
-    let projection_fixture = include_bytes!("fixtures/mhc_mix_projection_ds4_layer21_ids1234.bin");
+    let norm_fixture =
+        &crate::models::glm53::test_fixtures::read("mhc_mix_norm_ds4_layer21_ids1234.f32");
+    let projection_fixture =
+        &crate::models::glm53::test_fixtures::read("mhc_mix_projection_ds4_layer21_ids1234.bin");
     assert_eq!(
         norm_fixture.len(),
         ROWS * WIDTH * 4 * std::mem::size_of::<f32>()
@@ -3539,8 +3562,9 @@ fn glm53_mhc_mix_prefill_gemm_layer21_rows9_matches_ds4_fixture() {
     const WEIGHT_BYTES: usize = 24 * WIDTH * std::mem::size_of::<u16>();
     const INPUT_BYTES: usize = ROWS * WIDTH * std::mem::size_of::<f32>();
     const OUTPUT_BYTES: usize = OUTPUTS * std::mem::size_of::<f32>();
-    let weights_fixture = include_bytes!("fixtures/mhc_mix_projection_ds4_layer21_ids1234.bin");
-    let fixture = include_bytes!("fixtures/mhc_mix_gemm_ds4_layer21_rows9.bin");
+    let weights_fixture =
+        &crate::models::glm53::test_fixtures::read("mhc_mix_projection_ds4_layer21_ids1234.bin");
+    let fixture = &crate::models::glm53::test_fixtures::read("mhc_mix_gemm_ds4_layer21_rows9.bin");
     assert_eq!(weights_fixture.len(), 2 * (WEIGHT_BYTES + 4 * 24 * 4));
     assert_eq!(fixture.len(), INPUT_BYTES + OUTPUT_BYTES);
     let mut weight_values = Vec::with_capacity(24 * WIDTH);
@@ -3588,7 +3612,8 @@ fn glm53_mhc_split_norm_layer21_capture_matches_ds4_fixture() {
     const NORM_VALUES: usize = ROWS * HIDDEN;
     const FIXTURE_VALUES: usize =
         SPLIT_VALUES + 3 + 24 + RESIDUAL_VALUES + HIDDEN + SPLIT_VALUES + NORM_VALUES + NORM_VALUES;
-    let fixture = include_bytes!("fixtures/mhc_split_norm_ds4_layer21_ids1234.f32");
+    let fixture =
+        &crate::models::glm53::test_fixtures::read("mhc_split_norm_ds4_layer21_ids1234.f32");
     assert_eq!(fixture.len(), FIXTURE_VALUES * std::mem::size_of::<f32>());
     let values = fixture
         .chunks_exact(std::mem::size_of::<f32>())
@@ -3671,7 +3696,8 @@ fn glm53_mhc_ffn_split_norm_layer21_capture_matches_ds4_fixture() {
     const NORM_VALUES: usize = ROWS * HIDDEN;
     const FIXTURE_VALUES: usize =
         SPLIT_VALUES + 3 + 24 + RESIDUAL_VALUES + HIDDEN + SPLIT_VALUES + NORM_VALUES + NORM_VALUES;
-    let fixture = include_bytes!("fixtures/mhc_ffn_split_norm_ds4_layer21_ids1234.f32");
+    let fixture =
+        &crate::models::glm53::test_fixtures::read("mhc_ffn_split_norm_ds4_layer21_ids1234.f32");
     assert_eq!(fixture.len(), FIXTURE_VALUES * std::mem::size_of::<f32>());
     let values = fixture
         .chunks_exact(std::mem::size_of::<f32>())
@@ -3808,16 +3834,17 @@ fn glm53_indexer_topk_matches_ds4_sparse_tail_fixture() {
         eprintln!("[glm53-indexer-topk] skipping: no Metal device available");
         return;
     }
-    const FIXTURE: &[u8] = include_bytes!("fixtures/indexer_topk_ds4_sparse_tail.bin");
+    let external_fixture: &[u8] =
+        &crate::models::glm53::test_fixtures::read("indexer_topk_ds4_sparse_tail.bin");
     const SCORE_COUNT: usize = 4 * 513;
     const SCORE_BYTES: usize = SCORE_COUNT * 4;
     const TOPK_BYTES: usize = 4 * 512 * 4;
     const EXPANDED_START: usize = SCORE_BYTES + TOPK_BYTES;
-    let scores: Vec<f32> = FIXTURE[..SCORE_BYTES]
+    let scores: Vec<f32> = external_fixture[..SCORE_BYTES]
         .chunks_exact(4)
         .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("F32 score fixture word")))
         .collect();
-    let expected: Vec<i32> = FIXTURE[SCORE_BYTES..EXPANDED_START]
+    let expected: Vec<i32> = external_fixture[SCORE_BYTES..EXPANDED_START]
         .chunks_exact(4)
         .map(|chunk| i32::from_le_bytes(chunk.try_into().expect("I32 ID fixture word")))
         .collect();
@@ -3846,7 +3873,7 @@ fn glm53_indexer_topk_matches_ds4_sparse_tail_fixture() {
         .expect("DS4-shaped pool expansion should dispatch")
         .to_vec1::<i32>()
         .expect("expanded token IDs should be readable");
-    let expected_expanded: Vec<i32> = FIXTURE[EXPANDED_START..]
+    let expected_expanded: Vec<i32> = external_fixture[EXPANDED_START..]
         .chunks_exact(4)
         .map(|chunk| i32::from_le_bytes(chunk.try_into().expect("I32 expanded ID word")))
         .collect();
@@ -3867,12 +3894,13 @@ fn glm53_indexer_topk_model_ties_match_ds4_order() {
     const POOLS: usize = 1024;
     const TOP_K: usize = 512;
     const SCORE_BYTES: usize = ROWS * POOLS * std::mem::size_of::<f32>();
-    const FIXTURE: &[u8] = include_bytes!("fixtures/indexer_topk_tied_model_rows_ds4.bin");
-    let scores = FIXTURE[..SCORE_BYTES]
+    let external_fixture: &[u8] =
+        &crate::models::glm53::test_fixtures::read("indexer_topk_tied_model_rows_ds4.bin");
+    let scores = external_fixture[..SCORE_BYTES]
         .chunks_exact(4)
         .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("F32 score fixture word")))
         .collect::<Vec<_>>();
-    let expected = FIXTURE[SCORE_BYTES..]
+    let expected = external_fixture[SCORE_BYTES..]
         .chunks_exact(4)
         .map(|chunk| i32::from_le_bytes(chunk.try_into().expect("I32 ID fixture word")))
         .collect::<Vec<_>>();
@@ -3922,7 +3950,8 @@ fn glm53_indexed_lora_matches_ds4_sparse_boundary_fixture() {
         eprintln!("[glm53-indexed-lora] skipping: no Metal device available");
         return;
     }
-    const FIXTURE: &[u8] = include_bytes!("fixtures/dsa_indexed_lora_ds4_boundary.bin");
+    let external_fixture: &[u8] =
+        &crate::models::glm53::test_fixtures::read("dsa_indexed_lora_ds4_boundary.bin");
     const Q_LOW_BYTES: usize = 64 * 512 * 4;
     const CACHE_START: usize = Q_LOW_BYTES;
     const CACHE_BYTES: usize = 2052 * 512 * 2;
@@ -3930,7 +3959,7 @@ fn glm53_indexed_lora_matches_ds4_sparse_boundary_fixture() {
     const SELECTED_BYTES: usize = 2051 * 4;
     const EXPECTED_START: usize = SELECTED_START + SELECTED_BYTES;
     const OUTPUT_COUNT: usize = 64 * 512;
-    assert_eq!(FIXTURE.len(), EXPECTED_START + OUTPUT_COUNT * 4);
+    assert_eq!(external_fixture.len(), EXPECTED_START + OUTPUT_COUNT * 4);
 
     let read_f32 = |bytes: &[u8]| -> Vec<f32> {
         bytes
@@ -3938,17 +3967,17 @@ fn glm53_indexed_lora_matches_ds4_sparse_boundary_fixture() {
             .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("F32 fixture word")))
             .collect()
     };
-    let q_low = read_f32(&FIXTURE[..CACHE_START]);
-    let latents: Vec<half::f16> = FIXTURE[CACHE_START..SELECTED_START]
+    let q_low = read_f32(&external_fixture[..CACHE_START]);
+    let latents: Vec<half::f16> = external_fixture[CACHE_START..SELECTED_START]
         .chunks_exact(2)
         .map(|chunk| half::f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])))
         .collect();
-    let selected: Vec<i32> = FIXTURE[SELECTED_START..EXPECTED_START]
+    let selected: Vec<i32> = external_fixture[SELECTED_START..EXPECTED_START]
         .chunks_exact(4)
         .map(|chunk| i32::from_le_bytes(chunk.try_into().expect("I32 fixture word")))
         .collect();
     assert_eq!(selected.iter().filter(|&&row| row < 0).count(), 2);
-    let expected = read_f32(&FIXTURE[EXPECTED_START..]);
+    let expected = read_f32(&external_fixture[EXPECTED_START..]);
 
     let q_low = Array::from_slice(&q_low, &[1, 1, 64, 512]);
     let latents = Array::from_slice(&latents, &[1, 2052, 512]);
@@ -4013,7 +4042,8 @@ fn glm53_indexer_pool_matches_ds4_f16_midpoint_fixture() {
         eprintln!("[glm53-indexer-pool] skipping: no Metal device available");
         return;
     }
-    const FIXTURE: &[u8] = include_bytes!("fixtures/indexer_pool_ds4_midpoints.bin");
+    let external_fixture: &[u8] =
+        &crate::models::glm53::test_fixtures::read("indexer_pool_ds4_midpoints.bin");
     const RAW_BYTES: usize = 2 * 4 * 128 * 4;
     const NORM_W_START: usize = RAW_BYTES;
     const GATE_START: usize = NORM_W_START + 128 * 4;
@@ -4026,15 +4056,15 @@ fn glm53_indexer_pool_matches_ds4_f16_midpoint_fixture() {
             .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("F32 fixture word")))
             .collect()
     }
-    let raw = read_f32(&FIXTURE[..RAW_BYTES]);
-    let norm_w = read_f32(&FIXTURE[NORM_W_START..GATE_START]);
-    let gate = read_f32(&FIXTURE[GATE_START..NORM_B_START]);
-    let norm_b = read_f32(&FIXTURE[NORM_B_START..APE_START]);
-    let ape: Vec<half::bf16> = FIXTURE[APE_START..EXPECTED_START]
+    let raw = read_f32(&external_fixture[..RAW_BYTES]);
+    let norm_w = read_f32(&external_fixture[NORM_W_START..GATE_START]);
+    let gate = read_f32(&external_fixture[GATE_START..NORM_B_START]);
+    let norm_b = read_f32(&external_fixture[NORM_B_START..APE_START]);
+    let ape: Vec<half::bf16> = external_fixture[APE_START..EXPECTED_START]
         .chunks_exact(2)
         .map(|chunk| half::bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])))
         .collect();
-    let expected: Vec<u16> = FIXTURE[EXPECTED_START..]
+    let expected: Vec<u16> = external_fixture[EXPECTED_START..]
         .chunks_exact(2)
         .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
         .collect();
@@ -4072,14 +4102,15 @@ fn glm53_indexer_pool_matches_ds4_layer11_fixture() {
         eprintln!("[glm53-indexer-pool] skipping: no Metal device available");
         return;
     }
-    const FIXTURE: &[u8] = include_bytes!("fixtures/indexer_pool_ds4_layer11.bin");
+    let external_fixture: &[u8] =
+        &crate::models::glm53::test_fixtures::read("indexer_pool_ds4_layer11.bin");
     const RAW_BYTES: usize = 4 * 128 * 4;
     const NORM_W_START: usize = RAW_BYTES;
     const GATE_START: usize = NORM_W_START + 128 * 4;
     const NORM_B_START: usize = GATE_START + RAW_BYTES;
     const APE_START: usize = NORM_B_START + 128 * 4;
     const EXPECTED_START: usize = APE_START + 4 * 128 * 2;
-    assert_eq!(FIXTURE.len(), EXPECTED_START + 128 * 2);
+    assert_eq!(external_fixture.len(), EXPECTED_START + 128 * 2);
 
     fn read_f32(bytes: &[u8]) -> Vec<f32> {
         bytes
@@ -4087,15 +4118,15 @@ fn glm53_indexer_pool_matches_ds4_layer11_fixture() {
             .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("F32 fixture word")))
             .collect()
     }
-    let raw = read_f32(&FIXTURE[..NORM_W_START]);
-    let norm_w = read_f32(&FIXTURE[NORM_W_START..GATE_START]);
-    let gate = read_f32(&FIXTURE[GATE_START..NORM_B_START]);
-    let norm_b = read_f32(&FIXTURE[NORM_B_START..APE_START]);
-    let ape: Vec<half::bf16> = FIXTURE[APE_START..EXPECTED_START]
+    let raw = read_f32(&external_fixture[..NORM_W_START]);
+    let norm_w = read_f32(&external_fixture[NORM_W_START..GATE_START]);
+    let gate = read_f32(&external_fixture[GATE_START..NORM_B_START]);
+    let norm_b = read_f32(&external_fixture[NORM_B_START..APE_START]);
+    let ape: Vec<half::bf16> = external_fixture[APE_START..EXPECTED_START]
         .chunks_exact(2)
         .map(|chunk| half::bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])))
         .collect();
-    let expected: Vec<u16> = FIXTURE[EXPECTED_START..]
+    let expected: Vec<u16> = external_fixture[EXPECTED_START..]
         .chunks_exact(2)
         .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
         .collect();
@@ -4136,13 +4167,14 @@ fn glm53_indexer_model_long_decode_projection_matches_ds4() {
     const INPUT_BYTES: usize = IN_DIM * std::mem::size_of::<f32>();
     const WEIGHT_BYTES: usize = OUT_DIM * IN_DIM * std::mem::size_of::<u16>();
     const OUTPUT_BYTES: usize = 2 * OUT_DIM * std::mem::size_of::<f32>();
-    const FIXTURE: &[u8] = include_bytes!("fixtures/indexer_projection_model_long_ds4.bin");
+    let external_fixture: &[u8] =
+        &crate::models::glm53::test_fixtures::read("indexer_projection_model_long_ds4.bin");
     assert_eq!(
-        FIXTURE.len(),
+        external_fixture.len(),
         HEADER_BYTES + INPUT_BYTES + 2 * WEIGHT_BYTES + OUTPUT_BYTES
     );
     assert_eq!(
-        FIXTURE[..HEADER_BYTES],
+        external_fixture[..HEADER_BYTES],
         [
             1u32.to_le_bytes(),
             (IN_DIM as u32).to_le_bytes(),
@@ -4168,10 +4200,10 @@ fn glm53_indexer_model_long_decode_projection_matches_ds4() {
     let key_start = input_start + INPUT_BYTES;
     let gate_start = key_start + WEIGHT_BYTES;
     let output_start = gate_start + WEIGHT_BYTES;
-    let input = read_f32(&FIXTURE[input_start..key_start]);
-    let key_weight = read_bf16(&FIXTURE[key_start..gate_start]);
-    let gate_weight = read_bf16(&FIXTURE[gate_start..output_start]);
-    let expected = read_f32(&FIXTURE[output_start..]);
+    let input = read_f32(&external_fixture[input_start..key_start]);
+    let key_weight = read_bf16(&external_fixture[key_start..gate_start]);
+    let gate_weight = read_bf16(&external_fixture[gate_start..output_start]);
+    let expected = read_f32(&external_fixture[output_start..]);
 
     let input = Array::from_slice(&input, &[1, IN_DIM as i32]);
     let key_weight = Array::from_slice(&key_weight, &[OUT_DIM as i32, IN_DIM as i32]);
@@ -4210,13 +4242,14 @@ fn glm53_indexer_model_long_pool_update_matches_ds4() {
     const NORM_BYTES: usize = DIM * std::mem::size_of::<f32>();
     const APE_BYTES: usize = 4 * DIM * std::mem::size_of::<u16>();
     const POOL_BYTES: usize = POOLS * DIM * std::mem::size_of::<u16>();
-    const FIXTURE: &[u8] = include_bytes!("fixtures/indexer_pool_model_long_ds4.bin");
+    let external_fixture: &[u8] =
+        &crate::models::glm53::test_fixtures::read("indexer_pool_model_long_ds4.bin");
     assert_eq!(
-        FIXTURE.len(),
+        external_fixture.len(),
         8 + 2 * RAW_BYTES + 2 * NORM_BYTES + APE_BYTES + POOL_BYTES
     );
     assert_eq!(
-        FIXTURE[..8],
+        external_fixture[..8],
         [(HISTORY as u32).to_le_bytes(), (POOLS as u32).to_le_bytes()].concat()
     );
 
@@ -4232,15 +4265,15 @@ fn glm53_indexer_model_long_pool_update_matches_ds4() {
     let norm_bias_start = norm_weight_start + NORM_BYTES;
     let ape_start = norm_bias_start + NORM_BYTES;
     let pool_start = ape_start + APE_BYTES;
-    let raw = read_f32(&FIXTURE[raw_start..gate_start]);
-    let gate = read_f32(&FIXTURE[gate_start..norm_weight_start]);
-    let norm_weight = read_f32(&FIXTURE[norm_weight_start..norm_bias_start]);
-    let norm_bias = read_f32(&FIXTURE[norm_bias_start..ape_start]);
-    let ape = FIXTURE[ape_start..pool_start]
+    let raw = read_f32(&external_fixture[raw_start..gate_start]);
+    let gate = read_f32(&external_fixture[gate_start..norm_weight_start]);
+    let norm_weight = read_f32(&external_fixture[norm_weight_start..norm_bias_start]);
+    let norm_bias = read_f32(&external_fixture[norm_bias_start..ape_start]);
+    let ape = external_fixture[ape_start..pool_start]
         .chunks_exact(2)
         .map(|chunk| half::bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])))
         .collect::<Vec<_>>();
-    let expected = FIXTURE[pool_start..]
+    let expected = external_fixture[pool_start..]
         .chunks_exact(2)
         .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
         .collect::<Vec<_>>();
@@ -4287,9 +4320,10 @@ fn glm53_indexer_pool_matches_ds4_incremental_rollback_replay_fixture() {
     const GATE_BYTES: usize = RAW_BYTES;
     const APE_BYTES: usize = POOL_SIZE * DIM * std::mem::size_of::<u16>();
     const OUTPUT_BYTES: usize = POOLS * DIM * std::mem::size_of::<u16>();
-    const FIXTURE: &[u8] = include_bytes!("fixtures/indexer_pool_lifecycle_ds4.bin");
+    let external_fixture: &[u8] =
+        &crate::models::glm53::test_fixtures::read("indexer_pool_lifecycle_ds4.bin");
     assert_eq!(
-        FIXTURE.len(),
+        external_fixture.len(),
         RAW_BYTES + NORM_BYTES + GATE_BYTES + NORM_BYTES + APE_BYTES + OUTPUT_BYTES
     );
 
@@ -4311,16 +4345,16 @@ fn glm53_indexer_pool_matches_ds4_incremental_rollback_replay_fixture() {
             .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
             .collect::<Vec<_>>()
     };
-    let raw = decode_f32(&FIXTURE[..RAW_BYTES]);
+    let raw = decode_f32(&external_fixture[..RAW_BYTES]);
     let norm_start = RAW_BYTES;
-    let norm_weight = decode_f32(&FIXTURE[norm_start..norm_start + NORM_BYTES]);
+    let norm_weight = decode_f32(&external_fixture[norm_start..norm_start + NORM_BYTES]);
     let gate_start = norm_start + NORM_BYTES;
-    let gate = decode_f32(&FIXTURE[gate_start..gate_start + GATE_BYTES]);
+    let gate = decode_f32(&external_fixture[gate_start..gate_start + GATE_BYTES]);
     let bias_start = gate_start + GATE_BYTES;
-    let norm_bias = decode_f32(&FIXTURE[bias_start..bias_start + NORM_BYTES]);
+    let norm_bias = decode_f32(&external_fixture[bias_start..bias_start + NORM_BYTES]);
     let ape_start = bias_start + NORM_BYTES;
-    let ape = decode_bf16(&FIXTURE[ape_start..ape_start + APE_BYTES]);
-    let expected = decode_f16_bits(&FIXTURE[ape_start + APE_BYTES..]);
+    let ape = decode_bf16(&external_fixture[ape_start..ape_start + APE_BYTES]);
+    let expected = decode_f16_bits(&external_fixture[ape_start + APE_BYTES..]);
 
     let raw = Array::from_slice(&raw, &[1, POOLS as i32, POOL_SIZE as i32, DIM as i32]);
     let gate = Array::from_slice(&gate, &[1, POOLS as i32, POOL_SIZE as i32, DIM as i32]);
@@ -4487,9 +4521,10 @@ fn glm53_indexer_prefill_tail_scores_match_ds4_natural_8k_fixture() {
     const POOL_BYTES: usize = POOLS * DIM * std::mem::size_of::<u16>();
     const SCORE_BYTES: usize = POOLS * std::mem::size_of::<f32>();
     const SELECTED_BYTES: usize = (2048 / 4 * 4 + 3) * std::mem::size_of::<i32>();
-    const FIXTURE: &[u8] = include_bytes!("fixtures/indexer_score_prefill_tail_ds4.bin");
+    let external_fixture: &[u8] =
+        &crate::models::glm53::test_fixtures::read("indexer_score_prefill_tail_ds4.bin");
     assert_eq!(
-        FIXTURE.len(),
+        external_fixture.len(),
         Q_BYTES + WEIGHT_BYTES + POOL_BYTES + SCORE_BYTES + SELECTED_BYTES
     );
 
@@ -4499,17 +4534,17 @@ fn glm53_indexer_prefill_tail_scores_match_ds4_natural_8k_fixture() {
             .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("F32 fixture word")))
             .collect::<Vec<_>>()
     };
-    let q = read_f32(&FIXTURE[..Q_BYTES]);
-    let weights = read_f32(&FIXTURE[Q_BYTES..Q_BYTES + WEIGHT_BYTES]);
+    let q = read_f32(&external_fixture[..Q_BYTES]);
+    let weights = read_f32(&external_fixture[Q_BYTES..Q_BYTES + WEIGHT_BYTES]);
     let pool_start = Q_BYTES + WEIGHT_BYTES;
-    let pooled = FIXTURE[pool_start..pool_start + POOL_BYTES]
+    let pooled = external_fixture[pool_start..pool_start + POOL_BYTES]
         .chunks_exact(2)
         .map(|chunk| half::f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])))
         .collect::<Vec<_>>();
     let score_start = pool_start + POOL_BYTES;
-    let expected = read_f32(&FIXTURE[score_start..score_start + SCORE_BYTES]);
+    let expected = read_f32(&external_fixture[score_start..score_start + SCORE_BYTES]);
     let selected_start = score_start + SCORE_BYTES;
-    let expected_selected = FIXTURE[selected_start..]
+    let expected_selected = external_fixture[selected_start..]
         .chunks_exact(4)
         .map(|chunk| i32::from_le_bytes(chunk.try_into().expect("I32 fixture word")))
         .collect::<Vec<_>>();
@@ -4563,9 +4598,10 @@ fn glm53_indexer_decode_scores_match_ds4_sparse_boundary_fixture() {
     const WEIGHT_BYTES: usize = BATCHES * HEADS * std::mem::size_of::<f32>();
     const POOL_BYTES: usize = BATCHES * POOLS * DIM * std::mem::size_of::<u16>();
     const SCORE_BYTES: usize = BATCHES * POOLS * std::mem::size_of::<f32>();
-    const FIXTURE: &[u8] = include_bytes!("fixtures/indexer_score_decode_ds4_sparse_boundary.bin");
+    let external_fixture: &[u8] =
+        &crate::models::glm53::test_fixtures::read("indexer_score_decode_ds4_sparse_boundary.bin");
     assert_eq!(
-        FIXTURE.len(),
+        external_fixture.len(),
         Q_BYTES + WEIGHT_BYTES + POOL_BYTES + SCORE_BYTES
     );
 
@@ -4575,14 +4611,14 @@ fn glm53_indexer_decode_scores_match_ds4_sparse_boundary_fixture() {
             .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("F32 fixture word")))
             .collect::<Vec<_>>()
     };
-    let q = read_f32(&FIXTURE[..Q_BYTES]);
-    let weights = read_f32(&FIXTURE[Q_BYTES..Q_BYTES + WEIGHT_BYTES]);
+    let q = read_f32(&external_fixture[..Q_BYTES]);
+    let weights = read_f32(&external_fixture[Q_BYTES..Q_BYTES + WEIGHT_BYTES]);
     let pool_start = Q_BYTES + WEIGHT_BYTES;
-    let pooled = FIXTURE[pool_start..pool_start + POOL_BYTES]
+    let pooled = external_fixture[pool_start..pool_start + POOL_BYTES]
         .chunks_exact(2)
         .map(|chunk| half::f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])))
         .collect::<Vec<_>>();
-    let expected = read_f32(&FIXTURE[pool_start + POOL_BYTES..]);
+    let expected = read_f32(&external_fixture[pool_start + POOL_BYTES..]);
 
     let q = Array::from_slice(&q, &[BATCHES as i32, HEADS as i32, 1, DIM as i32]);
     let weights = Array::from_slice(&weights, &[BATCHES as i32, 1, HEADS as i32]);
@@ -4627,9 +4663,10 @@ fn glm53_indexer_long_decode_scores_and_topk_match_ds4_fixture() {
     const POOL_BYTES: usize = BATCHES * POOLS * DIM * std::mem::size_of::<u16>();
     const SCORE_BYTES: usize = BATCHES * POOLS * std::mem::size_of::<f32>();
     const IDS_BYTES: usize = BATCHES * TOP_K * std::mem::size_of::<i32>();
-    const FIXTURE: &[u8] = include_bytes!("fixtures/indexer_score_decode_ds4_long_window.bin");
+    let external_fixture: &[u8] =
+        &crate::models::glm53::test_fixtures::read("indexer_score_decode_ds4_long_window.bin");
     assert_eq!(
-        FIXTURE.len(),
+        external_fixture.len(),
         Q_BYTES + WEIGHT_BYTES + POOL_BYTES + SCORE_BYTES + IDS_BYTES
     );
 
@@ -4639,16 +4676,16 @@ fn glm53_indexer_long_decode_scores_and_topk_match_ds4_fixture() {
             .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("F32 fixture word")))
             .collect::<Vec<_>>()
     };
-    let q = read_f32(&FIXTURE[..Q_BYTES]);
-    let weights = read_f32(&FIXTURE[Q_BYTES..Q_BYTES + WEIGHT_BYTES]);
+    let q = read_f32(&external_fixture[..Q_BYTES]);
+    let weights = read_f32(&external_fixture[Q_BYTES..Q_BYTES + WEIGHT_BYTES]);
     let pool_start = Q_BYTES + WEIGHT_BYTES;
-    let pooled = FIXTURE[pool_start..pool_start + POOL_BYTES]
+    let pooled = external_fixture[pool_start..pool_start + POOL_BYTES]
         .chunks_exact(2)
         .map(|chunk| half::f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])))
         .collect::<Vec<_>>();
     let score_start = pool_start + POOL_BYTES;
-    let expected_scores = read_f32(&FIXTURE[score_start..score_start + SCORE_BYTES]);
-    let expected_ids = FIXTURE[score_start + SCORE_BYTES..]
+    let expected_scores = read_f32(&external_fixture[score_start..score_start + SCORE_BYTES]);
+    let expected_ids = external_fixture[score_start + SCORE_BYTES..]
         .chunks_exact(4)
         .map(|chunk| i32::from_le_bytes(chunk.try_into().expect("I32 fixture word")))
         .collect::<Vec<_>>();
@@ -4720,9 +4757,10 @@ fn glm53_indexer_model_long_decode_scores_topk_and_expansion_match_ds4() {
     const SCORE_BYTES: usize = POOLS * std::mem::size_of::<f32>();
     const POOL_IDS_BYTES: usize = TOP_POOLS * std::mem::size_of::<i32>();
     const EXPANDED_BYTES: usize = SELECTED_WIDTH * std::mem::size_of::<i32>();
-    const FIXTURE: &[u8] = include_bytes!("fixtures/indexer_score_model_long_ds4.bin");
+    let external_fixture: &[u8] =
+        &crate::models::glm53::test_fixtures::read("indexer_score_model_long_ds4.bin");
     assert_eq!(
-        FIXTURE.len(),
+        external_fixture.len(),
         Q_BYTES + WEIGHT_BYTES + POOL_BYTES + SCORE_BYTES + POOL_IDS_BYTES + EXPANDED_BYTES
     );
 
@@ -4739,18 +4777,19 @@ fn glm53_indexer_model_long_decode_scores_topk_and_expansion_match_ds4() {
             .collect::<Vec<_>>()
     };
 
-    let q = read_f32(&FIXTURE[..Q_BYTES]);
-    let weights = read_f32(&FIXTURE[Q_BYTES..Q_BYTES + WEIGHT_BYTES]);
+    let q = read_f32(&external_fixture[..Q_BYTES]);
+    let weights = read_f32(&external_fixture[Q_BYTES..Q_BYTES + WEIGHT_BYTES]);
     let pool_start = Q_BYTES + WEIGHT_BYTES;
-    let pooled = FIXTURE[pool_start..pool_start + POOL_BYTES]
+    let pooled = external_fixture[pool_start..pool_start + POOL_BYTES]
         .chunks_exact(2)
         .map(|chunk| half::f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])))
         .collect::<Vec<_>>();
     let score_start = pool_start + POOL_BYTES;
-    let expected_scores = read_f32(&FIXTURE[score_start..score_start + SCORE_BYTES]);
+    let expected_scores = read_f32(&external_fixture[score_start..score_start + SCORE_BYTES]);
     let pool_ids_start = score_start + SCORE_BYTES;
-    let expected_pool_ids = read_i32(&FIXTURE[pool_ids_start..pool_ids_start + POOL_IDS_BYTES]);
-    let expected_expanded = read_i32(&FIXTURE[pool_ids_start + POOL_IDS_BYTES..]);
+    let expected_pool_ids =
+        read_i32(&external_fixture[pool_ids_start..pool_ids_start + POOL_IDS_BYTES]);
+    let expected_expanded = read_i32(&external_fixture[pool_ids_start + POOL_IDS_BYTES..]);
 
     let q = Array::from_slice(&q, &[1, HEADS as i32, 1, DIM as i32]);
     let weights = Array::from_slice(&weights, &[1, 1, HEADS as i32]);
@@ -4814,9 +4853,10 @@ fn glm53_indexed_lora_model_long_decode_matches_ds4() {
     const CACHE_BYTES: usize = CACHE_ROWS * WIDTH * std::mem::size_of::<u16>();
     const SELECTED_BYTES: usize = SELECTED * std::mem::size_of::<i32>();
     const OUTPUT_BYTES: usize = HEADS * WIDTH * std::mem::size_of::<f32>();
-    const FIXTURE: &[u8] = include_bytes!("fixtures/dsa_indexed_lora_model_long_ds4.bin");
+    let external_fixture: &[u8] =
+        &crate::models::glm53::test_fixtures::read("dsa_indexed_lora_model_long_ds4.bin");
     assert_eq!(
-        FIXTURE.len(),
+        external_fixture.len(),
         Q_BYTES + LOW_BYTES + CACHE_BYTES + SELECTED_BYTES + OUTPUT_BYTES
     );
 
@@ -4833,17 +4873,17 @@ fn glm53_indexed_lora_model_long_decode_matches_ds4() {
             .collect::<Vec<_>>()
     };
 
-    let _query = read_f32(&FIXTURE[..Q_BYTES]);
+    let _query = read_f32(&external_fixture[..Q_BYTES]);
     let low_start = Q_BYTES;
-    let q_low = read_f32(&FIXTURE[low_start..low_start + LOW_BYTES]);
+    let q_low = read_f32(&external_fixture[low_start..low_start + LOW_BYTES]);
     let cache_start = low_start + LOW_BYTES;
-    let compact = FIXTURE[cache_start..cache_start + CACHE_BYTES]
+    let compact = external_fixture[cache_start..cache_start + CACHE_BYTES]
         .chunks_exact(2)
         .map(|chunk| half::f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])))
         .collect::<Vec<_>>();
     let selected_start = cache_start + CACHE_BYTES;
-    let selected = read_i32(&FIXTURE[selected_start..selected_start + SELECTED_BYTES]);
-    let expected = read_f32(&FIXTURE[selected_start + SELECTED_BYTES..]);
+    let selected = read_i32(&external_fixture[selected_start..selected_start + SELECTED_BYTES]);
+    let expected = read_f32(&external_fixture[selected_start + SELECTED_BYTES..]);
 
     let q_low = Array::from_slice(
         &q_low,
@@ -5334,14 +5374,14 @@ fn kda_prepare_two_calls() {
 }
 
 #[test]
+#[ignore = "requires a KDA input capture selected by LISA_GLM53_DUMP"]
 fn kda_prepare_real_inputs() {
     // Loads the real-model inputs dumped by LISA_GLM53_DUMP and validates
     // the kernel against the naive reference formulas on REAL data.
-    let path = "/tmp/kda-real-inputs.bin";
-    let Ok(bytes) = std::fs::read(path) else {
-        eprintln!("[real-inputs] {path} missing — skipping");
-        return;
-    };
+    let path = std::env::var_os("LISA_GLM53_DUMP")
+        .expect("set LISA_GLM53_DUMP to the required KDA input capture file");
+    let bytes = std::fs::read(&path)
+        .unwrap_or_else(|error| panic!("cannot read required KDA input capture {path:?}: {error}"));
     let mut off = 0usize;
     let read_vec = |bytes: &Vec<u8>, off: &mut usize| -> Vec<f32> {
         let n = u32::from_le_bytes(bytes[*off..*off + 4].try_into().unwrap()) as usize;

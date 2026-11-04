@@ -11,6 +11,7 @@ name = "lisa-bench"
 path = "src/main.rs"
 
 [dependencies]
+lisa-gguf.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 lisa-mlx.workspace = true

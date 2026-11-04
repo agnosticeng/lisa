@@ -10,6 +10,7 @@
 //! The normal single-stream path uses the ds4 prepare, recurrence, and output
 //! kernels. The Array-op path remains an explicit diagnostic fallback.
 
+use super::gguf::projection::Projection;
 use super::mhc::{concat, concat_refs, fscalar, mm, narrow};
 use crate::core::cache::GdnCache;
 use crate::core::capture;
@@ -42,16 +43,16 @@ fn capture_decode_diagnostic(
 }
 
 pub struct Kda {
-    q_w: Array, // Plain model weight in source dtype, row-major [out, in]
-    k_w: Array,
-    v_w: Array,
-    o_proj: Array, // Plain KDA projection in source dtype, row-major [out, in]
-    f_a_w: Array,  // [4096, 128]
-    f_b_w: Array,  // [128, 8192]
-    g_a_w: Array,  // [4096, 128]
-    g_b_w: Array,  // [128, 8192]
-    b_w: Array,    // [4096, 64]
-    conv_q: Array, // F32 [channels, 4], taps flattened from [channels, 1, 4]
+    q_w: Projection, // Plain model weight in source dtype, row-major [out, in]
+    k_w: Projection,
+    v_w: Projection,
+    o_proj: Projection, // Plain KDA projection in source dtype, row-major [out, in]
+    f_a_w: Projection,  // [4096, 128]
+    f_b_w: Projection,  // [128, 8192]
+    g_a_w: Projection,  // [4096, 128]
+    g_b_w: Projection,  // [128, 8192]
+    b_w: Projection,    // [4096, 64]
+    conv_q: Array,      // F32 [channels, 4], taps flattened from [channels, 1, 4]
     conv_k: Array,
     conv_v: Array,
     dt_bias: Array,  // [64, 128] f32
@@ -152,15 +153,15 @@ impl Kda {
         let o_norm_w = take(w, &p("o_norm.weight"))?.as_dtype(Dtype::Float32)?;
         let o_proj = take(w, &p("o_proj.weight"))?;
         Ok(Self {
-            q_w,
-            k_w,
-            v_w,
-            o_proj,
-            f_a_w,
-            f_b_w,
-            g_a_w,
-            g_b_w,
-            b_w,
+            q_w: q_w.into(),
+            k_w: k_w.into(),
+            v_w: v_w.into(),
+            o_proj: o_proj.into(),
+            f_a_w: f_a_w.into(),
+            f_b_w: f_b_w.into(),
+            g_a_w: g_a_w.into(),
+            g_b_w: g_b_w.into(),
+            b_w: b_w.into(),
             conv_q,
             conv_k,
             conv_v,
@@ -190,8 +191,11 @@ impl Kda {
     }
 
     /// Apply a plain `[out,in]` projection using ds4's BF16 GEMV/GEMM split.
-    fn linear(&self, x: &Array, weight: &Array) -> anyhow::Result<Array> {
-        linear_projection(x, weight)
+    fn linear(&self, x: &Array, weight: &Projection) -> anyhow::Result<Array> {
+        match weight {
+            Projection::Plain(w) => linear_projection(x, w),
+            Projection::Packed(_) => weight.forward(x),
+        }
     }
 
     /// Fuse the two one-to-eight-row dense KDA gate projections. This keeps
@@ -820,16 +824,16 @@ impl Kda {
                         .reshape(&[1i32, (self.conv_k_sz - 1) as i32, (conv_dim) as i32])?
                         .as_dtype(Dtype::Float32)?,
                 );
-                if std::env::var_os("LISA_GLM53_DUMP").is_some() && layer == 0 {
+                if layer == 0
+                    && let Some(path) = std::env::var_os("LISA_GLM53_DUMP")
+                {
                     use std::io::Write;
-                    let path = "/tmp/kda-real-inputs.bin";
-                    let mut f = std::fs::File::create(path).unwrap();
+                    let path = std::path::Path::new(&path);
+                    let mut f = std::fs::File::create(path)?;
                     for arr in [&qo_f, &ko_f, &vo_f, &gate_f] {
-                        let v = arr.to_vec1::<f32>().unwrap_or_default();
-                        let _ = f.write_all(&(v.len() as u32).to_le_bytes());
-                        let _ = f.write_all(
-                            &v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>(),
-                        );
+                        let v = arr.to_vec1::<f32>()?;
+                        f.write_all(&(v.len() as u32).to_le_bytes())?;
+                        f.write_all(&v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())?;
                     }
                     for arr in [
                         &self.conv_q,
@@ -838,18 +842,15 @@ impl Kda {
                         &self.a_log,
                         &self.dt_bias,
                     ] {
-                        let cf = arr.as_dtype(Dtype::Float32).unwrap();
-                        let v = cf.to_vec1::<f32>().unwrap_or_default();
-                        let _ = f.write_all(&(v.len() as u32).to_le_bytes());
-                        let _ = f.write_all(
-                            &v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>(),
-                        );
+                        let cf = arr.as_dtype(Dtype::Float32)?;
+                        let v = cf.to_vec1::<f32>()?;
+                        f.write_all(&(v.len() as u32).to_le_bytes())?;
+                        f.write_all(&v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())?;
                     }
-                    let v = conv_in.to_vec1::<f32>().unwrap_or_default();
-                    let _ = f.write_all(&(v.len() as u32).to_le_bytes());
-                    let _ =
-                        f.write_all(&v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
-                    eprintln!("[kda-dump] wrote {path}");
+                    let v = conv_in.to_vec1::<f32>()?;
+                    f.write_all(&(v.len() as u32).to_le_bytes())?;
+                    f.write_all(&v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())?;
+                    eprintln!("[kda-dump] wrote {}", path.display());
                 }
                 if std::env::var_os("LISA_GLM53_DEBUG").is_some() && layer == 0 {
                     let qpre = qo_f.to_vec1::<f32>().unwrap_or_default();
@@ -1231,3 +1232,37 @@ impl Kda {
 #[cfg(test)]
 #[path = "kda_tests.rs"]
 mod tests;
+
+impl Kda {
+    pub(crate) fn load_gguf(
+        w: &crate::core::gguf_resident::ResidentWeights,
+        layer: usize,
+    ) -> anyhow::Result<Self> {
+        use super::gguf::projection::plain;
+        let p = |name: &str| format!("blk.{layer}.{name}.weight");
+        let projection = |name: &str| Projection::load(w, &p(name));
+        let f = |name: &str| plain(w, &p(name));
+        Ok(Self {
+            q_w: projection("kda_q")?,
+            k_w: projection("kda_k")?,
+            v_w: projection("kda_v")?,
+            o_proj: projection("kda_output")?,
+            f_a_w: projection("kda_f_a")?,
+            f_b_w: projection("kda_f_b")?,
+            g_a_w: projection("kda_g_a")?,
+            g_b_w: projection("kda_g_b")?,
+            b_w: projection("kda_beta")?,
+            conv_q: f("kda_q_conv")?.reshape(&[8192, 4])?,
+            conv_k: f("kda_k_conv")?.reshape(&[8192, 4])?,
+            conv_v: f("kda_v_conv")?.reshape(&[8192, 4])?,
+            dt_bias: f("kda_dt_bias")?,
+            a_log: f("kda_a_log")?,
+            o_norm_w: f("kda_o_norm")?,
+            heads: 64,
+            head_dim: 128,
+            conv_k_sz: 4,
+            lower_bound: -5.0,
+            norm_eps: 1e-5,
+        })
+    }
+}

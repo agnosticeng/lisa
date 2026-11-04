@@ -470,9 +470,8 @@ fn bench_verify_qmm_m_sweep() {
     }
 }
 
-/// Peak streaming-READ bandwidth of this box: the number `specs/07`'s
-/// that the tree never actually measured. If the real peak is well above
-/// 819 GB/s then 723 is a kernel-efficiency problem, not a floor.
+/// Measure streaming-read bandwidth on the selected Metal device.
+/// Use the result as a hardware diagnostic, not an inference-throughput claim.
 ///
 /// Grid-stride read of a 1 GiB bf16 buffer, reduced per threadgroup and
 /// flushed with one atomic per warp, so the traffic is `n * 2` bytes read and
@@ -554,5 +553,5 @@ fn bench_peak_stream() {
             gbs
         );
     }
-    println!(">>> PEAK STREAMING READ = {best:.1} GB/s (specs/07 assumed 819)");
+    println!(">>> PEAK STREAMING READ = {best:.1} GB/s");
 }

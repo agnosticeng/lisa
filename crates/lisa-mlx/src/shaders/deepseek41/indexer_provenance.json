@@ -1,0 +1,22 @@
+{
+  "repository": "https://github.com/antirez/ds4",
+  "revision": "b3f50180ec2c7324892be1f50bc83555ccb8d5e7",
+  "sources": {
+    "dsv4_misc.metal": "ee2923600e10ef3fff1d060901e661d4c01d8c698a8312c50cd9d65d8d047671",
+    "dsv41.metal": "070e2eb4c8494a28d6d172790977a24ce58fb54faddf3e404985894643e2b473"
+  },
+  "section_sha256": [
+    "b982b36f77bfc387a7172a62e8eeb998414319672c7469548ffa9b632e9720a9",
+    "768879dc6e037163d3b1cc559c5877e30d9e5c565a75129c2889105df190f23f",
+    "092032f13b38cd45330da1025e6d71c0e046f4fdbff3de38c9cd84bba580caf6",
+    "8e10f97212ae961fc8d971d5b43da9dc7c46fa798457e2595fafb5b34e7fb77d",
+    "29243a7750b846c887775e70bdb5d34ad8b2fa2d6a4ad45ccb11b119b7365109",
+    "4c71bd618135eb2f079cf269be32fd8a2e63d1d06f9e1ee61c3b09c06486304b",
+    "5288fd4d7ed66bac95de6de6dc339f9a943715b980853231288f734ac678ff46",
+    "6fcd6fcaf8d86e6e4cc28e2ef3ca9c8cd86c8792e2433bff1bb7f9ee9b3005ec",
+    "a8c6e66a6619845580eae6d0ddd86a94ab538f625ad9337fd1b8c5e415df1487",
+    "71d9d6da915abafabbf6a01f3206e7ffb3f3032755de74e3e3d71c69f1e80dcd"
+  ],
+  "local_sha256": "d7ef6ebcf4850d0efdbe3a6e5f7ca8fe67dc2b2dcfccf734cbc374d9234aa557",
+  "changes": "Self-contained original direct/rows-four/wide/BF16 split index scoring, BF16 key storage, pool2, candidate block/filter/list/id and top-k mask sections; arithmetic unchanged."
+}

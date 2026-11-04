@@ -158,6 +158,7 @@ struct TargetMtpPending {
 /// recurrent state (short-conv, fp32 SSM, PLE conv).
 #[derive(Clone)]
 pub struct LayerSnapshot {
+    pub native: Option<crate::core::cache::NativeCache>,
     pub full_offset: Option<usize>,
     pub gdn: Option<(Option<Array>, Option<Array>, Option<Array>)>,
 }
@@ -331,12 +332,19 @@ impl Session {
             .iter()
             .map(|c| match c {
                 LayerCache::Full(f) => LayerSnapshot {
+                    native: None,
                     full_offset: Some(f.offset),
                     gdn: None,
                 },
                 LayerCache::Linear(g) => LayerSnapshot {
+                    native: None,
                     full_offset: None,
                     gdn: Some(g.snapshot_state()),
+                },
+                LayerCache::Native(n) => LayerSnapshot {
+                    native: Some(n.clone()),
+                    full_offset: None,
+                    gdn: None,
                 },
             })
             .collect();
@@ -369,6 +377,13 @@ impl Session {
         let glm_mtp_min_position = self.glm_mtp_snapshots[idx].1;
         for (c, s) in self.caches.iter_mut().zip(snaps.iter()) {
             match (c, s) {
+                (
+                    LayerCache::Native(n),
+                    LayerSnapshot {
+                        native: Some(saved),
+                        ..
+                    },
+                ) => *n = saved.clone(),
                 (
                     LayerCache::Full(f),
                     LayerSnapshot {
@@ -537,7 +552,7 @@ impl Session {
         if let Some(cb) = after_prefill.as_deref_mut() {
             cb(&self.caches);
         }
-        let mut token = if tower.has_target_mtp() {
+        let mut token = if tower.uses_ds4_sampling() {
             sampler.draw_ds4(&logits, &self.fed)?
         } else {
             sampler.draw(&logits, &self.fed)?
@@ -585,7 +600,7 @@ impl Session {
         }
         while out.len() < max_tokens && !is_eos(token) {
             let logits = self.decode_token(tower, token)?;
-            token = if tower.has_target_mtp() {
+            token = if tower.uses_ds4_sampling() {
                 sampler.draw_ds4(&logits, &self.fed)?
             } else {
                 sampler.draw(&logits, &self.fed)?
@@ -619,7 +634,7 @@ impl Session {
         let mut mode = TargetMtpSamplingMode::Configured;
         let mut token = if mode == TargetMtpSamplingMode::Greedy {
             crate::models::speculate::argmax_id(&logits)?
-        } else if tower.has_target_mtp() {
+        } else if tower.uses_ds4_sampling() {
             sampler.draw_ds4(&logits, &self.fed)?
         } else {
             sampler.draw(&logits, &self.fed)?
@@ -631,7 +646,7 @@ impl Session {
             logits = self.decode_token(tower, token)?;
             token = if mode == TargetMtpSamplingMode::Greedy {
                 crate::models::speculate::argmax_id(&logits)?
-            } else if tower.has_target_mtp() {
+            } else if tower.uses_ds4_sampling() {
                 sampler.draw_ds4(&logits, &self.fed)?
             } else {
                 sampler.draw(&logits, &self.fed)?
@@ -772,9 +787,8 @@ fn target_mtp_uses_exact_sampling(sampler: Option<&Sampler>, mode: TargetMtpSamp
 /// with top-k=1. A repetition penalty can also change the unmodified argmax.
 fn target_mtp_draw_reuses_argmax(sampler: Option<&Sampler>, mode: TargetMtpSamplingMode) -> bool {
     mode == TargetMtpSamplingMode::Greedy
-        || sampler.is_none_or(|sampler| {
-            sampler.temperature <= 0.0 && sampler.repetition_penalty == 1.0
-        })
+        || sampler
+            .is_none_or(|sampler| sampler.temperature <= 0.0 && sampler.repetition_penalty == 1.0)
 }
 
 fn draw_target_mtp_token(
@@ -2741,6 +2755,9 @@ impl Session {
                     match c {
                         LayerCache::Full(f) => f.trim(advance - keep),
                         LayerCache::Linear(g) => g.rollback_to(keep, 4)?,
+                        LayerCache::Native(_) => anyhow::bail!(
+                            "native cache speculative rollback requires a model-specific verifier"
+                        ),
                     }
                 }
                 store_tokens.extend_from_slice(&main_tokens[..emitted]);
@@ -2753,6 +2770,9 @@ impl Session {
                 match c {
                     LayerCache::Full(f) => f.trim(advance - n),
                     LayerCache::Linear(g) => g.rollback_to(n, 4)?,
+                    LayerCache::Native(_) => anyhow::bail!(
+                        "native cache speculative rollback requires a model-specific verifier"
+                    ),
                 }
             }
             // Head-cache trim: after every
@@ -2991,6 +3011,9 @@ mod target_mtp_tests {
             let rows = Array::from_slice(&values, &[1, values.len() as i32, 1]);
             for cache in caches {
                 match cache {
+                    LayerCache::Native(_) => {
+                        anyhow::bail!("toy target-MTP model received a native cache")
+                    }
                     LayerCache::Linear(state) => {
                         for slot in [&mut state.conv, &mut state.ssm] {
                             *slot = Some(match slot {
@@ -3284,12 +3307,20 @@ mod target_mtp_tests {
             self.target.forward_capture(ids, caches, capture)
         }
 
-        fn prefill(&mut self, tokens: &[u32], caches: &mut Vec<LayerCache>) -> anyhow::Result<Array> {
+        fn prefill(
+            &mut self,
+            tokens: &[u32],
+            caches: &mut Vec<LayerCache>,
+        ) -> anyhow::Result<Array> {
             self.prefill_calls.push(tokens.to_vec());
             self.target.prefill(tokens, caches)
         }
 
-        fn decode_token(&mut self, token: u32, caches: &mut Vec<LayerCache>) -> anyhow::Result<Array> {
+        fn decode_token(
+            &mut self,
+            token: u32,
+            caches: &mut Vec<LayerCache>,
+        ) -> anyhow::Result<Array> {
             self.decode_calls.push(token);
             let ids = Array::from_slice(&[token as i32], &[1, 1]);
             let (mixed, _) = self.target.forward(&ids, Some(caches))?;
@@ -3364,7 +3395,10 @@ mod target_mtp_tests {
         let mut session = Session::new(&mut tower);
         let _ = session.feed(&mut tower, &[1])?;
         tower.law = 2;
-        let error = session.decode_token(&mut tower, 2).err().expect("law refusal");
+        let error = session
+            .decode_token(&mut tower, 2)
+            .err()
+            .expect("law refusal");
         assert!(error.to_string().contains("numerical law changed"));
         assert!(tower.decode_calls.is_empty());
         assert_eq!(session.fed, vec![1]);
@@ -3374,7 +3408,10 @@ mod target_mtp_tests {
         let _ = session.decode_token(&mut tower, 2)?;
         assert_eq!(session.fed, vec![1, 2]);
         assert_eq!(tower.decode_calls, vec![2]);
-        let error = session.decode_token(&mut tower, 3).err().expect("context refusal");
+        let error = session
+            .decode_token(&mut tower, 3)
+            .err()
+            .expect("context refusal");
         assert!(error.to_string().contains("context overflow"));
         assert_eq!(tower.decode_calls, vec![2]);
         assert_eq!(session.fed, vec![1, 2]);
@@ -3403,7 +3440,10 @@ mod target_mtp_tests {
                 vec![1.0]
             );
             assert_eq!(tower.decode_calls, vec![2]);
-            let error = session.decode_token(&mut tower, 3).err().expect("invalid session refusal");
+            let error = session
+                .decode_token(&mut tower, 3)
+                .err()
+                .expect("invalid session refusal");
             assert!(error.to_string().contains("session state is invalid"));
             assert_eq!(tower.decode_calls, vec![2]);
         }
@@ -3489,6 +3529,77 @@ mod target_mtp_tests {
             } else {
                 assert_eq!(tower.mtp_calls.len(), 4);
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn glm53_mtp_scheduler_admits_late_requests_and_reuses_slots() -> anyhow::Result<()> {
+        use crate::core::sched::{Request, run_speculative_streaming};
+        use std::cell::Cell;
+        for capacity in [1, 2] {
+            let make_tower = || ToyTargetMtp {
+                bad_first_draft: false,
+                eos_on_verify: false,
+                bias_verify_multi: false,
+                bias_verify_logits: false,
+                fail_verify_after_cache_append: false,
+                soft_logits: true,
+                context_limit: 128,
+                mtp_calls: Vec::new(),
+            };
+            let request = |id| Request {
+                id,
+                prompt: vec![1],
+                max_tokens: 8,
+                sampler: Sampler {
+                    temperature: 0.8,
+                    seed: 0x5eed + id as u64,
+                    ..Default::default()
+                },
+                ignore_eos: false,
+            };
+            let mut expected = Vec::new();
+            for id in 0..3 {
+                let mut tower = make_tower();
+                let mut session = Session::new(&mut tower);
+                let mut req = request(id);
+                expected.push(session.generate_mtp_depth(
+                    &mut tower,
+                    &req.prompt,
+                    req.max_tokens,
+                    MtpDepth::Fixed(2),
+                    None,
+                    Some(&mut req.sampler),
+                    &mut |_| Ok(()),
+                )?);
+            }
+            let first_emitted = Cell::new(false);
+            let next_id = Cell::new(1usize);
+            let mut events = Vec::new();
+            let actual = run_speculative_streaming(
+                &mut make_tower(),
+                vec![request(0)],
+                capacity,
+                2,
+                &mut |id, _| {
+                    first_emitted.set(true);
+                    events.push(id);
+                    Ok(())
+                },
+                &mut || {
+                    if !first_emitted.get() || next_id.get() >= 3 {
+                        return None;
+                    }
+                    let id = next_id.get();
+                    next_id.set(id + 1);
+                    Some(request(id))
+                },
+            )?;
+            assert_eq!(actual, expected, "capacity={capacity}");
+            let first_late = events.iter().position(|&id| id == 1).unwrap();
+            let last_first = events.iter().rposition(|&id| id == 0).unwrap();
+            assert_eq!(first_late < last_first, capacity > 1);
         }
         Ok(())
     }

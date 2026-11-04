@@ -313,6 +313,10 @@ impl BufferPool {
         // observe strong_count == 1 and clone the same pooled buffer before
         // either clone becomes visible, then bind it for unrelated writes.
         // Serialize the eligibility check and lease acquisition with sweeps.
+        #[expect(
+            clippy::readonly_write_lock,
+            reason = "eligibility and Arc lease acquisition must be exclusive"
+        )]
         let buckets = self.buckets.write().unwrap();
         // Keep the pool's strong reference while a buffer is leased. The
         // caller gets a clone; `strong_count == 1` makes it available again

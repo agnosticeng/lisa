@@ -1,6 +1,6 @@
 {
   "model": "agnosticeng/MiMo-V2.6-Distill-Qwen-9B-4bit",
-  "note": "MiMo 9B greedy golden baselines (temperature 0, serial decode), captured on this box. Same cases as the 27B golden; separate file because goldens are model-specific.",
+  "note": "MiMo 9B greedy golden baselines (temperature 0, serial decode). Same cases as the 27B golden; separate file because goldens are model-specific.",
   "cases": [
     {
       "name": "haiku_gpus_64",

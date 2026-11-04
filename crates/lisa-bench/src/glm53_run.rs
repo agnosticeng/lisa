@@ -88,7 +88,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     }
     let model_type = models::model_type_of(&args.model)?;
     ensure!(
-        matches!(model_type.as_str(), "glm5_next" | "glm5_next_text"),
+        matches!(
+            model_type.as_str(),
+            "glm5_next" | "glm5_next_text" | "glm5-next"
+        ),
         "glm53-run requires a GLM-5.3 checkpoint, got {model_type}"
     );
     let prompt = match (&args.prompt, &args.prompt_file) {
@@ -109,7 +112,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         )
     };
     let input_ids = if args.raw {
-        tokenizer.encode(&rendered_prompt, false)?
+        tokenizer.encode_plain(&rendered_prompt)?
     } else {
         tokenizer.encode_special(&rendered_prompt)?
     };
@@ -145,6 +148,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let load_started = Instant::now();
     let mut tower = match models::load_dir(&args.model)? {
         Loaded::Language(tower) => tower,
+        Loaded::Image(_) => anyhow::bail!("this command requires a language or decision model"),
         Loaded::Decision(_) => anyhow::bail!("glm53-run requires a language model"),
     };
     tower.set_context_capacity(args.ctx_size)?;
@@ -230,11 +234,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         "max_tokens": args.max_tokens,
         "depth": args.depth,
         "capture_logits": args.capture_logits,
-        "q8_schedule": "native_ds4",
+        "q8_schedule": if model_type == "glm5-next" { "gguf_scalar" } else { "native_ds4" },
         "matrix_prefill_explicit": args.matrix_prefill,
         "dsa_schedule": if lisa_mlx::models::glm53::kernels::glm53_dsa_native_enabled() { "native_ds4" } else { "legacy_affine" },
         "native_dsa_explicit": args.native_dsa,
-        "q8_gate_up_schedule": if lisa_engine::models::glm53::moe::native_gate_up_enabled() && std::env::var("LISA_GLM53_Q8_GATE_UP").as_deref() != Ok("separate") { "native_ds4_fused" } else { "separate" },
+        "q8_gate_up_schedule": if model_type == "glm5-next" { "gguf_separate" } else if lisa_engine::models::glm53::moe::native_gate_up_enabled() && std::env::var("LISA_GLM53_Q8_GATE_UP").as_deref() != Ok("separate") { "native_ds4_fused" } else { "separate" },
         "native_q8_gate_up_explicit": args.native_q8_gate_up,
         "timing_valid_for_performance": args.capture_logits.is_none(),
         "sampling": {"seed": args.seed, "temperature": args.temperature,

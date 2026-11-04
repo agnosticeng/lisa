@@ -28,6 +28,86 @@ use super::{Device, Tensor};
 use super::{MLX_FUSED_ADD_RMS_SOURCE, MLX_RMS_NORM_SOURCE, MLX_UTILS_PREAMBLE};
 use crate::error::Result;
 
+/// MLX LayerNorm forward, including its two-pass reduction and cast before
+/// the affine transform. Vision models use this with original checkpoint data.
+pub fn layer_norm(
+    device: &Device,
+    x: &Tensor,
+    weight: &Tensor,
+    bias: &Tensor,
+    eps: f32,
+) -> Result<Tensor> {
+    let (_, layout) = x.buffer_and_layout();
+    if x.dims().is_empty() || !layout.is_contiguous() {
+        crate::bail!("layer_norm requires contiguous non-scalar input");
+    }
+    let axis = *x.dims().last().unwrap();
+    if axis == 0
+        || weight.dims().len() != 1
+        || bias.dims().len() != 1
+        || weight.elem_count() != axis
+        || bias.elem_count() != axis
+        || x.dtype() != weight.dtype()
+        || x.dtype() != bias.dtype()
+    {
+        crate::bail!("layer_norm requires matching input, weight and bias shapes/dtypes");
+    }
+    let looped = axis > 6656;
+    let fun = if looped {
+        "layer_norm_looped"
+    } else {
+        "layer_norm_single_row"
+    };
+    let name = format!("lisa_{fun}_{}", type_to_name(x.dtype())?);
+    let defs = builtin_template_def(&name, fun, &[type_string(x.dtype())?.to_string()]);
+    let source = format!(
+        "{MLX_UTILS_PREAMBLE}{}{defs}",
+        crate::kernel_source!("common/attention/layer_norm.metal")
+    );
+    let pipeline = super::compile::compile_builtin(device, &source, &name)?;
+    let dims = x.dims().to_vec();
+    let output =
+        device.buffer_for_full_gpu_write(x.elem_count() * x.dtype().size_of(), "layer_norm_out")?;
+    let out = Array::from_parts(device, output.clone(), &dims, x.dtype());
+    let guard = device.commands.encoder()?;
+    let enc = guard.encoder();
+    enc.set_pipeline(&pipeline);
+    for (index, tensor) in [x, weight, bias].iter().enumerate() {
+        let (buffer, layout) = tensor.buffer_and_layout();
+        enc.set_input(
+            index,
+            Some(buffer),
+            layout.offset * tensor.dtype().size_of(),
+        );
+    }
+    enc.set_output(3, Some(&output), 0);
+    enc.set_bytes(4, &eps);
+    enc.set_bytes(5, &(axis as u32));
+    enc.set_bytes(6, &(weight.buffer_and_layout().1.stride()[0] as u32));
+    enc.set_bytes(7, &(bias.buffer_and_layout().1.stride()[0] as u32));
+    let threads = if looped {
+        pipeline.max_total_threads_per_threadgroup()
+    } else {
+        axis.div_ceil(8).div_ceil(32) * 32
+    };
+    if threads > pipeline.max_total_threads_per_threadgroup() {
+        crate::bail!("layer_norm threadgroup exceeds device limit");
+    }
+    enc.dispatch_threads_size(
+        MTLSize {
+            width: x.elem_count() / axis * threads,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: threads,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(out)
+}
+
 /// The weightless-rms ones scalar, cached per dtype (specs/08 item 3). The
 /// runtime is single-GPU (the device argument is identical across calls in a
 /// process), matching the `BF16_SIGMOID` static precedent in moe_decode.
@@ -118,7 +198,7 @@ pub fn fused_add_rms_norm(
     }
     let w_stride: u32 = {
         let (ms, wl) = weight.buffer_and_layout();
-        enc.set_input(2, Some(ms), wl.start_offset());
+        enc.set_input(2, Some(ms), wl.offset * weight.dtype().size_of());
         if weight.rank() == 1 {
             wl.stride()[0] as u32
         } else {
@@ -226,7 +306,7 @@ pub fn rms_norm(device: &Device, x: &Tensor, weight: Option<&Tensor>, eps: f32) 
     }
     let w_stride: u32 = {
         let (ms, wl) = weight.buffer_and_layout();
-        enc.set_input(1, Some(ms), wl.start_offset());
+        enc.set_input(1, Some(ms), wl.offset * weight.dtype().size_of());
         if weight.rank() == 1 {
             wl.stride()[0] as u32
         } else {

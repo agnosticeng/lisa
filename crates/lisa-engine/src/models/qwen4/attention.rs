@@ -116,7 +116,11 @@ impl Attention {
             .contiguous()?
             .reshape(&[b, s, -1])?;
 
-        let (cos, sin) = rope.cos_sin(positions)?;
+        let (cos, sin) = if positions.shape().len() == 3 {
+            rope.cos_sin_multimodal(positions)?
+        } else {
+            rope.cos_sin(positions)?
+        };
         // The engine's fused `track_attn_prep` covers every width it serves
         // (S <= 8 uses the fused qkv form, wide prefill the split form); the
         // split kernel is the same body, so use it at every width.

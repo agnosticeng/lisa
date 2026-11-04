@@ -137,9 +137,9 @@ fn median(v: &[f64]) -> f64 {
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct ModelCost {
     pub key: String,
-    /// Serial decode step (forward [1,1] + head + argmax), ms per bucket.
+    /// Serial decode step (forward `[1,1]` + head + argmax), ms per bucket.
     pub serial_ms: [Cell; 6],
-    /// One synchronous `draft_step` ([1,1] token + multi row), ms per bucket.
+    /// One synchronous `draft_step` (`[1,1]` token + multi row), ms per bucket.
     /// KEPT for schema compatibility but NOT used for pricing when a trusted
     /// chain cell exists: this cell is effectively enqueue-priced (one warm,
     /// serialized step), while the served round enqueues the whole chain lazy
@@ -152,7 +152,7 @@ pub struct ModelCost {
     #[serde(default)]
     pub chain_ms: BTreeMap<u32, [Cell; 6]>,
     /// Width `S` (= depth+1) verify forward (forward_capture + head + argmax
-    /// over [1,S], incl. its readback eval), ms per bucket.
+    /// over `[1,S]`, incl. its readback eval), ms per bucket.
     pub verify_ms: BTreeMap<u32, [Cell; 6]>,
     /// WHOLE-ROUND cells keyed by width `S` (schema v2, fed by serving
     /// traffic — the reconciliation with the reference's whole-round table,
@@ -501,7 +501,7 @@ pub fn host_chip() -> String {
 /// because the EV controller scores accepted-tokens-per-round and on an M1
 /// Pro that IMPROVED (3.65 -> 4.00) while realized tok/s fell 21%. Measured
 /// rows: M1 Pro -> 4, base M4 -> 4, base M5 -> 4; M4 Pro/Max and every
-/// unmeasured chip (including this box's M5 Max — no reference row exists
+/// unmeasured chip (including M5 Max — no reference row exists
 /// upstream, do not guess one) -> the default 6. Returns (cap, resolution
 /// string for the one-per-process log).
 pub fn adaptive_cap_for_machine() -> (usize, String) {
@@ -649,10 +649,7 @@ pub fn measure_at_kv(
             let snaps: Vec<_> = sess
                 .caches
                 .iter()
-                .map(|c| match c {
-                    LayerCache::Full(f) => (Some(f.offset), None),
-                    LayerCache::Linear(g) => (None, Some(g.snapshot_state())),
-                })
+                .map(LayerCache::snapshot_rollback)
                 .collect();
             tower.set_context_tails(vec![sess_tail(&sess, ctx_len)]);
             // Tail-ULP contract scope (AGENTS.md §9): round-cost must measure
@@ -667,11 +664,7 @@ pub fn measure_at_kv(
             drop(_verify_splitk);
             let dt = t0.elapsed().as_secs_f64() * 1e3;
             for (c, s) in sess.caches.iter_mut().zip(snaps.iter()) {
-                match (c, s) {
-                    (LayerCache::Full(f), (Some(off), _)) => f.trim(f.offset - off),
-                    (LayerCache::Linear(g), (_, Some(st))) => g.restore_state(st),
-                    _ => {}
-                }
+                c.restore_rollback(s)?;
             }
             if i >= warm {
                 times.push(dt);
@@ -799,7 +792,7 @@ pub struct DepthController {
     /// depth the controller currently runs: a d2 incumbent never observes
     /// index-2 hits, so the shared EMA at index >= 2 decays toward its last
     /// stale trial value and permanently under-prices d3+ EV (spec 03: at
-    /// 12.5k the shared EMA read acc[2]=0.49 while forced-d3 measured 0.66,
+    /// 12.5k the shared EMA read `acc[2]`=0.49 while forced-d3 measured 0.66,
     /// freezing the pick on d2 — 30 vs 37.7 tok/s measured). Each depth's EV
     /// is priced from ITS OWN acceptance once that depth has MIN_SAMPLES
     /// rounds; before that the shared EMA is the warm-start prior.

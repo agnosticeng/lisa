@@ -430,7 +430,7 @@ impl MetalKernel {
         Ok(res.into_iter().map(Array::new).collect())
     }
 
-    /// Like [`apply`], but writes into the caller's pre-allocated output
+    /// Like [`Self::apply`], but writes into the caller's pre-allocated output
     /// tensors instead of allocating fresh buffers. `prealloc` must match the
     /// kernel's output count and shapes.
     pub fn apply_into(

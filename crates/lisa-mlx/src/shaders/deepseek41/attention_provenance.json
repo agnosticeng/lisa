@@ -1,0 +1,19 @@
+{
+  "repository": "https://github.com/antirez/ds4",
+  "revision": "b3f50180ec2c7324892be1f50bc83555ccb8d5e7",
+  "source_sha256": {
+    "flash_attn.metal": "50b7bdd361030f82c3df07e287f6deeb00c849d02b44e135973d4f9364c6fb07",
+    "cpy.metal": "bcb5a19a794d0cc9631802fcc26f9cde9c373e5e6318788cb0a26c4483d87a39",
+    "dense.metal": "eaf88d4c95b76be123329feef5a88d038e908f22b27c108d77e7b42d0bbc81dc",
+    "dsv41.metal": "070e2eb4c8494a28d6d172790977a24ce58fb54faddf3e404985894643e2b473"
+  },
+  "section_sha256": [
+    "f4fe12f420eb962da056c3f398f288485fb7eaf9735af3d3d0beb0929095852c",
+    "324b86691f549b473cc207c16cd2232ff34d93305df8be7d477a9a7b771f3c88",
+    "e24568e4f85c8be9c310efa931c31fc77b3af7c7fd98f99a92671866884e320e",
+    "41bba121df01d711cd1742f144f67f5e212bb2bbd125e507f848b74eff4da3e0",
+    "f84582cd28639236935f6f860c43d371620060efe74b80a36ee9cc195e3dadc1"
+  ],
+  "local_sha256": "ca87a7c123a68d289ba24f9a55c1e3ec14eaa64d15099c797817c7110a9a1528",
+  "changes": "Self-contained decode, padding, split-K reduce and staging sections. Staging argument adds cache_rows and invalid GPU-selected ids read zero. Valid ids retain the original arithmetic. Original V4.1 transforming attention-reduce entry point."
+}

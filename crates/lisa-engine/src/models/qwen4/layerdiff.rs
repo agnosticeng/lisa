@@ -1,15 +1,15 @@
-//! Layer-diff against the Python reference dumps in /tmp/lisa-diff.
+//! Layer-diff against explicitly selected reference dumps and prompt tokens.
 
 use anyhow::Context;
 use lisa_mlx::ops::indexing::IndexOp;
 use lisa_mlx::{Array, Dtype, ops};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::models::qwen4::config::ModelConfig;
 use crate::models::qwen4::tower::{Block, Tower};
 
-fn load_bin(name: &str) -> anyhow::Result<Vec<f32>> {
-    let p = PathBuf::from("/tmp/lisa-diff").join(format!("{name}.bin"));
+fn load_bin(reference: &Path, name: &str) -> anyhow::Result<Vec<f32>> {
+    let p = reference.join(format!("{name}.bin"));
     let data = std::fs::read(&p).with_context(|| format!("reading {}", p.display()))?;
     Ok(data
         .chunks_exact(4)
@@ -17,28 +17,17 @@ fn load_bin(name: &str) -> anyhow::Result<Vec<f32>> {
         .collect())
 }
 
-fn diff(name: &str, arr: &Array) -> anyhow::Result<f32> {
-    // save my side for elementwise analysis
-    {
-        let got_f: Vec<f32> = arr
-            .as_dtype(Dtype::Float32)
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-            .reshape(&[-1])?
-            .as_slice::<f32>()
-            .to_vec();
-        let path = format!("/tmp/lisa-diff/rs_{name}.bin");
-        std::fs::write(&path, unsafe {
-            std::slice::from_raw_parts(got_f.as_ptr() as *const u8, got_f.len() * 4)
-        })
-        .ok();
-    }
+fn diff(reference: &Path, output: &Path, name: &str, arr: &Array) -> anyhow::Result<f32> {
     let got: Vec<f32> = arr
         .as_dtype(Dtype::Float32)
         .map_err(|e| anyhow::anyhow!("{e}"))?
         .reshape(&[-1])?
         .as_slice::<f32>()
         .to_vec();
-    let want = match load_bin(name) {
+    let path = output.join(format!("rs_{name}.bin"));
+    let bytes: Vec<u8> = got.iter().flat_map(|value| value.to_le_bytes()).collect();
+    std::fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))?;
+    let want = match load_bin(reference, name) {
         Ok(w) if w.len() == got.len() => w,
         _ => {
             println!("{name}: (no python reference at this length; saved rs side)");
@@ -53,7 +42,16 @@ fn diff(name: &str, arr: &Array) -> anyhow::Result<f32> {
     Ok(max)
 }
 
-pub fn run(model: &Path) -> anyhow::Result<()> {
+pub fn run(model: &Path, reference: &Path, golden: &Path, output: &Path) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        reference.is_dir(),
+        "reference dump directory does not exist"
+    );
+    let golden: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(golden).with_context(|| format!("reading {}", golden.display()))?,
+    )?;
+    std::fs::create_dir_all(output)?;
+    let diff = |name, arr: &Array| diff(reference, output, name, arr);
     {
         // Weight sanity: final mixer hc_norm
         let config = ModelConfig::from_json(&model.join("config.json"))?;
@@ -80,9 +78,6 @@ pub fn run(model: &Path) -> anyhow::Result<()> {
     let _ = &tower;
 
     // Re-run the tiny forward manually using the tower's modules.
-    let golden: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
-        "reference/correctness_prompts/public_longcopy_gate_english_1024_256.json",
-    )?)?;
     let take: usize = 48;
     let ptok: Vec<i32> = golden["cases"][0]["prompt_tokens"]
         .as_array()
@@ -298,11 +293,18 @@ pub fn run(model: &Path) -> anyhow::Result<()> {
     let layer_out = crate::models::qwen4::hyper::inject(&stream2, &moe_added, &inj2)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     diff("24_layer0_out", &layer_out)?;
-    diff_rest(&mut tower, layer_out, &ids)
+    diff_rest(&mut tower, layer_out, &ids, reference, output)
 }
 
 /// Layers 1-2 (with PLE) then layer-3 attention internals.
-fn diff_rest(tower: &mut Tower, mut hidden: Array, ids: &Array) -> anyhow::Result<()> {
+fn diff_rest(
+    tower: &mut Tower,
+    mut hidden: Array,
+    ids: &Array,
+    reference: &Path,
+    output: &Path,
+) -> anyhow::Result<()> {
+    let diff = |name, arr: &Array| diff(reference, output, name, arr);
     let _ = &mut hidden;
     let cfg = &tower.config;
     let b = ids.dim(0);
@@ -365,7 +367,7 @@ fn diff_rest(tower: &mut Tower, mut hidden: Array, ids: &Array) -> anyhow::Resul
     // Surgical: feed the PYTHON-computed layer-3 input so any downstream diff
     // is purely the attention path.
     let mixed3_py = {
-        let data = load_bin("41_layer3_mixed")?;
+        let data = load_bin(reference, "41_layer3_mixed")?;
         Array::from_slice(&data, &[b, s, mixed3.dim(-1)])
             .as_dtype(Dtype::Bfloat16)
             .map_err(|e| anyhow::anyhow!("{e}"))?
@@ -419,7 +421,7 @@ fn diff_rest(tower: &mut Tower, mut hidden: Array, ids: &Array) -> anyhow::Resul
     // --- final mixer + lm_head on the SAME hidden Python used (layer-2 out)
     // Feed PYTHON's hidden so the mixer + head are compared on identical input
     let hidden_py = {
-        let data = load_bin("40_layer2_out")?;
+        let data = load_bin(reference, "40_layer2_out")?;
         Array::from_slice(&data, &[1i32, s, hidden.dim(-1)])
             .as_dtype(Dtype::Bfloat16)
             .map_err(|e| anyhow::anyhow!("{e}"))?

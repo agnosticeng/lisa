@@ -58,37 +58,51 @@ pub fn glm53_dsa_native_enabled() -> bool {
     GLM53_DSA_NATIVE_OVERRIDE.with(std::cell::Cell::get)
 }
 
-const KDA_RECURRENCE_SOURCE: &str = include_str!("../../shaders/glm53/kda_recurrence.metal");
-const KDA_PREPARE_SOURCE: &str = include_str!("../../shaders/glm53/kda_prepare.metal");
-const KDA_OUTPUT_SOURCE: &str = include_str!("../../shaders/glm53/kda_output.metal");
-const KDA_DECODE_SOURCE: &str = include_str!("../../shaders/glm53/kda_decode.metal");
-const BF16_GEMV_SOURCE: &str = include_str!("../../shaders/glm53/bf16_gemv.metal");
-const BF16_GEMV_ROWS2_SOURCE: &str = include_str!("../../shaders/glm53/bf16_gemv_rows2.metal");
-const BF16_PAIR_GEMV_SOURCE: &str = include_str!("../../shaders/glm53/bf16_pair_gemv.metal");
-const BF16_QKV_SOURCE: &str = include_str!("../../shaders/glm53/bf16_qkv.metal");
-const BF16_GEMM_SOURCE: &str = include_str!("../../shaders/glm53/bf16_gemm.metal");
-const BF16_KDA_PROJECT_SOURCE: &str = include_str!("../../shaders/glm53/bf16_kda_project.metal");
-const AFFINE_Q8_MV_DS4_SOURCE: &str = include_str!("../../shaders/glm53/affine_q8_mv_ds4.metal");
-const INDEXER_TOPK_SORT_SOURCE: &str = include_str!("../../shaders/glm53/indexer_topk_sort.metal");
-const INDEXER_TOPK_MERGE_SOURCE: &str =
-    include_str!("../../shaders/glm53/indexer_topk_merge.metal");
-const INDEXER_EXPAND_SELECTION_SOURCE: &str =
-    include_str!("../../shaders/glm53/indexer_expand_selection.metal");
-const DSA_INDEXED_LORA_SOURCE: &str = include_str!("../../shaders/glm53/dsa_indexed_lora.metal");
-const DSA_INDEXED_LORA_NATIVE_SOURCE: &str =
-    include_str!("../../shaders/glm53/dsa_indexed_lora_native.metal");
-const DSA_INDEXED_DECODE_FUSED_SOURCE: &str =
-    include_str!("../../shaders/glm53/dsa_indexed_decode_fused.metal");
-const DSA_INDEXED_DECODE_NATIVE_SOURCE: &str =
-    include_str!("../../shaders/glm53/dsa_indexed_decode_native.metal");
-const DSA_VALUE_PROJECT_SOURCE: &str = include_str!("../../shaders/glm53/dsa_value_project.metal");
-const DSA_QK_LOWRANK_NATIVE_SOURCE: &str =
-    include_str!("../../shaders/glm53/dsa_qk_lowrank_native.metal");
-const DSA_VALUE_PROJECT_NATIVE_SOURCE: &str =
-    include_str!("../../shaders/glm53/dsa_value_project_native.metal");
-const DSA_VALUE_PROJECT_NATIVE_MMA_SOURCE: &str =
-    include_str!("../../shaders/glm53/dsa_value_project_native_mma.metal");
-const DSA_O_PROJECT_SOURCE: &str = include_str!("../../shaders/glm53/dsa_o_project.metal");
+const KDA_RECURRENCE_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/kda_recurrence.metal");
+const KDA_PREPARE_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/kda_prepare.metal");
+const KDA_OUTPUT_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/kda_output.metal");
+const KDA_DECODE_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/kda_decode.metal");
+const BF16_GEMV_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/bf16_gemv.metal");
+const BF16_GEMV_ROWS2_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/bf16_gemv_rows2.metal");
+const BF16_PAIR_GEMV_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/bf16_pair_gemv.metal");
+const BF16_QKV_SOURCE: &crate::shader_pack::Source = crate::kernel_source!("glm53/bf16_qkv.metal");
+const BF16_GEMM_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/bf16_gemm.metal");
+const BF16_KDA_PROJECT_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/bf16_kda_project.metal");
+const AFFINE_Q8_MV_DS4_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/affine_q8_mv_ds4.metal");
+const INDEXER_TOPK_SORT_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/indexer_topk_sort.metal");
+const INDEXER_TOPK_MERGE_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/indexer_topk_merge.metal");
+const INDEXER_EXPAND_SELECTION_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/indexer_expand_selection.metal");
+const DSA_INDEXED_LORA_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/dsa_indexed_lora.metal");
+const DSA_INDEXED_LORA_NATIVE_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/dsa_indexed_lora_native.metal");
+const DSA_INDEXED_DECODE_FUSED_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/dsa_indexed_decode_fused.metal");
+const DSA_INDEXED_DECODE_NATIVE_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/dsa_indexed_decode_native.metal");
+const DSA_VALUE_PROJECT_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/dsa_value_project.metal");
+const DSA_QK_LOWRANK_NATIVE_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/dsa_qk_lowrank_native.metal");
+const DSA_VALUE_PROJECT_NATIVE_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/dsa_value_project_native.metal");
+const DSA_VALUE_PROJECT_NATIVE_MMA_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/dsa_value_project_native_mma.metal");
+const DSA_O_PROJECT_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/dsa_o_project.metal");
 
 fn indexer_topk_sort_kernel() -> &'static Option<MetalKernel> {
     static K: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
@@ -1407,7 +1421,7 @@ pub fn kda_prepare(
 }
 
 /// Fused gated RMS-norm output stage: `in` [B, T, heads*D] f32 (recurrence
-/// output), `gate` [B, T, heads*D] f32 pre-sigmoid, `w` [D] f32.
+/// output), `gate` `[B, T, heads*D]` f32 pre-sigmoid, `w` `[D]` f32.
 pub fn kda_output_norm(
     y: &Array,
     gate: &Array,
@@ -1447,7 +1461,7 @@ pub fn kda_output_norm(
     Some(out.into_iter().next()?)
 }
 
-const RMS_ROW_SOURCE: &str = include_str!("../../shaders/glm53/rms_row.metal");
+const RMS_ROW_SOURCE: &crate::shader_pack::Source = crate::kernel_source!("glm53/rms_row.metal");
 
 fn rms_row_kernel() -> &'static Option<MetalKernel> {
     static K: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
@@ -1518,10 +1532,12 @@ pub fn rms_row_fused(x: &Array, eps: f32, h: usize, stream: &Stream) -> Option<A
     Some(out.into_iter().next()?)
 }
 
-const HC_SPLIT_SOURCE: &str = include_str!("../../shaders/glm53/hc_split.metal");
-const HC_SPLIT_NORM4_SOURCE: &str = include_str!("../../shaders/glm53/hc_split_norm4.metal");
-const HC_EXPAND_SOURCE: &str = include_str!("../../shaders/glm53/hc_expand.metal");
-const HC_WSUM_SOURCE: &str = include_str!("../../shaders/glm53/hc_wsum.metal");
+const HC_SPLIT_SOURCE: &crate::shader_pack::Source = crate::kernel_source!("glm53/hc_split.metal");
+const HC_SPLIT_NORM4_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/hc_split_norm4.metal");
+const HC_EXPAND_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/hc_expand.metal");
+const HC_WSUM_SOURCE: &crate::shader_pack::Source = crate::kernel_source!("glm53/hc_wsum.metal");
 
 fn hc_wsum_kernel() -> &'static Option<MetalKernel> {
     static K: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
@@ -1542,8 +1558,8 @@ fn hc_wsum_kernel() -> &'static Option<MetalKernel> {
     })
 }
 
-/// Fused mHC collapse (ds4 weighted_sum port): residual [B,T,4,H] f32,
-/// pre [B,T,4] f32 -> x [B,T,H] f32. One dispatch replaces the narrow/add
+/// Fused mHC collapse (ds4 weighted_sum port): residual `[B,T,4,H]` f32,
+/// pre `[B,T,4]` f32 -> x `[B,T,H]` f32. One dispatch replaces the narrow/add
 /// op chain.
 pub fn hc_weighted_sum(residual: &Array, pre: &Array, stream: &Stream) -> Option<Array> {
     let kernel = hc_wsum_kernel().as_ref()?;
@@ -1652,8 +1668,8 @@ fn hc_expand_kernel() -> &'static Option<MetalKernel> {
     })
 }
 
-/// Fused HC split+sinkhorn: mixes [N,24] f32 -> split [N,24] f32
-/// (pre out[0:4], post out[4:8], comb out[8:24] row-major [source][destination]).
+/// Fused HC split+sinkhorn: mixes `[N,24]` f32 -> split `[N,24]` f32
+/// (pre `out[0:4]`, post `out[4:8]`, comb `out[8:24]` row-major `[source][destination]`).
 pub fn hc_split_sinkhorn(
     mixes: &Array,
     scale: &Array,
@@ -1802,8 +1818,8 @@ pub fn hc_split_weighted_sum_norm4(
     ))
 }
 
-/// Fused HC expand4: y [B,T,H] f32, residual [B,T,4,H] f32, post [B,T,4] f32,
-/// comb [B,T,4,4] f32 -> new stream [B,T,4,H] f32.
+/// Fused HC expand4: y `[B,T,H]` f32, residual `[B,T,4,H]` f32, post `[B,T,4]` f32,
+/// comb `[B,T,4,4]` f32 -> new stream `[B,T,4,H]` f32.
 pub fn hc_expand4(
     y: &Array,
     residual: &Array,
@@ -1852,9 +1868,9 @@ pub fn hc_expand4(
     Some(out.into_iter().next()?)
 }
 
-const SWIGLU_SOURCE: &str = include_str!("../../shaders/glm53/swiglu.metal");
-const SHARED_Q8_SWIGLU_SOURCE: &str =
-    include_str!("../../shaders/glm53/shared_q8_swiglu_ds4.metal");
+const SWIGLU_SOURCE: &crate::shader_pack::Source = crate::kernel_source!("glm53/swiglu.metal");
+const SHARED_Q8_SWIGLU_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/shared_q8_swiglu_ds4.metal");
 
 fn shared_q8_swiglu_ds4_kernel() -> &'static Option<MetalKernel> {
     static K: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
@@ -1982,7 +1998,7 @@ fn swiglu_kernel() -> &'static Option<MetalKernel> {
     })
 }
 
-/// Fused clamped SwiGLU (ds4 glu.metal port): gate/up f32 [N] -> f32 [N],
+/// Fused clamped SwiGLU (ds4 glu.metal port): gate/up f32 `[N]` -> f32 `[N]`,
 /// one dispatch replaces the min/max/silu/multiply op chain.
 pub fn swiglu_fused(gate: &Array, up: &Array, limit: f32, stream: &Stream) -> Option<Array> {
     let kernel = swiglu_kernel().as_ref()?;
@@ -2015,26 +2031,29 @@ pub fn swiglu_fused(gate: &Array, up: &Array, limit: f32, stream: &Stream) -> Op
     Some(out.into_iter().next()?)
 }
 
-const MOE_GATHER_SOURCE: &str = include_str!("../../shaders/glm53/moe_gather.metal");
-const MOE_PAIR_SWIGLU_SOURCE: &str = include_str!("../../shaders/glm53/moe_pair_swiglu.metal");
-const MOE_GATHER_ADDR_SOURCE: &str = include_str!("../../shaders/glm53/moe_gather_addr.metal");
-const MOE_GATHER_ADDR_DS4_SOURCE: &str =
-    include_str!("../../shaders/glm53/moe_gather_addr_ds4.metal");
-const MOE_GATHER_SUM8_ADDR_DS4_SOURCE: &str =
-    include_str!("../../shaders/glm53/moe_gather_sum8_addr_ds4.metal");
-const MOE_GATHER_SUM8_ADDR_SOURCE: &str =
-    include_str!("../../shaders/glm53/moe_gather_sum8_addr.metal");
-const MOE_PAIR_SWIGLU_ADDR_SOURCE: &str =
-    include_str!("../../shaders/glm53/moe_pair_swiglu_addr.metal");
-const MOE_EXPERT_ROUTE_MAP_SOURCE: &str =
-    include_str!("../../shaders/glm53/moe_expert_route_map.metal");
-const MOE_MAPPED_RESOURCE_HELPER: &str =
-    include_str!("../../shaders/glm53/moe_mapped_resource.metal");
-const MOE_PAIR_SWIGLU_MAPPED_BODY: &str =
-    include_str!("../../shaders/glm53/moe_pair_swiglu_mapped.metal");
-const MOE_GATHER_SUM8_MAPPED_BODY: &str =
-    include_str!("../../shaders/glm53/moe_gather_sum8_mapped.metal");
-const MOE_SUM8_SOURCE: &str = include_str!("../../shaders/glm53/moe_sum8.metal");
+const MOE_GATHER_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/moe_gather.metal");
+const MOE_PAIR_SWIGLU_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/moe_pair_swiglu.metal");
+const MOE_GATHER_ADDR_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/moe_gather_addr.metal");
+const MOE_GATHER_ADDR_DS4_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/moe_gather_addr_ds4.metal");
+const MOE_GATHER_SUM8_ADDR_DS4_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/moe_gather_sum8_addr_ds4.metal");
+const MOE_GATHER_SUM8_ADDR_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/moe_gather_sum8_addr.metal");
+const MOE_PAIR_SWIGLU_ADDR_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/moe_pair_swiglu_addr.metal");
+const MOE_EXPERT_ROUTE_MAP_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/moe_expert_route_map.metal");
+const MOE_MAPPED_RESOURCE_HELPER: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/moe_mapped_resource.metal");
+const MOE_PAIR_SWIGLU_MAPPED_BODY: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/moe_pair_swiglu_mapped.metal");
+const MOE_GATHER_SUM8_MAPPED_BODY: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/moe_gather_sum8_mapped.metal");
+const MOE_SUM8_SOURCE: &crate::shader_pack::Source = crate::kernel_source!("glm53/moe_sum8.metal");
 const MOE_MAPPED_RESOURCE_INPUTS: [&str; 16] = [
     "resource_00",
     "resource_01",
@@ -3539,9 +3558,12 @@ pub fn moe_pair_swiglu(
     out.into_iter().next()
 }
 
-const ROUTER_SELECT_SOURCE: &str = include_str!("../../shaders/glm53/router_select.metal");
-const ROUTER_MV_SOURCE: &str = include_str!("../../shaders/glm53/router_mv.metal");
-const ROUTER_MV_SMALL_SOURCE: &str = include_str!("../../shaders/glm53/router_mv_small.metal");
+const ROUTER_SELECT_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/router_select.metal");
+const ROUTER_MV_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/router_mv.metal");
+const ROUTER_MV_SMALL_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/router_mv_small.metal");
 
 fn router_mv_kernel() -> &'static Option<MetalKernel> {
     static K: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
@@ -3724,7 +3746,7 @@ fn router_select_kernel() -> &'static Option<MetalKernel> {
 }
 
 /// Fused MoE router select (ds4 `kernel_glm_router_select_one` port): logits
-/// [n, E] f32 (contiguous), bias [E] (any dtype, cast to f32) -> selected
+/// `[n, E]` f32 (contiguous), bias `[E]` (any dtype, cast to f32) -> selected
 /// [n, top_k] i32 (descending by sigmoid+bias, ties by lower index) and
 /// weights [n, top_k] f32 (sigmoid renormalized over the selected list,
 /// clamped at 2^-14, scaled). `None` = declined (host fallback). Covers the
@@ -3801,14 +3823,18 @@ pub fn router_select_fused(
     Some((sel, wts))
 }
 
-const INDEXER_POOL_SOURCE: &str = include_str!("../../shaders/glm53/indexer_pool.metal");
+const INDEXER_POOL_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/indexer_pool.metal");
 
-const MTP_RMS_NORM_SOURCE: &str = include_str!("../../shaders/glm53/mtp_rms_norm.metal");
-const HC_MIX_RMS_SOURCE: &str = include_str!("../../shaders/glm53/hc_mix_rms.metal");
-const HC_MIX_RMS_BF16_GEMV_SOURCE: &str =
-    include_str!("../../shaders/glm53/hc_mix_rms_bf16_gemv.metal");
-const MTP_ADD_RMS_NORM_SOURCE: &str = include_str!("../../shaders/glm53/mtp_add_rms_norm.metal");
-const MTP_ADD3_SOURCE: &str = include_str!("../../shaders/glm53/mtp_add3.metal");
+const MTP_RMS_NORM_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/mtp_rms_norm.metal");
+const HC_MIX_RMS_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/hc_mix_rms.metal");
+const HC_MIX_RMS_BF16_GEMV_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/hc_mix_rms_bf16_gemv.metal");
+const MTP_ADD_RMS_NORM_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/mtp_add_rms_norm.metal");
+const MTP_ADD3_SOURCE: &crate::shader_pack::Source = crate::kernel_source!("glm53/mtp_add3.metal");
 
 fn ds4_rms_norm_kernel() -> &'static Option<MetalKernel> {
     static K: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
@@ -4186,13 +4212,14 @@ pub fn glm53_mtp_add3(a: &Array, b: &Array, c: &Array, stream: &Stream) -> Optio
         .next()
 }
 
-const MTP_KV_LORA_RMS_NORM_SOURCE: &str =
-    include_str!("../../shaders/glm53/mtp_kv_lora_rms_norm.metal");
-const QKV_NORM_COMPACT_SOURCE: &str = include_str!("../../shaders/glm53/qkv_norm_compact.metal");
-const DSA_QKV_NORM_ROWS_SOURCE: &str =
-    include_str!("../../shaders/glm53/dsa_qkv_rms_norm_rows.metal");
-const DSA_QKV_PROJECT_PAIR_SOURCE: &str =
-    include_str!("../../shaders/glm53/dsa_qkv_project_pair.metal");
+const MTP_KV_LORA_RMS_NORM_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/mtp_kv_lora_rms_norm.metal");
+const QKV_NORM_COMPACT_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/qkv_norm_compact.metal");
+const DSA_QKV_NORM_ROWS_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/dsa_qkv_rms_norm_rows.metal");
+const DSA_QKV_PROJECT_PAIR_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/dsa_qkv_project_pair.metal");
 
 fn mtp_kv_lora_rms_norm_kernel() -> &'static Option<MetalKernel> {
     static K: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
@@ -4883,17 +4910,19 @@ pub fn indexer_pool_fused(
     Some(out.into_iter().next()?)
 }
 
-const DSA_SCORES_SOURCE: &str = include_str!("../../shaders/glm53/dsa_scores.metal");
-const DSA_WV_SOURCE: &str = include_str!("../../shaders/glm53/dsa_wv.metal");
-const INDEXER_SCORES_BATCH_SOURCE: &str =
-    include_str!("../../shaders/glm53/indexer_scores_batch.metal");
-const INDEXER_SCORES_DECODE_SOURCE: &str =
-    include_str!("../../shaders/glm53/indexer_scores_decode.metal");
-const INDEXER_SCORES_DECODE_ROWS4_SOURCE: &str =
-    include_str!("../../shaders/glm53/indexer_scores_decode_rows4.metal");
-const INDEXER_SCORES_TILED_SOURCE: &str =
-    include_str!("../../shaders/glm53/indexer_scores_tiled.metal");
-const DSA_QK_LOWRANK_SOURCE: &str = include_str!("../../shaders/glm53/dsa_qk_lowrank.metal");
+const DSA_SCORES_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/dsa_scores.metal");
+const DSA_WV_SOURCE: &crate::shader_pack::Source = crate::kernel_source!("glm53/dsa_wv.metal");
+const INDEXER_SCORES_BATCH_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/indexer_scores_batch.metal");
+const INDEXER_SCORES_DECODE_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/indexer_scores_decode.metal");
+const INDEXER_SCORES_DECODE_ROWS4_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/indexer_scores_decode_rows4.metal");
+const INDEXER_SCORES_TILED_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/indexer_scores_tiled.metal");
+const DSA_QK_LOWRANK_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("glm53/dsa_qk_lowrank.metal");
 
 fn indexer_scores_batch_kernel() -> &'static Option<MetalKernel> {
     static K: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
@@ -5212,8 +5241,8 @@ fn dsa_wv_kernel() -> &'static Option<MetalKernel> {
     })
 }
 
-/// Fused DSA decode attention, stage 1: q [B,heads,256], k
-/// [B,heads,tc,256], keep [B,tc] are F32. Returns F32 scores.
+/// Fused DSA decode attention, stage 1: q `[B,heads,256]`, k
+/// `[B,heads,tc,256]`, keep `[B,tc]` are F32. Returns F32 scores.
 pub fn dsa_decode_scores(
     q: &Array,
     k: &Array,
@@ -5276,8 +5305,8 @@ pub fn dsa_decode_scores(
     Some(out.into_iter().next()?)
 }
 
-/// Fused DSA decode attention, stage 2: scores [B*heads,tc] and
-/// v [B,heads,tc,256] are F32 -> out [B*heads,256] F32.
+/// Fused DSA decode attention, stage 2: scores `[B*heads,tc]` and
+/// v `[B,heads,tc,256]` are F32 -> out `[B*heads,256]` F32.
 pub fn dsa_decode_weighted_v(scores: &Array, v: &Array, stream: &Stream) -> Option<Array> {
     let kernel = dsa_wv_kernel().as_ref()?;
     if scores.dtype() != Dtype::Float32 || v.dtype() != Dtype::Float32 {
@@ -5355,7 +5384,7 @@ fn dsa_qk_lowrank_native_kernel() -> &'static Option<MetalKernel> {
 }
 
 /// QK projection with the native DS4 schedule available under its diagnostic
-/// scope. Queries are [B,H,T,256], output is [B,T,H,512].
+/// scope. Queries are `[B,H,T,256]`, output is `[B,T,H,512]`.
 pub fn dsa_qk_lowrank_project(
     q: &Array,
     kv_weight: &Array,
@@ -5536,7 +5565,7 @@ struct Ds4IndexedLoraArgs {
 /// DS4's split serial attention fallback for a private MTP window beyond
 /// the fused kernel's 2051-row limit. Eight SIMD groups stage 16 F16 rows at
 /// a time; scratch remains 16 KiB independent of the selected-window length.
-fn dsa_indexed_lora_wide_native(
+pub(super) fn dsa_indexed_lora_wide_native(
     q: &Array,
     q_low: &Array,
     compact_latents: &Array,

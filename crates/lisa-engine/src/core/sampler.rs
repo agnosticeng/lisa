@@ -156,16 +156,15 @@ impl Sampler {
         if values.is_empty() {
             return None;
         }
-        let vocab_len = values.len();
-        let start = history.len().saturating_sub(self.penalty_window);
-        let mut seen = vec![false; vocab_len];
-        for &token in &history[start..] {
-            if let Some(is_seen) = seen.get_mut(token as usize) {
-                *is_seen = true;
-            }
+        if self.repetition_penalty == 1.0 || history.is_empty() || self.penalty_window == 0 {
+            return Some(values);
         }
-        for (value, is_seen) in values.iter_mut().zip(seen) {
-            if self.repetition_penalty != 1.0 && is_seen {
+        let start = history.len().saturating_sub(self.penalty_window);
+        let mut seen = std::collections::HashSet::with_capacity(history.len() - start);
+        for &token in &history[start..] {
+            if let Some(value) = values.get_mut(token as usize)
+                && seen.insert(token)
+            {
                 *value = if *value > 0.0 {
                     *value / self.repetition_penalty
                 } else {
@@ -850,6 +849,38 @@ mod keyed_tests {
         Array::from_slice(&v, &[v.len() as i32])
             .as_dtype(Dtype::Float32)
             .unwrap()
+    }
+
+    #[test]
+    fn ds4_sparse_penalty_matches_vocab_scan() {
+        let source = [2.0f32, -3.0, 0.0, -0.0, 4.5, f32::NAN, f32::INFINITY];
+        let logits = Array::from_slice(&source, &[source.len() as i32]);
+        let history = [0, 1, 4, 1, 3, 5, 6, u32::MAX];
+        for penalty in [1.0, 1.2, 0.8] {
+            for window in [0, 1, 4, 64] {
+                let sampler = Sampler {
+                    repetition_penalty: penalty,
+                    penalty_window: window,
+                    ..Default::default()
+                };
+                let mut expected = source;
+                let tail = &history[history.len().saturating_sub(window)..];
+                for (index, value) in expected.iter_mut().enumerate() {
+                    if penalty != 1.0 && tail.contains(&(index as u32)) {
+                        *value = if *value > 0.0 {
+                            *value / penalty
+                        } else {
+                            *value * penalty
+                        };
+                    }
+                }
+                let actual = sampler.ds4_logits(&logits, &history).unwrap();
+                assert_eq!(
+                    actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    expected.map(f32::to_bits)
+                );
+            }
+        }
     }
 
     #[test]

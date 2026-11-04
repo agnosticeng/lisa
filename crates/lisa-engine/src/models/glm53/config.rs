@@ -3,7 +3,7 @@
 //! GLM-5.3 Flash: 45 layers (34 KDA `linear_attention` + 11 NoPE-MLA
 //! `deepseek_sparse_attention`), 288-expert MoE from layer 3, mHC
 //! hyper-connections, one MTP block. Field names follow the official HF
-//! config; see `specs/11-glm53-flash.md`.
+//! config; see `specs/models/glm53.md`.
 
 use serde::Deserialize;
 

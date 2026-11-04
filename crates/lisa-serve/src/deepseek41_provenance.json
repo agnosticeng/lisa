@@ -1,0 +1,13 @@
+{
+  "repository": "https://github.com/antirez/ds4",
+  "revision": "b3f50180ec2c7324892be1f50bc83555ccb8d5e7",
+  "sources": {
+    "ds4_server.c": "48900a900db51b0060af0767f7b7dd38c9049b4ad94bc83297b6b0dfffdceab2",
+    "ds4_tool_text.h": "a9c09f4a4d1cf2a3260d9c539de222cd949b5cd7710c7bf17ec9be5bc58bd159",
+    "ds4.c": "c471a2fc003e91555b4aac4d262b2d685603258486bacacaaee7582096cd8764"
+  },
+  "oracle_c_sha256": "8a9079e3478243b79fe8e45b2287578df411926caf239c0d0a40b268b29297bf",
+  "render_cases": 11,
+  "parse_cases": 3,
+  "tracker_cases": 5
+}

@@ -179,12 +179,10 @@ fn glm53_mhc_mix_rows_layer21_capture_matches_ds4_fixture() {
     const MIX_VALUES: usize = ROWS * 24;
     const MIX_BYTES: usize = MIX_VALUES * std::mem::size_of::<f32>();
 
-    let norm_fixture = include_bytes!(
-        "../../../../lisa-mlx/src/models/glm53/fixtures/mhc_mix_norm_ds4_layer21_ids1234.f32"
-    );
-    let projection_fixture = include_bytes!(
-        "../../../../lisa-mlx/src/models/glm53/fixtures/mhc_mix_projection_ds4_layer21_ids1234.bin"
-    );
+    let norm_fixture =
+        &crate::models::glm53::test_fixtures::read("mhc_mix_norm_ds4_layer21_ids1234.f32");
+    let projection_fixture =
+        &crate::models::glm53::test_fixtures::read("mhc_mix_projection_ds4_layer21_ids1234.bin");
     assert_eq!(norm_fixture.len(), 4 * STATE_VALUES * 4);
     assert_eq!(projection_fixture.len(), 2 * (WEIGHT_BYTES + MIX_BYTES));
     let state_values = norm_fixture
@@ -271,10 +269,9 @@ fn glm53_mhc_mix_rows_prefill_layer21_rows9_matches_ds4_fixture() {
     const MIX_VALUES: usize = ROWS * 24;
     const MIX_BYTES: usize = MIX_VALUES * std::mem::size_of::<f32>();
 
-    let projection_fixture = include_bytes!(
-        "../../../../lisa-mlx/src/models/glm53/fixtures/mhc_mix_projection_ds4_layer21_ids1234.bin"
-    );
-    let fixture = include_bytes!("fixtures/mhc_mix_rows9_ds4_layer21.bin");
+    let projection_fixture =
+        &crate::models::glm53::test_fixtures::read("mhc_mix_projection_ds4_layer21_ids1234.bin");
+    let fixture = &crate::models::glm53::test_fixtures::read("mhc_mix_rows9_ds4_layer21.bin");
     assert_eq!(projection_fixture.len(), 2 * (WEIGHT_BYTES + 4 * 24 * 4));
     assert_eq!(fixture.len(), STATE_BYTES + MIX_BYTES);
     let mut weight_values = Vec::with_capacity(WEIGHT_VALUES);

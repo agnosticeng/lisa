@@ -16,11 +16,12 @@ use lisa_mlx::{Array, Stream, ops};
 
 use crate::ffi::{MetalKernel, OutputArg, TemplateArg};
 
-const HEADER: &str = include_str!("../../shaders/qwen4/qsa/prefill_header.metal");
-const SOURCE: &str = include_str!("../../shaders/qwen4/qsa/prefill.metal");
+const HEADER: &crate::shader_pack::Source = crate::kernel_source!("qwen4/qsa/prefill_header.metal");
+const SOURCE: &crate::shader_pack::Source = crate::kernel_source!("qwen4/qsa/prefill.metal");
 
-const SELECT_HEADER: &str = include_str!("../../shaders/qwen4/qsa/select_header.metal");
-const SELECT_SOURCE: &str = include_str!("../../shaders/qwen4/qsa/select.metal");
+const SELECT_HEADER: &crate::shader_pack::Source =
+    crate::kernel_source!("qwen4/qsa/select_header.metal");
+const SELECT_SOURCE: &crate::shader_pack::Source = crate::kernel_source!("qwen4/qsa/select.metal");
 
 static SELECT: OnceLock<Option<MetalKernel>> = OnceLock::new();
 

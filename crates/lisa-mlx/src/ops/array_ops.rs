@@ -348,7 +348,7 @@ impl Drop for Glm53LmHeadQmvTileScope {
     }
 }
 
-/// RAII guard for [`VERIFY_SPLITK`]: enables the split-K verify lane on this
+/// RAII guard for `VERIFY_SPLITK`: enables the split-K verify lane on this
 /// thread until dropped.
 pub struct VerifySplitkGuard {
     _priv: (),

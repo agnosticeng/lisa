@@ -133,9 +133,10 @@ pub fn physical_ram() -> usize {
     })
 }
 
-/// The admission budget in bytes — ALWAYS non-zero, unlike [`memory_limit`].
+/// The admission budget in bytes. Zero means RAM detection failed or the host
+/// cannot provide the required reserve; admission then refuses new allocations.
 ///
-/// `LISA_RAM_CAP_GB` if set, else physical RAM minus [`RAM_RESERVE_GIB`]. This is
+/// `LISA_RAM_CAP_GB` if set, else physical RAM minus `RAM_RESERVE_GIB`. This is
 /// the number an admission layer must refuse against: the machine-safety rule is
 /// that allocations beyond the budget are refused, not attempted.
 pub fn ram_budget() -> usize {

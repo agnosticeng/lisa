@@ -1,6 +1,8 @@
 // Native DS4 paired Q8 gate/up plus SwiGLU. The embedding source supplies
 // affine metadata helpers; arithmetic and reductions follow dense.metal.
 
+constant bool glm53_write_projections [[function_constant(2)]];
+
 template<short r1ptg>
 kernel void glm53_affine_q8_pair_native(
         constant glm53_affine_q8_ext_args &args [[buffer(0)]],
@@ -106,14 +108,16 @@ kernel void glm53_affine_q8_pair_native(
         for (short ir1 = 0; ir1 < r1ptg && i11 + ir1 < args.n_rows; ++ir1) {
             const uint64_t dst_base =
                 (uint64_t)i1m*args.out_dim*args.n_rows + (uint64_t)(i11 + ir1)*args.out_dim;
-            device float * gate_f32 = (device float *)dst_gate + dst_base;
-            device float * up_f32   = (device float *)dst_up   + dst_base;
             device float * mid_f32  = (device float *)dst_mid  + dst_base;
 
             const float gate = sum_gate[ir1];
             const float up = sum_up[ir1];
-            gate_f32[i01] = gate;
-            up_f32[i01] = up;
+            if (glm53_write_projections) {
+                device float * gate_f32 = (device float *)dst_gate + dst_base;
+                device float * up_f32   = (device float *)dst_up   + dst_base;
+                gate_f32[i01] = gate;
+                up_f32[i01] = up;
+            }
 
             float g = gate;
             float u = up;
@@ -228,10 +232,6 @@ kernel void glm53_affine_q8_pair_native_m1(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    device float *gate_f32 = (device float *)dst_gate +
-        (uint64_t)im * args.out_dim * args.n_rows + (uint64_t)r1 * args.out_dim;
-    device float *up_f32 = (device float *)dst_up +
-        (uint64_t)im * args.out_dim * args.n_rows + (uint64_t)r1 * args.out_dim;
     device float *mid_f32 = (device float *)dst_mid +
         (uint64_t)im * args.out_dim * args.n_rows + (uint64_t)r1 * args.out_dim;
 
@@ -240,7 +240,11 @@ kernel void glm53_affine_q8_pair_native_m1(
         const float up = simd_sum(sh_up[row][tiisg]);
         if (tiisg == 0 && sgitg == 0) {
             const uint out_row = r0 + row;
-            {
+            if (glm53_write_projections) {
+                device float *gate_f32 = (device float *)dst_gate +
+                    (uint64_t)im * args.out_dim * args.n_rows + (uint64_t)r1 * args.out_dim;
+                device float *up_f32 = (device float *)dst_up +
+                    (uint64_t)im * args.out_dim * args.n_rows + (uint64_t)r1 * args.out_dim;
                 gate_f32[out_row] = gate;
                 up_f32[out_row] = up;
             }

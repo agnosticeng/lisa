@@ -1,6 +1,6 @@
 {
   "model": "agnosticeng/Qwen3.8-Flash-Next-4bit",
-  "note": "qwen4 greedy golden baseline (temperature 0, serial decode). Successor to the lost reference/correctness_prompts/public_longcopy_gate_english_1024_256.json: a fresh ~1024-token English longcopy prompt captured on the validated build (256/256). Prompt is wrapped in the generation prompt (same as the qwen3_5 golden). Verify with: `lisa golden --model agnosticeng/Qwen3.8-Flash-Next-4bit`. Re-capture with: `lisa golden --model ... --golden <path> --capture`.",
+  "note": "Qwen4 greedy golden baseline (temperature 0, serial decode): an approximately 1024-token English longcopy prompt with 256 expected output tokens. The prompt uses the generation wrapper, as in the qwen3_5 golden. Verify with: `lisa-bench golden --model agnosticeng/Qwen3.8-Flash-Next-4bit`. Capture with an explicit destination: `lisa-bench golden --model ... --golden <path> --capture`.",
   "cases": [
     {
       "name": "longcopy_gate_english_1024_256",

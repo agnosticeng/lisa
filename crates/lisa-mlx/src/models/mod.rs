@@ -4,6 +4,7 @@
 //! runtime and op surface. The wrappers are re-exported at the crate root so
 //! the engine reads `lisa_mlx::kernels::…` regardless of where they live.
 
+pub mod deepseek41;
 pub mod gdn;
 pub mod glm53;
 pub mod qwen35;

@@ -1,0 +1,8 @@
+{
+  "repository": "https://github.com/antirez/ds4",
+  "revision": "b3f50180ec2c7324892be1f50bc83555ccb8d5e7",
+  "source": "metal/argsort.metal",
+  "source_sha256": "e9e8ae37c37ce2a10a42b450a2e25476e04c35a81f262e9a1038768c88216123",
+  "local_sha256": "fe95fe80f0a636be79b5b2929f298eba31ed3ed523d0c8ea7ede8e0aa79a7a93",
+  "changes": "Original source with standalone standard-library and sort-order preamble."
+}

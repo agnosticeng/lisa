@@ -89,7 +89,7 @@ DS4-derived GLM kernels live under crates/lisa-mlx/src/shaders/glm53/ and in
 common/attention/ds4_flash_attn.metal, common/matmul/glm53_*.metal and
 common/elementwise/glm53_moe_grouped_swiglu_weight.metal. Associated Rust
 bindings and GLM execution code adapt DS4's shape gates and scheduling to
-LISA's runtime and original MLX affine storage.
+LISA's runtime, with legacy MLX affine storage and native GGUF block views.
 
 Upstream: https://github.com/antirez/ds4
 Reference revision: b4e3faf5262b21db94ec309cf321640ff1eed460
@@ -101,6 +101,75 @@ Copyright (c) 2023 DeepSeek.
 License: MIT. The full notice is retained in:
 crates/lisa-mlx/src/shaders/common/attention/ds4_flash_attn.LICENSE
 crates/lisa-mlx/src/shaders/common/elementwise/ds4_glm53_moe_swiglu.LICENSE
+
+The DeepSeek V4.1 GGUF port under crates/lisa-engine/src/models/deepseek41/
+and crates/lisa-mlx/src/{models,shaders}/deepseek41/ uses DS4 revision
+b3f50180ec2c7324892be1f50bc83555ccb8d5e7. It adapts the tokenizer, Engram
+hash/read scheduling, hyper-connections, cache quantization, sparse attention,
+index selection and routed/shared experts to LISA's Rust runtime. Source
+hashes and local adaptations are recorded beside each shader. The full MIT
+notice is in crates/lisa-mlx/src/shaders/deepseek41/LICENSE.
+The native V4.1 renderer and DSML parser in crates/lisa-serve/src/deepseek41.rs
+port ds4_server.c and ds4_tool_text.h from that same revision. Their original-C
+test oracle identity is in deepseek41_provenance.json; the full MIT notice is
+retained in crates/lisa-serve/src/LICENSE-DS4.
+The reference builder under crates/lisa-bench/reference/deepseek41/ extracts
+that pinned DS4 graph and GGML CPU decoders into an external build directory.
+Generated upstream code retains these licenses; adapter identities and compiler
+commands are recorded in its build manifest.
+
+The native GLM GGUF path under models/glm53/gguf and shaders/glm53/gguf_*
+uses DS4 revision b3f50180ec2c7324892be1f50bc83555ccb8d5e7. Original Q2_K and
+Q4_K helpers are included in shaders/deepseek41/iq.metal. Shared native GGUF
+BPE and GLM4 split rules live in lisa-engine/src/core/gguf_tokenizer.rs and
+gguf_glm4.rs. Adjacent JSON files record source and adapter identities.
+
+GGML packed-weight extensions
+----------------------------
+The GGUF block decoders and codebooks under crates/lisa-gguf/src/
+derive from ggml-org/llama.cpp revision
+ca3d5a3e10d53f7ea672cb9b6178faca3e2807bc. The IQ1_M, IQ2_XS and Q5_K
+Metal arithmetic helpers in shaders/deepseek41/iq.metal derive from revision
+7071ba378afa96dcd69c41e1ec2b4912364dbee4; the IQ2_XXS path retains DS4's
+helper. These adapters retain the original GGML block bytes and do not
+requantize the checkpoint to MLX affine storage.
+Upstream: https://github.com/ggml-org/llama.cpp
+Copyright (c) 2023-2026 The ggml authors. License: MIT.
+Full notices and provenance are retained in crates/lisa-gguf/src/LICENSE-GGML
+and crates/lisa-mlx/src/shaders/deepseek41/LICENSE-GGML, with provenance.json
+alongside the sources.
+
+MLX-Serve media implementations
+-------------------------------
+The native vision processors/encoders and FLUX.2 pipeline under
+crates/lisa-engine/src/models/{vision,flux2}/ adapt operation order and model
+layout from https://github.com/ddalcu/mlx-serve
+Revision: 6c4306145b7331f6b962b97e145fd9ac46e9e14a
+Copyright (c) 2026 David Dalcu. License: MIT (full text below).
+LISA supplies its own Rust execution, bounded attention and convolution storage,
+request isolation, image decoding, HTTP handling and AppKit integration.
+
+The LayerNorm source common/attention/layer_norm.metal comes from MLX revision
+1f8e74e3f12f31365464a6867c6579f0e9b29d85,
+mlx/backend/metal/kernels/layer_norm.metal. The utils include and explicit
+instantiation list are omitted because LISA supplies them at JIT assembly.
+Original SHA-256: 2d243f5abea7353929f9bc838ceb5a98e52a452dfc29609ad4d5974447ea689f
+
+Black Forest Labs FLUX image inference
+--------------------------------------
+The native FLUX 3 implementation under crates/lisa-engine/src/models/flux3/
+adapts the transformer, text-encoder contract, VAE layout and flow-map schedule
+from https://github.com/black-forest-labs/flux-3-image-klein
+Revision: bfc8889a4497f846416f253a3972a1941ac698b9.
+Copyright 2026 Black Forest Labs, Inc. License: Apache-2.0.
+The full license is retained in crates/lisa-engine/src/models/flux3/LICENSE.
+LISA changes execution to Rust/Metal, stages model loading, bounds attention and
+convolution scratch, and uses its bundled text encoder for prompt expansion
+with a compact adaptation of the reference's external-LLM caption guide.
+FLUX.2 Klein 9B dimensions and encoder taps were checked against the official
+https://github.com/black-forest-labs/flux2 reference at
+50fe5162777813d869182b139e83b10743caef15. MLX tensor bytes are retained.
+Model weights carry their own licenses, separate from inference source code.
 
 MIT license text
 ----------------

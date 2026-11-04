@@ -33,7 +33,9 @@ pub mod indexing;
 pub mod memory;
 pub mod nn;
 pub use array_ops::*;
+mod topk;
 pub mod transforms;
+pub use topk::top32_indices;
 
 pub use array::Array;
 pub use stream::{

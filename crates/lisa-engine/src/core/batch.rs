@@ -364,6 +364,7 @@ mod tests {
             for (layer, cache) in caches.iter().enumerate() {
                 let prefix = format!("glm53.cache.layer_{layer:02}");
                 match cache {
+                    LayerCache::Native(_) => anyhow::bail!("GLM capture received a native cache"),
                     LayerCache::Full(full) => {
                         let tape = &full.indexer_tape;
                         metadata.extend_from_slice(&[
@@ -1858,7 +1859,7 @@ impl Batch {
             n,
             sampler,
             &prompts.to_vec(),
-            tower.has_target_mtp(),
+            tower.uses_ds4_sampling(),
         )?;
 
         Ok((
@@ -1919,7 +1920,7 @@ impl Batch {
             let mut c = tower.new_caches();
             let last = tower.prefill(p, &mut c)?;
             let logits = tower.head(&last)?;
-            let t = if tower.has_target_mtp() {
+            let t = if tower.uses_ds4_sampling() {
                 sampler.draw_ds4(&logits, p)?
             } else {
                 sampler.draw(&logits, p)?
@@ -1996,7 +1997,7 @@ impl Batch {
             tower.set_context_tails(self.tails.clone());
             let last = mixed.index((.., mixed.dim(1) - 1, ..));
             let logits = tower.head_ragged(&last, per)?;
-            return draw_rows(&logits, n, sampler, &self.fed, tower.has_target_mtp());
+            return draw_rows(&logits, n, sampler, &self.fed, tower.uses_ds4_sampling());
         }
 
         // Ragged: rebuild the per-stream keep mask for the (growing) key length.
@@ -2031,7 +2032,7 @@ impl Batch {
         let (mixed, _) = tower.forward(&arr, Some(&mut self.caches))?;
         let last = mixed.index((.., mixed.dim(1) - 1, ..));
         let logits = tower.head(&last)?;
-        let out = draw_rows(&logits, n, sampler, &self.fed, tower.has_target_mtp())?;
+        let out = draw_rows(&logits, n, sampler, &self.fed, tower.uses_ds4_sampling())?;
         for (i, t) in tokens.iter().enumerate() {
             self.fed[i].push(*t);
         }
@@ -2144,7 +2145,7 @@ impl Batch {
                     active.len(),
                     sampler,
                     &active_fed,
-                    tower.has_target_mtp(),
+                    tower.uses_ds4_sampling(),
                 )?;
                 for (slot, &row) in active.iter().enumerate() {
                     next[row] = next_active[slot];
@@ -2261,6 +2262,13 @@ fn pack_layer(
         lens.len()
     );
     match &per[0][li] {
+        LayerCache::Native(cache) => {
+            anyhow::ensure!(
+                per.len() == 1,
+                "native cache batching requires a model-specific implementation"
+            );
+            Ok(LayerCache::Native(cache.clone()))
+        }
         LayerCache::Full(tmpl) => {
             if tmpl.keys.is_none() && tmpl.values.is_none() {
                 let mut tapes = Vec::with_capacity(per.len());
@@ -2295,7 +2303,7 @@ fn pack_layer(
                     indexer_tape,
                     indexer_ok: per.iter().all(|caches| match &caches[li] {
                         LayerCache::Full(cache) => cache.indexer_ok,
-                        LayerCache::Linear(_) => false,
+                        LayerCache::Linear(_) | LayerCache::Native(_) => false,
                     }),
                     ple_conv: None,
                     capture_ple_full: None,
@@ -2519,7 +2527,7 @@ impl ContinuousBatch {
         sampler: &mut Sampler,
     ) -> anyhow::Result<u32> {
         let logits = tower.head(&per.last_hidden)?;
-        let tok = if tower.has_target_mtp() {
+        let tok = if tower.uses_ds4_sampling() {
             sampler.draw_ds4(&logits, prompt)?
         } else {
             sampler.draw(&logits, prompt)?
@@ -2627,7 +2635,7 @@ impl ContinuousBatch {
         } else {
             tower.head(&last)?
         };
-        let out = draw_rows_multi(&logits, n, samplers, &self.fed, tower.has_target_mtp())?;
+        let out = draw_rows_multi(&logits, n, samplers, &self.fed, tower.uses_ds4_sampling())?;
         if ragged {
             for c in self.caches.iter_mut() {
                 if let LayerCache::Full(f) = c {
@@ -2775,6 +2783,13 @@ fn extract_streams(
         let mut layers = Vec::with_capacity(packed.len());
         for c in packed {
             match c {
+                LayerCache::Native(cache) => {
+                    anyhow::ensure!(
+                        pack_lens.len() == 1 && i == 0,
+                        "native cache extraction only supports one stream"
+                    );
+                    layers.push(LayerCache::Native(cache.clone()));
+                }
                 LayerCache::Full(f) => {
                     let (k, v, indexer_tape, indexer_ok) = match (&f.keys, &f.values) {
                         (Some(keys), Some(values)) => (

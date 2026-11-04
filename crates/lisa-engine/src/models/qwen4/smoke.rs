@@ -381,16 +381,6 @@ fn smoke_rms_row_exact() -> anyhow::Result<()> {
     for (a, b) in got_f.iter().zip(want.iter()) {
         max = max.max((a - b).abs());
     }
-    if std::env::var("RMS_TOTALS").is_ok() {
-        std::fs::write("/tmp/rms-trace/host_want.bin", unsafe {
-            std::slice::from_raw_parts(want.as_ptr() as *const u8, want.len() * 4)
-        })
-        .ok();
-        std::fs::write("/tmp/rms-trace/host_got.bin", unsafe {
-            std::slice::from_raw_parts(got_f.as_ptr() as *const u8, got_f.len() * 4)
-        })
-        .ok();
-    }
     println!("rms_row_exact vs host reference: max abs diff {max:.6}");
 
     // Micro-test: narrow the LAST axis and materialise (copy_strided), the op

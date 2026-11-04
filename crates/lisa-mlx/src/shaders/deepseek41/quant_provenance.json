@@ -1,0 +1,16 @@
+{
+  "repository": "https://github.com/antirez/ds4",
+  "revision": "b3f50180ec2c7324892be1f50bc83555ccb8d5e7",
+  "source": "metal/dense.metal",
+  "source_sha256": "eaf88d4c95b76be123329feef5a88d038e908f22b27c108d77e7b42d0bbc81dc",
+  "sections_sha256": [
+    "98507aeb05525a3c101471052222ad42f891160f59a574dee97f590eeab4f71f",
+    "774a38372117335d8a126e2009865d6e8f93a1aadcccbb2b7d0d6fa2393df0f9",
+    "e8715d375c81e0a68bc3487536189c095c78d8f85a16d85da864849a2f4ddfaa",
+    "8acac09b5db74ca46b85d9e78a3c4811bb4923135529b57135c6262d067ca56f",
+    "bb312f8c90a3763545b223513e4039e713565f1d388edecbafee3320169c8865",
+    "2069bfa6818018c2e348f9eee22acb7b3b11685613307f71b3ec4c81cc929dad"
+  ],
+  "local_sha256": "4183fc7d5726c6405f3c029b77f7266520c9796911c1b2eca61fe12285e2e94d",
+  "changes": "Preamble supplies the original ds4_gpu_source constants and Q8 block declaration. Arithmetic sections and native entry points are unchanged. Function constant 600 remains a Metal short."
+}

@@ -12,7 +12,8 @@ use super::common::EXACT_HEADER;
 /// `routed` is the sorted down output `[rows*K, H]`, `w` the float32 weights in
 /// ORIGINAL slot order `[rows*K]`, `inverse_order` u32 `[rows*K]`, `shared`
 /// `[rows, H]`, `gate` bf16 `[rows]` -> `[rows, H]`.
-const MOE_COMBINE_SOURCE: &str = include_str!("../../../shaders/qwen4/moe_combine.metal");
+const MOE_COMBINE_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("qwen4/moe_combine.metal");
 
 static MOE_COMBINE: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 
@@ -74,11 +75,11 @@ pub fn moe_combine(
 /// merge sort (7 launches per `argSort`, 14 per layer). MLX's argsort is stable
 /// and a stable counting sort is the unique stable permutation, so the two agree
 /// element for element.
-const ROUTE_BLOCK_COUNTS_SOURCE: &str =
-    include_str!("../../../shaders/qwen4/route_block_counts.metal");
+const ROUTE_BLOCK_COUNTS_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("qwen4/route_block_counts.metal");
 
-const ROUTE_COUNTING_SCATTER_SOURCE: &str =
-    include_str!("../../../shaders/qwen4/route_counting_scatter.metal");
+const ROUTE_COUNTING_SCATTER_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("qwen4/route_counting_scatter.metal");
 
 static ROUTE_BLOCK_COUNTS: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 static ROUTE_COUNTING_SCATTER: std::sync::OnceLock<Option<MetalKernel>> =
@@ -219,7 +220,8 @@ pub fn route_counting_sort(
 }
 /// `track_router_gemv`: the decode router as a bf16 GEMV with f32 accumulate,
 /// one token (`x` f32 `[K]`, `w` bf16 `[N,K]`) -> logits f32 `[N]`.
-const ROUTER_GEMV_SOURCE: &str = include_str!("../../../shaders/qwen4/router_gemv.metal");
+const ROUTER_GEMV_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("qwen4/router_gemv.metal");
 
 static ROUTER_GEMV: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 

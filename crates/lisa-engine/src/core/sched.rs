@@ -50,12 +50,10 @@ struct Active {
 /// `on_token(id, token)` is called as each token is produced. Returns the
 /// generated ids per request (indexed by `request.id`).
 ///
-/// `depth > 0` switches to **per-stream speculative decoding with batch size
-/// 1** (the inline MTP drafter, `maximumSpeculativeBatch == 1`): each request
-/// is driven on its own
-/// `Session` with `generate_mtp`, one at a time. The continuous batch is used
-/// for `depth == 0`. Depth 1 is rejected: a single draft never pays for a
-/// speculative round.
+/// `depth > 0` uses independent speculative sessions. GLM interleaves committed
+/// target-MTP cycles with at most `max_batch` live sessions; Qwen runs one
+/// request to completion at a time. Neither path batches speculative GPU
+/// forwards. The continuous batch is used for `depth == 0`. Depth 1 is rejected.
 pub fn run(
     tower: &mut dyn LanguageModel,
     requests: Vec<Request>,
@@ -93,6 +91,9 @@ fn run_with_source(
         "depth 1 is not supported; use 0 (serial) or 2..=6 (MTP)"
     );
     if depth > 0 {
+        if tower.has_target_mtp() {
+            return run_target_mtp_round_robin(tower, requests, max_batch, on_token, next);
+        }
         return run_speculative(tower, requests, depth, on_token);
     }
     run_batch(tower, requests, max_batch, on_token, next)
@@ -105,9 +106,6 @@ fn run_speculative(
     depth: usize,
     on_token: &mut dyn FnMut(usize, u32) -> anyhow::Result<()>,
 ) -> anyhow::Result<Vec<Vec<u32>>> {
-    if tower.has_target_mtp() && requests.len() > 1 {
-        return run_target_mtp_round_robin(tower, requests, on_token);
-    }
     let n = requests.iter().map(|r| r.id).max().map_or(0, |m| m + 1);
     let mut out: Vec<Vec<u32>> = vec![Vec::new(); n];
     for mut req in requests {
@@ -149,67 +147,71 @@ fn run_speculative(
 /// pending proposal while every other live stream advances.
 fn run_target_mtp_round_robin(
     tower: &mut dyn LanguageModel,
-    mut requests: Vec<Request>,
+    requests: Vec<Request>,
+    max_batch: usize,
     on_token: &mut dyn FnMut(usize, u32) -> anyhow::Result<()>,
+    next: &mut dyn FnMut() -> Option<Request>,
 ) -> anyhow::Result<Vec<Vec<u32>>> {
-    eprintln!(
-        "[batched] GLM target-MTP round-robin: {} streams, one target cycle per turn",
-        requests.len()
-    );
-    let n = requests.iter().map(|r| r.id).max().map_or(0, |m| m + 1);
-    let mut out: Vec<Vec<u32>> = vec![Vec::new(); n];
-    let mut sessions = (0..requests.len())
-        .map(|_| Session::new(tower))
-        .collect::<Vec<_>>();
-    let mut done = vec![false; requests.len()];
-    let mut live = requests.len();
-
-    while live > 0 {
-        for index in 0..requests.len() {
-            if done[index] {
-                continue;
-            }
-            let req = &mut requests[index];
-            let _eos_scope = req.ignore_eos.then(crate::core::generate::ignore_eos_scope);
-            let id = req.id;
-            let remaining = req.max_tokens.saturating_sub(out[id].len());
-            if remaining == 0 || out[id].last().is_some_and(|&token| is_eos(token)) {
-                done[index] = true;
-                live -= 1;
-                continue;
-            }
-
-            let input = if sessions[index].fed.is_empty() {
-                req.prompt.as_slice()
-            } else {
-                &[]
+    let capacity = max_batch.max(1);
+    let mut queued: VecDeque<Request> = requests.into();
+    let mut active: VecDeque<(Request, Session, bool)> = VecDeque::new();
+    let mut out: Vec<Vec<u32>> = Vec::new();
+    let mut seen = HashSet::new();
+    loop {
+        // Poll at committed cycle boundaries. Retired sessions are dropped
+        // immediately, before their slots are reused by late arrivals.
+        while active.len() < capacity {
+            let Some(req) = queued.pop_front().or_else(&mut *next) else {
+                break;
             };
-            let before = out[id].len();
-            let mut cb = |token| {
+            anyhow::ensure!(seen.insert(req.id), "duplicate request id {}", req.id);
+            out.resize_with(out.len().max(req.id + 1), Vec::new);
+            if req.max_tokens == 0 {
+                continue;
+            }
+            active.push_back((req, Session::new(tower), false));
+        }
+        let Some((mut req, mut session, started)) = active.pop_front() else {
+            break;
+        };
+        let _eos_scope = req.ignore_eos.then(crate::core::generate::ignore_eos_scope);
+        let id = req.id;
+        let remaining = req.max_tokens.saturating_sub(out[id].len());
+        let input = if started { &[] } else { req.prompt.as_slice() };
+        let before = out[id].len();
+        session.target_mtp_cycle(
+            tower,
+            input,
+            remaining,
+            Some(&mut req.sampler),
+            &mut |token| {
                 out[id].push(token);
                 on_token(id, token)?;
                 Ok(crate::core::session::TargetMtpSamplingMode::Configured)
-            };
-            sessions[index].target_mtp_cycle(
-                tower,
-                input,
-                remaining,
-                Some(&mut req.sampler),
-                &mut cb,
-            )?;
-            anyhow::ensure!(
-                out[id].len() > before,
-                "GLM target-MTP scheduler made no progress for request {id}"
-            );
-            if out[id].len() >= req.max_tokens || out[id].last().is_some_and(|&token| is_eos(token))
-            {
-                done[index] = true;
-                live -= 1;
-            }
+            },
+        )?;
+        anyhow::ensure!(
+            out[id].len() > before,
+            "GLM target-MTP scheduler made no progress for request {id}"
+        );
+        if out[id].len() < req.max_tokens && !out[id].last().is_some_and(|&token| is_eos(token)) {
+            active.push_back((req, session, true));
         }
     }
-
     Ok(out)
+}
+
+/// Stream speculative requests, admitting GLM arrivals at committed MTP cycle
+/// boundaries. Independent Qwen draft chains retain their existing schedule.
+pub fn run_speculative_streaming(
+    tower: &mut dyn LanguageModel,
+    requests: Vec<Request>,
+    max_batch: usize,
+    depth: usize,
+    on_token: &mut dyn FnMut(usize, u32) -> anyhow::Result<()>,
+    next: &mut dyn FnMut() -> Option<Request>,
+) -> anyhow::Result<Vec<Vec<u32>>> {
+    run_with_source(tower, requests, max_batch, depth, on_token, next)
 }
 
 fn run_batch(

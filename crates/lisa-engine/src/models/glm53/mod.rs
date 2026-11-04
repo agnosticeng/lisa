@@ -4,10 +4,11 @@
 //! (`deepseek_sparse_attention`, 11 layers), 288-expert MoE with clamped
 //! SwiGLU, mHC hyper-connections (4 streams, sinkhorn-normalized mixing),
 //! one MTP block. Ports ds4's execution graph to lisa's Rust + Metal stack
-//! with MLX-format weights. Campaign:
-//! `specs/11-glm53-flash.md`.
+//! with legacy MLX weights or original DS4 GGUF blocks. The native GGUF
+//! implementation and validation limits are recorded in `specs/models/glm53.md`.
 
 pub mod config;
+pub mod gguf;
 pub mod kda;
 pub mod mhc;
 pub mod moe;
@@ -15,7 +16,7 @@ pub mod moe;
 pub mod smoke;
 pub mod sparse;
 #[cfg(test)]
-mod test_fixtures;
+pub(crate) mod test_fixtures;
 pub mod tower;
 
 // Explicit cache-law revision for DS4 b4e3faf, original MLX affine metadata,

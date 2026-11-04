@@ -3,14 +3,17 @@ name = "lisa-engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Model loading and inference for Qwen, GLM and Laya"
+description = "Native language, image and decision model inference for LISA"
 
 [features]
-# Enable only when the local GLM-5.3 DS4 capture archive is available.
+# Oracle checks load captures from LISA_GLM53_FIXTURE_DIR when executed.
 glm53-fixtures = []
 
 [dependencies]
+lisa-gguf.workspace = true
 anyhow.workspace = true
+base64.workspace = true
+image.workspace = true
 half.workspace = true
 libm.workspace = true
 libc.workspace = true

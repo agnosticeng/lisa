@@ -209,11 +209,12 @@ impl DecoderLayer {
 }
 
 pub struct Qwen35Tower {
+    vision: Option<crate::models::vision::Vision>,
     embed_tokens: QuantizedEmbedding,
     layers: Vec<DecoderLayer>,
     norm: RmsNorm,
     lm_head: QuantizedLinear,
-    /// Draft-only 3-bit requantized copy (`draft_head`); Some only
+    /// Draft-only 2-bit requantized copy (`draft_head`); Some only
     /// when the checkpoint carries an MTP head. Never used by verify.
     draft_head: Option<QuantizedLinear>,
     rope: Rotary,
@@ -273,7 +274,9 @@ impl Qwen35Tower {
                 }
             }
         }
-        Self::from_weights_cached(weights, config, Some(dir))
+        let mut tower = Self::from_weights_cached(weights, config, Some(dir))?;
+        tower.vision = crate::models::vision::Vision::from_dir(dir, tower.rope.dimensions)?;
+        Ok(tower)
     }
 
     pub fn from_weights(w: Weights, config: Qwen35Config) -> anyhow::Result<Self> {
@@ -293,7 +296,17 @@ impl Qwen35Tower {
         crate::core::mem::mlx_mem_line("t0-mmap-only");
         let mut embed_tokens = QuantizedEmbedding::load(&mut w, "model.embed_tokens")?;
         embed_tokens.set_quant(gs, bits);
-        let mut lm_head = QuantizedLinear::load(&mut w, "lm_head", "")?;
+        let mut lm_head = if config.tie_word_embeddings {
+            QuantizedLinear {
+                weight: embed_tokens.weight.clone(),
+                scales: embed_tokens.scales.clone(),
+                biases: embed_tokens.biases.clone(),
+                group_size: embed_tokens.group_size,
+                bits: embed_tokens.bits,
+            }
+        } else {
+            QuantizedLinear::load(&mut w, "lm_head", "")?
+        };
         lm_head.set_quant(gs, bits);
         crate::core::mem::mlx_mem_line("t1-heads");
 
@@ -354,11 +367,10 @@ impl Qwen35Tower {
         let mtp = crate::models::qwen3_5::mtp::MtpHead::load(&mut w, &config)?;
         crate::core::mem::mlx_mem_line("t3-mtp-head");
         let t_draft = std::time::Instant::now();
-        // Draft-only lm_head width: OFF by default, so drafts run through the
-        // trunk's own lm_head. A narrower draft head shrinks a read the round
-        // barely notices and charges it to ACCEPTANCE, which is the scarce
-        // resource — the trunk head is exact either way. `LISA_DRAFT_HEAD_BITS`
-        // selects a width (2, 3, 4, 6, 8) for the A/B; 0 or unset keeps it off.
+        // The default draft head shortlists with a cached 2-bit projection,
+        // then rescores its candidates through the original trunk head.
+        // LISA_DRAFT_HEAD_BITS=0 disables it; any positive value enables the
+        // supported 2-bit head (see build_draft_lm_head_cached).
         let draft_head = if mtp.is_some() && Self::draft_head_bits_from_env() > 0 {
             Self::build_draft_lm_head_cached(&lm_head, cache_dir)
         } else {
@@ -386,6 +398,7 @@ impl Qwen35Tower {
             t_draft.elapsed().as_secs_f64()
         ));
         Ok(Self {
+            vision: None,
             embed_tokens,
             layers,
             norm,
@@ -654,7 +667,10 @@ impl Qwen35Tower {
         // cos/sin once per forward: the 16 attention layers used to recompute
         // (exp, mul, concat, cos, sin + a bf16 cast each) them per layer per
         // token. Same ops, same values — hoisted.
-        let (cos, sin) = self.rope.cos_sin(&pos)?;
+        let (cos, sin) = match self.vision.as_ref().and_then(|v| v.positions(offset, s)) {
+            Some(pos) => self.rope.cos_sin_multimodal(&pos)?,
+            None => self.rope.cos_sin(&pos)?,
+        };
         let cos = cos.expand_dims(1)?;
         let sin = sin.expand_dims(1)?;
         // cos/sin cast to bf16 ONCE per forward (hoisted): every layer consumed
@@ -671,6 +687,9 @@ impl Qwen35Tower {
         // chain is identical: bf16 add, then rms (the same fused kernel the
         // post-norm site has used since wave 2).
         let mut x = self.embed_tokens.forward(ids)?;
+        if let Some(vision) = &self.vision {
+            x = vision.splice(x, offset)?;
+        }
         let mut m_prev: Option<Array> = None;
         for i in 0..self.layers.len() {
             let _trace_layer = lisa_mlx::trace::span_detail("tower.layer", i as u64);
@@ -794,6 +813,26 @@ impl Qwen35Tower {
 }
 
 impl crate::models::LanguageModel for Qwen35Tower {
+    fn supports_images(&self) -> bool {
+        self.vision.is_some()
+    }
+    fn prepare_images(
+        &mut self,
+        tokens: &mut Vec<u32>,
+        images: &[image::RgbImage],
+    ) -> anyhow::Result<()> {
+        let limit = self.max_position_embeddings();
+        self.vision
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("checkpoint has no supported vision encoder"))?
+            .prepare(tokens, images, limit)
+    }
+    fn clear_images(&mut self) {
+        if let Some(v) = &mut self.vision {
+            v.clear();
+        }
+    }
+
     fn batch_decode_ok(&self) -> bool {
         // The B>1 forward is batch-clean (specs/07 fix): the MLP swiglu2 keeps
         // its rank, ragged prefill takes per-stream RoPE positions, and the
@@ -904,20 +943,13 @@ impl crate::models::LanguageModel for Qwen35Tower {
         // way (proposal side only).
         let draft_id: Array = match &self.draft_head {
             Some(dh) => {
-                use lisa_mlx::ops::argpartition_axis;
                 use lisa_mlx::ops::indexing::take_axis;
                 const K: usize = 32;
                 let coarse = dh.forward(&last)?; // [1, V]
                 let v: i32 = coarse.dim(-1);
                 let kk: i32 = K as i32;
                 anyhow::ensure!(v >= kk, "vocab {v} smaller than the top-{K} shortlist");
-                let part = argpartition_axis(&(-&coarse), kk - 1, -1)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?; // [1, V] ids (repo convention: negated, first-k)
-                let flat = part.reshape(&[v])?;
-                let cands = flat
-                    .index(0..kk)
-                    .contiguous()
-                    .map_err(|e| anyhow::anyhow!("{e}"))?; // [32] ids
+                let cands = lisa_mlx::ops::top32_indices(&coarse)?.reshape(&[kk])?;
                 // Exact re-score through the trunk head's own rows.
                 let w32 = self.lm_head.weight.take_axis(&cands, 0)?; // [32, pk]
                 let s32 = self.lm_head.scales.take_axis(&cands, 0)?;
@@ -961,10 +993,8 @@ impl crate::models::LanguageModel for Qwen35Tower {
                 let id = lisa_mlx::ops::indexing::argmax_axis(&logits, -1, None)
                     .map_err(|e| anyhow::anyhow!("{e}"))?
                     .reshape(&[1, 1])?;
-                // Chunk-A confidence from the trunk head's own full
-                // distribution (log p_head of the argmax). The 27B ships no
-                // 2-bit shortlist head, so THIS is the head confidence the
-                // tau gate reads — arguably the more faithful surface.
+                // Without a shortlist, the confidence uses the full trunk
+                // head distribution (log p_head of its argmax).
                 if self.conf_capture {
                     let sm = logits
                         .softmax_axis(-1)

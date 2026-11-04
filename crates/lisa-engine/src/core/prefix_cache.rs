@@ -24,6 +24,7 @@
 use crate::core::cache::{LayerCache, LayerState};
 use crate::core::session::Session;
 use crate::models::LanguageModel;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 
 /// Do not spend ~113 MB of GDN state on prefixes shorter than this.
@@ -174,11 +175,19 @@ impl PrefixCache {
             }
         }
         let l = ram_len?;
-        let e = self
-            .entries
-            .iter()
-            .find(|e| e.tokens.len() == l && e.law == law)?;
-        Some((l, Session::from_prefix(tower, &e.layers, prompt, l)))
+        let entry = self.promote_ram_match(prompt, l, law)?;
+        Some((l, Session::from_prefix(tower, &entry.layers, prompt, l)))
+    }
+
+    fn promote_ram_match(&mut self, prompt: &[u32], len: usize, law: u64) -> Option<&PrefixEntry> {
+        let index = self.entries.iter().position(|e| {
+            e.tokens.len() == len && e.law == law && prompt.get(..len) == Some(e.tokens.as_slice())
+        })?;
+        // A RAM hit is a use too: keep frequently reused prefixes at the LRU
+        // front instead of spilling them when an unrelated prompt is inserted.
+        let entry = self.entries.remove(index);
+        self.entries.insert(0, entry);
+        self.entries.first()
     }
 
     /// Re-warm a restored disk entry: admit only if no identical-token entry
@@ -214,13 +223,18 @@ impl PrefixCache {
 /// leftovers (partial write before the tmp+rename completes is invisible —
 /// only the renamed file exists; a truncated one fails this scan).
 fn spill_header(path: &std::path::Path) -> Option<(u64, usize)> {
-    let b = std::fs::read(path).ok()?;
-    if b.len() < SPILL_HEADER || b[..4] != SPILL_MAGIC {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut b = [0u8; SPILL_HEADER];
+    file.read_exact(&mut b).ok()?;
+    if b[..4] != SPILL_MAGIC {
         return None;
     }
     let law = u64::from_le_bytes(b[4..12].try_into().ok()?);
     let ntok = u32::from_le_bytes(b[12..SPILL_HEADER].try_into().ok()?) as usize;
-    if b.len() < SPILL_HEADER + ntok * 4 + 4 {
+    let minimum_len = SPILL_HEADER
+        .checked_add(ntok.checked_mul(4)?)?
+        .checked_add(4)?;
+    if file.metadata().ok()?.len() < minimum_len as u64 {
         return None;
     }
     Some((law, ntok))
@@ -265,10 +279,18 @@ fn best_disk_match(prompt: &[u32], law: u64, at_least: Option<usize>) -> Option<
 }
 
 fn spill_tokens(path: &std::path::Path, ntok: usize) -> Option<Vec<u32>> {
-    let b = std::fs::read(path).ok()?;
-    let s = &b[SPILL_HEADER..SPILL_HEADER + ntok * 4];
+    let mut file = std::fs::File::open(path).ok()?;
+    let bytes = ntok.checked_mul(4)?;
+    let end = SPILL_HEADER.checked_add(bytes)?;
+    if file.metadata().ok()?.len() < end as u64 {
+        return None;
+    }
+    file.seek(SeekFrom::Start(SPILL_HEADER as u64)).ok()?;
+    let mut tokens = vec![0u8; bytes];
+    file.read_exact(&mut tokens).ok()?;
     Some(
-        s.chunks_exact(4)
+        tokens
+            .chunks_exact(4)
             .map(|c| u32::from_le_bytes(c.try_into().expect("tok")))
             .collect(),
     )
@@ -368,6 +390,10 @@ fn load_spill_entry(
     if file_law != law || ntok != n {
         return None;
     }
+    let token_end = SPILL_HEADER.checked_add(ntok.checked_mul(4)?)?;
+    if b.len() < token_end.checked_add(4)? || prompt.len() < n {
+        return None;
+    }
     let mut off = SPILL_HEADER;
     let mut tokens = Vec::with_capacity(ntok);
     for _ in 0..ntok {
@@ -396,12 +422,48 @@ fn load_spill_entry(
 mod tests {
     use super::*;
 
+    #[test]
+    fn spill_metadata_reads_only_header_and_token_prefix() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!("lisa-spill-header-{}", std::process::id()));
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(&SPILL_MAGIC).unwrap();
+        file.write_all(&7u64.to_le_bytes()).unwrap();
+        file.write_all(&2u32.to_le_bytes()).unwrap();
+        file.write_all(&11u32.to_le_bytes()).unwrap();
+        file.write_all(&17u32.to_le_bytes()).unwrap();
+        file.write_all(&0u32.to_le_bytes()).unwrap();
+        // A sparse large payload would make the former metadata scan allocate
+        // and read gigabytes. The lookup now touches just 16 + 8 bytes.
+        file.set_len(2 * 1024 * 1024 * 1024).unwrap();
+        assert_eq!(spill_header(&path), Some((7, 2)));
+        assert_eq!(spill_tokens(&path, 2), Some(vec![11, 17]));
+        file.set_len(19).unwrap();
+        assert_eq!(spill_header(&path), None);
+        assert_eq!(spill_tokens(&path, 2), None);
+        assert!(load_spill_entry(&path, &[11, 17], 2, 7).is_none());
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
+
     fn entry(tokens: Vec<u32>, law: u64) -> PrefixEntry {
         PrefixEntry {
             tokens,
             law,
             layers: Vec::new(),
         }
+    }
+
+    #[test]
+    fn ram_restore_selects_matching_tokens_and_promotes_the_hit() {
+        let mut cache = PrefixCache::new(3);
+        cache.entries = vec![entry(vec![1, 2], 7), entry(vec![3, 4], 7)];
+        let hit = cache.promote_ram_match(&[3, 4, 5], 2, 7).unwrap();
+        assert_eq!(hit.tokens, [3, 4]);
+        assert_eq!(cache.entries[0].tokens, [3, 4]);
+        assert_eq!(cache.entries[1].tokens, [1, 2]);
+        assert!(cache.promote_ram_match(&[3, 4, 5], 2, 8).is_none());
+        assert!(cache.promote_ram_match(&[3], 2, 7).is_none());
     }
 
     /// O2: states computed under a different numerical law must never be served,

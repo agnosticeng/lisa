@@ -1,0 +1,20 @@
+{
+  "ds4_revision": "b3f50180ec2c7324892be1f50bc83555ccb8d5e7",
+  "ggml_repository": "https://github.com/ggml-org/llama.cpp",
+  "ggml_revision": "7071ba378afa96dcd69c41e1ec2b4912364dbee4",
+  "ds4_moe_sha256": "c5f5d968be87ade2a48697b78efa99581fab8412943bbac1d8f26e02090cf5b7",
+  "ggml_matvec_sha256": "67d12dfe7a12fa4b042089c89ed5a7096dc6a2c12840e6c3ba11799b3b239578",
+  "ggml_common_sha256": "0061131b615c5721fc88a78feeb22c1f8c450f1c2646a317d80796a653bf595c",
+  "arithmetic_helpers_sha256": [
+    "b09ebd83e25bd74ef4d18f994ada0b0cc46cde92b4f5e8e74881137d49f3cdb8",
+    "b843baf3967d4137b59a736fb15398a7b38da4eea69cbc220512dd1d54f15fc5",
+    "51b1db89be56fc20f0d44b408ad7057032661bea35a17810d77315ce3334cb88",
+    "fc8c61b422343e5ea0da508e76edf34960c6beed9d0016a82c70ebe9fcfa53b5"
+  ],
+  "local_sha256": "e7e8739c15cccfd33c87333cbacdfdc00b94a1f4c2999601b6aa2b37d881ec33",
+  "changes": "DS4 IQ2_XXS helper and indirect expert wrapper retained. GGML IQ2_XS, IQ1_M and dense Q5_K helpers extend unavailable formats. Codebooks extracted from GGML_TABLE macros; GGML helpers instantiated with the DS4-compatible argument fields. New entry points use four rows per SIMD group, NSG=2, no short-K split. No requantization. The indirect wrapper additionally rejects out-of-range expert ids on the GPU before weight addressing; valid router ids retain the original arithmetic. Original DS4 Q2_K and Q4_K helpers appended for GLM GGUF; Q4_K uses the original two-row classic lane.",
+  "glm53_q2_q4_helpers": {
+    "q2_K": "3ccbc3cc8b46b20fa437e12ad28b0e2c9527e1ed49404f5cd50334d4860bce35",
+    "q4_K": "47f0092901a73b30a7bcd1d0604ce3f3f48bdea9d6dd71be0a389b02a681552d"
+  }
+}
