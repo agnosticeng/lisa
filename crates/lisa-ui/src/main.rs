@@ -19,6 +19,13 @@ fn main() {
         .setProcessName(&objc2_foundation::NSString::from_str("lisa"));
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+    if let Err(error) = lisa_engine::check_metal_support() {
+        let alert = NSAlert::new(mtm);
+        alert.setMessageText(&NSString::from_str("LISA needs a newer version of macOS"));
+        alert.setInformativeText(&NSString::from_str(&error.to_string()));
+        alert.runModal();
+        return;
+    }
     if let Err(error) = lisa_engine::initialize_kernels() {
         let alert = NSAlert::new(mtm);
         alert.setMessageText(&NSString::from_str("LISA could not load its kernels"));

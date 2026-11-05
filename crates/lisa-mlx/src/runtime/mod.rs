@@ -29,8 +29,8 @@ pub use buffer::{Buffer, BufferPool, ResidentMemoryReservation};
 pub use commands::{Commands, ComputeEncoder, EncoderGuard};
 pub use device::{
     ConstVal, JIT_COMPILES, Math, MetalRuntime, OrderedGpuReuseScope,
-    enter_ordered_gpu_reuse_scope, fnv1a, jit_compiles, kernel_fingerprint, kernel_law,
-    nax_available,
+    check_platform_support, enter_ordered_gpu_reuse_scope, fnv1a, jit_compiles,
+    kernel_fingerprint, kernel_law, nax_available,
 };
 pub use env::{
     ALLOC_COUNT, DISPATCH_COUNT, ENCODER_COUNT, GPU_PROBE_RECORDS, LABEL_COUNTS, LABEL_DISPATCH,

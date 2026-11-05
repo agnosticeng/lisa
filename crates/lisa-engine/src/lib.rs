@@ -34,4 +34,6 @@ pub fn ttft_mark(label: &str) {
 pub use core::{batch, generate, loader, mem, norm, quant, sampler, sched, session, tokenizer};
 /// Load and validate the packaged Metal sources without allocating GPU resources.
 pub use lisa_mlx::shader_pack::initialize as initialize_kernels;
+/// Validate the OS requirements without creating a GPU runtime or loading weights.
+pub use lisa_mlx::runtime::check_platform_support as check_metal_support;
 pub use models::{DecisionModel, LanguageModel, Loaded, laya, qwen4};
