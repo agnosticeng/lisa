@@ -225,6 +225,28 @@ pub enum ConstVal {
     Short(i16),
 }
 
+/// Check before creating a runtime or loading weights. The compiler's separate
+/// math controls and MSL 3.2 require macOS 15; older Objective-C runtimes throw
+/// an exception for these selectors rather than returning a Metal error.
+pub fn check_platform_support() -> Result<()> {
+    let version = objc2_foundation::NSProcessInfo::processInfo().operatingSystemVersion();
+    check_macos_version(
+        version.majorVersion,
+        version.minorVersion,
+        version.patchVersion,
+    )
+}
+
+fn check_macos_version(major: isize, minor: isize, patch: isize) -> Result<()> {
+    if major < 15 {
+        return Err(err(format!(
+            "LISA requires macOS 15.0 or later for Metal inference. \
+             This Mac runs macOS {major}.{minor}.{patch}. Update macOS to load models."
+        )));
+    }
+    Ok(())
+}
+
 fn compile_options(math: Math, nax: bool) -> Retained<MTLCompileOptions> {
     use objc2_metal::MTLLanguageVersion;
     let opts = MTLCompileOptions::new();
@@ -262,6 +284,7 @@ fn compile_options(math: Math, nax: bool) -> Retained<MTLCompileOptions> {
 
 impl MetalRuntime {
     pub fn new(per_buffer: usize) -> Result<Self> {
+        check_platform_support()?;
         crate::shader_pack::initialize()?;
         let device: Retained<ProtocolObject<dyn MTLDevice>> =
             MTLCreateSystemDefaultDevice().ok_or_else(|| err("no Metal device"))?;
@@ -603,5 +626,29 @@ mod ordered_gpu_reuse_scope_tests {
         assert!(ordered_gpu_reuse_enabled());
         drop(outer);
         assert!(!ordered_gpu_reuse_enabled());
+    }
+}
+
+#[cfg(test)]
+mod platform_tests {
+    use super::check_macos_version;
+
+    #[test]
+    fn rejects_sonoma_with_an_actionable_error() {
+        for (major, minor, patch) in [(13, 7, 0), (14, 1, 0), (14, 7, 6)] {
+            let error = check_macos_version(major, minor, patch)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("requires macOS 15.0 or later"));
+            assert!(error.contains(&format!("macOS {major}.{minor}.{patch}")));
+            assert!(error.contains("Update macOS"));
+        }
+    }
+
+    #[test]
+    fn accepts_the_metal_compiler_api_boundary_and_newer_versions() {
+        for (major, minor, patch) in [(15, 0, 0), (15, 1, 1), (26, 0, 0), (27, 0, 0)] {
+            check_macos_version(major, minor, patch).unwrap();
+        }
     }
 }

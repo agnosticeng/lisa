@@ -364,6 +364,7 @@ pub fn load_dir_with(dir: &Path, backend: lisa_mlx::backend::Backend) -> anyhow:
     // buffers before the replacement reserves its resident weights. The CPU
     // decision path must not initialize a Metal runtime just to sweep it.
     if backend == lisa_mlx::backend::Backend::Metal {
+        lisa_mlx::runtime::check_platform_support()?;
         lisa_mlx::memory::clear_cache();
     }
     Ok(match kind {

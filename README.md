@@ -28,8 +28,8 @@ with its own Rust engine and Metal runtime.
 
 ## Get started
 
-Requires **macOS on Apple Silicon**, Apple command line developer tools and a
-Rust toolchain supporting edition 2024. Choose a model that leaves enough
+Requires **macOS 15 or later on Apple Silicon**, Apple command line developer
+tools and a Rust toolchain supporting edition 2024. Choose a model that leaves enough
 unified memory for its weights, context, working buffers and macOS.
 
 ```sh

@@ -5,6 +5,14 @@ The native AppKit app lives in [lisa-ui](../crates/lisa-ui/src/). Launch
 `sh crates/lisa-ui/bundle.sh`. The editable icon and generated assets live in
 [assets](../crates/lisa-ui/assets/).
 
+Metal inference requires macOS 15 or later, including on M1–M4 Macs. The
+compiler's separate math controls and MSL 3.2 are unavailable on macOS 14.
+The bundle declares this minimum, and standalone launches show an upgrade
+message before starting the engine. Shared model loading and runtime creation
+also reject unsupported macOS versions before allocating GPU resources. This
+keeps the existing arithmetic contracts; an older-OS compiler fallback would
+need separate numerical validation.
+
 The bundle script produces `target/dist/Lisa.app` and enforces a 10,000,000-byte
 limit for the complete bundle, including the engine, UI, kernel package, icon
 and notices. The `dist` profile uses full LTO; engine/runtime optimization stays
