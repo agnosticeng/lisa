@@ -1,35 +1,32 @@
-//! Minimal Hugging Face Hub downloader.
+//! Hugging Face downloads through the official Rust Hub client.
 //!
-//! Lists a repo's files through the Hub API and fetches each with `curl`
-//! (present on macOS), writing the standard hub cache layout
-//! (`blobs/<hash>` + `snapshots/<rev>/…` symlinks) so downloaded and
-//! `huggingface_hub`-managed caches stay interchangeable. No
-//! `huggingface_hub` dependency.
-//!
-//! Downloads are resumable: partial files live in `blobs/<hash>.incomplete`
-//! (counted by the UI's byte-progress meter) and are renamed once complete. A
-//! snapshot is only published under its final `snapshots/<rev>` name after
-//! every file lands, so an interrupted download is never mistaken for a cached
-//! model.
+//! The client owns HTTP transfers, retries, resumption and the standard
+//! Hub cache. A snapshot remains hidden from Lisa discovery until every selected
+//! file is present with its advertised size, including after an interrupted run.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use serde_json::Value;
+use hf_hub::api::sync::{Api, ApiBuilder, ApiRepo};
+use hf_hub::{Repo, RepoType};
 
-/// The Hugging Face hub cache root: `$HF_HOME/hub`, else
-/// `~/.cache/huggingface/hub`.
+const INCOMPLETE_MARKER: &str = ".lisa-incomplete";
+
+/// Use the same environment-based cache root as the Hub client.
 pub fn hub_root() -> PathBuf {
-    match std::env::var_os("HF_HOME") {
-        Some(h) => PathBuf::from(h).join("hub"),
-        None => home_dir().join(".cache").join("huggingface").join("hub"),
-    }
+    std::env::var_os("HF_HUB_CACHE")
+        .or_else(|| std::env::var_os("HUGGINGFACE_HUB_CACHE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| hf_home().join("hub"))
 }
 
 /// Whether a snapshot has an entry point the resolver can recognize.
 /// Tensor completeness and compatibility are checked when the model is opened.
 pub fn is_model_dir(dir: &Path) -> bool {
+    if dir.join(INCOMPLETE_MARKER).exists() {
+        return false;
+    }
     dir.join("config.json").is_file()
         || dir.join("encoder/config.json").is_file()
         || super::flux2::is_checkpoint(dir)
@@ -44,7 +41,10 @@ pub fn checkpoint_path(dir: PathBuf) -> PathBuf {
         return dir;
     }
     if !dir.join("config.json").exists() {
-        for name in [super::deepseek41::GGUF_ENTRY, super::glm53::gguf::ENTRY] {
+        for name in [
+            super::deepseek41::GGUF_ENTRY,
+            super::glm53::gguf::ENTRY,
+        ] {
             let file = dir.join(name);
             if file.is_file() {
                 return file;
@@ -107,117 +107,126 @@ pub fn cached_snapshot(repo: &str) -> Option<PathBuf> {
     cached_snapshots(repo).into_iter().next()
 }
 
-fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
+fn hf_home() -> PathBuf {
+    std::env::var_os("HF_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
+        .unwrap_or_else(|| {
+            std::env::var_os("XDG_CACHE_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| ".".into()))
+                        .join(".cache")
+                })
+                .join("huggingface")
+        })
 }
 
-/// A Hub access token from `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN` or the
-/// standard `token` file beside the cache.
 fn token() -> Option<String> {
+    if std::env::var("HF_HUB_DISABLE_IMPLICIT_TOKEN").is_ok_and(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    }) {
+        return None;
+    }
     for key in ["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"] {
-        if let Ok(t) = std::env::var(key) {
-            if !t.is_empty() {
-                return Some(t);
-            }
+        if let Ok(token) = std::env::var(key)
+            && !token.trim().is_empty()
+        {
+            return Some(token.trim().into());
         }
     }
-    let root = std::env::var_os("HF_HOME")
+    let path = std::env::var_os("HF_TOKEN_PATH")
         .map(PathBuf::from)
-        .unwrap_or_else(|| home_dir().join(".cache").join("huggingface"));
-    std::fs::read_to_string(root.join("token"))
+        .unwrap_or_else(|| hf_home().join("token"));
+    std::fs::read_to_string(path)
         .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
 }
 
-/// Run `curl` with the shared flags and optional auth; returns stdout bytes.
-fn curl(args: &[String]) -> Result<Vec<u8>> {
-    let mut cmd = Command::new("curl");
-    cmd.args(["-sSL", "--fail", "--retry", "3"]);
-    if let Some(t) = token() {
-        cmd.arg("-H").arg(format!("Authorization: Bearer {t}"));
-    }
-    cmd.args(args);
-    let out = cmd
-        .output()
-        .context("running `curl` (is curl installed?)")?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        bail!("curl failed: {}", err.trim());
-    }
-    Ok(out.stdout)
+fn client(anonymous: bool) -> Result<Api> {
+    ApiBuilder::from_env()
+        .with_cache_dir(hub_root())
+        .with_progress(false)
+        .with_retries(3)
+        .with_token(if anonymous { None } else { token() })
+        .build()
+        .context("creating Hugging Face client")
 }
 
-fn get_json(url: &str) -> Result<Value> {
-    let bytes = curl(&[
-        "--connect-timeout".into(),
-        "10".into(),
-        "--max-time".into(),
-        "30".into(),
-        url.to_string(),
-    ])?;
-    serde_json::from_slice(&bytes).with_context(|| format!("parsing Hub API JSON from {url}"))
+fn connect(repo: &str, make_client: impl Fn(bool) -> Result<Api>) -> Result<(Api, String)> {
+    anyhow::ensure!(is_repo_id(repo), "invalid Hub repository ID {repo:?}");
+    let authenticated = make_client(false)?;
+    let revision = match authenticated.model(repo.into()).info_request().call() {
+        Ok(response) => response.into_json::<hf_hub::api::RepoInfo>()?.sha,
+        Err(error) => {
+            let detail = error.to_string();
+            if error
+                .into_response()
+                .is_some_and(|response| response.status() == 401)
+            {
+                // Expired credentials must not block a public checkpoint.
+                let anonymous = make_client(true)?;
+                if let Ok(info) = anonymous.model(repo.into()).info() {
+                    return Ok((anonymous, info.sha));
+                }
+                bail!("Hugging Face login rejected for {repo}; refresh your token: {detail}");
+            }
+            bail!("reading {repo} metadata: {detail}");
+        }
+    };
+    Ok((authenticated, revision))
 }
 
-/// One file to fetch: repo-relative path, expected size, and its content hash
-/// (the blob name).
+#[derive(serde::Deserialize)]
 struct RemoteFile {
+    #[serde(rename = "rfilename")]
     path: String,
     size: u64,
-    hash: String,
 }
 
-fn list_files(repo: &str, rev: &str) -> Result<Vec<RemoteFile>> {
-    // Unlike the paginated tree endpoint, revision metadata lists every file.
-    let url = format!("https://huggingface.co/api/models/{repo}/revision/{rev}?blobs=true");
-    let metadata = get_json(&url)?;
-    let arr = metadata
-        .get("siblings")
-        .and_then(Value::as_array)
-        .with_context(|| format!("unexpected Hub file manifest for {repo}"))?;
+fn download_files(repo: &str, remote: &ApiRepo, rev: &str) -> Result<Vec<RemoteFile>> {
+    #[derive(serde::Deserialize)]
+    struct Manifest {
+        siblings: Vec<RemoteFile>,
+    }
+    // The flat revision manifest includes nested paths without tree pagination.
+    let response = remote
+        .info_request()
+        .query("blobs", "true")
+        .call()
+        .with_context(|| format!("listing {repo}@{rev}"))?;
+    let manifest: Manifest = response.into_json().context("reading Hub file metadata")?;
     let mut files = Vec::new();
-    for e in arr {
-        let path = e
-            .get("rfilename")
-            .and_then(Value::as_str)
-            .context("Hub file manifest is missing a filename")?;
+    for file in manifest.siblings {
         anyhow::ensure!(
-            !path.is_empty()
-                && Path::new(path)
+            !file.path.is_empty()
+                && file.path != INCOMPLETE_MARKER
+                && Path::new(&file.path)
                     .components()
                     .all(|part| matches!(part, std::path::Component::Normal(_))),
-            "invalid Hub file path {path:?}"
+            "invalid Hub file path {:?}",
+            file.path
         );
-        let size = e
-            .get("size")
-            .and_then(Value::as_u64)
-            .with_context(|| format!("Hub file size is missing for {path}"))?;
-        let hash = e
-            .get("lfs")
-            .and_then(|lfs| lfs.get("sha256"))
-            .or_else(|| e.get("blobId"))
-            .and_then(Value::as_str)
-            .with_context(|| format!("Hub content hash is missing for {path}"))?;
-        anyhow::ensure!(
-            !hash.is_empty() && hash.bytes().all(|b| b.is_ascii_hexdigit()),
-            "invalid Hub content hash for {path}"
-        );
-        files.push(RemoteFile {
-            path: path.into(),
-            size,
-            hash: hash.into(),
-        });
+        if include_download_file(repo, &file.path) {
+            files.push(file);
+        }
     }
+    anyhow::ensure!(!files.is_empty(), "{repo}@{rev} has no downloadable files");
     Ok(files)
 }
 
-/// Complete selected package size, including nested tokenizer and auxiliary weights.
-pub fn download_size(repo: &str) -> Result<u64> {
-    anyhow::ensure!(is_repo_id(repo), "invalid Hub repository ID {repo:?}");
-    let files = download_files(repo, "main")?;
-    anyhow::ensure!(!files.is_empty(), "{repo} has no downloadable files");
+fn pinned_repo(client: &Api, repo: &str, revision: &str) -> ApiRepo {
+    client.repo(Repo::with_revision(
+        repo.into(),
+        RepoType::Model,
+        revision.into(),
+    ))
+}
+
+fn package_size(files: &[RemoteFile]) -> Result<u64> {
     files.iter().try_fold(0u64, |total, file| {
         total
             .checked_add(file.size)
@@ -225,12 +234,14 @@ pub fn download_size(repo: &str) -> Result<u64> {
     })
 }
 
-/// FLUX 3 publishes multiple complete tensor layouts and NVIDIA-only formats.
-/// LISA consumes the native BF16 package, retaining its notices and encoder.
-fn download_files(repo: &str, rev: &str) -> Result<Vec<RemoteFile>> {
-    let mut files = list_files(repo, rev)?;
-    files.retain(|file| include_download_file(repo, &file.path));
-    Ok(files)
+/// Complete selected package size, including nested tokenizer and auxiliary weights.
+pub fn download_size(repo: &str) -> Result<u64> {
+    let (client, revision) = connect(repo, client)?;
+    package_size(&download_files(
+        repo,
+        &pinned_repo(&client, repo, &revision),
+        &revision,
+    )?)
 }
 
 fn include_download_file(repo: &str, path: &str) -> bool {
@@ -270,110 +281,112 @@ fn include_download_file(repo: &str, path: &str) -> bool {
         )
 }
 
-fn download_file(repo: &str, rev: &str, file: &RemoteFile, dest: &Path) -> Result<()> {
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let url = format!("https://huggingface.co/{repo}/resolve/{rev}/{}", file.path);
-    curl(&[
-        "-C".to_string(),
-        "-".to_string(),
-        "-o".to_string(),
-        dest.display().to_string(),
-        url,
-    ])
-    .with_context(|| format!("downloading {}", file.path))?;
-    Ok(())
+struct FileProgress {
+    callback: Arc<dyn Fn(u64, u64) + Send + Sync>,
+    completed: u64,
+    size: u64,
+    total: u64,
+    transferred: u64,
+    reported: u64,
 }
 
-/// Download `repo` into the hub cache and return its snapshot directory.
-///
-/// Idempotent and resumable: complete blobs are left alone, partial ones resume
-/// with a range request, and the snapshot is published atomically at the end.
+impl hf_hub::api::Progress for FileProgress {
+    fn init(&mut self, _size: usize, _filename: &str) {
+        self.transferred = 0;
+    }
+    fn update(&mut self, bytes: usize) {
+        self.transferred = self.transferred.saturating_add(bytes as u64).min(self.size);
+        if self.transferred > self.reported {
+            self.reported = self.transferred;
+            (self.callback)(self.completed + self.reported, self.total);
+        }
+    }
+    fn finish(&mut self) {}
+}
+
+/// Download a selected package into the standard Hub cache.
 pub fn download_repo(repo: &str) -> Result<PathBuf> {
+    download_repo_with_progress(repo, |_, _| {})
+}
+
+/// The callback reports completed bytes across the selected package, including
+/// cache hits. Discovery stays disabled until the complete package is verified.
+pub fn download_repo_with_progress(
+    repo: &str,
+    progress: impl Fn(u64, u64) + Send + Sync + 'static,
+) -> Result<PathBuf> {
+    let (client, revision) = connect(repo, client)?;
+    download_with_client(repo, &client, &hub_root(), &revision, Arc::new(progress))
+}
+
+fn file_complete(path: &Path, expected: u64) -> bool {
+    std::fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.len() == expected)
+}
+
+fn download_with_client(
+    repo: &str,
+    client: &Api,
+    cache_root: &Path,
+    rev: &str,
+    progress: Arc<dyn Fn(u64, u64) + Send + Sync>,
+) -> Result<PathBuf> {
     if !is_repo_id(repo) {
         bail!("{repo:?} is not a Hugging Face repo id (expected `org/name`)");
     }
-
-    let rev = match get_json(&format!("https://huggingface.co/api/models/{repo}")) {
-        Ok(v) => v
-            .get("sha")
-            .and_then(|s| s.as_str())
-            .unwrap_or("main")
-            .to_string(),
-        // The metadata call can fail on a gated repo without a token; fall back
-        // to the branch and let the per-file requests surface auth errors.
-        Err(_) => "main".to_string(),
-    };
+    let remote = pinned_repo(client, repo, rev);
     anyhow::ensure!(
-        rev == "main" || (!rev.is_empty() && rev.bytes().all(|b| b.is_ascii_hexdigit())),
+        rev.len() == 40 && rev.bytes().all(|b| b.is_ascii_hexdigit()),
         "invalid Hub revision {rev:?}"
     );
-
-    let root = repo_dir(repo);
-    let snap = root.join("snapshots").join(&rev);
-    let files = download_files(repo, &rev)?;
-    if files.is_empty() {
-        bail!("{repo}@{rev} has no downloadable files");
-    }
-    if is_model_dir(&snap)
-        && files.iter().all(|file| {
-            std::fs::metadata(snap.join(&file.path)).is_ok_and(|meta| meta.len() == file.size)
-        })
-    {
-        return Ok(snap);
-    }
-
-    let blobs = root.join("blobs");
-    let partial = root.join("snapshots").join(format!("{rev}.lisa-partial"));
-    std::fs::create_dir_all(&blobs)?;
-    std::fs::create_dir_all(&partial)?;
-
+    let files = download_files(repo, &remote, rev)?;
+    let total = package_size(&files)?;
+    // Use the configured client's cache path so tests and explicit endpoints
+    // exercise exactly the same download/discovery boundary as production.
+    let root = cache_root.join(format!("models--{}", repo.replace('/', "--")));
+    let snap = root.join("snapshots").join(rev);
+    std::fs::create_dir_all(&snap)?;
+    let marker = snap.join(INCOMPLETE_MARKER);
+    std::fs::write(
+        &marker,
+        b"Download in progress; retry to complete this snapshot.\n",
+    )?;
+    let mut completed = 0;
+    progress(0, total);
     for file in &files {
-        let blob = blobs.join(&file.hash);
-        let blob_ok =
-            std::fs::metadata(&blob).is_ok_and(|meta| meta.is_file() && meta.len() == file.size);
-        if !blob_ok {
-            let incomplete = blobs.join(format!("{}.incomplete", file.hash));
-            download_file(repo, &rev, file, &incomplete)?;
-            let got = std::fs::metadata(&incomplete)?.len();
+        let destination = snap.join(&file.path);
+        if !file_complete(&destination, file.size) {
+            // Download bypasses the client's existing snapshot fast path, so a
+            // truncated final file is replaced; `.part` files still resume.
+            let downloaded = remote
+                .download_with_progress(
+                    &file.path,
+                    FileProgress {
+                        callback: progress.clone(),
+                        completed,
+                        size: file.size,
+                        total,
+                        transferred: 0,
+                        reported: 0,
+                    },
+                )
+                .with_context(|| format!("downloading {} from {repo}", file.path))?;
             anyhow::ensure!(
-                got == file.size,
-                "{}: expected {} bytes, got {got} — retry the download",
-                file.path,
-                file.size
+                downloaded == destination,
+                "Hub returned an unexpected snapshot path"
             );
-            std::fs::rename(&incomplete, &blob)?;
         }
-
-        // snapshots/<rev>/<path> -> ../../blobs/<hash> (relative, so the tree
-        // can be relocated).
-        let link = partial.join(&file.path);
-        if let Some(parent) = link.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let _ = std::fs::remove_file(&link);
-        let depth = file.path.matches('/').count() + 2;
-        let target = format!("{}blobs/{}", "../".repeat(depth), file.hash);
-        std::os::unix::fs::symlink(&target, &link)
-            .with_context(|| format!("linking {}", file.path))?;
-    }
-
-    if snap.is_dir() {
-        // Repair previously incomplete snapshots, preserving prepared storage.
-        for file in &files {
-            let destination = snap.join(&file.path);
-            if let Some(parent) = destination.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::rename(partial.join(&file.path), destination)?;
-        }
-        std::fs::remove_dir_all(&partial)?;
-    } else {
-        std::fs::rename(&partial, &snap)?;
+        anyhow::ensure!(
+            file_complete(&destination, file.size),
+            "{}: expected {} bytes after download; retry to repair the cache",
+            file.path,
+            file.size
+        );
+        completed += file.size;
+        progress(completed, total);
     }
     std::fs::create_dir_all(root.join("refs"))?;
-    std::fs::write(root.join("refs").join("main"), rev.as_bytes())?;
+    std::fs::write(root.join("refs/main"), rev.as_bytes())?;
+    std::fs::remove_file(marker)?;
     Ok(snap)
 }
 
@@ -459,3 +472,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "hf_download_tests.rs"]
+mod download_tests;

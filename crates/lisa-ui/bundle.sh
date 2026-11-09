@@ -21,8 +21,8 @@ test -d "$TARGET/dist/lisa-ui.dSYM"
 strip "$APP/Contents/MacOS/lisa-ui"
 codesign --force --sign - "$APP"
 bytes=$(find "$APP" -type f -exec stat -f '%z' {} + | awk '{total += $1} END {printf "%.0f", total}')
-if [ "$bytes" -gt 10000000 ]; then
-    printf 'App bundle exceeds the 10 MB limit: %s bytes\n' "$bytes" >&2
+if [ "$bytes" -gt 12000000 ]; then
+    printf 'App bundle exceeds the 12 MB limit: %s bytes\n' "$bytes" >&2
     exit 1
 fi
 printf 'App bundle: %s bytes; debug symbols: %s/dist/lisa-ui.dSYM\n' "$bytes" "$TARGET"

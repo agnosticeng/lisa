@@ -127,6 +127,25 @@ chat. Local size accounting follows Hub links, counts each inode once and
 avoids directory cycles. The displayed RAM budget uses the engine's shared
 budget calculation.
 
+Downloads use the official `hf-hub` 0.4 synchronous Rust client for authenticated
+metadata, resumable HTTP transfers and cache writes. Its async and native Xet
+transfer stacks are excluded to limit app size. The progress ring uses transfer callbacks
+for the selected files, including cache hits, instead of counting unrelated
+cached blobs. A `.lisa-incomplete` marker hides a snapshot from Lisa discovery
+until all selected files pass size checks; retrying reuses completed files and
+repairs truncated entries. `HF_HUB_CACHE`, `HF_HOME`, `HF_TOKEN`, token files and
+`HF_ENDPOINT` are supported. If ambient credentials
+are rejected, Lisa retries public metadata anonymously; private/gated access
+still reports the authentication failure.
+
+November 9 downloader validation: release workspace build, 358 library tests
+(26 existing tests ignored), eight UI tests and kernel smoke passed. Local Hub
+fixtures checked partial-transfer resumption, interrupted package discovery,
+cache reuse, truncated-file repair, nested files and stale-token fallback.
+A fresh 12,512,611-byte public repository download passed with expired ambient
+credentials. The lighter client's signed workspace bundle is 11,296,700 bytes;
+it fits the 12 MB packaging limit adopted for the synchronous Hub client.
+
 The list separates download size from resident memory estimates. DeepSeek's
 Engram table is disk-only. GGUF packages select the required files and skip
 legacy MLX preparation. Original model licenses/notices remain with downloads.

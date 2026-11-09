@@ -23,6 +23,7 @@ block2 = "0.6"
 clap = { version = "4.6.6", features = ["derive"] }
 half = "2.7.1"
 hf-chat-template = "1"
+hf-hub = { version = "0.4.3", default-features = false, features = ["ureq"] }
 libm = "0.2.15"
 libc = "0.2"
 memmap2 = "0.9.11"
@@ -60,3 +61,10 @@ opt-level = "z"
 
 [profile.dist.package.minijinja]
 opt-level = "s"
+
+# Network transfer code favors app size; inference profiles are unchanged.
+[profile.dist.package.hf-hub]
+opt-level = "z"
+
+[profile.dist.package.ureq]
+opt-level = "z"

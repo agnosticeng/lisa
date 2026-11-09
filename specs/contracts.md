@@ -222,6 +222,11 @@ CLI and UI use the same default. An explicit `--ctx-size` on `run` or `serve`
 is applied afterward and retains the model's validation and memory admission.
 The advertised capacity does not certify numerical parity at every length.
 
+Hub downloads use the `hf-hub` client and pin the selected package to a commit
+revision. Lisa does not discover snapshots marked `.lisa-incomplete`; the marker
+is removed only after every selected file has its advertised size. Retries reuse
+complete cached files and force a transfer for truncated snapshot entries.
+
 Resolve a local directory, supported GGUF file or HF repository ID to one
 checkpoint; fail clearly on ambiguity or unsupported model type/quantization.
 Read the checkpoint's actual dtype, shapes, quantization groups and per-tensor

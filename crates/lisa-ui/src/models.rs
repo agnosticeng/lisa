@@ -1,7 +1,5 @@
 //! Desktop model discovery, sizes and curated download metadata.
 
-use std::path::PathBuf;
-
 use crate::catalog;
 
 #[derive(Clone, Debug)]
@@ -197,16 +195,6 @@ fn dir_size(path: &std::path::Path) -> u64 {
 
 pub(super) fn model_ram_budget() -> u64 {
     lisa_engine::core::admission::MemoryBudget::from_host().budget() as u64
-}
-
-/// The Hub cache directory for a repo (`models--org--name`).
-fn hf_hub_dir(repo: &str) -> PathBuf {
-    lisa_engine::models::hf::repo_dir(repo)
-}
-
-/// Bytes already written for a repo's blobs (in-progress downloads included).
-pub(super) fn hf_blobs_size(repo: &str) -> u64 {
-    dir_size(&hf_hub_dir(repo).join("blobs"))
 }
 
 /// Refresh sizes for the explicit catalog; network results cannot add models.

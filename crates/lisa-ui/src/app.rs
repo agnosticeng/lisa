@@ -15,7 +15,7 @@ use objc2_app_kit::*;
 use objc2_foundation::*;
 
 use crate::models::{
-    Model, config_model_type, discover_models, display_name, fetch_remote_models, hf_blobs_size,
+    Model, config_model_type, discover_models, display_name, fetch_remote_models,
     model_ram_budget,
 };
 use crate::{catalog, chats, ui};
@@ -86,6 +86,7 @@ enum UiEvent {
     RemoteModels(Vec<(String, u64)>),
     /// The local model set changed (e.g. a download finished).
     ModelsChanged,
+    DownloadProgress { repo: String, completed: u64, total: u64 },
 }
 
 /// Upcast any Foundation object whose superclass is `NSObject` to `AnyObject`.
@@ -1715,13 +1716,30 @@ fn spawn_engine(rx: mpsc::Receiver<Command>, events: Arc<Mutex<Vec<UiEvent>>>) {
                                 .name("lisa-download".into())
                                 .spawn(move || {
                                     let push = |e: UiEvent| events.lock().unwrap().push(e);
-                                    match lisa_engine::models::hf::download_repo(&repo2) {
+                                    let progress_events = events.clone();
+                                    let progress_repo = repo2.clone();
+                                    let progress = move |completed, total| {
+                                        let mut events = progress_events.lock().unwrap();
+                                        // Coalesce transfer callbacks between UI ticks.
+                                        if let Some(UiEvent::DownloadProgress { completed: done, total: size, .. }) =
+                                            events.iter_mut().rev().find(|event| matches!(event,
+                                                UiEvent::DownloadProgress { repo, .. } if repo == &progress_repo))
+                                        {
+                                            *done = completed;
+                                            *size = total;
+                                        } else {
+                                            events.push(UiEvent::DownloadProgress {
+                                                repo: progress_repo.clone(), completed, total,
+                                            });
+                                        }
+                                    };
+                                    match lisa_engine::models::hf::download_repo_with_progress(&repo2, progress) {
                                         Ok(_) => {
                                             push(UiEvent::Log(format!("downloaded {repo2}")));
                                             push(UiEvent::ModelsChanged);
                                         }
                                         Err(e) => {
-                                            push(UiEvent::Log(format!("download error: {e}")));
+                                            push(UiEvent::Log(format!("download error: {e:#}")));
                                             push(UiEvent::ModelsChanged);
                                         }
                                     }
@@ -3188,6 +3206,16 @@ define_class!(
                         *self.ivars().remote_ids.borrow_mut() = ids;
                         self.refresh_models();
                     }
+                    UiEvent::DownloadProgress { repo, completed, total } => {
+                        let row = *self.ivars().loading_row.borrow();
+                        if self.ivars().downloading.get() && row.is_some_and(|row|
+                            self.ivars().models.borrow().get(row).is_some_and(|model| model.repo_id == repo))
+                        {
+                            self.ivars().download_progress.set(if total == 0 { 0.0 } else {
+                                (completed as f64 / total as f64).clamp(0.0, 1.0)
+                            });
+                        }
+                    }
                     UiEvent::ModelsChanged => {
                         if self.ivars().downloading.get() {
                             self.ivars().downloading.set(false);
@@ -4414,33 +4442,16 @@ impl AppDelegate {
         }
     }
 
-    /// Refresh the download ring from the bytes written to the Hub cache.
-    /// Throttled to ~3 Hz so the directory walk stays cheap.
+    /// Paint Hub transfer progress at ~3 Hz, independently of callback frequency.
     fn tick_download_progress(&self) {
         if !self.ivars().downloading.get() {
             return;
         }
         let tick = self.ivars().progress_tick.get() + 1;
         self.ivars().progress_tick.set(tick);
-        if tick % 10 != 0 {
-            return;
+        if tick % 10 == 0 && let Some(row) = *self.ivars().loading_row.borrow() {
+            self.refresh_model_row(row);
         }
-        let Some(row) = *self.ivars().loading_row.borrow() else {
-            return;
-        };
-        let (repo, total) = {
-            let models = self.ivars().models.borrow();
-            match models.get(row) {
-                Some(m) => (m.repo_id.clone(), m.size),
-                None => return,
-            }
-        };
-        if total > 0 {
-            let done = hf_blobs_size(&repo);
-            let progress = (done as f64 / total as f64).clamp(0.0, 1.0);
-            self.ivars().download_progress.set(progress);
-        }
-        self.refresh_model_row(row);
     }
 
     /// Stream a chunk into the active assistant bubble (plain while generating).

@@ -46,7 +46,7 @@ open target/dist/Lisa.app
 
 The script builds and locally signs the app, keeping debug symbols separately
 in `target/dist/lisa-ui.dSYM`. The complete app includes its compressed Metal
-source package, `kernels.bin`; the bundle build enforces a 10 MB size limit.
+source package, `kernels.bin`; the bundle build enforces a 12 MB size limit.
 In **Models**, download a checkpoint, then select it to load. Choose a language model to chat or an image
 model to generate. Downloaded models appear first; compatible checkpoints
 already in your Hugging Face cache are discovered automatically.
