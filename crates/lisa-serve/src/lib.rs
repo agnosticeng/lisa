@@ -2809,19 +2809,23 @@ fn streaming_stop_safe_len(text: &str, stops: &[String]) -> usize {
 /// Split a generated reply into visible content and OpenAI-style `tool_calls`,
 /// parsing the Qwen/MiMo text form
 /// `<tool_call><function=NAME><parameter=K>V</parameter>…</function></tool_call>`.
+/// Complete bare function blocks are also accepted when their tools are declared.
 /// Any reasoning block is stripped first.
-fn extract_tool_calls(text: &str, tools: &[Value]) -> (String, Vec<Value>) {
+pub fn extract_tool_calls(text: &str, tools: &[Value]) -> (String, Vec<Value>) {
     let (_, answer) = split_reasoning(text);
     if let Some(result) = deepseek41::extract(&answer) {
         return result.unwrap_or_else(|_| (answer, Vec::new()));
     }
     const OPEN: &str = "<tool_call>";
     const CLOSE: &str = "</tool_call>";
+    let types = tool_types(tools);
     let Some(start) = answer.find(OPEN) else {
+        if let Some(calls) = parse_bare_tool_calls(&answer, &types) {
+            return (String::new(), calls);
+        }
         return (answer, Vec::new());
     };
     let content = answer[..start].trim().to_string();
-    let types = tool_types(tools);
     let mut calls = Vec::new();
     let mut rest = &answer[start..];
     while let Some(i) = rest.find(OPEN) {
@@ -2841,6 +2845,36 @@ fn extract_tool_calls(text: &str, tools: &[Value]) -> (String, Vec<Value>) {
         }
     }
     (content, calls)
+}
+
+/// A missing outer wrapper is recoverable only for a reply consisting entirely
+/// of complete calls to declared tools. Prose and code examples remain text.
+fn parse_bare_tool_calls(
+    answer: &str,
+    types: &std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+) -> Option<Vec<Value>> {
+    let mut rest = answer.trim();
+    while let Some(prefix) = rest
+        .strip_suffix("<|im_end|>")
+        .or_else(|| rest.strip_suffix("<|endoftext|>"))
+    {
+        rest = prefix.trim_end();
+    }
+    let mut calls = Vec::new();
+    while !rest.is_empty() {
+        if !rest.starts_with("<function=") {
+            return None;
+        }
+        let end = rest.find("</function>")? + "</function>".len();
+        let call = parse_tool_call(&rest[..end], types);
+        let name = call.get("function")?.get("name")?.as_str()?;
+        if !types.contains_key(name) {
+            return None;
+        }
+        calls.push(call);
+        rest = rest[end..].trim_start();
+    }
+    (!calls.is_empty()).then_some(calls)
 }
 
 /// Per-tool parameter type map (`name -> {param -> "string"|"integer"|…}`) from

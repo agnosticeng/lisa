@@ -23,6 +23,7 @@ objc2-foundation = { workspace = true, features = [
     "NSValue",
     "NSNotification",
     "NSURL",
+    "NSURLRequest",
     "NSFileManager",
     "NSBundle",
     "NSEnumerator",
@@ -36,6 +37,14 @@ objc2-foundation = { workspace = true, features = [
     "NSTimer",
     "NSUserDefaults",
 ] }
+objc2-web-kit = { workspace = true, features = [
+    "WKWebView",
+    "WKWebViewConfiguration",
+    "WKNavigation",
+    "WKNavigationDelegate",
+    "block2",
+] }
+block2.workspace = true
 objc2-app-kit = { workspace = true, features = [
     "NSApplication",
     "NSWindow",

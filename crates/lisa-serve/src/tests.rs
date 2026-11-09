@@ -84,6 +84,43 @@ fn parses_ds4_glm_arg_key_value_tool_calls() {
 }
 
 #[test]
+fn parses_bare_browser_tool_calls() {
+    let tools = [json!({"type":"function", "function": {
+        "name":"web_search", "parameters":{"type":"object", "properties":{
+            "query":{"type":"string"}
+        }}}
+    })];
+    let bare = "<function=web_search>\n\n<parameter=query>\n\nlatest Rust stable release official Rust blog\n\n</parameter>\n\n</function>";
+    for text in [
+        bare.to_string(),
+        format!("<think>Find current sources.</think>\n{bare}<|im_end|>"),
+        format!("<tool_call>{bare}</tool_call>"),
+    ] {
+        let (content, calls) = extract_tool_calls(&text, &tools);
+        assert!(content.is_empty(), "{content}");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "web_search");
+        let args: serde_json::Value = serde_json::from_str(
+            calls[0]["function"]["arguments"].as_str().unwrap(),
+        ).unwrap();
+        assert_eq!(args["query"], "latest Rust stable release official Rust blog");
+    }
+    let (_, calls) = extract_tool_calls(&format!("{bare}\n{bare}"), &tools);
+    assert_eq!(calls.len(), 2);
+    for text in [
+        format!("Example:\n{bare}"),
+        format!("```xml\n{bare}\n```"),
+        bare.replace("web_search", "undeclared_tool"),
+        bare.replace("</function>", ""),
+    ] {
+        let (content, calls) = extract_tool_calls(&text, &tools);
+        assert_eq!(content, text);
+        assert!(calls.is_empty());
+    }
+    assert!(extract_tool_calls(bare, &[]).1.is_empty());
+}
+
+#[test]
 fn dsml_sampling_switches_at_glm_and_qwen_payload_boundaries() {
     use TargetMtpSamplingMode::{Configured, Greedy};
 

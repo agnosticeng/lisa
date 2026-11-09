@@ -54,6 +54,10 @@ already in your Hugging Face cache are discovered automatically.
 Chats and attachments stay in `~/Library/Application Support/Lisa/chats`.
 Generated images appear as preview cards and are saved to `~/Pictures/Lisa`.
 Use **⌘N** for a new chat, **Return** to send and **Shift-Return** for a new line.
+The model can use the browser in any language-model chat when it needs current
+information. It can search the web, open useful pages and follow links; the
+browser panel stays visible while it works. Ask naturally; no browser command
+is needed.
 
 Language-model context capacity defaults to the checkpoint metadata in both
 the app and CLI. Use `--ctx-size` with `lisa run` or `lisa serve` to override

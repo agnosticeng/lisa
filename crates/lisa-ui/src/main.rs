@@ -4,6 +4,7 @@ mod chats;
 mod media;
 mod models;
 mod ui;
+mod web_search;
 
 use objc2::runtime::ProtocolObject;
 use objc2::{AnyThread, MainThreadMarker};

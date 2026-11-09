@@ -62,6 +62,57 @@ cleanup failures in the log. The active chat is replaced safely when deleted.
 **New chat** (Command-N) starts a separate conversation. Return sends and
 Shift-Return inserts a line break.
 
+Every language-model chat turn gives the model access to the `web_search` and
+`web_open` tools. It can search for sources, read page text and follow links
+before answering. The model chooses when to browse from ordinary messages;
+there is no browser slash command or keyword-triggered navigation.
+Image-generation turns do not use the language-model agent.
+Lisa loads normal web pages in a visible WebKit browser panel and extracts
+readable text and links from the rendered page; it does not send whole HTML documents to the model or use a search API key.
+If Google shows consent or verification, Lisa asks in the chat for the user to
+review and resolve the prompt in the visible browser. It does not accept
+cookies or solve verification automatically. The pending navigation waits up
+to five minutes, then reports a timeout; it resumes after the prompt is gone.
+
+Each turn has a budget of six browser actions, executed sequentially in the
+same WebKit view. Multiple tool calls each receive a result; invalid arguments
+and navigation failures are returned to the model so it can correct or report
+them. Navigation callbacks prevent a failed load from returning stale page
+content. A page read returns up to 12,000 characters and 24 links, preferring
+main/article content. Search returns up to eight result cards. Before each
+model pass, long excerpts are shortened to fit its context limit while keeping
+page headers and trailing links; older complete chat pairs are dropped only
+when needed. The current question and tool-call associations remain intact. Sources added by
+the UI come only from opened pages, and Markdown source links are clickable.
+Answer text streams during generation. Partial control markers, reasoning
+and tool arguments are withheld; final tool parsing and source formatting
+settle the completed reply.
+
+Extraction depends on the page DOM and can fail if a site blocks access or
+changes its page structure. Google verification challenges require manual
+input. Closing the browser panel hides it; the next tool navigation shows it
+again. Search queries and requested URLs reach Google and the visited sites
+through normal browser requests; model inference remains local.
+
+November 9 integration validation: release workspace build; 356 library tests
+passed (26 existing tests ignored); eight UI tests passed; kernel smoke passed.
+The extraction scripts passed JavaScript syntax and Google prompt detection
+checks; a fresh consent prompt was not exercised live. The signed dist bundle
+is 9,895,697 bytes, with matching symbols outside the app. The UI crate uses
+size optimization `z`; inference crates retain their existing settings.
+
+Live UI checks confirmed the slash menu has no `/web` command, WebKit searches
+execute, and `web_open` reads example.com and produces a clickable source.
+The final 0.8B model run reported a 262,144-token metadata context in the UI
+log. Short CLI runs passed with the Qwen 27B GGUF metadata default and an
+explicit 512-token override. These checks do not certify long-context accuracy
+or reliable research: the 27B search run exhausted its action budget without
+opening a source, and the 0.8B model failed to browse for a Rust follow-up.
+The streaming regression check observed the 0.8B reply grow while Lisa was
+responding, then return to Ready. The response repeated itself until its token
+limit; this verifies delivery behavior, not answer quality. Boundary tests
+cover split tool markers, hidden reasoning and Unicode text.
+
 ## Models and downloads
 
 The allowlist is [catalog.rs](../crates/lisa-ui/src/catalog.rs), with seven
