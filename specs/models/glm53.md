@@ -50,8 +50,9 @@ CLI, server and desktop discovery recognize the architecture directly.
 The MTP head uses shared session acceptance/rollback machinery. Its private
 attention operation switches to the bounded wide-lora path above 2,051 selected
 rows. This does not make the target's serial verification a wide matrix pass.
-Default context capacity is 32,768, adjustable through `--ctx-size`; allocation
-capacity is not long-context certification.
+CLI and UI default context capacity comes from checkpoint metadata (1,048,576
+for the curated GGUF), with an explicit CLI override through `--ctx-size`.
+Allocation capacity is not long-context certification.
 
 ### Recorded checks: November 4
 

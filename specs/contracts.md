@@ -214,6 +214,14 @@ for the current controller behavior.
 
 ### Model loading
 
+The shared application loader uses checkpoint context metadata before warmup
+or session creation: `<architecture>.context_length` for GGUF and
+`text_config.max_position_embeddings` (then the root field) for JSON configs.
+Absent metadata retains the model's fallback; invalid explicit metadata fails.
+CLI and UI use the same default. An explicit `--ctx-size` on `run` or `serve`
+is applied afterward and retains the model's validation and memory admission.
+The advertised capacity does not certify numerical parity at every length.
+
 Resolve a local directory, supported GGUF file or HF repository ID to one
 checkpoint; fail clearly on ambiguity or unsupported model type/quantization.
 Read the checkpoint's actual dtype, shapes, quantization groups and per-tensor

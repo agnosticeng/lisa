@@ -126,3 +126,95 @@ pub fn model_type_of(dir: &Path) -> anyhow::Result<String> {
         dir.display()
     )
 }
+
+/// Application defaults come from the checkpoint, before warmup or session
+/// creation. Explicit CLI overrides are applied by the caller after loading.
+pub(super) fn default_context_capacity(path: &Path) -> anyhow::Result<Option<usize>> {
+    if path.is_file() {
+        return gguf_context_capacity(&lisa_gguf::Header::open(path)?);
+    }
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path.join("config.json"))?)?;
+    json_context_capacity(&config)
+}
+
+fn context_value(value: Option<u64>, key: &str) -> anyhow::Result<usize> {
+    let value = value.ok_or_else(|| anyhow::anyhow!("{key} must be a positive integer"))?;
+    anyhow::ensure!(value > 0, "{key} must be a positive integer");
+    usize::try_from(value)
+        .map_err(|_| anyhow::anyhow!("{key} exceeds the platform's context capacity"))
+}
+
+fn gguf_context_capacity(header: &lisa_gguf::Header) -> anyhow::Result<Option<usize>> {
+    let key = format!("{}.context_length", header.architecture()?);
+    header
+        .metadata
+        .get(&key)
+        .map(|value| context_value(value.as_u64(), &key))
+        .transpose()
+}
+
+fn json_context_capacity(config: &serde_json::Value) -> anyhow::Result<Option<usize>> {
+    let key = "max_position_embeddings";
+    config
+        .get("text_config")
+        .and_then(|text| text.get(key))
+        .filter(|value| !value.is_null())
+        .or_else(|| config.get(key).filter(|value| !value.is_null()))
+        .map(|value| context_value(value.as_u64(), key))
+        .transpose()
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn metadata_context_uses_nested_text_config_and_preserves_missing_defaults() {
+        assert_eq!(
+            json_context_capacity(&json!({"max_position_embeddings":262144})).unwrap(),
+            Some(262144)
+        );
+        assert_eq!(json_context_capacity(&json!({"max_position_embeddings":4096,"text_config":{"max_position_embeddings":131072}})).unwrap(), Some(131072));
+        assert_eq!(json_context_capacity(&json!({"max_position_embeddings":32768,"text_config":{"max_position_embeddings":null}})).unwrap(), Some(32768));
+        assert_eq!(json_context_capacity(&json!({})).unwrap(), None);
+        for value in [json!(0), json!(-1), json!(1.5), json!("4096")] {
+            assert!(json_context_capacity(&json!({"max_position_embeddings":value})).is_err());
+        }
+    }
+
+    #[test]
+    fn gguf_context_uses_the_architecture_metadata_without_a_startup_cap() {
+        for (architecture, capacity) in [
+            ("qwen35", 262144),
+            ("glm5-next", 1048576),
+            ("deepseek41", 1048576),
+        ] {
+            let mut header = lisa_gguf::Header {
+                metadata: std::collections::BTreeMap::from([
+                    (
+                        "general.architecture".into(),
+                        lisa_gguf::Value::String(architecture.into()),
+                    ),
+                    (
+                        format!("{architecture}.context_length"),
+                        lisa_gguf::Value::Unsigned(capacity),
+                    ),
+                ]),
+                tensors: Default::default(),
+                data_offset: 0,
+                file_bytes: 0,
+            };
+            assert_eq!(
+                gguf_context_capacity(&header).unwrap(),
+                Some(capacity as usize)
+            );
+            header.metadata.insert(
+                format!("{architecture}.context_length"),
+                lisa_gguf::Value::Unsigned(0),
+            );
+            assert!(gguf_context_capacity(&header).is_err());
+        }
+    }
+}

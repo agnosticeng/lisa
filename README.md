@@ -55,6 +55,10 @@ Chats and attachments stay in `~/Library/Application Support/Lisa/chats`.
 Generated images appear as preview cards and are saved to `~/Pictures/Lisa`.
 Use **⌘N** for a new chat, **Return** to send and **Shift-Return** for a new line.
 
+Language-model context capacity defaults to the checkpoint metadata in both
+the app and CLI. Use `--ctx-size` with `lisa run` or `lisa serve` to override
+it where the model supports runtime context configuration.
+
 ### Use the terminal
 
 ```sh

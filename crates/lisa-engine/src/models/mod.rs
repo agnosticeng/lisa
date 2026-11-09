@@ -367,7 +367,7 @@ pub fn load_dir_with(dir: &Path, backend: lisa_mlx::backend::Backend) -> anyhow:
         lisa_mlx::runtime::check_platform_support()?;
         lisa_mlx::memory::clear_cache();
     }
-    Ok(match kind {
+    let mut loaded = match kind {
         ModelKind::Glm53Gguf | ModelKind::DeepSeek41 => {
             anyhow::ensure!(
                 dir.is_file(),
@@ -400,5 +400,13 @@ pub fn load_dir_with(dir: &Path, backend: lisa_mlx::backend::Backend) -> anyhow:
             };
             Loaded::Decision(Box::new(laya::Laya::load_device(dir, device)?))
         }
-    })
+    };
+    if let Loaded::Language(model) = &mut loaded {
+        if let Some(capacity) = checkpoint::default_context_capacity(dir)? {
+            if model.max_position_embeddings() != capacity {
+                model.set_context_capacity(capacity)?;
+            }
+        }
+    }
+    Ok(loaded)
 }

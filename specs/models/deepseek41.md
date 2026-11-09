@@ -44,8 +44,9 @@ fused RoPE/cache writes, per-position coefficients, Engram split gates and
 wide index selection. Context gates include 8,192, 10,240, 65,536 and 98,304;
 their existence does not certify those real-context workloads.
 
-Default capacity is 4,096 tokens. Allocation support extends to the checkpoint
-limit of 1,048,576, subject to memory admission. Only the measured contexts
+CLI and UI default to the checkpoint metadata limit of 1,048,576 tokens.
+`--ctx-size` can override it in the CLI; allocation remains subject to memory
+admission. Only the measured contexts
 below have model-level comparison evidence.
 
 The native cache supports copy-on-write RAM snapshots bound to model/file and

@@ -220,7 +220,7 @@ enum Command {
     Run {
         #[arg(long)]
         model: ModelDir,
-        /// Runtime prompt + output context capacity (GLM default: 32768).
+        /// Override prompt + output context capacity (default: checkpoint metadata).
         #[arg(long, value_parser = parse_context_capacity)]
         ctx_size: Option<usize>,
         #[arg(long, default_value = "Explain what a MoE layer is in two sentences.")]
@@ -359,7 +359,7 @@ enum Command {
     Serve {
         #[arg(long)]
         model: ModelDir,
-        /// Runtime prompt + output context capacity (GLM default: 32768).
+        /// Override prompt + output context capacity (default: checkpoint metadata).
         #[arg(long, value_parser = parse_context_capacity)]
         ctx_size: Option<usize>,
         #[arg(long, default_value = "127.0.0.1:8080")]
