@@ -13,7 +13,6 @@
 //! CLI (`lisa run --oracle`), not from an env var — the repo keeps its env
 //! flag set closed.
 
-use lisa_mlx::Array;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -55,28 +54,6 @@ pub fn push(cands: Vec<u32>, scores: Vec<f32>) {
 /// The distribution pushed by the most recent draft step, if any.
 pub fn last() -> Option<DraftScores> {
     lock_last().clone()
-}
-
-/// Record from device arrays: `scores` is the head's `[1, V]` (or `[1, K]`)
-/// readout, `ids` the matching vocabulary ids (row -> id). `ids == None`
-/// means the rows already ARE vocabulary ids (`0..V`).
-pub fn push_arrays(ids: Option<&Array>, scores: &Array) -> anyhow::Result<()> {
-    if !enabled() {
-        return Ok(());
-    }
-    let scores = scores.as_dtype(lisa_mlx::Dtype::Float32)?;
-    scores.eval()?;
-    let scores = scores.as_slice::<f32>().to_vec();
-    let cands = match ids {
-        Some(a) => {
-            let a = a.as_dtype(lisa_mlx::Dtype::Int32)?;
-            a.eval()?;
-            a.as_slice::<i32>().iter().map(|&x| x as u32).collect()
-        }
-        None => (0..scores.len() as u32).collect(),
-    };
-    push(cands, scores);
-    Ok(())
 }
 
 /// 1-based rank of `token` in a recorded candidate set.
@@ -316,4 +293,21 @@ mod tests {
         assert_eq!(rank(&r, 7, 7), Some(1));
         assert_eq!(rank(&r, 9, 7), Some(2));
     }
+}
+
+/// Capture logical tensor values without assuming a provider or storage layout.
+pub fn push_arrays<T: lisa_backend::TensorAccess>(
+    ids: Option<&T>,
+    scores: &T,
+) -> anyhow::Result<()> {
+    if !enabled() {
+        return Ok(());
+    }
+    let scores = scores.read_f32()?;
+    let candidates = match ids {
+        Some(ids) => ids.read_ids()?,
+        None => (0..scores.len() as u32).collect(),
+    };
+    push(candidates, scores);
+    Ok(())
 }

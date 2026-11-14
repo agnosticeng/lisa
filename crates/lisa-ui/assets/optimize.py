@@ -1,8 +1,13 @@
-"""Losslessly recompress exported PNG/ICNS assets using the Python standard library."""
+"""Losslessly compact exported assets; optional zopfli improves PNG compression."""
 
 from pathlib import Path
 import struct
 import zlib
+
+try:
+    from zopfli.zlib import compress as zopfli_compress
+except ImportError:
+    zopfli_compress = None
 
 
 def chunk(kind, data):
@@ -93,6 +98,10 @@ def png(data):
     # suited to the flat icon artwork before selecting the smallest encoding.
     header = next(payload for kind, payload in chunks if kind == b"IHDR")
     compressed = compact_scanlines(zlib.decompress(original), header)
+    if zopfli_compress is not None:
+        candidate = zopfli_compress(zlib.decompress(compressed), numiterations=5)
+        if len(candidate) < len(compressed):
+            compressed = candidate
     if len(compressed) >= len(original):
         return data
     output = bytearray(data[:8])
@@ -112,12 +121,20 @@ def icns(data):
     if magic != b"icns" or size != len(data):
         raise ValueError("Invalid ICNS header")
     output = bytearray()
+    seen_png = set()
     offset = 8
     while offset < len(data):
         kind, size = struct.unpack_from(">4sI", data, offset)
         if size < 8 or offset + size > len(data):
             raise ValueError("Invalid ICNS element")
         payload = png(data[offset + 8 : offset + size])
+        # Some @2x and @1x entries contain exactly the same physical image.
+        # Keep every distinct resolution/pixel payload, only once.
+        if payload.startswith(b"\x89PNG\r\n\x1a\n"):
+            if payload in seen_png:
+                offset += size
+                continue
+            seen_png.add(payload)
         output.extend(struct.pack(">4sI", kind, len(payload) + 8) + payload)
         offset += size
     return struct.pack(">4sI", b"icns", len(output) + 8) + output

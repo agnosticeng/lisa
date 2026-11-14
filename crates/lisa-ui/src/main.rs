@@ -1,9 +1,12 @@
 mod app;
+mod backend;
+mod browser;
 mod catalog;
 mod chats;
 mod media;
 mod models;
 mod ui;
+mod voice;
 mod web_search;
 
 use objc2::runtime::ProtocolObject;
@@ -20,14 +23,14 @@ fn main() {
         .setProcessName(&objc2_foundation::NSString::from_str("lisa"));
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
-    if let Err(error) = lisa_engine::check_metal_support() {
+    if let Err(error) = lisa_metal::runtime::check_platform_support() {
         let alert = NSAlert::new(mtm);
         alert.setMessageText(&NSString::from_str("LISA needs a newer version of macOS"));
         alert.setInformativeText(&NSString::from_str(&error.to_string()));
         alert.runModal();
         return;
     }
-    if let Err(error) = lisa_engine::initialize_kernels() {
+    if let Err(error) = lisa_metal::shader_pack::initialize() {
         let alert = NSAlert::new(mtm);
         alert.setMessageText(&NSString::from_str("LISA could not load its kernels"));
         alert.setInformativeText(&NSString::from_str(&error.to_string()));

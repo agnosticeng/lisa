@@ -1,9 +1,9 @@
 # Contracts
 
 Requirements for the current engine. [AGENTS.md](../AGENTS.md) and explicit
-task instructions take precedence over historical reports. These are obligations, not a claim that
+task instructions take precedence. These are obligations, not a claim that
 every model has passed every case. See [model status](README.md#model-status)
-and the [roadmap](roadmap.md) for measured gaps.
+and the [roadmap](roadmap.md) for current gaps.
 
 ## 1. Numerics
 
@@ -38,9 +38,7 @@ comparison remains the numerical contract.
   all 65,536 input patterns where that domain is sufficient, then exercise
   real activations. Synthetic equality alone does not cover every input path.
 - Pipeline keys include math mode, constants and NAX language target. Source
-  hashing and same-name/different-source checks belong on cache misses; a
-  per-dispatch source hash once reduced measured decode from 30.6 to 14.3
-  tokens/s while goldens remained green.
+  hashing and same-name/different-source checks belong on cache misses; per-dispatch hashing is prohibited in the hot path.
 - `LISA_STRICT_KERNELS` makes a same-name/different-source collision fatal.
   Numerical state identity must be available when state is captured and checked
   before it is restored; it must not depend on expensive per-dispatch work.
@@ -49,8 +47,7 @@ comparison remains the numerical contract.
 
 The server exposes chat completions, model listing, health, decisions and
 embeddings, together with its implemented messages/responses surfaces. Endpoint
-availability is distinct from certification for every model. Historical Qwen
-conformance does not certify newly changed GLM cache or scheduling paths.
+availability is distinct from certification for every model. API conformance and model numerical acceptance are separate requirements.
 
 ### Determinism and response semantics
 
@@ -73,7 +70,7 @@ conformance does not certify newly changed GLM cache or scheduling paths.
   failure branch is implemented; current validation scope is in
   [serving](serving.md#evidence-boundaries).
 - Embeddings use mean-pooled, L2-normalized trunk states. Their dimension is
-  model-dependent; the measured 27B case has 5,120 dimensions.
+  model-dependent; the 27B model has 5,120 dimensions.
 - A persistent session preserves committed state, sampling configuration and
   absolute token position. Reject an incompatible numerical law before reuse.
 - Response identity and continuation history belong to a server instance.
@@ -118,7 +115,7 @@ also uses the shared resident adapter.
   footprint and allocator accounting measure different things; explain their
   differences rather than requiring them to be numerically identical.
 - The resident weight lifetime reservation counts unique mapped model bytes
-  once plus private pool bytes against `memory::ram_budget()`. Admission happens
+  once plus private pool bytes against `lisa_engine::memory::ram_budget()`. Admission happens
   before a new allocation. Completed unused buffers may be reclaimed; failure must be
   actionable and must not wait for GPU completion while holding an allocator
   lock. Dropping one reservation must not reset another model's reservation.

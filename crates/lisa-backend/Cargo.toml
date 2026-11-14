@@ -1,0 +1,10 @@
+[package]
+name = "lisa-backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Portable device import and kernel contracts for LISA"
+
+[dependencies]
+anyhow.workspace = true
+smallvec = "1"

@@ -3,43 +3,12 @@ name = "lisa-mlx"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Native tensor runtime and Metal kernels for LISA"
-
-[lib]
-name = "lisa_mlx"
-path = "src/lib.rs"
-
-[features]
-# Oracle checks load captures from LISA_GLM53_FIXTURE_DIR when executed.
-glm53-fixtures = []
+description = "Portable MLX checkpoint metadata, safetensors mappings and shard indices"
 
 [dependencies]
-# No MLX dependency: the library name is `lisa_mlx` so call sites resolve here.
-objc2.workspace = true
-objc2-metal = { workspace = true, features = [
-    "MTLFunctionConstantValues",
-    "MTLLibrary",
-    "MTLDevice",
-    "MTLBuffer",
-    "MTLResource",
-    "MTLCommandQueue",
-    "MTLCommandBuffer",
-    "MTLCommandEncoder",
-    "MTLComputeCommandEncoder",
-    "MTLComputePipeline",
-    "MTLAllocation",
-    "MTLResidencySet",
-    "MTLFence",
-    "MTLTypes",
-    "MTLGPUAddress",
-    "block2",
-] }
-block2.workspace = true
-objc2-foundation.workspace = true
-half.workspace = true
-miniz_oxide = "0.9"
-sha2.workspace = true
+anyhow.workspace = true
+memmap2.workspace = true
+serde_json.workspace = true
 
-[build-dependencies]
-miniz_oxide = "0.9"
-sha2.workspace = true
+[dev-dependencies]
+tempfile = "3"

@@ -1,14 +1,21 @@
-//! Native Rust inference for language, image and decision models.
+//! Device-independent inference execution and state management.
 //!
-//! - [`core`] provides shared loading, quantization, norm/rope primitives,
-//!   the layer caches, sampling, tokenization, and the generation / batching /
-//!   scheduling loops.
-//! - [`models`] holds the model implementations. The runtime drives them
-//!   through [`models::LanguageModel`], [`models::DecisionModel`] or the image pipeline.
+//! Model computation plans live in `lisa-models`. This crate imports original
+//! checkpoint payloads, executes plans through `lisa-backend`, and owns shared
+//! generation, batching, speculation and session policy. It has no concrete
+//! device dependency. Applications choose providers through `loading`; native
+//! provider construction lives at the application composition boundary.
 
-pub mod cli;
+pub mod batching;
+pub mod checkpoint;
+pub mod conversation;
 pub mod core;
-pub mod models;
+pub mod decision;
+pub mod device;
+pub mod eos;
+pub mod language;
+pub mod laya;
+pub mod loading;
 
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -31,9 +38,56 @@ pub fn ttft_mark(label: &str) {
 }
 
 // Convenience re-exports for the common entry points.
-pub use core::{batch, generate, loader, mem, norm, quant, sampler, sched, session, tokenizer};
-/// Load and validate the packaged Metal sources without allocating GPU resources.
-pub use lisa_mlx::shader_pack::initialize as initialize_kernels;
-/// Validate the OS requirements without creating a GPU runtime or loading weights.
-pub use lisa_mlx::runtime::check_platform_support as check_metal_support;
-pub use models::{DecisionModel, LanguageModel, Loaded, laya, qwen4};
+pub use core::tokenizer;
+pub use decision::DecisionModel;
+pub use language::LanguageModel;
+pub use loading::Loaded;
+
+pub mod generation;
+pub mod speculation;
+pub mod speculative_runtime;
+
+pub mod scheduling;
+
+pub mod weights;
+
+pub mod execution;
+
+pub mod storage;
+
+pub mod memory;
+
+pub mod indexer_cache;
+
+pub mod attention_cache;
+
+pub mod recurrent;
+
+pub mod recurrent_cache;
+
+pub mod cache;
+
+pub mod prefix_cache;
+
+pub mod sampling;
+pub mod tensor_ops;
+
+pub mod cache_batching;
+
+pub mod bindings;
+
+pub mod language_runtime;
+
+pub mod sampler;
+
+pub mod vision;
+
+pub mod image_generation;
+
+pub mod cli;
+
+pub mod model_binding;
+
+pub mod conversation_cache;
+
+pub mod session_check;

@@ -1,0 +1,352 @@
+{
+  "checkpoint": {
+    "repository": "unsloth/Qwen3.8-27B-GGUF",
+    "revision": "4ca720788d1e01f1bff70c033e0d0028fd02e502",
+    "file": "Qwen3.8-27B-UD-Q2_K_XL.gguf",
+    "bytes": 9828981664,
+    "sha256": "fd4730dd8aad070517978752b63d530aeb1740d2283cab9fa24f1e404032ddb0"
+  },
+  "reference": {
+    "repository": "https://github.com/ggml-org/llama.cpp",
+    "revision": "18ab62a8ec5144ae5d2f65e78374ba69652d75dd",
+    "sources": {
+      "src/models/qwen35.cpp": "3387cf23a95ca71d2a38fac4b32708d6424fc9888273148ff6b4db5e510c9406",
+      "src/models/models.h": "a18e20327512624d2add1ddbb4a94902dd3a79970fc3c16aba15ee675b3cd95f",
+      "src/models/delta-net-base.cpp": "9cd452f76d60df96a994a1ee545872896e32d0c0d1cb594afbc5fcea31a75a31",
+      "src/llama-vocab.cpp": "ac6fd43eca27c67a213a98e27b87e8ca1f26d8d82a63e79543a06ca64ef10a95"
+    }
+  },
+  "format": "qwen35; 64 trunk layers and one embedded NextN layer; text only; original packed tensor payloads",
+  "tensor_types": {
+    "0": 360,
+    "8": 98,
+    "10": 16,
+    "11": 5,
+    "12": 21,
+    "13": 2,
+    "14": 6,
+    "16": 48,
+    "17": 34,
+    "18": 112,
+    "19": 20,
+    "21": 57,
+    "22": 67,
+    "23": 19,
+    "29": 1
+  },
+  "arithmetic": "Shared Qwen35 tower, GGUF F32 execution policy and F32 KV cache. Packed projections and recurrence ported from the pinned reference; RMSNorm, partial RoPE, convolution and vector attention use LISA primitives. Each prefill/verify row retains the serial reduction policy. No claim of bitwise cross-engine or throughput equivalence.",
+  "reference_capture": {
+    "filename": "qwen35-q2-xl-serial-logits.f32",
+    "bytes": 993280,
+    "sha256": "0d43342e4ad631acc37ad95d289de286286f488dcc0a1f50207ea93667a489f3",
+    "producer": "Pinned llama.cpp: llama_model_load_from_file, n_gpu_layers=99; llama_init_from_model n_ctx=512, n_batch=64, n_ubatch=1, F32 K/V, flash attention disabled; llama_decode; last output row from llama_get_logits_ith(ctx,-1).",
+    "prompt": "<|im_start|>user\nExplain why the sky is blue in two short sentences.<|im_end|>\n<|im_start|>assistant\n<think>\n</think>\n\n",
+    "prompt_tokens": [
+      248045,
+      846,
+      198,
+      814,
+      20139,
+      3069,
+      279,
+      12515,
+      369,
+      6105,
+      303,
+      1330,
+      2716,
+      22157,
+      13,
+      248046,
+      198,
+      248045,
+      74455,
+      198,
+      248068,
+      198,
+      248069,
+      271
+    ],
+    "storage": "External capture, not a tracked weight fixture. Set LISA_QWEN_GGUF_REFERENCE to its path; the explicitly enabled integration test fails if absent."
+  },
+  "pointwise_performance_receipt": {
+    "date": "2026-11-06",
+    "change": "F32 convolution/SiLU, softplus/decay/beta and SiLU-product launch fusion. Original packed projections, recurrent updates and numerical law unchanged; MTP timing key v1 -> v2.",
+    "machine": "Apple M5 Max",
+    "physical_ram_bytes": 137438953472,
+    "engine_ram_cap_bytes": 10737418240,
+    "safety": "Physical RAM and memory_pressure read before each measured run; one GPU workload at a time. 10 GiB cap simulates admission on an 18 GiB machine, not M3 Pro throughput.",
+    "baseline": "Initial uncommitted Qwen GGUF implementation over LISA 3202cbb; binary and package identities below.",
+    "artifacts_sha256": {
+      "before/lisa": "bdc20165816e835a208518b2fb54cbc9129d27412f10ed43d6a6d1d2f6a525df",
+      "before/lisa-bench": "fa63b2fd123d48308737e531d4e4f373cf82abe468c7ee53f6eb4cd713552785",
+      "before/kernels.bin": "7300f1869128974f904bcd1d183eca34ba9947011ed11165212eb4837f377e0f",
+      "after/lisa": "3b713e9494a57233494cbb05c3c1753a0b2601b77e94f982968e9b49ccbff4a9",
+      "after/lisa-bench": "5dfa9bee4dfaece7be37dcf6f04781da0a590115b518dfdffad64bc3142fdf7d",
+      "after/kernels.bin": "18a6248b9a1541d0cb5421c20e974918ad6f100ba2320a7407fee54644db99f7"
+    },
+    "changed_sources_sha256": {
+      "lisa-mlx/src/shaders/gguf/pointwise.metal": "2964d422c906f641bf0b56b5eed2a90c5387d2c942c539f23159699a70f2b8c3",
+      "lisa-mlx/src/models/gguf/pointwise.rs": "cb137d7c0dc812da75e4253e97b86b322c02d8835fd099a8e211f854d53a6142",
+      "lisa-engine/src/models/qwen3_5/gguf/execution.rs": "ff0b95102a3ac9bdef3ea28b9d113654c4346504c55a004005fd937a805e9245"
+    },
+    "prompt": "<|im_start|>user\nWrite a Python function that merges overlapping intervals. Include type hints and explain how it handles empty input.\n<|im_end|>\n<|im_start|>assistant\n<think>\n</think>\n\n",
+    "cli_arguments": "run --model unsloth/Qwen3.8-27B-GGUF --raw --prompt <prompt> --max-tokens 128 --ignore-eos --depth <0|auto> --temperature 0 --ctx-size 512",
+    "prompt_tokens": 33,
+    "output_tokens": 128,
+    "seed": 0,
+    "order_per_mode": [
+      "before",
+      "after",
+      "after",
+      "before"
+    ],
+    "auto_state": "No persisted cost rows; both Qwen EV acceptance-seed entries cleared before each automatic run and restored afterwards. Other model entries preserved.",
+    "serial_decode_tokens_per_second": {
+      "before": [
+        14.5,
+        14.4
+      ],
+      "after": [
+        20.2,
+        20.2
+      ]
+    },
+    "serial_prefill_tokens_per_second": {
+      "before": [
+        30.0,
+        32.3
+      ],
+      "after": [
+        38.9,
+        34.5
+      ]
+    },
+    "auto_prefill_plus_decode_tokens_per_second": {
+      "before": [
+        13.7,
+        12.6
+      ],
+      "after": [
+        14.5,
+        14.9
+      ]
+    },
+    "timing_boundaries": "CLI serial: 128 emitted tokens divided by reported decode duration; prefill separate. CLI auto: 128 emitted tokens divided by prefill-plus-decode duration. Startup/load excluded. These two columns are different metrics.",
+    "text_sha256": "11f965579e20f2a5c6c52643b36c535cc394aa1b18f0bd635611b5cb48ef4b9c",
+    "text_comparison": "All eight runs identical after removing load/prompt/timing metadata and trailing whitespace.",
+    "trace": {
+      "prompt": "Explain why the sky is blue.",
+      "mode": "raw, depth 0, greedy, 8 output tokens, context 512, default detected RAM budget",
+      "controls": [
+        "LISA_TRACE",
+        "LISA_TRACE_JSON",
+        "LISA_CB_RECORD",
+        "LISA_GPU_PROBE"
+      ],
+      "before_dispatches": 38120,
+      "after_dispatches": 22104,
+      "scope": "Process totals include identical warmup shapes. Probe runs excluded from throughput evidence; command-buffer intervals are not exclusive hardware counters."
+    },
+    "round_cost": {
+      "arguments": "round-cost --model unsloth/Qwen3.8-27B-GGUF --kv 64 --widths 3 --steps 8 --out <external-result>",
+      "order": [
+        "before",
+        "after",
+        "after",
+        "before"
+      ],
+      "samples": [
+        {
+          "build": "before",
+          "serial_ms": 67.568085,
+          "draft_ms": 2.416459,
+          "chain_2_ms": 5.527708,
+          "verify_3_ms": 151.87863
+        },
+        {
+          "build": "after",
+          "serial_ms": 55.833874,
+          "draft_ms": 2.461291,
+          "chain_2_ms": 5.924959,
+          "verify_3_ms": 134.7467
+        },
+        {
+          "build": "after",
+          "serial_ms": 49.344418,
+          "draft_ms": 2.56675,
+          "chain_2_ms": 5.464417,
+          "verify_3_ms": 134.87875
+        },
+        {
+          "build": "before",
+          "serial_ms": 68.53467,
+          "draft_ms": 2.388167,
+          "chain_2_ms": 5.508833,
+          "verify_3_ms": 158.91396
+        }
+      ]
+    },
+    "validation": "Release workspace build; 353 enabled library tests passed, 26 ignored; smoke passed. Affected kernel checks and enabled model-reference/replay test each passed twice on final code. Reference logits max_abs=0.000018119812, serial/prefill max_abs=0.",
+    "reference_inspection": {
+      "llama_cpp_fetched": "6c01da6278ab6c69ed67d9124806b50d2b299ba7",
+      "llama_cpp_note": "No model/kernel changes relative to pinned 18ab62a8; retained pinned oracle. One supplementary F32-KV/no-flash run: 23.51 tok/s for 127 llama eval calls, 76.30 prefill tok/s for 33 tokens; not interleaved or identically normalized, excluded from speedup claim.",
+      "mlx_serve": "1f1332d788105a9a4b0d06f662ec63acd5faec07",
+      "strata": "9f7d977d220e9fdf2ec53cf2620cdadac1cfb24e"
+    }
+  },
+  "warm_http_context_receipt": {
+    "date": "2026-11-06",
+    "machine": "Apple M5 Max",
+    "physical_ram_bytes": 137438953472,
+    "engine_ram_cap_bytes": 128849018880,
+    "build": "pointwise_performance_receipt.artifacts_sha256.after; before packed-kernel experiments",
+    "arguments": "serve --model unsloth/Qwen3.8-27B-GGUF --ctx-size 8192 --max-tokens 128 --temperature 0 --depth auto --prefix-cache 0 --max-batch 1",
+    "protocol": "One resident server; health ready after startup warmup. At each context, discard a depth-2 16-output-token request, then measure serial/auto/auto/serial, 128 outputs each. Greedy seed 0, thinking disabled, ignore_eos true, no prefix reuse. Read RAM and memory_pressure before each run; no concurrent inference or GPU tests.",
+    "prompt": "Service configuration inventory followed by a typed Python validation/grouping request. Each prompt counted through the server token-count API.",
+    "request_sha256": {
+      "256": "90a825e6087926c09da8e19fbe8c8899cbc3a9a220f2dacf7cd2e0c64cc8ce9a",
+      "2048": "cc19a1a8490cbd2059730654c55ce4f777233c1e4181a3b27a904d3e0a721ce5",
+      "4096": "1c6dbe64378d37cf3ecf2ac65c285a0883b35e923caebe39bc0b882109275806"
+    },
+    "timing": "TTFT is HTTP request start to first content event. Streamed decode is 127/(last content time - first content time), using reported completion count. Prompt prefill is cumulative engine chunk time through the prompt token count; excludes later one-row serial decode calls. These are not exclusive kernel timings.",
+    "runs": [
+      {
+        "name": "2048-0-serial",
+        "prefill_s": 86.7,
+        "ttft_s": 87.432134292,
+        "stream_decode_tok_s": 9.69784740089169,
+        "total_s": 100.527916417,
+        "output_sha256": "f8c47bca00caa8a733a195a4295b1342be330dc6f0c920b6cb19feef15894202"
+      },
+      {
+        "name": "2048-1-auto",
+        "prefill_s": 96.86,
+        "ttft_s": 99.73083041700002,
+        "stream_decode_tok_s": 9.973919705482324,
+        "total_s": 112.58024958299998,
+        "output_sha256": "f8c47bca00caa8a733a195a4295b1342be330dc6f0c920b6cb19feef15894202"
+      },
+      {
+        "name": "2048-2-auto",
+        "prefill_s": 82.38,
+        "ttft_s": 84.84681795799997,
+        "stream_decode_tok_s": 11.198461519168697,
+        "total_s": 96.294132666,
+        "output_sha256": "f8c47bca00caa8a733a195a4295b1342be330dc6f0c920b6cb19feef15894202"
+      },
+      {
+        "name": "2048-3-serial",
+        "prefill_s": 76.65,
+        "ttft_s": 77.260576958,
+        "stream_decode_tok_s": 14.951556660919254,
+        "total_s": 85.754833792,
+        "output_sha256": "f8c47bca00caa8a733a195a4295b1342be330dc6f0c920b6cb19feef15894202"
+      },
+      {
+        "name": "256-0-serial",
+        "prefill_s": 6.28,
+        "ttft_s": 6.729636292000001,
+        "stream_decode_tok_s": 17.56031471195043,
+        "total_s": 13.961920000000003,
+        "output_sha256": "47d6778dc6dc2a534c4cf337785b2da8c695d66a3839d6f93a44cc8ccab2a977"
+      },
+      {
+        "name": "256-1-auto",
+        "prefill_s": 6.99,
+        "ttft_s": 7.6488027920000015,
+        "stream_decode_tok_s": 12.395848891709777,
+        "total_s": 17.894234417,
+        "output_sha256": "47d6778dc6dc2a534c4cf337785b2da8c695d66a3839d6f93a44cc8ccab2a977"
+      },
+      {
+        "name": "256-2-auto",
+        "prefill_s": 6.64,
+        "ttft_s": 7.185253500000002,
+        "stream_decode_tok_s": 16.03228818816758,
+        "total_s": 15.106826541000004,
+        "output_sha256": "47d6778dc6dc2a534c4cf337785b2da8c695d66a3839d6f93a44cc8ccab2a977"
+      },
+      {
+        "name": "256-3-serial",
+        "prefill_s": 6.98,
+        "ttft_s": 7.504220291999999,
+        "stream_decode_tok_s": 18.80331693471878,
+        "total_s": 14.258404749999997,
+        "output_sha256": "47d6778dc6dc2a534c4cf337785b2da8c695d66a3839d6f93a44cc8ccab2a977"
+      },
+      {
+        "name": "4096-0-serial",
+        "prefill_s": 141.45,
+        "ttft_s": 142.01118629199993,
+        "stream_decode_tok_s": 14.898543922577499,
+        "total_s": 150.535565958,
+        "output_sha256": "a82e49bf0133d7bd84783b3137fde57f345eb9b422a6bb1027ab2d69bd33b419"
+      },
+      {
+        "name": "4096-1-auto",
+        "prefill_s": 138.35,
+        "ttft_s": 141.61442904199998,
+        "stream_decode_tok_s": 13.493270437699405,
+        "total_s": 151.103971,
+        "output_sha256": "a82e49bf0133d7bd84783b3137fde57f345eb9b422a6bb1027ab2d69bd33b419"
+      },
+      {
+        "name": "4096-2-auto",
+        "prefill_s": 127.12,
+        "ttft_s": 130.3728967909999,
+        "stream_decode_tok_s": 13.884213557625518,
+        "total_s": 139.596237083,
+        "output_sha256": "a82e49bf0133d7bd84783b3137fde57f345eb9b422a6bb1027ab2d69bd33b419"
+      },
+      {
+        "name": "4096-3-serial",
+        "prefill_s": 132.67,
+        "ttft_s": 133.251362125,
+        "stream_decode_tok_s": 16.70549863990918,
+        "total_s": 140.8537035830002,
+        "output_sha256": "a82e49bf0133d7bd84783b3137fde57f345eb9b422a6bb1027ab2d69bd33b419"
+      }
+    ],
+    "interpretation": "Identical generated text across all four runs within each context. Material timing variation, especially at 2048 tokens. Automatic MTP did not demonstrate a win over serial. This is a warm context baseline, not an optimization speedup or M3 Pro measurement."
+  },
+  "packed_projection_experiments": {
+    "date": "2026-11-06",
+    "machine": "Apple M5 Max",
+    "format": "IQ3_XXS; original bytes and F32 inputs",
+    "decision": "No experimental dispatch retained. Production gguf.rs and matvec.metal restored byte-for-byte to the validated pointwise baseline.",
+    "numerical_cases": "Original GPU kernel versus candidate bit patterns; K=256/768/2048/5120/6144/10240/17408; N=8/512; M=1/2/3/7/9/16/17; finite signed half scales, F32 inputs and nonzero weight/input offsets.",
+    "experiments": [
+      {
+        "change": "Two token rows per group, four output rows per SIMD",
+        "correctness": "Interleaved accumulator updates failed bitwise equality. Separate token loops passed the full matrix.",
+        "timing": "At K=5120,N=17408,M=3: original 187.996\u2013188.185 us, candidate 292.672\u2013293.930 us; M=16: last original 961.620 us, candidates 1204.152\u20131207.574 us. Rejected."
+      },
+      {
+        "change": "Two token rows, two output rows per SIMD, four SIMD groups",
+        "correctness": "Passed bitwise cases.",
+        "timing": "Slower than the original across the measured projection shapes. Rejected."
+      },
+      {
+        "change": "Original one-token body with output tile 2 or 8",
+        "correctness": "Passed bitwise cases.",
+        "timing": "Tile 2 regressed. Tile 8 changed large-M latency by roughly 0\u20133% but regressed small-M cases; no compelling adoption evidence."
+      },
+      {
+        "change": "32-bit codebook loads unpacked to uchar4",
+        "correctness": "Failed bitwise equality, including with loop vectorization disabled. Rejected."
+      },
+      {
+        "change": "Read original codebook bytes directly from constant memory, two or four SIMD groups",
+        "correctness": "Passed bitwise cases.",
+        "timing": "No convincing isolated improvement; small-M regressions. Rejected."
+      }
+    ],
+    "measurement_limits": "Isolated warmed allocation/dispatch batches, original/candidate/candidate/original; 32 calls per batch at (K,N)=(5120,5120),(5120,17408),(17408,5120), M=2/3/16. Early batches showed startup/allocation variation. These screening results are not end-to-end speedup evidence. No candidate advanced to full-checkpoint or interleaved HTTP adoption checks.",
+    "restored_sources_sha256": {
+      "gguf.rs": "9665491e83187d101dab8cd6e8870414bc81c2419f94885dc1da7b7b2029192f",
+      "matvec.metal": "069e86f8d91c72c6c7c3bb49489e827c82d59f85d09fa15983106297fd3f1201"
+    },
+    "restored_validation": "Release CLI and benchmark build passed. Six affected GGUF kernel tests passed twice; smoke suite passed. Production shader and wrapper sources match the pre-experiment baseline byte-for-byte."
+  }
+}

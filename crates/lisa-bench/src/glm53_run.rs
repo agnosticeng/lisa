@@ -6,9 +6,12 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context, ensure};
-use lisa_engine::cli::ModelDir;
-use lisa_engine::models::{self, Loaded};
-use lisa_engine::{generate, sampler, session, tokenizer};
+use lisa_bench::cli::ModelDir;
+use lisa_bench::{
+    checkpoint,
+    loading::{self, Loaded},
+};
+use lisa_bench::{generate, sampler, session, tokenizer};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -86,7 +89,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             path.display()
         );
     }
-    let model_type = models::model_type_of(&args.model)?;
+    let model_type = checkpoint::model_type_of(&args.model)?;
     ensure!(
         matches!(
             model_type.as_str(),
@@ -138,15 +141,15 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     let _q8_scope = args
         .matrix_prefill
-        .then(|| lisa_engine::core::quant::Glm53Q8PrefillScope::new(true));
+        .then(|| lisa_bench::core::quant::Glm53Q8PrefillScope::new(true));
     let _dsa_scope = args
         .native_dsa
-        .then(|| lisa_mlx::models::glm53::kernels::Glm53DsaNativeScope::new(true));
+        .then(|| lisa_bench::bindings::glm53_attention_mode::Glm53DsaNativeScope::new(true));
     let _gate_up_scope = args
         .native_q8_gate_up
-        .then(|| lisa_engine::models::glm53::moe::Glm53Q8GateUpNativeScope::new(true));
+        .then(|| lisa_bench::bindings::glm53_affine_moe::Glm53Q8GateUpNativeScope::new(true));
     let load_started = Instant::now();
-    let mut tower = match models::load_dir(&args.model)? {
+    let mut tower = match loading::load_dir(&args.model)? {
         Loaded::Language(tower) => tower,
         Loaded::Image(_) => anyhow::bail!("this command requires a language or decision model"),
         Loaded::Decision(_) => anyhow::bail!("glm53-run requires a language model"),
@@ -159,7 +162,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             tower.enable_stage_capture(args.capture_layers.clone(), args.capture_keys.clone())?;
         }
     }
-    let runtime = lisa_mlx::Stream::thread_local_or_default()
+    let runtime = lisa_metal::Stream::thread_local_or_default()
         .runtime()
         .clone();
     runtime.synchronize()?;
@@ -169,13 +172,13 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         "checkpoint has no target MTP head"
     );
     generate::set_eos_ids_for_model(tokenizer.im_end_ids.clone(), tower.as_ref());
-    let mut sampler = sampler::Sampler {
+    let mut sampler = sampler::Sampler(lisa_engine::sampling::Sampler {
         temperature: args.temperature,
         seed: args.seed,
         ..Default::default()
-    };
-    let active_loaded = lisa_mlx::memory::active_memory()?;
-    let private_loaded = lisa_mlx::memory::private_allocated_memory()?;
+    });
+    let active_loaded = lisa_metal::memory::active_memory()?;
+    let private_loaded = lisa_metal::memory::private_allocated_memory()?;
     let mut first_token_seconds = None;
     let generation_started = Instant::now();
     let mut on_token = |_token: u32| -> anyhow::Result<()> {
@@ -211,8 +214,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     if let Some(path) = &args.capture_logits {
         tower.write_logit_capture(path.to_str().context("capture path is not UTF-8")?)?;
     }
-    let active_final = lisa_mlx::memory::active_memory()?;
-    let private_final = lisa_mlx::memory::private_allocated_memory()?;
+    let active_final = lisa_metal::memory::active_memory()?;
+    let private_final = lisa_metal::memory::private_allocated_memory()?;
     let decode_steps = serial_stats
         .as_ref()
         .map(|stats| stats.generated_tokens.saturating_sub(1));
@@ -236,9 +239,9 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         "capture_logits": args.capture_logits,
         "q8_schedule": if model_type == "glm5-next" { "gguf_scalar" } else { "native_ds4" },
         "matrix_prefill_explicit": args.matrix_prefill,
-        "dsa_schedule": if lisa_mlx::models::glm53::kernels::glm53_dsa_native_enabled() { "native_ds4" } else { "legacy_affine" },
+        "dsa_schedule": if lisa_bench::bindings::glm53_attention_mode::glm53_dsa_native_enabled() { "native_ds4" } else { "legacy_affine" },
         "native_dsa_explicit": args.native_dsa,
-        "q8_gate_up_schedule": if model_type == "glm5-next" { "gguf_separate" } else if lisa_engine::models::glm53::moe::native_gate_up_enabled() && std::env::var("LISA_GLM53_Q8_GATE_UP").as_deref() != Ok("separate") { "native_ds4_fused" } else { "separate" },
+        "q8_gate_up_schedule": if model_type == "glm5-next" { "gguf_separate" } else if lisa_bench::bindings::glm53_affine_moe::native_gate_up_enabled() && std::env::var("LISA_GLM53_Q8_GATE_UP").as_deref() != Ok("separate") { "native_ds4_fused" } else { "separate" },
         "native_q8_gate_up_explicit": args.native_q8_gate_up,
         "timing_valid_for_performance": args.capture_logits.is_none(),
         "sampling": {"seed": args.seed, "temperature": args.temperature,
@@ -263,7 +266,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             "private_after_load_bytes": private_loaded,
             "active_after_generation_bytes": active_final,
             "private_after_generation_bytes": private_final,
-            "ram_budget_bytes": lisa_mlx::memory::ram_budget(),
+            "ram_budget_bytes": lisa_engine::memory::ram_budget(),
         },
     });
     // All token serialization and filesystem work happens after timing ends.

@@ -13,7 +13,7 @@ adjacent licenses and [NOTICE](NOTICE) when changing them.
 | Checkpoint `model_type` | Module | Model |
 | --- | --- | --- |
 | `qwen4_exp`, `qwen4_exp_text` | `qwen4` | Qwen 3.8 Flash-Next, hybrid GDN + MoE + MTP |
-| `qwen3_5`, `qwen3_5_text` | `qwen3_5` | Qwen 3.8 27B, dense hybrid GDN/attention |
+| `qwen3_5`, `qwen3_5_text`, GGUF `qwen35` | `qwen3_5` | Qwen 3.8 27B, dense hybrid GDN/attention |
 | `glm5_next`, `glm5_next_text`, GGUF `glm5-next` | `glm53` | GLM-5.3 Flash, KDA + sparse attention + MoE + MTP |
 | GGUF `general.architecture=deepseek41` | `deepseek41` | DeepSeek V4.1 Flash Coder, mixed IQ GGUF, experimental |
 | `flux2-klein`, `flux3-klein` | `flux2`, `flux3` | Local image generation |
@@ -30,21 +30,30 @@ format adapters, measured checks and remaining parity work are recorded in
 
 | Crate | Responsibility |
 | --- | --- |
-| `lisa-mlx` | Tensor runtime, allocation, JIT dispatch and Metal shaders |
+| `lisa-backend` | Portable tensor-import, capability and prepared-kernel contracts |
+| `lisa-models` | Backend-independent model schemas and plans; no I/O, device allocation or kernel execution |
+| `lisa-metal` | Tensor runtime, allocation, JIT dispatch and Metal shaders |
+| `lisa-cpu` | Host tensor storage and model-independent ordered f32 kernels |
+| `lisa-mlx` | Portable MLX safetensors parsing, shard indices and mapped host storage |
 | `lisa-gguf` | GGUF parsing, split packages, mapped storage and CPU block decoding |
-| `lisa-engine` | Model implementations and shared generation/session logic |
-| `lisa-serve` | HTTP APIs and request handling |
+| `lisa-engine` | Portable weight binding, generic plan execution, host memory admission and shared generation/session logic; no concrete device dependency |
+| `lisa-serve` | HTTP APIs, request handling and application provider composition |
 | `lisa-cli` | `lisa` CLI |
 | `lisa-bench` | Compiled diagnostics, benchmarks and embedded goldens |
 | `lisa-ui` | Native macOS app |
 
-Put Metal sources under `crates/lisa-mlx/src/shaders/` and their Rust wrappers
-under `jit/` or `models/`. Shared architecture code such as GDN belongs at the
-models root. Keep model-specific logic out of `lisa-engine/src/core/` when it
+Put Metal sources under `crates/lisa-metal/src/shaders/` and their Rust wrappers
+under `jit/` or operation modules in `kernels/`. Device crates have no model
+namespace; checkpoint configuration and model plans belong to `lisa-models`. Keep model-specific logic out of `lisa-engine/src/core/` when it
 can be expressed through `LanguageModel`.
 
-Keep `lisa-gguf` independent of the engine and Metal runtime. The engine's
-`core::gguf_resident` adapter owns GPU weight views and RAM admission.
+Keep `lisa-mlx` and `lisa-gguf` independent of the engine and all compute runtimes.
+Model schemas and computation plans belong to `lisa-models`; the engine owns
+file access, binds weights and executes plans. Model definitions must not read
+files/environment variables or import device/format crates.
+Device crates must not traverse models or own inference policy.
+Device selection belongs to the engine/application, never to a format reader
+or the Metal crate. Preserve original packed payloads across format imports. The engine's `weights::gguf` adapter owns generic device weight views and RAM admission.
 
 Keep self-contained test fixtures with the owning crate. Large model-dependent
 captures are external data selected through `LISA_GLM53_FIXTURE_DIR`; retain
@@ -100,7 +109,7 @@ data do not certify those cases.
 - After an abort, stop residual processes from that run before loading again.
   Prefer 64–256 output tokens unless measuring long generation.
 - GLM's resident reservation counts mapped model bytes plus private allocations
-  against `memory::ram_budget()`. Server request admission is separately armed
+  against `lisa_engine::memory::ram_budget()`. Server request admission is separately armed
   by `LISA_RAM_CAP_GB`; these are distinct mechanisms.
 - Preserve allocation lifetime and completion ordering. Never wait for GPU
   completion while holding the allocator lock.
@@ -190,7 +199,7 @@ weakening the strict requirements below.
   width is not draft depth; GLM's two-draft MTP is a separate contract.
 - Consult prior findings before reopening AOT, paged-KV decode, norm-inside-qmv,
   tree verification, ANE/GPU prefill or MTP-head grafting. See
-  [performance dispositions](specs/performance.md#historical-conclusions-to-preserve).
+  [performance dispositions](specs/performance.md#optimization-admission).
 
 ## Diagnostics and documentation
 

@@ -87,5 +87,5 @@ lines += ['static const char *engram_path='+json.dumps(a[-1]['path'])+';',f'stat
 beg=code.index('#define DS41_SCRATCH(X)');end=code.index('\n\n',beg);lines.append(code[beg:end])
 (out/'manifest.h').write_text('\n'.join(lines))
 # Native GGML extension source: unchanged, already independently checked against the GGML C decoders.
-(out/'packed.metal').write_bytes((repo/'crates/lisa-mlx/src/shaders/deepseek41/iq.metal').read_bytes())
+(out/'packed.metal').write_bytes((repo/'crates/lisa-metal/src/shaders/deepseek41/iq.metal').read_bytes())
 print('Prepared',len(ts),'tensor mappings',base/2**30,'GiB')

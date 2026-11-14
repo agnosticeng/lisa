@@ -77,5 +77,5 @@ at `-O3`. Other units use `-O3`; the original Metal compile options are
 unchanged. Account for this host-build limitation in performance comparisons.
 
 Generated upstream portions retain their upstream licenses. DS4 attribution
-and license are also kept under `crates/lisa-mlx/src/shaders/deepseek41/`;
+and license are also kept under `crates/lisa-metal/src/shaders/deepseek41/`;
 GGML/llama.cpp attribution is recorded in the GGUF and shader provenance files.

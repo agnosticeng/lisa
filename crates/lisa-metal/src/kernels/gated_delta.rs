@@ -1,0 +1,1231 @@
+use crate::ffi::{MetalKernel, OutputArg, TemplateArg};
+#[cfg(test)]
+use lisa_metal::ops::indexing::IndexOp;
+use lisa_metal::{Array, Dtype, Stream};
+
+use crate::kernels::EXACT_HEADER;
+
+/// The gated delta rule scan kernel from `GatedDelta.swift`.
+///
+/// Inputs: q [B,T,Hk,Dk], k [B,T,Hk,Dk], v [B,T,Hv,Dv], g [B,T,Hv] f32,
+/// beta [B,T,Hv] f32, state_in [B,Hv,Dv,Dk], T scalar i32.
+/// Outputs: y [B,T,Hv,Dv] (activation dtype), state_out [B,Hv,Dv,Dk] (StT).
+const GATED_DELTA_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("gdn/gated_delta.metal");
+
+/// `track_p12_gdn_prep_split_inputs`: the causal depthwise conv + silu, the q/k
+/// RMS norms with their scales, and the decay/beta gates in ONE launch. The two
+/// 48-wide gate rows come from their own projection buffers instead of a
+/// concatenated `proj`.
+///
+/// Inputs: `qkv [B,T,CONV_DIM]`, `conv_state [B,KC-1,CONV_DIM]`,
+/// `conv_w [CONV_DIM,KC,1]`, `neg_exp_alog [Hv] f32`, `dt_bias [Hv]`,
+/// `b_gate [B,T,Hv]`, `a_gate [B,T,Hv]`.
+/// Outputs: `qn [B,T,Hk,Dk]`, `kn [B,T,Hk,Dk]`, `vv [B,T,Hv,Dv]`,
+/// `g [B,T,Hv] f32`, `beta [B,T,Hv] f32`, `conv_out [B,KC-1,CONV_DIM]`.
+const GDN_PREP_SOURCE: &crate::shader_pack::Source = crate::kernel_source!("gdn/gdn_prep.metal");
+
+static GDN_PREP: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
+
+fn gdn_prep_kernel() -> &'static Option<MetalKernel> {
+    GDN_PREP.get_or_init(|| {
+        MetalKernel::new(
+            "track_p12_gdn_prep_split_inputs",
+            &[
+                "proj",
+                "conv_state",
+                "conv_w",
+                "neg_exp_alog",
+                "dt_bias",
+                "b_gate",
+                "a_gate",
+            ],
+            &["qn", "kn", "vv", "g", "beta", "conv_out"],
+            GDN_PREP_SOURCE,
+            EXACT_HEADER,
+            true,
+            false,
+        )
+        .ok()
+    })
+}
+
+/// Run the fused GDN prep. Returns `(qn, kn, vv, g, beta, conv_out)` or `None`.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_prep(
+    qkv: &Array,
+    conv_state: &Array,
+    conv_w: &Array,
+    neg_exp_alog: &Array,
+    dt_bias: &Array,
+    b_gate: &Array,
+    a_gate: &Array,
+    t_len: i32,
+    hk: i32,
+    hv: i32,
+    dk: i32,
+    dv: i32,
+    kc: i32,
+    conv_dim: i32,
+    stream: &Stream,
+) -> Option<(Array, Array, Array, Array, Array, Array)> {
+    let kernel = gdn_prep_kernel().as_ref()?;
+    let b = qkv.dim(0);
+    let inputs: [&Array; 7] = [
+        qkv,
+        conv_state,
+        conv_w,
+        neg_exp_alog,
+        dt_bias,
+        b_gate,
+        a_gate,
+    ];
+    let template = [
+        TemplateArg::Dtype("InT", Dtype::Bfloat16),
+        TemplateArg::Int("T", t_len),
+        TemplateArg::Int("Dk", dk),
+        TemplateArg::Int("Dv", dv),
+        TemplateArg::Int("Hk", hk),
+        TemplateArg::Int("Hv", hv),
+        TemplateArg::Int("KC", kc),
+        TemplateArg::Int("PROJ_W", conv_dim),
+        TemplateArg::Int("CONV_DIM", conv_dim),
+        TemplateArg::Int("B_OFF", 0),
+        TemplateArg::Int("A_OFF", 0),
+    ];
+    let outs = [
+        OutputArg {
+            shape: vec![b, t_len, hk, dk],
+            dtype: Dtype::Bfloat16,
+        },
+        OutputArg {
+            shape: vec![b, t_len, hk, dk],
+            dtype: Dtype::Bfloat16,
+        },
+        OutputArg {
+            shape: vec![b, t_len, hv, dv],
+            dtype: Dtype::Bfloat16,
+        },
+        OutputArg {
+            shape: vec![b, t_len, hv],
+            dtype: Dtype::Float32,
+        },
+        OutputArg {
+            shape: vec![b, t_len, hv],
+            dtype: Dtype::Float32,
+        },
+        OutputArg {
+            shape: vec![b, kc - 1, conv_dim],
+            dtype: Dtype::Bfloat16,
+        },
+    ];
+    let out = kernel
+        .apply(
+            &inputs,
+            &template,
+            (32, conv_dim / 128, b * t_len),
+            (32, 4, 1),
+            &outs,
+            stream,
+        )
+        .ok()?;
+    let mut it = out.into_iter();
+    Some((
+        it.next()?,
+        it.next()?,
+        it.next()?,
+        it.next()?,
+        it.next()?,
+        it.next()?,
+    ))
+}
+
+/// `track_gdn_prep`: the same prep with the two gate rows read from offsets
+/// `B_OFF`/`A_OFF` in the concatenated `proj [B,T,PROJ_W]` (the verify/capture
+/// and small-window path; the engine only splits for eligible wide prefill).
+///
+/// Inputs: `proj [B,T,PROJ_W]`, `conv_state [B,KC-1,CONV_DIM]`,
+/// `conv_w [CONV_DIM,KC,1]`, `neg_exp_alog [Hv] f32`, `dt_bias [Hv]`.
+const GDN_PREP_FUSED_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("gdn/gdn_prep_fused.metal");
+
+static GDN_PREP_FUSED: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
+
+fn gdn_prep_fused_kernel() -> &'static Option<MetalKernel> {
+    GDN_PREP_FUSED.get_or_init(|| {
+        MetalKernel::new(
+            "track_gdn_prep",
+            &["proj", "conv_state", "conv_w", "neg_exp_alog", "dt_bias"],
+            &["qn", "kn", "vv", "g", "beta", "conv_out", "conv_in"],
+            GDN_PREP_FUSED_SOURCE,
+            EXACT_HEADER,
+            true,
+            false,
+        )
+        .ok()
+    })
+}
+
+/// Run the fused-projection GDN prep. Returns
+/// `(qn, kn, vv, g, beta, conv_out, conv_in)` where `conv_in` is the rollback
+/// conv input `[B, KC-1+T, CONV_DIM]` (state rows then the proj rows — the
+/// same values the composed `concatenate` produced, emitted copy-free).
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_prep_fused(
+    proj: &Array,
+    conv_state: &Array,
+    conv_w: &Array,
+    neg_exp_alog: &Array,
+    dt_bias: &Array,
+    b_off: i32,
+    a_off: i32,
+    t_len: i32,
+    hk: i32,
+    hv: i32,
+    dk: i32,
+    dv: i32,
+    kc: i32,
+    proj_w: i32,
+    conv_dim: i32,
+    stream: &Stream,
+) -> Option<(Array, Array, Array, Array, Array, Array, Array)> {
+    let kernel = gdn_prep_fused_kernel().as_ref()?;
+    let b = proj.dim(0);
+    let inputs: [&Array; 5] = [proj, conv_state, conv_w, neg_exp_alog, dt_bias];
+    let template = [
+        TemplateArg::Dtype("InT", Dtype::Bfloat16),
+        TemplateArg::Int("T", t_len),
+        TemplateArg::Int("Dk", dk),
+        TemplateArg::Int("Dv", dv),
+        TemplateArg::Int("Hk", hk),
+        TemplateArg::Int("Hv", hv),
+        TemplateArg::Int("KC", kc),
+        TemplateArg::Int("PROJ_W", proj_w),
+        TemplateArg::Int("CONV_DIM", conv_dim),
+        TemplateArg::Int("B_OFF", b_off),
+        TemplateArg::Int("A_OFF", a_off),
+    ];
+    let outs = [
+        OutputArg {
+            shape: vec![b, t_len, hk, dk],
+            dtype: Dtype::Bfloat16,
+        },
+        OutputArg {
+            shape: vec![b, t_len, hk, dk],
+            dtype: Dtype::Bfloat16,
+        },
+        OutputArg {
+            shape: vec![b, t_len, hv, dv],
+            dtype: Dtype::Bfloat16,
+        },
+        OutputArg {
+            shape: vec![b, t_len, hv],
+            dtype: Dtype::Float32,
+        },
+        OutputArg {
+            shape: vec![b, t_len, hv],
+            dtype: Dtype::Float32,
+        },
+        OutputArg {
+            shape: vec![b, kc - 1, conv_dim],
+            dtype: Dtype::Bfloat16,
+        },
+        OutputArg {
+            shape: vec![b, kc - 1 + t_len, conv_dim],
+            dtype: Dtype::Bfloat16,
+        },
+    ];
+    let out = kernel
+        .apply(
+            &inputs,
+            &template,
+            (32, conv_dim / 128, b * t_len),
+            (32, 4, 1),
+            &outs,
+            stream,
+        )
+        .ok()?;
+    let mut it = out.into_iter();
+    Some((
+        it.next()?,
+        it.next()?,
+        it.next()?,
+        it.next()?,
+        it.next()?,
+        it.next()?,
+        it.next()?,
+    ))
+}
+/// `track_gdn_lean_two_row`: the decode recurrence with two value rows per
+/// simdgroup. The kernel body is static (see `kernels/models/qwen4/`).
+const GDN_LEAN_TWO_ROW_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("gdn/gdn_lean_two_row.metal");
+/// `track_gdn_rows`: the prefill recurrence with four value rows per simdgroup.
+const GDN_ROWS_SOURCE: &crate::shader_pack::Source = crate::kernel_source!("gdn/gdn_rows.metal");
+
+static GDN_ROWS: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
+static GDN_TWO_ROW: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
+
+/// The `T` scalar argument, cached per value (specs/08 item 3): rebuilding it
+/// per layer per step was a host-side graph-node reconstruction. `Array` is
+/// immutable and `Arc`-backed, so sharing one instance is safe.
+pub fn t_scalar_pub(t: i32) -> Array {
+    t_scalar(t)
+}
+
+fn t_scalar(t: i32) -> Array {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<i32, Array>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    cache
+        .lock()
+        .unwrap()
+        .entry(t)
+        .or_insert_with(|| Array::from_int(t))
+        .clone()
+}
+
+fn gdn_two_row_kernel() -> &'static Option<MetalKernel> {
+    GDN_TWO_ROW.get_or_init(|| {
+        MetalKernel::new(
+            "track_gdn_lean_two_row",
+            &["q", "k", "v", "g", "beta", "state_in", "T"],
+            &["y", "state_out"],
+            GDN_LEAN_TWO_ROW_SOURCE,
+            "",
+            true,
+            false,
+        )
+        .ok()
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_two_row(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    g: &Array,
+    beta: &Array,
+    state: &Array,
+    capture: bool,
+    stream: &Stream,
+) -> Option<(Array, Array)> {
+    gdn_two_row_impl(q, k, v, g, beta, state, capture, None, stream)
+}
+
+/// As [`gdn_two_row`] but writes `y`/`state_out` into the caller's persistent
+/// buffers (the MTP verify reuses its large capture-state buffer across
+/// rounds instead of reallocating it per GDN layer).
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_two_row_into(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    g: &Array,
+    beta: &Array,
+    state: &Array,
+    capture: bool,
+    out_y: &Array,
+    out_state: &Array,
+    stream: &Stream,
+) -> Option<(Array, Array)> {
+    gdn_two_row_impl(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        state,
+        capture,
+        Some((out_y, out_state)),
+        stream,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gdn_two_row_impl(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    g: &Array,
+    beta: &Array,
+    state: &Array,
+    capture: bool,
+    prealloc: Option<(&Array, &Array)>,
+    stream: &Stream,
+) -> Option<(Array, Array)> {
+    let kernel = gdn_two_row_kernel().as_ref()?;
+    let b = k.dim(0);
+    let t = k.dim(1);
+    let hk = k.dim(2);
+    let dk = k.dim(3);
+    let hv = v.dim(2);
+    let dv = v.dim(3);
+    let rows = 2;
+    let t_scalar = t_scalar(t);
+    let inputs: [&Array; 7] = [q, k, v, g, beta, state, &t_scalar];
+    let template = [
+        TemplateArg::Dtype("InT", Dtype::Bfloat16),
+        TemplateArg::Dtype("StT", Dtype::Float32),
+        TemplateArg::Int("Dk", dk),
+        TemplateArg::Int("Dv", dv),
+        TemplateArg::Int("Hk", hk),
+        TemplateArg::Int("Hv", hv),
+        TemplateArg::Bool("CAPTURE", capture),
+    ];
+    let state_shape = if capture {
+        vec![b * t, hv, dv, dk]
+    } else {
+        state.shape().to_vec()
+    };
+    let outs = [
+        OutputArg {
+            shape: vec![b, t, hv, dv],
+            dtype: Dtype::Bfloat16,
+        },
+        OutputArg {
+            shape: state_shape,
+            dtype: Dtype::Float32,
+        },
+    ];
+    let grid = (32, dv / rows, b * hv);
+    let tg = (32, 4, 1);
+    let r = match prealloc {
+        Some((py, ps)) => kernel.apply_into(&inputs, &template, grid, tg, &outs, &[py, ps], stream),
+        None => kernel.apply(&inputs, &template, grid, tg, &outs, stream),
+    }
+    .ok()?;
+    let mut it = r.into_iter();
+    Some((it.next()?, it.next()?))
+}
+
+fn gdn_rows_kernel() -> &'static Option<MetalKernel> {
+    GDN_ROWS.get_or_init(|| {
+        MetalKernel::new(
+            "track_gdn_rows",
+            &["q", "k", "v", "g", "beta", "state_in", "T"],
+            &["y", "state_out"],
+            GDN_ROWS_SOURCE,
+            "",
+            true,
+            false,
+        )
+        .ok()
+    })
+}
+
+/// Snapshot verification with the exact gated RMS epilogue in the same
+/// dispatch. All recurrence outputs round to BF16 in threadgroup memory before
+/// normalization; the FP32 per-prefix states retain the ordinary capture layout.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_verify_fused(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    g: &Array,
+    beta: &Array,
+    state: &Array,
+    z: &Array,
+    weight: &Array,
+    eps: f32,
+    prealloc: Option<(&Array, &Array)>,
+    stream: &Stream,
+) -> Option<(Array, Array)> {
+    let (b, t, hk, dk) = (k.dim(0), k.dim(1), k.dim(2), k.dim(3));
+    let (hv, dv) = (v.dim(2), v.dim(3));
+    if dk != 128
+        || dv != 128
+        || !(2..=16).contains(&t)
+        || hk == 0
+        || hv % hk != 0
+        || state.dtype() != Dtype::Float32
+        || !(state.shape() == [b, hv, dv, dk] || b == 1 && state.shape() == [hv, dv, dk])
+        || [q, k, v, z, weight]
+            .iter()
+            .any(|x| x.dtype() != Dtype::Bfloat16)
+        || q.shape() != k.shape()
+        || v.shape() != [b, t, hv, dv]
+        || weight.shape() != [dv]
+        || g.shape() != [b, t, hv]
+        || beta.shape() != [b, t, hv]
+        || g.dtype() != Dtype::Float32
+        || beta.dtype() != Dtype::Float32
+    {
+        return None;
+    }
+    let q = q.contiguous().ok()?;
+    let k = k.contiguous().ok()?;
+    let v = v.contiguous().ok()?;
+    let g = g.contiguous().ok()?;
+    let beta = beta.contiguous().ok()?;
+    let state = state.contiguous().ok()?;
+    let weight = weight.contiguous().ok()?;
+    let z = z.reshape_rows_view((b * t) as usize, (hv * dv) as usize)?;
+    static KERNEL: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
+    let kernel = KERNEL
+        .get_or_init(|| {
+            MetalKernel::new(
+                "gdn_verify_fused",
+                &["q", "k", "v", "g", "beta", "state_in", "T", "zproj", "w"],
+                &["y", "state_out"],
+                crate::kernel_source!("gdn/gdn_verify_fused.metal"),
+                crate::kernel_source!("common/exact_header.metal"),
+                true,
+                false,
+            )
+            .ok()
+        })
+        .as_ref()?;
+    let t_scalar = t_scalar(t);
+    let inputs = [&q, &k, &v, &g, &beta, &state, &t_scalar, &z, &weight];
+    let template = [
+        TemplateArg::Dtype("InT", Dtype::Bfloat16),
+        TemplateArg::Dtype("StT", Dtype::Float32),
+        TemplateArg::Int("Dk", dk),
+        TemplateArg::Int("Dv", dv),
+        TemplateArg::Int("Hk", hk),
+        TemplateArg::Int("Hv", hv),
+        TemplateArg::Int("EPS_BITS", eps.to_bits() as i32),
+        TemplateArg::Bool("CAPTURE", true),
+        TemplateArg::Bool("SIGLU", true),
+    ];
+    let outs = [
+        OutputArg {
+            shape: vec![b, t, hv, dv],
+            dtype: Dtype::Bfloat16,
+        },
+        OutputArg {
+            shape: vec![b * t, hv, dv, dk],
+            dtype: Dtype::Float32,
+        },
+    ];
+    let output = match prealloc {
+        Some((y, state)) if y.shape() == outs[0].shape && state.shape() == outs[1].shape => kernel
+            .apply_into(
+                &inputs,
+                &template,
+                (32, 32, b * hv),
+                (32, 32, 1),
+                &outs,
+                &[y, state],
+                stream,
+            ),
+        _ => kernel.apply(
+            &inputs,
+            &template,
+            (32, 32, b * hv),
+            (32, 32, 1),
+            &outs,
+            stream,
+        ),
+    }
+    .ok()?;
+    let mut output = output.into_iter();
+    Some((output.next()?, output.next()?))
+}
+
+/// The prefill recurrence with 4 value rows per simdgroup (`track_gdn_rows`).
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_rows(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    g: &Array,
+    beta: &Array,
+    state: &Array,
+    capture: bool,
+    stream: &Stream,
+) -> Option<(Array, Array)> {
+    let kernel = gdn_rows_kernel().as_ref()?;
+    let b = k.dim(0);
+    let t = k.dim(1);
+    let hk = k.dim(2);
+    let dk = k.dim(3);
+    let hv = v.dim(2);
+    let dv = v.dim(3);
+    let rows = 4;
+    let t_scalar = t_scalar(t);
+    let inputs: [&Array; 7] = [q, k, v, g, beta, state, &t_scalar];
+    let template = [
+        TemplateArg::Dtype("InT", Dtype::Bfloat16),
+        TemplateArg::Dtype("StT", Dtype::Float32),
+        TemplateArg::Int("Dk", dk),
+        TemplateArg::Int("Dv", dv),
+        TemplateArg::Int("Hk", hk),
+        TemplateArg::Int("Hv", hv),
+        TemplateArg::Bool("CAPTURE", capture),
+    ];
+    let state_shape = if capture {
+        vec![b * t, hv, dv, dk]
+    } else {
+        state.shape().to_vec()
+    };
+    let outs = [
+        OutputArg {
+            shape: vec![b, t, hv, dv],
+            dtype: Dtype::Bfloat16,
+        },
+        OutputArg {
+            shape: state_shape,
+            dtype: Dtype::Float32,
+        },
+    ];
+    let r = kernel
+        .apply(
+            &inputs,
+            &template,
+            (32, dv / rows, b * hv),
+            (32, 4, 1),
+            &outs,
+            stream,
+        )
+        .ok()?;
+    let mut it = r.into_iter();
+    Some((it.next()?, it.next()?))
+}
+/// Manages the JIT-compiled GDN kernels.
+pub struct GatedDeltaKernels {
+    kernel: Option<MetalKernel>,
+}
+
+static GDN_KERNEL: std::sync::OnceLock<GatedDeltaKernels> = std::sync::OnceLock::new();
+
+impl GatedDeltaKernels {
+    fn new() -> Self {
+        let kernel = MetalKernel::new(
+            "gated_delta_step",
+            &["q", "k", "v", "g", "beta", "state_in", "T"],
+            &["y", "state_out"],
+            GATED_DELTA_SOURCE,
+            "",
+            true,
+            false,
+        )
+        .ok();
+        Self { kernel }
+    }
+}
+
+fn gdn_kernels() -> &'static GatedDeltaKernels {
+    GDN_KERNEL.get_or_init(GatedDeltaKernels::new)
+}
+
+pub fn gdn_kernel_available() -> bool {
+    gdn_kernels().kernel.is_some()
+}
+
+/// The gated delta scan via the custom Metal kernel.
+///
+/// q/k: `[B,T,Hk,Dk]` (activation dtype), v: `[B,T,Hv,Dv]` (activation dtype),
+/// g/beta: `[B,T,Hv]` f32, state: `[B,Hv,Dv,Dk]` f32.
+///
+/// `capture` writes the state after every position instead of only the last,
+/// so `state_out` is `[B*T, Hv, Dv, Dk]` (slot `b*T + t`); the return value is
+/// `(y, state_out)`. Without capture it is the usual `[B, Hv, Dv, Dk]`.
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_kernel(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    g: &Array,
+    beta: &Array,
+    state: &Array,
+    capture: bool,
+    stream: &Stream,
+) -> Option<(Array, Array)> {
+    gated_delta_kernel_impl(q, k, v, g, beta, state, capture, stream)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gated_delta_kernel_impl(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    g: &Array,
+    beta: &Array,
+    state: &Array,
+    capture: bool,
+    stream: &Stream,
+) -> Option<(Array, Array)> {
+    let kernels = gdn_kernels();
+    let kernel = kernels.kernel.as_ref()?;
+
+    let b = k.dim(0);
+    let t = k.dim(1);
+    let hk = k.dim(2);
+    let dk = k.dim(3);
+    let hv = v.dim(2);
+    let dv = v.dim(3);
+    let input_type = q.dtype();
+    let state_type = state.dtype();
+
+    let t_scalar = t_scalar(t);
+    let inputs: [&Array; 7] = [q, k, v, g, beta, state, &t_scalar];
+    let template = [
+        TemplateArg::Dtype("InT", input_type),
+        TemplateArg::Dtype("StT", state_type),
+        TemplateArg::Int("Dk", dk),
+        TemplateArg::Int("Dv", dv),
+        TemplateArg::Int("Hk", hk),
+        TemplateArg::Int("Hv", hv),
+        TemplateArg::Bool("CAPTURE", capture),
+    ];
+    let state_shape = if capture {
+        vec![b * t, hv, dv, dk]
+    } else {
+        state.shape().to_vec()
+    };
+    let outputs = [
+        OutputArg {
+            shape: vec![b, t, hv, dv],
+            dtype: input_type,
+        },
+        OutputArg {
+            shape: state_shape,
+            dtype: state_type,
+        },
+    ];
+    let out = match kernel.apply(
+        &inputs,
+        &template,
+        (32, dv, b * hv),
+        (32, 4, 1),
+        &outputs,
+        stream,
+    ) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("[gdn-decline] {e}");
+            return None;
+        }
+    };
+    let mut it = out.into_iter();
+    let y = it.next()?;
+    let state_out = it.next()?;
+    Some((y, state_out))
+}
+
+/// `track_gdn_decode_complete`: the S=1 GDN (causal conv + q/k l2norm + the
+/// gated delta rule + gated RMS) in one launch. Ported verbatim from
+/// upstream `Runner/FastModel/TrackFastGDNDecode.swift`.
+///
+/// `proj` is the concatenated `[qkv | z | b | a]` projection (one GEMM); the
+/// kernel reads z/b/a from their offsets in it.
+const GDN_DECODE_COMPLETE_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("gdn/gdn_decode_complete.metal");
+
+static GDN_DECODE_COMPLETE: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
+
+fn gdn_decode_complete_kernel() -> &'static Option<MetalKernel> {
+    GDN_DECODE_COMPLETE.get_or_init(|| {
+        MetalKernel::new(
+            "track_gdn_decode_complete",
+            &[
+                "proj",
+                "conv_state",
+                "conv_w",
+                "neg_exp_alog",
+                "dt_bias",
+                "state_in",
+                "w",
+            ],
+            &["state_out", "gated", "conv_out"],
+            GDN_DECODE_COMPLETE_SOURCE,
+            EXACT_HEADER,
+            true,
+            false,
+        )
+        .ok()
+    })
+}
+
+/// The S=1 fused GDN. Returns `(gated [b,1,hv*dv], state_out [b,hv,dv,dk], conv_out [b,KC-1,convDim])`.
+///
+/// `swish_gate` selects the qwen3_5 output gate (`silu(z) * rms`, SWISH
+/// template flag) over the Flash-Next sigmoid gate.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_decode_complete(
+    proj: &Array,
+    conv_state: &Array,
+    conv_w: &Array,
+    neg_exp_alog: &Array,
+    dt_bias: &Array,
+    state_in: &Array,
+    norm_w: &Array,
+    hk: i32,
+    hv: i32,
+    dk: i32,
+    dv: i32,
+    kc: i32,
+    conv_dim: i32,
+    pw: i32,
+    b_off: i32,
+    a_off: i32,
+    z_off: i32,
+    eps: f32,
+    swish_gate: bool,
+    stream: &Stream,
+) -> Option<(Array, Array, Array)> {
+    delta_decode_checked(
+        proj,
+        conv_state,
+        conv_w,
+        neg_exp_alog,
+        dt_bias,
+        state_in,
+        norm_w,
+        hk,
+        hv,
+        dk,
+        dv,
+        kc,
+        conv_dim,
+        pw,
+        b_off,
+        a_off,
+        z_off,
+        eps,
+        swish_gate,
+        stream,
+    )
+    .ok()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn delta_decode_checked(
+    proj: &Array,
+    conv_state: &Array,
+    conv_w: &Array,
+    neg_exp_alog: &Array,
+    dt_bias: &Array,
+    state_in: &Array,
+    norm_w: &Array,
+    hk: i32,
+    hv: i32,
+    dk: i32,
+    dv: i32,
+    kc: i32,
+    conv_dim: i32,
+    pw: i32,
+    b_off: i32,
+    a_off: i32,
+    z_off: i32,
+    eps: f32,
+    swish_gate: bool,
+    stream: &Stream,
+) -> crate::error::Result<(Array, Array, Array)> {
+    let kernel = gdn_decode_complete_kernel()
+        .as_ref()
+        .ok_or_else(|| crate::error::Error::msg("delta decode kernel unavailable"))?;
+    let b = proj.dim(0);
+    let inputs: [&Array; 7] = [
+        proj,
+        conv_state,
+        conv_w,
+        neg_exp_alog,
+        dt_bias,
+        state_in,
+        norm_w,
+    ];
+    let template = [
+        TemplateArg::Dtype("InT", Dtype::Bfloat16),
+        TemplateArg::Dtype("StT", Dtype::Float32),
+        TemplateArg::Int("Dk", dk),
+        TemplateArg::Int("Dv", dv),
+        TemplateArg::Int("Hk", hk),
+        TemplateArg::Int("Hv", hv),
+        TemplateArg::Int("KC", kc),
+        TemplateArg::Int("CONV_DIM", conv_dim),
+        TemplateArg::Int("PW", pw),
+        TemplateArg::Int("B_OFF", b_off),
+        TemplateArg::Int("A_OFF", a_off),
+        TemplateArg::Int("Z_OFF", z_off),
+        TemplateArg::Int("EPS_BITS", eps.to_bits() as i32),
+        TemplateArg::Int("RPS", 4),
+        TemplateArg::Bool("SWISH", swish_gate),
+    ];
+    let outs = [
+        OutputArg {
+            shape: vec![b, hv, dv, dk],
+            dtype: Dtype::Float32,
+        },
+        OutputArg {
+            shape: vec![b, 1, hv * dv],
+            dtype: Dtype::Bfloat16,
+        },
+        OutputArg {
+            shape: vec![b, kc - 1, conv_dim],
+            dtype: Dtype::Bfloat16,
+        },
+    ];
+    let r = kernel.apply(
+        &inputs,
+        &template,
+        (32, dv / 4, b * hv),
+        (32, dv / 4, 1),
+        &outs,
+        stream,
+    )?;
+    let mut it = r.into_iter();
+    let state_out = it.next().expect("validated decode output");
+    let gated = it.next().expect("validated decode output");
+    let conv_out = it.next().expect("validated decode output");
+    Ok((gated, state_out, conv_out))
+}
+/// Force `get_or_init` on every kernel static in this module (see
+/// `crate::kernels::warm_kernels`).
+pub fn warm() {
+    let _ = gdn_prep_kernel();
+    let _ = gdn_prep_fused_kernel();
+    let _ = gdn_two_row_kernel();
+    let _ = gdn_rows_kernel();
+    let _ = gdn_kernels();
+    let _ = gdn_decode_complete_kernel();
+}
+
+// Both replay kernels fully overwrite these outputs. Keep the ordinary pool's
+// completion requirements (no ordered-reuse scope) but omit the redundant CPU
+// zero fill of hundreds of MB of state per round. apply_into retains the leases.
+fn replay_output(shape: &[i32], dtype: Dtype, stream: &Stream) -> crate::error::Result<Array> {
+    let shape: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
+    let bytes = shape.iter().product::<usize>() * dtype.size_of();
+    let buffer = stream
+        .runtime()
+        .buffer_for_full_write(bytes, "gdn_replay_output")?;
+    Ok(Array::new(crate::array::Array::from_parts(
+        stream.runtime(),
+        buffer,
+        &shape,
+        dtype,
+    )))
+}
+
+/// Apply one compact-history recurrence kernel. Prefix selection and transaction
+/// lifetime belong to the model plan and engine, not the device.
+pub fn gdn_replay_restore(
+    base: &Array,
+    keys: &Array,
+    decay: &Array,
+    delta: &Array,
+    n: usize,
+    stream: &Stream,
+) -> crate::error::Result<Array> {
+    if keys.rank() != 4 || n > keys.dim(1) as usize {
+        return Err(crate::error::Error::msg("invalid delta replay prefix"));
+    }
+    static KERNEL: std::sync::OnceLock<std::result::Result<MetalKernel, String>> =
+        std::sync::OnceLock::new();
+    let kernel = KERNEL
+        .get_or_init(|| {
+            MetalKernel::new(
+                "gdn_replay_restore",
+                &["state_in", "k", "g", "delta", "T", "N"],
+                &["state_out"],
+                crate::kernel_source!("gdn/gdn_replay_restore.metal"),
+                "",
+                true,
+                false,
+            )
+            .map_err(|e| e.to_string())
+        })
+        .as_ref()
+        .map_err(|e| crate::error::Error::msg(e.clone()))?;
+    let t = t_scalar(keys.dim(1));
+    let n = t_scalar(n as i32);
+    let b = base.dim(0);
+    let hv = base.dim(1);
+    let dv = base.dim(2);
+    let dk = base.dim(3);
+    let template = [
+        TemplateArg::Dtype("InT", Dtype::Bfloat16),
+        TemplateArg::Int("Hk", keys.dim(2)),
+        TemplateArg::Int("Hv", hv),
+        TemplateArg::Int("Dv", dv),
+        TemplateArg::Int("Dk", dk),
+    ];
+    let output = replay_output(base.shape(), Dtype::Float32, stream)?;
+    let mut result = kernel.apply_into(
+        &[&base, &keys, &decay, &delta, &t, &n],
+        &template,
+        (32, dv / 2, b * hv),
+        (32, 4, 1),
+        &[OutputArg {
+            shape: base.shape().to_vec(),
+            dtype: Dtype::Float32,
+        }],
+        &[&output],
+        stream,
+    )?;
+    Ok(result.remove(0))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_replay_capture(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    g: &Array,
+    beta: &Array,
+    state: &Array,
+    stream: &Stream,
+) -> crate::error::Result<(Array, Array, Array)> {
+    // Supported shape of this kernel specialization; request policy is external.
+    if k.dim(0) != 1
+        || k.dim(3) != 128
+        || v.dim(3) != 128
+        || k.dim(1) <= 1
+        || q.dtype() != Dtype::Bfloat16
+        || k.dtype() != Dtype::Bfloat16
+        || v.dtype() != Dtype::Bfloat16
+        || state.dtype() != Dtype::Float32
+    {
+        return Err(crate::error::Error::msg(
+            "unsupported delta capture geometry",
+        ));
+    }
+    static KERNEL: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
+    let kernel = KERNEL
+        .get_or_init(|| {
+            MetalKernel::new(
+                "gdn_replay_capture",
+                &["q", "k", "v", "g", "beta", "state_in", "T"],
+                &["y", "state_out", "delta"],
+                crate::kernel_source!("gdn/gdn_replay_capture.metal"),
+                "",
+                true,
+                false,
+            )
+            .ok()
+        })
+        .as_ref()
+        .ok_or_else(|| crate::error::Error::msg("delta capture kernel unavailable"))?;
+    let b = k.dim(0);
+    let t = k.dim(1);
+    let hk = k.dim(2);
+    let dk = k.dim(3);
+    let hv = v.dim(2);
+    let dv = v.dim(3);
+    let state = &state.reshape(&[b, hv, dv, dk])?;
+    let template = [
+        TemplateArg::Dtype("InT", Dtype::Bfloat16),
+        TemplateArg::Dtype("StT", Dtype::Float32),
+        TemplateArg::Int("Dk", dk),
+        TemplateArg::Int("Dv", dv),
+        TemplateArg::Int("Hk", hk),
+        TemplateArg::Int("Hv", hv),
+    ];
+    let ts = t_scalar(t);
+    let outs = [
+        OutputArg {
+            shape: vec![b, t, hv, dv],
+            dtype: Dtype::Bfloat16,
+        },
+        OutputArg {
+            shape: state.shape().to_vec(),
+            dtype: Dtype::Float32,
+        },
+        OutputArg {
+            shape: vec![b, t, hv, dv],
+            dtype: Dtype::Float32,
+        },
+    ];
+    let allocated = outs
+        .iter()
+        .map(|out| replay_output(&out.shape, out.dtype, stream))
+        .collect::<crate::error::Result<Vec<_>>>()?;
+    let prealloc: Vec<_> = allocated.iter().collect();
+    let mut r = kernel
+        .apply_into(
+            &[q, k, v, g, beta, state, &ts],
+            &template,
+            (32, dv / 2, b * hv),
+            (32, 4, 1),
+            &outs,
+            &prealloc,
+            stream,
+        )?
+        .into_iter();
+    let y = r.next().expect("validated capture output");
+    let final_state = r.next().expect("validated final state output");
+    let delta = r.next().expect("validated delta output");
+    Ok((y, final_state, delta))
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+    #[test]
+    fn fused_verify_preserves_epilogue_and_every_snapshot() -> crate::error::Result<()> {
+        let stream = Stream::thread_local_or_default();
+        let values = |shape: &[i32], scale: f32, bias: f32, dtype| {
+            let len: i32 = shape.iter().product();
+            let data: Vec<f32> = (0..len)
+                .map(|i| (((i * 37 + 11) % 257) as f32 - 128.) * scale + bias)
+                .collect();
+            Array::from_slice(&data, shape).as_dtype(dtype)
+        };
+        for (b, t, hk, hv) in [
+            (1, 2, 4, 16),
+            (1, 3, 16, 48),
+            (1, 6, 16, 48),
+            (1, 7, 16, 48),
+            (1, 8, 16, 48),
+            (1, 16, 16, 48),
+            (2, 7, 16, 48),
+        ] {
+            let q = values(&[b, t, hk, 128], 0.0013, 0.0, Dtype::Bfloat16)?;
+            let k = values(&[b, t, hk, 128], 0.0017, 0.0, Dtype::Bfloat16)?;
+            let v = values(&[b, t, hv, 128], 0.0031, 0.0, Dtype::Bfloat16)?;
+            let g = values(&[b, t, hv], 0.0007, 0.90, Dtype::Float32)?;
+            let beta = values(&[b, t, hv], 0.0019, 0.5, Dtype::Float32)?;
+            let state = values(&[b, hv, 128, 128], 0.0023, 0.0, Dtype::Float32)?;
+            let weight = values(&[128], 0.0019, 1.0, Dtype::Bfloat16)?;
+            // Includes every BF16 gate encoding across the suite; retain a
+            // nonzero binding offset and a wider projection row stride.
+            let gates: Vec<_> = (0..b * t * (hv * 128 + 16))
+                .map(|i| half::bf16::from_bits(i as u16))
+                .collect();
+            let backing = Array::from_slice(&gates, &[b, t, hv * 128 + 16]);
+            let z = backing.index((.., .., 8..8 + hv * 128));
+            let (raw, expected_state) =
+                gdn_two_row(&q, &k, &v, &g, &beta, &state, true, &stream).unwrap();
+            for eps in [1e-6, 1e-5] {
+                let expected =
+                    crate::kernels::gated_rms_silu(&raw, &z, &weight, hv, 128, eps, &stream)
+                        .unwrap();
+                let (y, snapshots) = gdn_verify_fused(
+                    &q, &k, &v, &g, &beta, &state, &z, &weight, eps, None, &stream,
+                )
+                .unwrap();
+                for (a, e) in y
+                    .to_vec1::<half::bf16>()?
+                    .iter()
+                    .zip(expected.to_vec1::<half::bf16>()?)
+                {
+                    assert!(
+                        a.to_bits() == e.to_bits() || a.is_nan() && e.is_nan(),
+                        "B={b} T={t} eps={eps} {a:?} != {e:?}"
+                    );
+                }
+                assert_eq!(
+                    snapshots.to_vec1::<u32>()?,
+                    expected_state.to_vec1::<u32>()?,
+                    "B={b} T={t} capture"
+                );
+                let reference = y.to_vec1::<u16>()?;
+                let (reused, _) = gdn_verify_fused(
+                    &q,
+                    &k,
+                    &v,
+                    &g,
+                    &beta,
+                    &state,
+                    &z,
+                    &weight,
+                    eps,
+                    Some((&y, &snapshots)),
+                    &stream,
+                )
+                .unwrap();
+                assert_eq!(reused.to_vec1::<u16>()?, reference, "persistent output");
+                if b == 1 {
+                    // Production commits a rank-3 view of an accepted prefix.
+                    // The next round can reuse that same snapshot allocation.
+                    // Check both activation and bits through repeated commits,
+                    // including partial acceptance and nonzero input offsets.
+                    let (mut y, mut snapshots) = (reused, snapshots);
+                    for keep in [t, 1, t - 1, 2] {
+                        let committed = snapshots
+                            .index((keep - 1, .., .., ..))
+                            .contiguous()?
+                            .detach();
+                        assert_eq!(committed.shape(), [hv, 128, 128]);
+                        let (raw, expected_state) =
+                            gdn_two_row(&q, &k, &v, &g, &beta, &committed, true, &stream).unwrap();
+                        let expected = crate::kernels::gated_rms_silu(
+                            &raw, &z, &weight, hv, 128, eps, &stream,
+                        )
+                        .unwrap()
+                        .to_vec1::<half::bf16>()?;
+                        let expected_state = expected_state.to_vec1::<u32>()?;
+                        (y, snapshots) = gdn_verify_fused(
+                            &q,
+                            &k,
+                            &v,
+                            &g,
+                            &beta,
+                            &committed,
+                            &z,
+                            &weight,
+                            eps,
+                            Some((&y, &snapshots)),
+                            &stream,
+                        )
+                        .expect("fused verification must accept a committed rank-3 state");
+                        for (a, e) in y.to_vec1::<half::bf16>()?.iter().zip(expected) {
+                            assert!(
+                                a.to_bits() == e.to_bits() || a.is_nan() && e.is_nan(),
+                                "T={t} keep={keep} resumed epilogue"
+                            );
+                        }
+                        assert_eq!(
+                            snapshots.to_vec1::<u32>()?,
+                            expected_state,
+                            "T={t} keep={keep} resumed capture"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    #[test]
+    fn compact_replay_matches_every_snapshot_bitwise() -> crate::error::Result<()> {
+        let stream = Stream::thread_local_or_default();
+        let values = |shape: &[i32], scale: f32, bias: f32, dtype| {
+            let len: i32 = shape.iter().product();
+            let data: Vec<f32> = (0..len)
+                .map(|i| (((i * 37 + 11) % 257) as f32 - 128.) * scale + bias)
+                .collect();
+            Array::from_slice(&data, shape).as_dtype(dtype)
+        };
+        for (hk, hv) in [(4, 16), (16, 48)] {
+            for t in [2, 3, 7, 8, 12, 16] {
+                let q = values(&[1, t, hk, 128], 0.0013, 0.0, Dtype::Bfloat16)?;
+                let k = values(&[1, t, hk, 128], 0.0017, 0.0, Dtype::Bfloat16)?;
+                let v = values(&[1, t, hv, 128], 0.0031, 0.0, Dtype::Bfloat16)?;
+                let g = values(&[1, t, hv], 0.0007, 0.90, Dtype::Float32)?;
+                let beta = values(&[1, t, hv], 0.0019, 0.5, Dtype::Float32)?;
+                let state = values(&[1, hv, 128, 128], 0.0023, 0.0, Dtype::Float32)?;
+                let (expected_y, snapshots) =
+                    gdn_two_row(&q, &k, &v, &g, &beta, &state, true, &stream)
+                        .expect("snapshot kernel");
+                let (y, _, delta) = gdn_replay_capture(&q, &k, &v, &g, &beta, &state, &stream)
+                    .expect("replay kernel");
+                assert_eq!(
+                    y.to_vec1::<u16>()?,
+                    expected_y.to_vec1::<u16>()?,
+                    "T={t} output"
+                );
+                for n in (0..=t).rev().chain(0..=t) {
+                    let expected = if n == 0 {
+                        state.clone()
+                    } else {
+                        snapshots.index((n - 1, .., .., ..)).contiguous()?
+                    };
+                    assert_eq!(
+                        gdn_replay_restore(&state, &k, &g, &delta, n as usize, &stream)?
+                            .to_vec1::<u32>()?,
+                        expected.to_vec1::<u32>()?,
+                        "T={t}, prefix={n}"
+                    );
+                }
+                assert!(
+                    gdn_replay_restore(&state, &k, &g, &delta, t as usize + 1, &stream).is_err()
+                );
+            }
+        }
+        Ok(())
+    }
+}

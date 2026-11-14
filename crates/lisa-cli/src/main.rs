@@ -1,18 +1,21 @@
+use lisa_engine::core::config::ReadConfig;
+
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use lisa_models::qwen4::config;
+
 use lisa_engine::cli::{DepthArg, ModelDir, build_sampler};
-use lisa_engine::core::mem::mlx_mem_line;
-use lisa_engine::models::LanguageModel;
-use lisa_engine::models::laya::{Laya, LayaDevice};
-use lisa_engine::models::qwen4::config;
-use lisa_engine::models::qwen4::tower as model;
-use lisa_engine::{batch, generate, session, tokenizer};
+use lisa_serve::application::memory_line as mlx_mem_line;
+use lisa_engine::language::LanguageModel;
+use lisa_engine::laya::Laya;
+use lisa_engine::{generation as generate, tokenizer};
+use lisa_serve::application::{Batch, Session};
 use lisa_serve as serve;
 
 /// These commands currently use Qwen4-specific loading and turn framing.
 fn require_qwen4_command(model: &std::path::Path, command: &str) -> anyhow::Result<()> {
-    let family = lisa_engine::models::model_type_of(model)?;
+    let family = lisa_engine::checkpoint::model_type_of(model)?;
     anyhow::ensure!(
         matches!(family.as_str(), "qwen4_exp" | "qwen4_exp_text"),
         "`lisa {command}` currently supports Qwen4 checkpoints; use `run` or `serve` for {family}"
@@ -22,7 +25,7 @@ fn require_qwen4_command(model: &std::path::Path, command: &str) -> anyhow::Resu
 
 fn tokenize(model: &std::path::Path, prompt: &str, raw: bool) -> anyhow::Result<()> {
     let tok = tokenizer::Tokenizer::load(model)?;
-    if lisa_engine::models::model_type_of(model)? == "deepseek41" {
+    if lisa_engine::checkpoint::model_type_of(model)? == "deepseek41" {
         let ids = if raw {
             tok.encode_plain(prompt)?
         } else {
@@ -32,7 +35,7 @@ fn tokenize(model: &std::path::Path, prompt: &str, raw: bool) -> anyhow::Result<
         return Ok(());
     }
     let is_glm = matches!(
-        lisa_engine::models::model_type_of(model)?.as_str(),
+        lisa_engine::checkpoint::model_type_of(model)?.as_str(),
         "glm5_next" | "glm5_next_text" | "glm5-next"
     );
     let text = if raw {
@@ -402,7 +405,7 @@ enum Command {
 fn main() -> anyhow::Result<()> {
     lisa_engine::ttft_init();
     let result = run();
-    lisa_mlx::trace::finish();
+    lisa_metal::trace::finish();
     result
 }
 
@@ -423,8 +426,8 @@ fn run() -> anyhow::Result<()> {
             let header = Header::open(model)?;
             println!("GGUF architecture: {}", header.architecture()?);
             if header.architecture()? == "deepseek41" {
-                let config = lisa_engine::models::deepseek41::config::Config::from_header(&header)?;
-                let engram = lisa_engine::models::deepseek41::engram::Layout::from_header(&header)?;
+                let config = lisa_engine::checkpoint::deepseek41::config(&header)?;
+                let engram = lisa_engine::checkpoint::deepseek41::engram_layout(&header)?;
                 println!(
                     "{} layers, {} hidden, {}/{} active experts",
                     config.layers, config.width, config.selected_experts, config.experts
@@ -439,8 +442,15 @@ fn run() -> anyhow::Result<()> {
             } else {
                 let package = Package::open(model)?;
                 println!("{}", package.summary()?);
+                if header.architecture()? == "qwen35" {
+                    let resident = lisa_engine::bindings::qwen35_gguf::inspect(model)?;
+                    println!(
+                        "Qwen 27B GGUF: 64 trunk layers, embedded MTP, text only; {:.2} GiB resident weights. Experimental F32 graph.",
+                        resident as f64 / (1u64 << 30) as f64
+                    );
+                }
                 if header.architecture()? == "glm5-next" {
-                    let c = lisa_engine::models::glm53::gguf::weights::validate(&package)?;
+                    let c = lisa_engine::checkpoint::glm53::validate(&package)?;
                     println!(
                         "{} trunk layers, {} hidden, {}/{} active experts; embedded MTP block",
                         c.num_hidden_layers,
@@ -453,13 +463,11 @@ fn run() -> anyhow::Result<()> {
                     );
                 }
                 if header.architecture()? == "deepseek41" {
-                    use lisa_engine::models::deepseek41::{
-                        config::Config, engram::Layout, weights::WeightPlan,
-                    };
+                    use lisa_engine::bindings::deepseek41_weights::WeightPlan;
                     let plan = WeightPlan::inspect(
                         &package,
-                        &Config::from_header(&header)?,
-                        &Layout::from_header(&header)?,
+                        &lisa_engine::checkpoint::deepseek41::config(&header)?,
+                        &lisa_engine::checkpoint::deepseek41::engram_layout(&header)?,
                     )?;
                     println!(
                         "Resident payload: {:.2} GiB; disk-only Engram: {:.2} GiB",
@@ -479,15 +487,19 @@ fn run() -> anyhow::Result<()> {
     }
     // Resolve the device backend: `LISA_DEVICE`, else Metal when present, else
     // CPU. Announce a non-default (CPU) selection.
-    let backend = lisa_mlx::backend::Backend::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
-    if backend != lisa_mlx::backend::Backend::Metal {
+    let explicit_device = match &cli.command {
+        Command::Decide { device, .. } => device.as_deref(),
+        _ => None,
+    };
+    let backend = lisa_serve::application::device::Backend::from_options(explicit_device)?;
+    if backend != lisa_serve::application::device::Backend::Metal {
         eprintln!("device: {}", backend.name());
     }
-    lisa_mlx::ffi::install_error_handler();
+    lisa_metal::ffi::install_error_handler();
     // Cap how far the Metal buffer pool may grow past load-steady-state before
     // a sweep is forced. Without a cap a pipelined prefill or MTP round pins
     // every temporary it ever made (buffers are only released at a flush).
-    let _ = lisa_mlx::memory::set_cache_limit(8 << 30);
+    let _ = lisa_metal::memory::set_cache_limit(8 << 30);
     match cli.command {
         Command::Prepare { .. } => unreachable!("preparation is handled before runtime setup"),
         Command::Decide {
@@ -500,27 +512,16 @@ fn run() -> anyhow::Result<()> {
             max_len,
             temperature,
             temperature_by_options,
-            device,
+            device: _,
             top_k,
         } => {
-            let backend =
-                match device.as_deref() {
-                    Some(d) => lisa_mlx::backend::Backend::from_name(d)
-                        .map_err(|e| anyhow::anyhow!("{e}"))?,
-                    None => lisa_mlx::backend::Backend::from_env()
-                        .map_err(|e| anyhow::anyhow!("{e}"))?,
-                };
-            let model_type = lisa_engine::models::model_type_of(&model)?;
+            let model_type = lisa_engine::checkpoint::model_type_of(&model)?;
             anyhow::ensure!(
                 model_type == "laya",
                 "{} has model_type {model_type:?}, not a decision model",
                 model.display()
             );
-            let dev = match backend {
-                lisa_mlx::backend::Backend::Metal => LayaDevice::Metal,
-                lisa_mlx::backend::Backend::Cpu => LayaDevice::Cpu,
-            };
-            let mut laya = Laya::load_device(&model, dev)?;
+            let mut laya = Laya::load_on(&model, backend.open()?, backend.laya_arithmetic())?;
             let by_options = parse_temp_by_options(&temperature_by_options)?;
             laya.apply_overrides(head_max_len, max_len, temperature, &by_options)?;
 
@@ -559,7 +560,7 @@ fn run() -> anyhow::Result<()> {
         }
         Command::Inspect { model, .. } => {
             let t0 = std::time::Instant::now();
-            let _tower = lisa_engine::models::load_dir(&model)?;
+            let _tower = lisa_serve::application::loading::load_dir(&model)?;
             println!("loaded in {:.1}s", t0.elapsed().as_secs_f64());
             mlx_mem_line("inspect");
             Ok(())
@@ -579,7 +580,7 @@ fn run() -> anyhow::Result<()> {
         } => {
             require_qwen4_command(&model, "batch")?;
             let config = config::ModelConfig::from_json(&model.join("config.json"))?;
-            let mut tower = model::Tower::load(&model, config)?;
+            let mut tower = lisa_serve::application::load_qwen4(&model, config)?;
             let tok = tokenizer::Tokenizer::load(&model)?;
             generate::set_eos_ids_for_model(tok.im_end_ids.clone(), &tower);
             let texts: Vec<String> = prompts
@@ -603,7 +604,7 @@ fn run() -> anyhow::Result<()> {
             let mut acc: Vec<String> = vec![String::new(); ids.len()];
             let mut sampler = build_sampler(temperature, top_k, top_p, min_p, rep_penalty, seed);
             let (_b, out) =
-                batch::Batch::generate(&mut tower, &ids, max_tokens, &mut sampler, &mut |s, t| {
+                Batch::generate(&mut tower, &ids, max_tokens, &mut sampler, &mut |s, t| {
                     acc[s].push_str(&tok.decode(&[t])?);
                     Ok(())
                 })?;
@@ -635,7 +636,7 @@ fn run() -> anyhow::Result<()> {
             let pld = lisa_engine::cli::pld_enable(pld, pld_depth);
             let config = config::ModelConfig::from_json(&model.join("config.json"))?;
             let t0 = std::time::Instant::now();
-            let mut tower = model::Tower::load(&model, config)?;
+            let mut tower = lisa_serve::application::load_qwen4(&model, config)?;
             eprintln!("loaded in {:.1}s", t0.elapsed().as_secs_f64());
             let tok = tokenizer::Tokenizer::load(&model)?;
             generate::set_eos_ids_for_model(tok.im_end_ids.clone(), &tower);
@@ -647,7 +648,7 @@ fn run() -> anyhow::Result<()> {
             )?;
             tower.warmup(&warm)?;
 
-            let mut session = session::Session::new(&mut tower);
+            let mut session = Session::new(&mut tower);
             let mut turn = 0usize;
             let stdin = std::io::stdin();
             loop {
@@ -676,7 +677,7 @@ fn run() -> anyhow::Result<()> {
                         .copied()
                         .chain(suffix_ids.iter().copied())
                         .collect();
-                    let (eq, dlog, dhid) = session::verify_incremental(&mut tower, &all, verify)?;
+                    let (eq, dlog, dhid) = lisa_engine::session_check::verify_incremental(&mut tower, &all, verify)?;
                     eprintln!(
                         "[verify] chunk={verify} argmax_equal={eq} logit_diff={dlog:.6} hidden_diff={dhid:.6}"
                     );
@@ -778,7 +779,7 @@ fn run() -> anyhow::Result<()> {
                 cfg.gen_defaults.temperature, cfg.gen_defaults.top_p, cfg.gen_defaults.top_k
             );
             // Non-generative decision models get their own endpoint.
-            if lisa_engine::models::model_type_of(&model)? == "laya" {
+            if lisa_engine::checkpoint::model_type_of(&model)? == "laya" {
                 anyhow::ensure!(
                     ctx_size.is_none(),
                     "--ctx-size requires a language model with configurable context; omit it for Laya"
@@ -788,8 +789,8 @@ fn run() -> anyhow::Result<()> {
                     "--mtp-exact-sampling requires a GLM model with target MTP"
                 );
                 let t0 = std::time::Instant::now();
-                match lisa_engine::models::load_dir(&model)? {
-                    lisa_engine::Loaded::Decision(m) => {
+                match lisa_serve::application::loading::load_dir(&model)? {
+                    lisa_serve::application::Loaded::Decision(m) => {
                         eprintln!("loaded in {:.1}s", t0.elapsed().as_secs_f64());
                         return serve::run_decisions(m, cfg);
                     }
@@ -797,10 +798,10 @@ fn run() -> anyhow::Result<()> {
                 }
             }
             let t0 = std::time::Instant::now();
-            let mut tower = match lisa_engine::models::load_dir(&model)? {
-                lisa_engine::Loaded::Language(m) => m,
-                lisa_engine::Loaded::Image(pipeline) => return serve::images::run(pipeline, cfg),
-                lisa_engine::Loaded::Decision(_) => unreachable!("model_type was not laya"),
+            let mut tower = match lisa_serve::application::loading::load_dir(&model)? {
+                lisa_serve::application::Loaded::Language(m) => m,
+                lisa_serve::application::Loaded::Image(pipeline) => return serve::images::run(pipeline, cfg),
+                lisa_serve::application::Loaded::Decision(_) => unreachable!("model_type was not laya"),
             };
             if let Some(capacity) = ctx_size {
                 tower.set_context_capacity(capacity)?;
@@ -820,7 +821,7 @@ fn run() -> anyhow::Result<()> {
             // the session must NOT change the identity (that emptied the prefix
             // cache mid-run — measured 683/710 resumes → 0 after one long
             // request).
-            let _ = lisa_mlx::runtime::kernel_law();
+            let _ = lisa_metal::runtime::kernel_law();
             mlx_mem_line("serve-warm");
             serve::run(tower.as_mut(), &tok, cfg)
         }
@@ -836,11 +837,11 @@ fn run() -> anyhow::Result<()> {
             prompt_is_caption,
         } => {
             anyhow::ensure!(
-                backend == lisa_mlx::backend::Backend::Metal,
+                backend == lisa_serve::application::device::Backend::Metal,
                 "image generation requires the Metal backend"
             );
-            let pipeline = lisa_engine::models::image_generation::Pipeline::load(&model)?;
-            let options = lisa_engine::models::image_generation::Options {
+            let pipeline = lisa_serve::application::ImagePipeline::load(lisa_serve::application::context()?, &model)?;
+            let options = lisa_engine::image_generation::Options {
                 width,
                 height,
                 steps,
@@ -891,10 +892,10 @@ fn run() -> anyhow::Result<()> {
             }
             let pld = lisa_engine::cli::pld_enable(pld, pld_depth);
             let t0 = std::time::Instant::now();
-            let mut tower = match lisa_engine::models::load_dir(&model)? {
-                lisa_engine::models::Loaded::Language(m) => m,
-                lisa_engine::models::Loaded::Image(_)
-                | lisa_engine::models::Loaded::Decision(_) => {
+            let mut tower = match lisa_serve::application::loading::load_dir(&model)? {
+                lisa_serve::application::loading::Loaded::Language(m) => m,
+                lisa_serve::application::loading::Loaded::Image(_)
+                | lisa_serve::application::loading::Loaded::Decision(_) => {
                     anyhow::bail!(
                         "run expects a language model; use lisa image for image generation"
                     )
@@ -918,10 +919,10 @@ fn run() -> anyhow::Result<()> {
                 generate::set_eos_ids(Vec::new());
             }
 
-            let is_glm = lisa_engine::models::model_type_of(&model)?
+            let is_glm = lisa_engine::checkpoint::model_type_of(&model)?
                 .as_str()
                 .starts_with("glm5");
-            let is_deepseek = lisa_engine::models::model_type_of(&model)? == "deepseek41";
+            let is_deepseek = lisa_engine::checkpoint::model_type_of(&model)? == "deepseek41";
             anyhow::ensure!(
                 !is_deepseek || (pld == 0 && !router),
                 "DeepSeek GGUF currently supports serial generation; omit --pld and --router"
@@ -947,8 +948,8 @@ fn run() -> anyhow::Result<()> {
             let images = image
                 .iter()
                 .map(|path| {
-                    let url = lisa_engine::models::vision::file_data_url(path)?;
-                    lisa_engine::models::vision::decode_data_url(&url)
+                    let url = lisa_engine::vision::file_data_url(path)?;
+                    lisa_engine::vision::decode_data_url(&url)
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
             if !images.is_empty() {
@@ -1079,7 +1080,7 @@ fn run() -> anyhow::Result<()> {
                 pld = 0;
             }
             let (generated, stats) = if let Some(md) = mdepth {
-                let mut sess = session::Session::new(&mut *tower);
+                let mut sess = Session::new(&mut *tower);
                 let t = std::time::Instant::now();
                 let mtp_sampler =
                     if !tower.has_target_mtp() && sampler.greedy() && !sampler.mtp_exact_sampling {

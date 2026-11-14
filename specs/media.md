@@ -2,17 +2,17 @@
 
 All inference runs inside the native Rust/Metal engine. Python reference
 programs are validation tools, not runtime dependencies. Image pipelines have
-their own measured numerical bounds; they do not relax text-model STRICT
+their own numerical bounds; they do not relax text-model STRICT
 requirements.
 
 ## Image input
 
-| Text path | Vision support | Recorded evidence |
-| --- | --- | --- |
-| Qwen3.5 hybrid | Dense Qwen3-VL tower, merger and text M-RoPE | 0.8B encoder fixture: 65,536/65,536 values exact against MLX, twice |
-| Qwen4 hybrid | Same integration family | Full Qwen4 checkpoint not exercised |
-| Legacy MLX GLM | RMSNorm/QK-norm tower, 2D RoPE, downsample and merger | Integration works; final embedding cosine 0.98229, RMS 0.002855; parity open |
-| GLM / DeepSeek GGUF | Unsupported | No GGUF vision package/runtime |
+| Text path | Vision support / limit |
+| --- | --- |
+| Qwen dense hybrid | Dense Qwen3-VL tower, merger and text M-RoPE |
+| Qwen Flash-Next | Integrated; full-checkpoint vision qualification remains open |
+| Legacy MLX GLM | RMSNorm/QK-norm tower, 2D RoPE, downsample and merger; numerical parity remains open |
+| GLM / DeepSeek GGUF | Unsupported |
 
 Vision weights must be present alongside language weights. Dense projections
 are supported; quantized vision and DeepStack fail explicitly. GLM inserts
@@ -35,10 +35,24 @@ MTP, PLD, wave batching and token-only prefix reuse are bypassed; `session_id`
 and standalone image token-count requests are rejected. Clear image embeddings
 on success and error. The UI retains history and attachment copies locally.
 
-The GLM vision comparison first diverged in attention: 14/409,600 bf16 values,
-maximum 0.001953125, with errors accumulating through 24 blocks. Correct color
-or object answers do not establish numerical parity. The image-input reference
-was MLX-Serve `6c4306145b7331f6b962b97e145fd9ac46e9e14a`.
+GLM vision has an unresolved attention/embedding discrepancy; successful
+recognition is not numerical parity. Its execution reference is MLX-Serve
+`6c4306145b7331f6b962b97e145fd9ac46e9e14a`.
+
+## Desktop voice chat
+
+The native macOS composer uses Apple's Speech framework for microphone
+dictation and AVFAudio speech synthesis for spoken replies. Dictation updates
+the composer with partial and final text; the user reviews and sends it as an
+ordinary text turn. The **Read replies** control speaks completed assistant
+answers. Chat history stores the transcript and answer text; captured audio is
+not saved.
+
+Recognition requires microphone and speech-recognition permission and is
+restricted to Apple's on-device mode. If the current system language is not
+available for on-device recognition, voice input reports that it cannot start
+instead of sending audio to a network service. Voice is currently a desktop UI
+feature; the CLI and HTTP APIs continue to accept text and image input.
 
 ## Native text-to-image models
 
@@ -48,8 +62,8 @@ was MLX-Serve `6c4306145b7331f6b962b97e145fd9ac46e9e14a`.
 | `mlx-community/flux2-klein-9b-4bit` | MLX 4-bit, group 64 | 4 | Qwen3-8B; 8 double + 24 single blocks |
 | `black-forest-labs/flux-3-image-klein` | BF16 | 16 | Qwen3-VL-4B text encoder; 5 double + 28 joint blocks |
 
-The [FLUX.2](../crates/lisa-engine/src/models/flux2/) and
-[FLUX 3](../crates/lisa-engine/src/models/flux3/) implementations load encoder,
+The [FLUX.2](../crates/lisa-engine/src/bindings/flux2/) and
+[FLUX 3](../crates/lisa-engine/src/bindings/flux3/) implementations load encoder,
 denoiser and VAE stages sequentially. Selecting an image model releases the
 chat model. Admission includes stage weights/layout copies and conservative
 8 GiB scratch; actual allocations still obey the runtime budget. FLUX 3 reserves
@@ -59,7 +73,7 @@ Shared surface: CLI `image`, desktop Generate and
 `POST /v1/images/generations`. One PNG per request, default 512×512, each side
 64..1024 and a multiple of 32. FLUX.2 accepts 1..50 steps and truncates encoding
 to 512 tokens; prompt input is bounded to 16,384 bytes. HTTP returns `b64_json`.
-See [generation options](../crates/lisa-engine/src/models/image_generation.rs)
+See [generation options](../crates/lisa-engine/src/image_generation.rs)
 for model-specific validation.
 
 SplitMix64/Box–Muller noise makes a LISA seed reproducible within this engine;
@@ -96,33 +110,15 @@ official BFL 9B upsampler. `--prompt-is-caption` or HTTP
 | FLUX 3 checkpoint | `09561231f44e41381c461caf53d5452005a60ac9` |
 | FLUX 3 execution source | `bfc8889a4497f846416f253a3972a1941ac698b9` |
 
-## Validation scope
+## Validation requirements
 
-Recorded November 3, with independent fixed inputs at each stage. Encoder error
-is not carried into the denoiser comparison. BF16 stage acceptance was relative
-RMSE ≤0.03; f32 decoder ≤0.001. Both external suites passed twice.
-
-| Model / stage | Relative RMSE | Workload |
-| --- | ---: | --- |
-| Klein 9B encoder | 0.00758361 | 512 text tokens |
-| Klein 9B denoiser | 0.01481519 | 24 image tokens |
-| FLUX 3 encoder | 0.00267177 | 80 text tokens |
-| FLUX 3 denoiser | 0.02010682 | 24 image tokens |
-| FLUX 3 decoder | 0.00000332 | 64×96 output |
-
-Fixed-seed image reproducibility, HTTP parameter rejection, native UI generation
-and image-card display were exercised. Qwen 27B text goldens passed twice.
-Small stage fixtures and a few recognizable images do not certify broad image
-quality or end-to-end numerical parity. Controlled cross-engine throughput
-remains unmeasured.
-
-The dense layout cache removes repeated transposed-weight materialization
-without changing values. A reported FLUX 3 219.67→83.53-second observation had
-a competing CPU build in the baseline; it is diagnostic, not a speedup verdict.
+Use independent fixed inputs for each stage, so encoder errors do not contaminate
+denoiser comparisons. Current stage tolerances are relative RMSE <=0.03 for BF16
+and <=0.001 for the F32 decoder; these are not text-model STRICT exceptions.
+Full-checkpoint quality, larger shapes and controlled cross-engine performance
+remain separate acceptance work.
 
 External stage tests use `LISA_FLUX2_MODEL`, `LISA_FLUX2_FIXTURES`,
 `LISA_FLUX3_MODEL` and `LISA_FLUX3_FIXTURES`. The `reference.py` beside each
-implementation generates inputs; explicitly enabled tests fail when data is
-missing. Run sequentially under the [validation protocol](performance.md#validation-protocol).
-Retain fixture hashes, environment versions and exact measurements with each
-external capture set before using it as a reproducible comparison.
+binding generates inputs. Enabled tests fail if required data is missing.
+Follow the [validation protocol](performance.md#validation-protocol).

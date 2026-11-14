@@ -1,0 +1,18 @@
+{
+  "repository": "https://github.com/ggml-org/llama.cpp",
+  "revision": "18ab62a8ec5144ae5d2f65e78374ba69652d75dd",
+  "sources": {
+    "ggml-common.h": "0061131b615c5721fc88a78feeb22c1f8c450f1c2646a317d80796a653bf595c",
+    "ggml-metal/ggml-metal-impl.h": "a792d74277699289d76bad369f5402d0985e4e40645c8630fe21ca7f10c34a3c",
+    "ggml-metal/kernels/mul_mv.metal": "67d12dfe7a12fa4b042089c89ed5a7096dc6a2c12840e6c3ba11799b3b239578",
+    "ggml-metal/kernels/gated_delta_net.metal": "2d6b4c1e580918f07ad53cd9fec4400f58d92239c7c40f36f747a9fbf469056b"
+  },
+  "adaptation": "Selected packed matvec implementation bodies and GGML block tables retained verbatim. LISA entry points bind the original ABI. Split mode disabled; complete output row tiles required.",
+  "oracle": "models/gguf/oracle.rs: GGML C dequantizers from the pinned revision, finite deterministic xorshift32 blocks, independent f64 dot products at K=2048,5120,6144,10240,17408; 8 output rows, 2 input rows per format. F32 projection tolerance 0.002 + 2e-5*abs(reference).",
+  "pointwise_fusions": {
+    "source": "pointwise.metal",
+    "origin": "LISA F32 Qwen graph: ops::conv1d followed by SiLU; threshold-20 softplus/decay and sigmoid; SiLU products.",
+    "contract": "SafeNoLang (Safe + Precise, default language target); contraction and reassociation disabled. Retain four convolution products and left-to-right additions, stable sigmoid, separate F32 products and softplus threshold. Projection and recurrent kernels are unchanged.",
+    "validation": "Bitwise comparisons against the original GPU chains: convolution at 1/2/3/7/16 rows and 8/10240 channels; gates and products on every finite bf16 value represented in F32 plus 65536 full-mantissa samples and threshold neighbors; nonzero offsets and invalid layouts. Full-checkpoint serial/prefill, rollback and MTP replay checks repeated."
+  }
+}

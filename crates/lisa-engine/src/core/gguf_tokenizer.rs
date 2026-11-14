@@ -446,7 +446,7 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "../models/deepseek41/tokenizer_tests.rs"]
+#[path = "gguf_tokenizer_tests.rs"]
 mod checkpoint_tests;
 
 #[cfg(test)]

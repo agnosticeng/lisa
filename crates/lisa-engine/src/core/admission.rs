@@ -15,9 +15,9 @@ impl MemoryBudget {
         Self { budget, used: 0 }
     }
 
-    /// Budget from the host: `LISA_RAM_CAP_GB`, else physical RAM − 8 GiB.
+    /// Budget from the host: physical RAM − 8 GiB, lowered by `LISA_RAM_CAP_GB`.
     pub fn from_host() -> Self {
-        Self::new(lisa_mlx::memory::ram_budget())
+        Self::new(crate::memory::ram_budget())
     }
 
     pub fn budget(&self) -> usize {

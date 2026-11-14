@@ -1,10 +1,14 @@
 [workspace]
 members = [
+    "crates/lisa-backend",
+    "crates/lisa-cpu",
+    "crates/lisa-models",
     "crates/lisa-gguf",
     "crates/lisa-engine",
     "crates/lisa-serve",
     "crates/lisa-cli",
     "crates/lisa-bench",
+    "crates/lisa-metal",
     "crates/lisa-mlx",
     "crates/lisa-ui",
 ]
@@ -16,6 +20,9 @@ edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
+lisa-backend = { path = "crates/lisa-backend" }
+lisa-cpu = { path = "crates/lisa-cpu" }
+lisa-models = { path = "crates/lisa-models" }
 anyhow = "1.0.104"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
@@ -39,6 +46,7 @@ sha2 = "0.10"
 tokenizers = "0.23.2"
 lisa-gguf = { path = "crates/lisa-gguf" }
 lisa-engine = { path = "crates/lisa-engine" }
+lisa-metal = { path = "crates/lisa-metal" }
 lisa-mlx = { path = "crates/lisa-mlx" }
 lisa-serve = { path = "crates/lisa-serve" }
 
@@ -60,11 +68,45 @@ split-debuginfo = "packed"
 opt-level = "z"
 
 [profile.dist.package.minijinja]
-opt-level = "s"
+opt-level = "z"
 
 # Network transfer code favors app size; inference profiles are unchanged.
 [profile.dist.package.hf-hub]
 opt-level = "z"
 
 [profile.dist.package.ureq]
+opt-level = "z"
+
+# TLS transfer code shares the networking size policy used by the desktop bundle.
+[profile.dist.package.rustls]
+opt-level = "z"
+
+# URL/IDNA processing is used only by Hub downloads, not model tokenization.
+[profile.dist.package.url]
+opt-level = "z"
+
+[profile.dist.package.idna]
+opt-level = "z"
+
+[profile.dist.package.idna_adapter]
+opt-level = "z"
+
+[profile.dist.package.icu_normalizer]
+opt-level = "z"
+
+[profile.dist.package.icu_properties]
+opt-level = "z"
+
+[profile.dist.package.rustls-webpki]
+opt-level = "z"
+
+# Model schemas and symbolic plan construction contain no device execution.
+[profile.dist.package.lisa-models]
+opt-level = "s"
+
+# Checkpoint parsing and chat-template rendering contain no device execution.
+[profile.dist.package.lisa-mlx]
+opt-level = "z"
+
+[profile.dist.package.hf-chat-template]
 opt-level = "z"

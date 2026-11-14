@@ -2,7 +2,7 @@
 //! not certify parity with DS4's wide prefill or optimized decode schedule.
 
 use anyhow::{Context, Result, ensure};
-use lisa_engine::models::deepseek41::{self, graph::Graph, state::State, tokenizer::Tokenizer};
+use lisa_bench::bindings::deepseek41::{self, graph::Graph, state::State, tokenizer::Tokenizer};
 use lisa_gguf::Package;
 use std::{io::Write, path::PathBuf, time::Instant};
 
@@ -41,7 +41,7 @@ pub struct Args {
     output: Option<PathBuf>,
 }
 
-fn greedy(logits: &lisa_mlx::Array) -> Result<u32> {
+fn greedy(logits: &lisa_metal::Array) -> Result<u32> {
     let values = logits.as_slice::<f32>();
     ensure!(
         !values.is_empty() && values.iter().all(|v| v.is_finite()),
@@ -102,13 +102,18 @@ pub fn run(args: Args) -> Result<()> {
         deepseek41::DS4_REVISION
     );
     let start = Instant::now();
-    let mut graph = Graph::load(&package)?;
+    let mut graph = Graph::load(lisa_bench::metal_context::execution_context(), &package)?;
     let load_seconds = start.elapsed().as_secs_f64();
     eprintln!(
         "DeepSeek: mapped {:.2} GiB resident weights; Engram stays on disk",
         graph.mapped_weight_bytes() as f64 / (1u64 << 30) as f64
     );
-    let mut state = State::new(args.ctx_size)?;
+    let mut state = State::new(
+        lisa_bench::metal_context::execution_context()
+            .device()
+            .clone(),
+        args.ctx_size,
+    )?;
     let capture = args
         .capture
         .as_ref()

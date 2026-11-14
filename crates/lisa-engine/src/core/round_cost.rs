@@ -19,9 +19,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::cache::{IndexerTape, LayerCache};
-use crate::models::LanguageModel;
-use crate::models::speculate::argmax_id;
+use crate::language::LanguageModel;
+use crate::speculative_runtime::{SpeculativeRuntime, SpeculativeTensor};
 
 /// Sentinel depth used by the CLI/serve plumbing to mean "EV auto" (the
 /// `--depth auto` default). Any real depth stays 0 or 2..=6.
@@ -541,8 +540,8 @@ pub fn default_path() -> PathBuf {
 /// The KV state is built by prefilling `tokens` (the caller builds a synthetic
 /// prompt of the target length), then timing over the live caches. Caches are
 /// rolled back between verify passes, so the widths are comparable.
-pub fn measure_at_kv(
-    tower: &mut dyn LanguageModel,
+pub fn measure_at_kv<R: SpeculativeRuntime>(
+    tower: &mut dyn LanguageModel<R>,
     tokens: &[u32],
     widths: &[u32],
     steps: usize,
@@ -555,17 +554,17 @@ pub fn measure_at_kv(
         "round-cost measurement needs a model with an MTP drafter"
     );
     let warm: usize = 4;
-    let mut sess = crate::core::session::Session::new(tower);
+    let mut sess = crate::conversation::Conversation::new(tower);
     let ctx_len = tower.context_window();
 
     // --- serial S=1 step ---
     let (logits, _multi) = sess.feed_multi(tower, tokens)?;
-    let mut tok = argmax_id(&logits)?;
+    let mut tok = logits.argmax_id()?;
     let mut serial: Vec<f64> = Vec::new();
     for i in 0..(steps + warm) {
         let t0 = std::time::Instant::now();
         let logits = sess.decode_token(tower, tok)?;
-        let id = argmax_id(&logits)?;
+        let id = logits.argmax_id()?;
         let dt = t0.elapsed().as_secs_f64() * 1e3;
         if i >= warm {
             serial.push(dt);
@@ -577,19 +576,19 @@ pub fn measure_at_kv(
     // A fresh multi row from a capture forward (the [1,1] last row).
     let (_, m1) = {
         tower.set_context_tails(vec![sess_tail(&sess, ctx_len)]);
-        let arr = lisa_mlx::Array::from_slice(&[tok as i32], &[1i32, 1]);
+        let arr = tower.runtime().tokens(&[tok as i32], &[1i32, 1])?;
         // NOTE: this forward advances the full cache by one row; the draft
         // timings below do not touch the trunk caches, so the offset drift is
         // irrelevant for the verify passes (they snapshot/restore around each
         // pass and never rely on absolute offsets).
         let (mixed, multi) = tower.forward_capture(&arr, Some(&mut sess.caches), true)?;
         let logits = tower.head(&mixed)?;
-        let _ = argmax_id(&logits)?;
+        let _ = logits.argmax_id()?;
         ((), multi)
     };
     let mut draft: Vec<f64> = Vec::new();
     {
-        let mut tok_arr = lisa_mlx::Array::from_slice(&[tok as i32], &[1i32, 1]);
+        let mut tok_arr = tower.runtime().tokens(&[tok as i32], &[1i32, 1])?;
         let mut mul = m1.reshape(&[1, 1, m1.dim(-1)])?;
         for i in 0..(steps + warm) {
             let t0 = std::time::Instant::now();
@@ -617,7 +616,7 @@ pub fn measure_at_kv(
         let depth = (s.max(2) as usize).saturating_sub(1).min(6);
         let mut times: Vec<f64> = Vec::new();
         for i in 0..(steps + warm) {
-            let mut d_arr = lisa_mlx::Array::from_slice(&[tok as i32], &[1i32, 1]);
+            let mut d_arr = tower.runtime().tokens(&[tok as i32], &[1i32, 1])?;
             let mut m_arr = m1.reshape(&[1, 1, m1.dim(-1)])?;
             let t0 = std::time::Instant::now();
             for _ in 0..depth {
@@ -642,29 +641,24 @@ pub fn measure_at_kv(
     for &s in widths {
         let s = s.max(2);
         let ids: Vec<i32> = std::iter::repeat(tok as i32).take(s as usize).collect();
-        let arr = lisa_mlx::Array::from_slice(&ids, &[1i32, s as i32]);
+        let arr = tower.runtime().tokens(&ids, &[1i32, s as i32])?;
         let mut times: Vec<f64> = Vec::new();
         for i in 0..(steps + warm) {
             // Snapshot the caches, verify wide, roll back to the snapshot.
-            let snaps: Vec<_> = sess
-                .caches
-                .iter()
-                .map(LayerCache::snapshot_rollback)
-                .collect();
+            let snaps: Vec<_> = sess.caches.iter().map(R::snapshot_rollback).collect();
             tower.set_context_tails(vec![sess_tail(&sess, ctx_len)]);
             // Tail-ULP contract scope (AGENTS.md §9): round-cost must measure
             // the verify rows through the SAME dispatch the MTP round uses.
-            let _verify_splitk = lisa_mlx::ops::enter_verify_splitk_scope();
+            let _verify_splitk = tower.runtime().verify_scope();
             let t0 = std::time::Instant::now();
             let (mixed, _multi) = tower.forward_capture(&arr, Some(&mut sess.caches), true)?;
             let logits = tower.head(&mixed)?;
-            let top = lisa_mlx::ops::indexing::argmax_axis(&logits, -1, None)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let top = logits.argmax_axis(-1).map_err(|e| anyhow::anyhow!("{e}"))?;
             top.eval().map_err(|e| anyhow::anyhow!("{e}"))?;
             drop(_verify_splitk);
             let dt = t0.elapsed().as_secs_f64() * 1e3;
             for (c, s) in sess.caches.iter_mut().zip(snaps.iter()) {
-                c.restore_rollback(s)?;
+                R::restore_rollback(c, s)?;
             }
             if i >= warm {
                 times.push(dt);
@@ -678,8 +672,8 @@ pub fn measure_at_kv(
 /// Measure GLM's target-conditioned MTP path. It has one proposal position, so
 /// its only verify width is S=2; the proposal consumes a target multi-stream
 /// row and a private indexer tape rather than an independent drafter cache.
-fn measure_target_mtp_at_kv(
-    tower: &mut dyn LanguageModel,
+fn measure_target_mtp_at_kv<R: SpeculativeRuntime>(
+    tower: &mut dyn LanguageModel<R>,
     tokens: &[u32],
     widths: &[u32],
     steps: usize,
@@ -691,17 +685,17 @@ fn measure_target_mtp_at_kv(
     anyhow::ensure!(steps > 0, "round-cost needs at least one timed step");
 
     const WARM: usize = 4;
-    let mut sess = crate::core::session::Session::new(tower);
+    let mut sess = crate::conversation::Conversation::new(tower);
     let ctx_len = tower.context_window();
     let logits = sess.feed(tower, tokens)?;
-    let mut tok = argmax_id(&logits)?;
+    let mut tok = logits.argmax_id()?;
 
     // Price an ordinary serial decode step at this live KV length.
     let mut serial = Vec::with_capacity(steps);
     for i in 0..(steps + WARM) {
         let start = std::time::Instant::now();
         let logits = sess.decode_token(tower, tok)?;
-        tok = argmax_id(&logits)?;
+        tok = logits.argmax_id()?;
         if i >= WARM {
             serial.push(start.elapsed().as_secs_f64() * 1000.0);
         }
@@ -715,11 +709,11 @@ fn measure_target_mtp_at_kv(
         "GLM target-MTP round-cost seed exceeds model context"
     );
     tower.set_context_tails(vec![sess_tail(&sess, ctx_len)]);
-    let seed_ids = lisa_mlx::Array::from_slice(&[tok as i32], &[1i32, 1]);
+    let seed_ids = tower.runtime().tokens(&[tok as i32], &[1i32, 1])?;
     let (seed_mixed, seed_multi) =
         tower.forward_capture(&seed_ids, Some(&mut sess.caches), false)?;
     let seed_logits = tower.head(&seed_mixed)?;
-    let carry = argmax_id(&seed_logits)?;
+    let carry = seed_logits.argmax_id()?;
     sess.fed.push(tok);
 
     // A GLM proposal is one target-conditioned MTP step. Use a fresh private
@@ -727,10 +721,10 @@ fn measure_target_mtp_at_kv(
     // the same absolute target position and starts from the same state.
     let mut draft = Vec::with_capacity(steps);
     for i in 0..(steps + WARM) {
-        let mut cache = IndexerTape::new();
+        let mut cache = tower.runtime().new_draft_cache();
         let start = std::time::Instant::now();
         let proposal = tower.target_mtp_step(&mut cache, &seed_multi, carry, position, position)?;
-        let _draft_id = argmax_id(&proposal)?;
+        let _draft_id = proposal.argmax_id()?;
         if i >= WARM {
             draft.push(start.elapsed().as_secs_f64() * 1000.0);
         }
@@ -741,27 +735,26 @@ fn measure_target_mtp_at_kv(
     // target caches are restored after each pass; the MTP tape is not read by
     // this forward and remains independent of the verify transaction.
     let mut verify = Vec::with_capacity(steps);
-    let mut proposal_cache = IndexerTape::new();
+    let mut proposal_cache = tower.runtime().new_draft_cache();
     let proposal =
         tower.target_mtp_step(&mut proposal_cache, &seed_multi, carry, position, position)?;
-    let draft_id = argmax_id(&proposal)?;
-    let verify_ids = lisa_mlx::Array::from_slice(&[carry as i32, draft_id as i32], &[1i32, 2]);
+    let draft_id = proposal.argmax_id()?;
+    let verify_ids = tower
+        .runtime()
+        .tokens(&[carry as i32, draft_id as i32], &[1i32, 2])?;
     for i in 0..(steps + WARM) {
-        let snapshots: Vec<_> = sess
-            .caches
-            .iter()
-            .map(LayerCache::snapshot_rollback)
-            .collect();
+        let snapshots: Vec<_> = sess.caches.iter().map(R::snapshot_rollback).collect();
         tower.set_context_tails(vec![sess_tail(&sess, ctx_len)]);
         let start = std::time::Instant::now();
         let (mixed, _) = tower.forward_capture(&verify_ids, Some(&mut sess.caches), false)?;
         let logits = tower.head(&mixed)?;
-        let top = lisa_mlx::ops::indexing::argmax_axis(&logits, -1, None)
+        let top = logits
+            .argmax_axis(-1)
             .map_err(|error| anyhow::anyhow!("{error}"))?;
         top.eval().map_err(|error| anyhow::anyhow!("{error}"))?;
         let elapsed = start.elapsed().as_secs_f64() * 1000.0;
         for (cache, snapshot) in sess.caches.iter_mut().zip(&snapshots) {
-            cache.restore_rollback(snapshot)?;
+            R::restore_rollback(cache, snapshot)?;
         }
         if i >= WARM {
             verify.push(elapsed);
@@ -775,7 +768,10 @@ fn measure_target_mtp_at_kv(
     Ok((median(&serial), draft_ms, chain, verify_by_width))
 }
 
-fn sess_tail(sess: &crate::core::session::Session, ctx_len: usize) -> Vec<i64> {
+fn sess_tail<R: SpeculativeRuntime>(
+    sess: &crate::conversation::Conversation<R>,
+    ctx_len: usize,
+) -> Vec<i64> {
     sess.fed[sess.fed.len().saturating_sub(ctx_len)..]
         .iter()
         .map(|&t| t as i64)

@@ -5,13 +5,38 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+lisa-models.workspace = true
+lisa-mlx.workspace = true
+lisa-engine.workspace = true
 lisa-gguf.workspace = true
+lisa-metal.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-lisa-engine.workspace = true
 lisa-serve.workspace = true
 objc2.workspace = true
+objc2-avf-audio = { version = "0.3", default-features = false, features = [
+    "AVAudioApplication",
+    "AVAudioBuffer",
+    "AVAudioEngine",
+    "AVAudioFormat",
+    "AVAudioIONode",
+    "AVAudioNode",
+    "AVAudioTime",
+    "AVAudioTypes",
+    "AVSpeechSynthesis",
+    "block2",
+] }
+objc2-speech = { version = "0.3", default-features = false, features = [
+    "std",
+    "SFSpeechRecognitionRequest",
+    "SFSpeechRecognitionResult",
+    "SFSpeechRecognitionTask",
+    "SFSpeechRecognizer",
+    "SFTranscription",
+    "block2",
+    "objc2-avf-audio",
+] }
 objc2-foundation = { workspace = true, features = [
     "NSObject",
     "NSData",
@@ -45,6 +70,8 @@ objc2-web-kit = { workspace = true, features = [
     "block2",
 ] }
 block2.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
 objc2-app-kit = { workspace = true, features = [
     "NSApplication",
     "NSWindow",
@@ -104,3 +131,8 @@ objc2-app-kit = { workspace = true, features = [
 [[bin]]
 name = "lisa-ui"
 path = "src/main.rs"
+
+[lib]
+name = "lisa_app"
+crate-type = ["rlib", "staticlib"]
+path = "src/lib.rs"

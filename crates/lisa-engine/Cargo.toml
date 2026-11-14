@@ -6,19 +6,21 @@ license.workspace = true
 description = "Native language, image and decision model inference for LISA"
 
 [features]
-# Oracle checks load captures from LISA_GLM53_FIXTURE_DIR when executed.
-glm53-fixtures = []
+default = []
+diagnostics = []
+glm53-fixtures = ["diagnostics"]
 
 [dependencies]
+lisa-backend.workspace = true
+rayon.workspace = true
+lisa-models.workspace = true
 lisa-gguf.workspace = true
 anyhow.workspace = true
 base64.workspace = true
 image.workspace = true
 half.workspace = true
 hf-hub.workspace = true
-libm.workspace = true
 libc.workspace = true
-rayon.workspace = true
 memmap2.workspace = true
 lisa-mlx.workspace = true
 serde.workspace = true
@@ -27,4 +29,5 @@ sha2.workspace = true
 tokenizers.workspace = true
 
 [dev-dependencies]
+lisa-cpu.workspace = true
 tempfile = "3"

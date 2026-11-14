@@ -82,10 +82,50 @@ impl Store {
         }
     }
 
+    pub fn at(root: PathBuf) -> Self {
+        Self { root: Some(root) }
+    }
+
     fn root(&self) -> Result<&Path> {
         self.root
             .as_deref()
             .context("HOME is not set; chats cannot be saved")
+    }
+
+    /// iOS can change the application container UUID during an app update.
+    /// Repair only missing paths belonging to this app's own attachment stores.
+    #[cfg(target_os = "ios")]
+    fn relocate_owned_images(&self, mut chat: Chat) -> Chat {
+        let Some(root) = &self.root else { return chat };
+        for turn in &mut chat.turns {
+            for path in &mut turn.images {
+                if let Some(suffix) =
+                    owned_suffix(path, "/Library/Application Support/Lisa/chats/attachments/")
+                {
+                    if suffix
+                        .components()
+                        .next()
+                        .is_some_and(|part| part.as_os_str() == std::ffi::OsStr::new(&chat.id))
+                    {
+                        let candidate = root.join("attachments").join(suffix);
+                        if candidate.is_file() {
+                            *path = candidate;
+                        }
+                    }
+                }
+            }
+            if let Some(path) = &mut turn.generated_image {
+                if let Some(suffix) = owned_suffix(path, "/Pictures/Lisa/") {
+                    if let Some(home) = std::env::var_os("HOME") {
+                        let candidate = PathBuf::from(home).join("Pictures/Lisa").join(suffix);
+                        if candidate.is_file() {
+                            *path = candidate;
+                        }
+                    }
+                }
+            }
+        }
+        chat
     }
 
     /// Leave unreadable records untouched and report them instead of overwriting them.
@@ -110,6 +150,8 @@ impl Store {
                         path.file_stem().and_then(|s| s.to_str()) == Some(&chat.id),
                         "chat id does not match its file"
                     );
+                    #[cfg(target_os = "ios")]
+                    let chat = self.relocate_owned_images(chat);
                     Ok(chat)
                 })();
                 match record {
@@ -232,4 +274,46 @@ impl Store {
 
 fn valid_id(id: &str) -> bool {
     !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit() || b == b'-')
+}
+
+#[cfg(any(test, target_os = "ios"))]
+fn owned_suffix<'a>(path: &'a Path, marker: &str) -> Option<&'a Path> {
+    if path.is_file() {
+        return None;
+    }
+    let (_, suffix) = path.to_str()?.split_once(marker)?;
+    let suffix = Path::new(suffix);
+    (!suffix.as_os_str().is_empty()
+        && suffix
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_))))
+    .then_some(suffix)
+}
+
+#[cfg(test)]
+mod container_tests {
+    use super::*;
+    #[test]
+    fn relocation_only_accepts_owned_relative_components() {
+        let marker = "/Library/Application Support/Lisa/chats/attachments/";
+        assert_eq!(
+            owned_suffix(
+                Path::new(
+                    "/old/Library/Application Support/Lisa/chats/attachments/123-4/photo.png"
+                ),
+                marker
+            ),
+            Some(Path::new("123-4/photo.png"))
+        );
+        assert!(
+            owned_suffix(
+                Path::new(
+                    "/old/Library/Application Support/Lisa/chats/attachments/123-4/../../outside"
+                ),
+                marker
+            )
+            .is_none()
+        );
+        assert!(owned_suffix(Path::new("/private/photo.png"), marker).is_none());
+    }
 }

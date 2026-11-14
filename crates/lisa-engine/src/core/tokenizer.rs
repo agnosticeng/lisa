@@ -138,13 +138,25 @@ impl Tokenizer {
     pub fn load(dir: &std::path::Path) -> anyhow::Result<Self> {
         if dir.is_file() {
             let header = lisa_gguf::Header::open(dir)?;
+            if header.architecture()? == "qwen35" {
+                let inner = crate::checkpoint::qwen35_tokenizer::from_header(&header)?;
+                let im_end_ids = ["<|im_end|>", "<|endoftext|>"]
+                    .iter()
+                    .filter_map(|t| inner.token_to_id(t))
+                    .collect();
+                return Ok(Self {
+                    inner,
+                    im_end_ids,
+                    native: None,
+                });
+            }
             anyhow::ensure!(
                 matches!(header.architecture()?, "deepseek41" | "glm5-next"),
                 "unsupported GGUF tokenizer architecture"
             );
             let native = crate::core::gguf_tokenizer::Tokenizer::from_header(&header)?;
             let im_end_ids = if header.architecture()? == "glm5-next" {
-                crate::models::glm53::gguf::weights::config(&header)?
+                crate::checkpoint::glm53::config(&header)?
                     .eos_token_ids
                     .into_iter()
                     .map(|id| id as u32)

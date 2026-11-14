@@ -18,8 +18,8 @@ use anyhow::{Context, ensure};
 use serde::{Deserialize, Serialize, de};
 use sha2::{Digest, Sha256};
 
-use super::loader::sanitize_name;
 use super::weight_arena::{ArenaIndex, FileIdentity, TensorRecord};
+use lisa_models::checkpoint::sanitize_name;
 
 const INDEX_NAME: &str = "model.safetensors.index.json";
 const MAX_HEADER_BYTES: u64 = 64 * 1024 * 1024;
@@ -112,7 +112,7 @@ pub fn prepare_model(dir: &Path, plan_only: bool) -> anyhow::Result<Summary> {
         "checkpoint path is not a directory: {}",
         dir.display()
     );
-    let family = crate::models::model_type_of(&dir)?;
+    let family = crate::checkpoint::model_type_of(&dir)?;
     ensure!(
         matches!(family.as_str(), "glm5_next" | "glm5_next_text"),
         "resident preparation currently supports GLM-5.3 checkpoints; found model_type {family:?}"

@@ -24,5 +24,9 @@
     <string>15.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Lisa uses the microphone to turn your speech into a chat message.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>Lisa uses speech recognition to transcribe your voice messages.</string>
 </dict>
 </plist>

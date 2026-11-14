@@ -248,3 +248,6 @@ mod tests {
         assert!(decode(TensorType::Q8_0, &[], &mut []).is_err());
     }
 }
+
+mod ds4;
+pub use ds4::decode_ds4_mxfp8;

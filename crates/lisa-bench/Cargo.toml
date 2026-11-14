@@ -10,10 +10,32 @@ default-run = "lisa-bench"
 name = "lisa-bench"
 path = "src/main.rs"
 
+[features]
+default = ["metal"]
+metal = []
+glm53-fixtures = ["lisa-engine/glm53-fixtures"]
+
 [dependencies]
+lisa-engine.workspace = true
+half.workspace = true
 lisa-gguf.workspace = true
 anyhow.workspace = true
 clap.workspace = true
-lisa-mlx.workspace = true
+lisa-metal.workspace = true
 serde_json.workspace = true
-lisa-engine.workspace = true
+
+lisa-serve.workspace = true
+lisa-backend.workspace = true
+lisa-cpu.workspace = true
+lisa-models.workspace = true
+lisa-mlx.workspace = true
+base64.workspace = true
+image.workspace = true
+rayon.workspace = true
+memmap2.workspace = true
+serde.workspace = true
+sha2.workspace = true
+tokenizers.workspace = true
+[dev-dependencies]
+lisa-engine = {workspace=true,features=["diagnostics"]}
+tempfile = "3"

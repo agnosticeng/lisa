@@ -56,6 +56,16 @@ Automatic depth uses a loaded Qwen drafter or GLM target-MTP head. A model
 without either falls back to serial. A fixed unsupported depth fails instead
 of pretending to speculate. Image turns always use serial generation.
 
+Qwen 3.8 27B can select the external DSpine block drafter with
+`LISA_QWEN_DSPINE_MODEL`; it supports compatible MLX targets only and
+supports up to fifteen proposals per verify round. HTTP preserves explicit
+DSpine depth and lets the engine validate it against the loaded drafter; the
+six-token PLD clamp is independent. Automatic depth reads the
+matching local SPS profile (seven-row snapshots when unprofiled). DSpine's draft KV is rebuilt from
+the current session's committed prefix when the loaded draft prefix does not
+match, so interleaved sessions do not share draft context. A prefix rebuild
+adds a target prefill pass; the path has not been performance-qualified.
+
 The server may route four or more eligible requests through continuous native
 batching. Request features such as stops, tools, logprobs, structured output and persistent sessions
 also constrain eligibility. A model that declines batching uses its supported
@@ -95,7 +105,14 @@ configuration. A continuation must feed only the unseen suffix under a compatibl
 numerical law. Native DeepSeek state supports RAM snapshots with copy-on-write
 ownership; its current format has no SSD spill codec.
 
-The [prefix cache](../crates/lisa-engine/src/core/prefix_cache.rs) currently has:
+Message-based reuse compares all message fields, tool definitions and thinking
+configuration. Editing history restores only an exact message-boundary snapshot;
+if that snapshot is unavailable, the server prefills the complete prompt.
+A string suffix must never be paired with an earlier or empty restored state.
+
+The serial stateless path consults the prefix cache; ordinary batch-wave
+requests report zero reused prefix tokens. The
+[prefix cache](../crates/lisa-engine/src/conversation_cache.rs) currently has:
 
 - A minimum stored prefix of 128 tokens, at complete prompt boundaries.
 - Exact token matching and a **strict extension** requirement: an identical
@@ -121,21 +138,14 @@ This policy is distinct from resident weight/private allocation reservations.
 The default computed budget is detected RAM minus 8 GiB; never hardcode a
 particular Mac's capacity.
 
-Client disconnect recovery has been exercised, but reply-channel failures do
-not consistently propagate cancellation into active inference. Immediate
+Reply-channel failures do not consistently propagate cancellation into active
+inference. Immediate
 release of compute after disconnect is an open requirement. See
 [roadmap](roadmap.md#shared-engine-and-serving).
 
 ## Evidence boundaries
 
-Historical Qwen conformance covered stream/non-stream parity, seed zero,
-stop handling, tool-result turns, schema handling, embeddings, prefix resume
-and opt-in admission. New GLM/DeepSeek schedules require their own checks.
-DeepSeek has scoped DSML/streaming/prefix/session evidence; GLM GGUF has a short
-automatic-MTP HTTP check. These do not close every endpoint × model × mode
-combination. Use the individual [model documents](README.md#model-status) for
-current measured coverage.
-
-The HTTP/state modules and schema-failure behavior have compilation coverage
-across all targets and features. A live conformance run of the changed paths
-remains required; compilation does not establish endpoint or model correctness.
+Endpoint availability and compilation do not certify every model/mode. Changes
+to HTTP/state handling require live stream/non-stream, seed, stop, tool, schema,
+continuation, admission and failure checks. Model numerical/state acceptance is
+separate from API conformance.

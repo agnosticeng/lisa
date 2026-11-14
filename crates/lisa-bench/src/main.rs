@@ -1,13 +1,18 @@
+use lisa_bench::bindings::qwen4_tower::TowerLoad;
+use lisa_bench::core::config::ReadConfig;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use lisa_engine::cli::{DepthArg, ModelDir, parse_depth, pld_enable};
-use lisa_engine::core::prefix_cache;
-use lisa_engine::models::qwen4::tower as model;
-use lisa_engine::models::qwen4::{config, layerdiff, smoke};
-use lisa_engine::models::{self, Loaded};
-use lisa_engine::{generate, sampler, sched, session, tokenizer};
-use lisa_mlx::ops::indexing::IndexOp;
+use lisa_bench::bindings::qwen4::config;
+use lisa_bench::bindings::qwen4::tower as model;
+use lisa_bench::cli::{DepthArg, ModelDir, parse_depth, pld_enable};
+use lisa_engine::conversation_cache;
+mod layerdiff;
+mod recurrent_reference;
+mod smoke;
+use lisa_bench::loading::{self, Loaded};
+use lisa_bench::{generate, sampler, sched, session, tokenizer};
+use lisa_metal::ops::indexing::IndexOp;
 
 mod deepseek41_run;
 mod glm53_run;
@@ -264,7 +269,7 @@ fn whoami() -> String {
 
 fn main() -> anyhow::Result<()> {
     let result = run();
-    lisa_mlx::trace::finish();
+    lisa_metal::trace::finish();
     result
 }
 
@@ -272,15 +277,15 @@ fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     // Resolve the device backend: `LISA_DEVICE`, else Metal when present, else
     // CPU. Announce a non-default (CPU) selection.
-    let backend = lisa_mlx::backend::Backend::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
-    if backend != lisa_mlx::backend::Backend::Metal {
+    let backend = lisa_bench::device::Backend::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
+    if backend != lisa_bench::device::Backend::Metal {
         eprintln!("device: {}", backend.name());
     }
-    lisa_mlx::ffi::install_error_handler();
+    lisa_metal::ffi::install_error_handler();
     // Cap how far the Metal buffer pool may grow past load-steady-state before
     // a sweep is forced. Without a cap a pipelined prefill or MTP round pins
     // every temporary it ever made (buffers are only released at a flush).
-    let _ = lisa_mlx::memory::set_cache_limit(8 << 30);
+    let _ = lisa_metal::memory::set_cache_limit(8 << 30);
     // The GPU command buffer is committed every 50 dispatches by default,
     // which is late enough that the MTP head's sequential draft steps do not
     // overlap the CPU graph build. Committing at ~16 recovers ~2 ms of the
@@ -301,7 +306,7 @@ fn run() -> anyhow::Result<()> {
             raw,
             dump_logits,
         } => {
-            let mut tower = match models::load_dir(&model)? {
+            let mut tower = match loading::load_dir(&model)? {
                 Loaded::Language(tower) => tower,
                 Loaded::Image(_) => {
                     anyhow::bail!("this command requires a language or decision model")
@@ -321,18 +326,18 @@ fn run() -> anyhow::Result<()> {
             println!("input_ids: {ids:?}");
             let mut caches = tower.new_caches();
             let i32s: Vec<i32> = ids.iter().map(|&t| t as i32).collect();
-            let arr = lisa_mlx::Array::from_slice(&i32s, &[1i32, i32s.len() as i32]);
+            let arr = lisa_metal::Array::from_slice(&i32s, &[1i32, i32s.len() as i32]);
             let (mixed, _) = tower.forward(&arr, Some(&mut caches))?;
             let last = mixed.index((.., mixed.dim(1) - 1, ..));
             let logits = tower.head(&last)?;
             let neg = -&logits;
-            let top = lisa_mlx::ops::argpartition_axis(&neg, 7, -1)?;
+            let top = lisa_metal::ops::argpartition_axis(&neg, 7, -1)?;
             let top = top.index((.., 0..8));
             let vals = logits.take_along_axis(&top, -1)?;
             let _ = vals.eval();
             let toks: Vec<u32> = top.as_slice::<u32>().to_vec();
             let vf: Vec<f32> = vals
-                .as_dtype(lisa_mlx::Dtype::Float32)
+                .as_dtype(lisa_metal::Dtype::Float32)
                 .map_err(|e| anyhow::anyhow!("{e}"))?
                 .as_slice::<f32>()
                 .to_vec();
@@ -342,7 +347,7 @@ fn run() -> anyhow::Result<()> {
             }
             if let Some(path) = dump_logits {
                 let values = logits
-                    .as_dtype(lisa_mlx::Dtype::Float32)
+                    .as_dtype(lisa_metal::Dtype::Float32)
                     .map_err(|e| anyhow::anyhow!("{e}"))?
                     .as_slice::<f32>()
                     .to_vec();
@@ -370,11 +375,11 @@ fn run() -> anyhow::Result<()> {
         Command::NegSlice => smoke::run_negslice_test(),
         Command::Rounding => smoke::run_rounding_test(),
         Command::IndirectBench => {
-            lisa_mlx::kernels::indirect_bench();
+            lisa_metal::kernels::indirect_bench();
             Ok(())
         }
         Command::DecodeMoeBench => {
-            lisa_mlx::moe_decode::decode_bench();
+            lisa_metal::moe_decode::decode_bench();
             Ok(())
         }
         Command::QmmM => smoke::run_qmm_m_test(),
@@ -398,12 +403,12 @@ fn run() -> anyhow::Result<()> {
             )]);
             let prompt: Vec<u32> = tok.encode(&text, false)?;
             anyhow::ensure!(prompt.len() > 256, "prompt too short for a prefix test");
-            let mut tower = match lisa_engine::models::load_dir(&model)? {
-                lisa_engine::models::Loaded::Language(m) => m,
-                lisa_engine::models::Loaded::Image(_) => {
+            let mut tower = match lisa_bench::loading::load_dir(&model)? {
+                lisa_bench::loading::Loaded::Language(m) => m,
+                lisa_bench::loading::Loaded::Image(_) => {
                     anyhow::bail!("this command requires a language or decision model")
                 }
-                lisa_engine::models::Loaded::Decision(_) => {
+                lisa_bench::loading::Loaded::Decision(_) => {
                     anyhow::bail!("prefix-check expects a language model")
                 }
             };
@@ -421,15 +426,15 @@ fn run() -> anyhow::Result<()> {
                     })?;
                 // Cached: prefill the prefix once, snapshot it, resume from the
                 // entry on a fresh session, prefill only the suffix, decode.
-                let mut cache = prefix_cache::PrefixCache::new(4);
+                let mut cache = conversation_cache::PrefixCache::new(
+                    tower.runtime().context.device().clone(),
+                    4,
+                    None,
+                );
                 {
                     let mut s = session::Session::new(&mut *tower);
                     s.feed(&mut *tower, &prompt[..split])?;
-                    cache.insert_with_law(
-                        prefix_cache::model_numerical_law(&*tower),
-                        &prompt[..split],
-                        &s.caches,
-                    );
+                    cache.insert_model(&*tower, &prompt[..split], &s.caches);
                 }
                 let (matched, mut s) = cache
                     .restore_session(&mut *tower, &prompt)
@@ -481,11 +486,18 @@ fn run() -> anyhow::Result<()> {
                 .iter()
                 .filter_map(|v| v.as_u64().map(|x| x as u32))
                 .collect();
-            let config = config::ModelConfig::from_json(&model.join("config.json"))?;
-            let mut tower = model::Tower::load(&model, config)?;
-            generate::set_eos_ids(vec![248_046, 248_044]);
-            tower.warmup(&prompt[..8])?;
-            let (eq, dlog, dhid) = session::verify_incremental(&mut tower, &prompt, chunk)?;
+            anyhow::ensure!(
+                !prompt.is_empty(),
+                "session-check requires a nonempty prompt"
+            );
+            let mut tower = match lisa_bench::loading::load_dir(&model)? {
+                lisa_bench::Loaded::Language(tower) => tower,
+                _ => anyhow::bail!("session-check requires a language model"),
+            };
+            let tok = tokenizer::Tokenizer::load(&model)?;
+            generate::set_eos_ids_for_model(tok.im_end_ids.clone(), tower.as_ref());
+            tower.warmup(&prompt[..prompt.len().min(8)])?;
+            let (eq, dlog, dhid) = session::verify_incremental(tower.as_mut(), &prompt, chunk)?;
             println!("chunk={chunk} argmax_equal={eq} logit_diff={dlog:.6} hidden_diff={dhid:.6}");
             Ok(())
         }
@@ -504,15 +516,15 @@ fn run() -> anyhow::Result<()> {
             depth,
             show_ids,
         } => {
-            // models::load_dir routes by model_type (qwen4 AND qwen3_5);
+            // loading::load_dir routes by model_type (qwen4 AND qwen3_5);
             // the qwen4-only `model::Tower::load` needs a PLE ngram sidecar
             // the 27B does not ship, which locked cbatch to Flash-Next.
-            let mut tower = match lisa_engine::models::load_dir(&model)? {
-                lisa_engine::Loaded::Language(m) => m,
-                lisa_engine::Loaded::Image(_) => {
+            let mut tower = match lisa_bench::loading::load_dir(&model)? {
+                lisa_bench::Loaded::Language(m) => m,
+                lisa_bench::Loaded::Image(_) => {
                     anyhow::bail!("this command requires a language or decision model")
                 }
-                lisa_engine::Loaded::Decision(_) => {
+                lisa_bench::Loaded::Decision(_) => {
                     anyhow::bail!("cbatch needs a generative language model")
                 }
             };
@@ -529,7 +541,7 @@ fn run() -> anyhow::Result<()> {
                         p,
                         raw,
                         max_tokens,
-                        lisa_engine::cli::build_sampler(
+                        lisa_bench::cli::build_sampler(
                             temperature,
                             top_k,
                             top_p,
@@ -542,7 +554,7 @@ fn run() -> anyhow::Result<()> {
                 .collect::<anyhow::Result<_>>()?;
             tower.warmup(&requests[0].prompt)?;
             let depth_us = match depth {
-                DepthArg::Auto => lisa_engine::core::round_cost::AUTO_DEPTH,
+                DepthArg::Auto => lisa_bench::core::round_cost::AUTO_DEPTH,
                 DepthArg::Fixed(d) => d,
             };
             eprintln!(
@@ -600,16 +612,16 @@ fn run() -> anyhow::Result<()> {
                     || (kda_nsg == "ds4" && dsa_score != "abba" && dsa_topk != "abba"),
                 "--lm-head-qmv abba requires all other schedules to use one fixed path"
             );
-            use lisa_mlx::{
+            use lisa_metal::{
                 runtime_dispatch_count, runtime_label_counts, runtime_label_dispatches,
                 runtime_label_gpu_ms,
             };
-            let mut tower = match lisa_engine::models::load_dir(&model)? {
-                lisa_engine::models::Loaded::Language(m) => m,
-                lisa_engine::models::Loaded::Image(_) => {
+            let mut tower = match lisa_bench::loading::load_dir(&model)? {
+                lisa_bench::loading::Loaded::Language(m) => m,
+                lisa_bench::loading::Loaded::Image(_) => {
                     anyhow::bail!("this command requires a language or decision model")
                 }
-                lisa_engine::models::Loaded::Decision(_) => {
+                lisa_bench::loading::Loaded::Decision(_) => {
                     anyhow::bail!("serial-audit expects a language model")
                 }
             };
@@ -621,7 +633,7 @@ fn run() -> anyhow::Result<()> {
             let mut ids: Vec<u32> = tok.encode(&text, false)?;
             ids.truncate(kv);
             tower.warmup(&ids[..ids.len().min(64)])?;
-            let mut sess = lisa_engine::core::session::Session::new(&mut *tower);
+            let mut sess = lisa_bench::core::session::Session::new(&mut *tower);
             let logits = if prefill_chunk == 0 {
                 sess.feed_multi(&mut *tower, &ids)?.0
             } else {
@@ -630,13 +642,13 @@ fn run() -> anyhow::Result<()> {
                     let next = sess.feed(&mut *tower, chunk)?;
                     next.eval()?;
                     logits = Some(next);
-                    lisa_mlx::memory::trim_cache();
+                    lisa_metal::memory::trim_cache();
                 }
                 logits.expect("non-empty serial-audit prompt")
             };
-            let argmax_id = |a: &lisa_mlx::Array| -> anyhow::Result<u32> {
-                let out =
-                    lisa_mlx::ops::indexing::argmax(a, None).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let argmax_id = |a: &lisa_metal::Array| -> anyhow::Result<u32> {
+                let out = lisa_metal::ops::indexing::argmax(a, None)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
                 out.eval().map_err(|e| anyhow::anyhow!("{e}"))?;
                 Ok(out.item_cast::<i32>() as u32)
             };
@@ -696,14 +708,13 @@ fn run() -> anyhow::Result<()> {
                     _ => unreachable!("clap validates lm-head-qmv"),
                 };
                 let t0 = std::time::Instant::now();
-                let _dsa_score_scope = (dsa_score != "rows4").then(|| {
-                    lisa_engine::core::quant::Glm53IndexerDecodeRows4Scope::new(use_rows4)
-                });
+                let _dsa_score_scope = (dsa_score != "rows4")
+                    .then(|| lisa_bench::core::quant::Glm53IndexerDecodeRows4Scope::new(use_rows4));
                 let _dsa_topk_scope = (dsa_topk != "shuffle").then(|| {
-                    lisa_engine::core::quant::Glm53IndexerTopkShuffleScope::new(use_shuffle)
+                    lisa_bench::core::quant::Glm53IndexerTopkShuffleScope::new(use_shuffle)
                 });
                 let _lm_head_qmv_scope = (lm_head_qmv != "4").then(|| {
-                    lisa_mlx::ops::Glm53LmHeadQmvTileScope::new(if use_wide_lm_head {
+                    lisa_metal::ops::Glm53LmHeadQmvTileScope::new(if use_wide_lm_head {
                         8
                     } else {
                         4
@@ -715,7 +726,7 @@ fn run() -> anyhow::Result<()> {
                     } else {
                         16
                     };
-                    let _scope = lisa_engine::core::quant::Glm53KdaNsgScope::new(nsg);
+                    let _scope = lisa_bench::core::quant::Glm53KdaNsgScope::new(nsg);
                     sess.decode_token(&mut *tower, tok_id)?
                 } else {
                     sess.decode_token(&mut *tower, tok_id)?
@@ -887,13 +898,13 @@ fn run() -> anyhow::Result<()> {
             s,
             steps,
         } => {
-            use lisa_mlx::{runtime_dispatch_count, runtime_label_counts, runtime_label_gpu_ms};
-            let mut tower = match lisa_engine::models::load_dir(&model)? {
-                lisa_engine::models::Loaded::Language(m) => m,
-                lisa_engine::models::Loaded::Image(_) => {
+            use lisa_metal::{runtime_dispatch_count, runtime_label_counts, runtime_label_gpu_ms};
+            let mut tower = match lisa_bench::loading::load_dir(&model)? {
+                lisa_bench::loading::Loaded::Language(m) => m,
+                lisa_bench::loading::Loaded::Image(_) => {
                     anyhow::bail!("this command requires a language or decision model")
                 }
-                lisa_engine::models::Loaded::Decision(_) => {
+                lisa_bench::loading::Loaded::Decision(_) => {
                     anyhow::bail!("verify-audit expects a language model")
                 }
             };
@@ -905,7 +916,7 @@ fn run() -> anyhow::Result<()> {
             let mut ids: Vec<u32> = tok.encode(&text, false)?;
             ids.truncate(kv);
             tower.warmup(&ids[..ids.len().min(64)])?;
-            let mut sess = lisa_engine::core::session::Session::new(&mut *tower);
+            let mut sess = lisa_bench::core::session::Session::new(&mut *tower);
             let ctx_len = tower.context_window();
             let (logits, _) = sess.feed_multi(&mut *tower, &ids)?;
             let _ = logits;
@@ -913,13 +924,15 @@ fn run() -> anyhow::Result<()> {
             let verify_ids: Vec<i32> = std::iter::repeat(1i32).take(s as usize).collect();
             // One S-row verify forward with snapshot/rollback (round-cost's
             // verify pass); wall ms includes head+argmax, splitk scope armed.
-            let verify_once = |sess: &mut lisa_engine::core::session::Session,
-                               tower: &mut dyn lisa_engine::models::LanguageModel|
+            let verify_once = |sess: &mut lisa_bench::core::session::Session,
+                               tower: &mut dyn lisa_bench::language::LanguageModel<
+                lisa_bench::metal_language::MetalLanguageRuntime,
+            >|
              -> anyhow::Result<f64> {
                 let snaps: Vec<_> = sess
                     .caches
                     .iter()
-                    .map(lisa_engine::core::cache::LayerCache::snapshot_rollback)
+                    .map(lisa_bench::core::cache::LayerCache::snapshot_rollback)
                     .collect();
                 tower.set_context_tails(vec![
                     sess.fed[sess.fed.len().saturating_sub(ctx_len)..]
@@ -927,12 +940,12 @@ fn run() -> anyhow::Result<()> {
                         .map(|&t| t as i64)
                         .collect(),
                 ]);
-                let arr = lisa_mlx::Array::from_slice(&verify_ids, &[1i32, s as i32]);
-                let _splitk = lisa_mlx::ops::enter_verify_splitk_scope();
+                let arr = lisa_metal::Array::from_slice(&verify_ids, &[1i32, s as i32]);
+                let _splitk = lisa_metal::ops::enter_verify_splitk_scope();
                 let t0 = std::time::Instant::now();
                 let (mixed, _multi) = tower.forward_capture(&arr, Some(&mut sess.caches), true)?;
                 let logits = tower.head(&mixed)?;
-                let top = lisa_mlx::ops::indexing::argmax_axis(&logits, -1, None)
+                let top = lisa_metal::ops::indexing::argmax_axis(&logits, -1, None)
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
                 top.eval().map_err(|e| anyhow::anyhow!("{e}"))?;
                 let dt = t0.elapsed().as_secs_f64() * 1e3;
@@ -1006,15 +1019,15 @@ fn run() -> anyhow::Result<()> {
             widths,
             docs,
         } => {
-            use lisa_engine::core::round_cost::{
+            use lisa_bench::core::round_cost::{
                 ModelCost, RoundCostTable, bucket_for, default_path, measure_at_kv,
             };
-            let mut tower = match lisa_engine::models::load_dir(&model)? {
-                lisa_engine::models::Loaded::Language(m) => m,
-                lisa_engine::models::Loaded::Image(_) => {
+            let mut tower = match lisa_bench::loading::load_dir(&model)? {
+                lisa_bench::loading::Loaded::Language(m) => m,
+                lisa_bench::loading::Loaded::Image(_) => {
                     anyhow::bail!("this command requires a language or decision model")
                 }
-                lisa_engine::models::Loaded::Decision(_) => {
+                lisa_bench::loading::Loaded::Decision(_) => {
                     anyhow::bail!("round-cost expects a language model")
                 }
             };
@@ -1073,7 +1086,7 @@ fn run() -> anyhow::Result<()> {
                 }
                 println!(
                     "bucket {} (kv {}): serial {:.2} ms | draft {:.2} ms | chain {} | verify {}",
-                    lisa_engine::core::round_cost::BUCKET_NAMES[bucket],
+                    lisa_bench::core::round_cost::BUCKET_NAMES[bucket],
                     kv_len,
                     serial,
                     draft,
@@ -1157,7 +1170,7 @@ fn run() -> anyhow::Result<()> {
                 .collect();
             let n = prompt.len();
             let t0 = std::time::Instant::now();
-            let mut tower = match models::load_dir(&model)? {
+            let mut tower = match loading::load_dir(&model)? {
                 Loaded::Language(tower) => tower,
                 Loaded::Image(_) => {
                     anyhow::bail!("this command requires a language or decision model")
@@ -1223,23 +1236,22 @@ fn run() -> anyhow::Result<()> {
                                 let q2_vector_load = q2_load_override.unwrap_or(true);
                                 let q2_load_name = if q2_vector_load { "vector" } else { "scalar" };
                                 let _q8_scope =
-                                    lisa_engine::core::quant::Glm53Q8PrefillScope::new(use_ds4_mpp);
-                                let _moe_scope = grouped_override.map(
-                                    lisa_engine::core::quant::Glm53GroupedMoePrefillScope::new,
-                                );
+                                    lisa_bench::core::quant::Glm53Q8PrefillScope::new(use_ds4_mpp);
+                                let _moe_scope = grouped_override
+                                    .map(lisa_bench::core::quant::Glm53GroupedMoePrefillScope::new);
                                 let _pair_scope = pair_override
-                                    .map(lisa_engine::core::quant::Glm53GroupedMoePairScope::new);
+                                    .map(lisa_bench::core::quant::Glm53GroupedMoePairScope::new);
                                 let _q2_load_scope = q2_load_override
-                                    .map(lisa_engine::core::quant::Glm53GroupedMoeQ2LoadScope::new);
+                                    .map(lisa_bench::core::quant::Glm53GroupedMoeQ2LoadScope::new);
                                 let _down_tile_scope = down_tile_override.map(
-                                    lisa_engine::core::quant::Glm53GroupedMoeDownTileScope::new,
+                                    lisa_bench::core::quant::Glm53GroupedMoeDownTileScope::new,
                                 );
                                 let mut caches = tower.new_caches();
                                 tower.clear_context();
                                 let t = std::time::Instant::now();
                                 let last = tower.prefill(&prompt, &mut caches)?;
                                 let logits = tower.head(&last)?;
-                                let next = lisa_mlx::ops::indexing::argmax(&logits, None)?;
+                                let next = lisa_metal::ops::indexing::argmax(&logits, None)?;
                                 next.eval().map_err(|e| anyhow::anyhow!("{e}"))?;
                                 let next_token = next.item_cast::<i32>() as u32;
                                 if use_ds4_mpp && moe_grouped == "abba" {
@@ -1396,7 +1408,7 @@ fn run() -> anyhow::Result<()> {
                     _ => unreachable!("clap validates q8-prefill"),
                 };
                 let use_grouped_moe = match moe_grouped.as_str() {
-                    "auto" => n >= lisa_engine::core::quant::GLM53_GROUPED_MOE_MIN_ROWS,
+                    "auto" => n >= lisa_bench::core::quant::GLM53_GROUPED_MOE_MIN_ROWS,
                     "grouped" => true,
                     "stock" => false,
                     "abba" => matches!(i % 4, 0 | 3),
@@ -1436,25 +1448,24 @@ fn run() -> anyhow::Result<()> {
                 } else {
                     "scalar"
                 };
-                let _q8_scope = lisa_engine::core::quant::Glm53Q8PrefillScope::new(use_ds4_mpp);
+                let _q8_scope = lisa_bench::core::quant::Glm53Q8PrefillScope::new(use_ds4_mpp);
                 let _moe_scope = (moe_grouped != "auto").then(|| {
-                    lisa_engine::core::quant::Glm53GroupedMoePrefillScope::new(use_grouped_moe)
+                    lisa_bench::core::quant::Glm53GroupedMoePrefillScope::new(use_grouped_moe)
                 });
                 let _pair_scope = (moe_pair != "auto").then(|| {
-                    lisa_engine::core::quant::Glm53GroupedMoePairScope::new(use_split_pair)
+                    lisa_bench::core::quant::Glm53GroupedMoePairScope::new(use_split_pair)
                 });
                 let _q2_load_scope = (moe_q2_load != "vector").then(|| {
-                    lisa_engine::core::quant::Glm53GroupedMoeQ2LoadScope::new(use_vector_q2_load)
+                    lisa_bench::core::quant::Glm53GroupedMoeQ2LoadScope::new(use_vector_q2_load)
                 });
-                let _down_tile_scope = (moe_down_tile != "auto").then(|| {
-                    lisa_engine::core::quant::Glm53GroupedMoeDownTileScope::new(down_tile)
-                });
+                let _down_tile_scope = (moe_down_tile != "auto")
+                    .then(|| lisa_bench::core::quant::Glm53GroupedMoeDownTileScope::new(down_tile));
                 let mut caches = tower.new_caches();
                 tower.clear_context();
                 let t = std::time::Instant::now();
                 let last = tower.prefill(&prompt, &mut caches)?;
                 let logits = tower.head(&last)?;
-                let next = lisa_mlx::ops::indexing::argmax(&logits, None)?;
+                let next = lisa_metal::ops::indexing::argmax(&logits, None)?;
                 next.eval().map_err(|e| anyhow::anyhow!("{e}"))?;
                 let next_token = next.item_cast::<i32>() as u32;
                 let secs = t.elapsed().as_secs_f64();
@@ -1596,7 +1607,7 @@ fn run() -> anyhow::Result<()> {
             // qwen3_5 (27B) golden over every case in the file; `--depth 2..=7`
             // runs the same cases through the native MTP head (lossless greedy
             // verify). `--capture` writes the serial greedy baselines.
-            if lisa_engine::models::model_type_of(&model_dir)?.starts_with("qwen3_5") {
+            if lisa_bench::checkpoint::model_type_of(&model_dir)?.starts_with("qwen3_5") {
                 anyhow::ensure!(!capture || depth == 0, "--capture is serial greedy only");
                 let content = match golden.as_deref() {
                     Some(path) => std::fs::read_to_string(path)?,
@@ -1751,7 +1762,7 @@ fn embedded_qwen35_golden(dir: &std::path::Path) -> &'static str {
 /// an existing path is used as-is; a repo id must already be in the HF hub
 /// cache (the golden is an integrity check, not a fetcher).
 fn resolve_cached_model(target: &str) -> anyhow::Result<std::path::PathBuf> {
-    use lisa_engine::models::hf;
+    use lisa_bench::checkpoint::hf;
     let direct = std::path::Path::new(target);
     if direct.is_dir() {
         return Ok(direct.to_path_buf());
@@ -1864,12 +1875,12 @@ fn golden_qwen35(
             }
         }
     }
-    let mut tower = match lisa_engine::models::load_dir(model)? {
-        lisa_engine::models::Loaded::Language(m) => m,
-        lisa_engine::models::Loaded::Image(_) => {
+    let mut tower = match lisa_bench::loading::load_dir(model)? {
+        lisa_bench::loading::Loaded::Language(m) => m,
+        lisa_bench::loading::Loaded::Image(_) => {
             anyhow::bail!("this command requires a language or decision model")
         }
-        lisa_engine::models::Loaded::Decision(_) => {
+        lisa_bench::loading::Loaded::Decision(_) => {
             anyhow::bail!("golden expects a language model")
         }
     };

@@ -8,7 +8,7 @@ pub struct CuratedModel {
     pub quantization: &'static str,
     pub description: &'static str,
     pub model_type: &'static str,
-    /// Selected package sizes checked against Hub metadata on 2026-11-03.
+    /// Selected package sizes checked against Hub metadata.
     /// Used immediately at startup and when the Hub is unavailable.
     pub download_bytes: u64,
     /// Weight residency when disk-only tables make download size misleading.
@@ -20,10 +20,19 @@ pub const MODELS: &[CuratedModel] = &[
         repo_id: "agnosticeng/Qwen3.8-27B-4bit",
         name: "Qwen 3.8 27B",
         quantization: "4-bit",
-        description: "Everyday chat, coding and image input. Includes an MTP head.",
+        description: "Everyday chat, coding and image input. Includes the DSpine drafter.",
         model_type: "qwen3_5",
         resident_bytes: None,
         download_bytes: 16_320_428_961,
+    },
+    CuratedModel {
+        repo_id: "agnosticeng/Qwen3.8-27B-2bit",
+        name: "Qwen 3.8 27B",
+        quantization: "2-bit",
+        description: "Compact text-only Qwen 27B with the DSpine drafter.",
+        model_type: "qwen3_5",
+        resident_bytes: None,
+        download_bytes: 8_695_542_535,
     },
     CuratedModel {
         repo_id: "mlx-community/Qwen3.5-4B-MLX-4bit",
@@ -44,15 +53,6 @@ pub const MODELS: &[CuratedModel] = &[
         download_bytes: 652_031_020,
     },
     CuratedModel {
-        repo_id: "agnosticeng/Qwen3.8-27B-2bit",
-        name: "Qwen 3.8 27B",
-        quantization: "2-bit",
-        description: "A smaller 27B checkpoint for memory-constrained Macs. Includes MTP.",
-        model_type: "qwen3_5",
-        resident_bytes: None,
-        download_bytes: 8_695_542_535,
-    },
-    CuratedModel {
         repo_id: "agnosticeng/Qwen3.8-Flash-Next-4bit",
         name: "Qwen 3.8 Flash-Next",
         quantization: "4-bit",
@@ -62,7 +62,7 @@ pub const MODELS: &[CuratedModel] = &[
         download_bytes: 112_334_975_818,
     },
     CuratedModel {
-        repo_id: lisa_engine::models::glm53::gguf::REPO,
+        repo_id: lisa_engine::checkpoint::catalog::glm53::REPO,
         name: "GLM 5.3 Flash",
         quantization: "Q2 GGUF",
         description: "DS4's original GLM checkpoint with MTP. About 90 GiB of weights; requires a 128 GB Mac. Native GGUF support is experimental.",
@@ -71,7 +71,7 @@ pub const MODELS: &[CuratedModel] = &[
         download_bytes: 96_505_816_384,
     },
     CuratedModel {
-        repo_id: lisa_engine::models::deepseek41::REPO,
+        repo_id: lisa_engine::checkpoint::catalog::deepseek41::REPO,
         name: "DeepSeek V4.1 Flash Coder",
         quantization: "Mixed IQ GGUF",
         description: "Experimental text-only coding model. About 73 GB of resident weights and 111 GB of disk-only lookup data. Requires a high-memory Mac and fast SSD.",
@@ -117,4 +117,35 @@ pub fn rank(repo_id: &str) -> usize {
         .iter()
         .position(|entry| entry.repo_id == repo_id)
         .unwrap_or(usize::MAX)
+}
+
+/// One shared draft download across all compatible target quantizations.
+pub const DSPINE_DOWNLOAD_BYTES: u64 = 4_051_857_976;
+pub const DSPINE_WEIGHT_BYTES: u64 = 4_051_831_880;
+
+pub fn uses_dspine(repo: &str) -> bool {
+    matches!(
+        repo,
+        "agnosticeng/Qwen3.8-27B-4bit" | "agnosticeng/Qwen3.8-27B-2bit"
+    )
+}
+
+/// Fallback package size excludes MLX sidecars superseded by DSpine.
+/// Sizes include each sidecar's config/tokenizer, as advertised by the Hub.
+pub fn target_download_bytes(entry: &CuratedModel) -> u64 {
+    let mtp = match entry.repo_id {
+        "agnosticeng/Qwen3.8-27B-4bit" => 238_934_261 + 3_804,
+        "agnosticeng/Qwen3.8-27B-2bit" => 238_934_237 + 3_172 + 19_989_325,
+        _ => 0,
+    };
+    entry.download_bytes.saturating_sub(mtp)
+}
+
+pub fn bundle_download_bytes(entry: &CuratedModel) -> u64 {
+    target_download_bytes(entry)
+        + if uses_dspine(entry.repo_id) {
+            DSPINE_DOWNLOAD_BYTES
+        } else {
+            0
+        }
 }

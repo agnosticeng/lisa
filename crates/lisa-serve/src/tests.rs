@@ -5,7 +5,7 @@ use super::{
     split_reasoning_for_request, stream_delta, streaming_reply_sections, streaming_sections,
     streaming_stop_safe_len, usage_json,
 };
-use lisa_engine::core::session::TargetMtpSamplingMode;
+use lisa_engine::speculation::TargetMtpSamplingMode;
 use serde_json::json;
 
 #[test]
@@ -16,9 +16,7 @@ fn image_blocks_survive_api_adapters_in_order() {
         {"type":"text","text":"after"}
     ]}]});
     super::normalize_messages_body(&mut anthropic);
-    assert!(lisa_engine::models::vision::messages_have_images(
-        &anthropic
-    ));
+    assert!(lisa_engine::vision::messages_have_images(&anthropic));
     assert_eq!(
         anthropic["messages"][0]["content"][1]["source"]["data"],
         "abc"
@@ -29,9 +27,7 @@ fn image_blocks_survive_api_adapters_in_order() {
         {"type":"input_text","text":"after"}
     ]}]});
     super::normalize_responses_body(&mut responses);
-    assert!(lisa_engine::models::vision::messages_have_images(
-        &responses
-    ));
+    assert!(lisa_engine::vision::messages_have_images(&responses));
     let parts = responses["messages"][0]["content"].as_array().unwrap();
     assert_eq!(parts[0]["text"], "before");
     assert_eq!(parts[2]["text"], "after");
@@ -100,10 +96,12 @@ fn parses_bare_browser_tool_calls() {
         assert!(content.is_empty(), "{content}");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0]["function"]["name"], "web_search");
-        let args: serde_json::Value = serde_json::from_str(
-            calls[0]["function"]["arguments"].as_str().unwrap(),
-        ).unwrap();
-        assert_eq!(args["query"], "latest Rust stable release official Rust blog");
+        let args: serde_json::Value =
+            serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            args["query"],
+            "latest Rust stable release official Rust blog"
+        );
     }
     let (_, calls) = extract_tool_calls(&format!("{bare}\n{bare}"), &tools);
     assert_eq!(calls.len(), 2);
@@ -475,7 +473,7 @@ fn glm_tool_prompt_matches_ds4_multiple_and_deferred_tools() {
 #[test]
 #[ignore]
 fn render_mimo_tools_and_parts() {
-    let dir = match lisa_engine::models::resolve_model_dir(
+    let dir = match lisa_engine::checkpoint::resolve_model_dir(
         "agnosticeng/MiMo-V2.6-Distill-Qwen-9B-4bit",
     ) {
         Ok(d) => d,
@@ -521,7 +519,7 @@ fn render_mimo_tools_and_parts() {
 #[test]
 #[ignore]
 fn render_mimo_template() {
-    let dir = match lisa_engine::models::resolve_model_dir(
+    let dir = match lisa_engine::checkpoint::resolve_model_dir(
         "agnosticeng/MiMo-V2.6-Distill-Qwen-9B-4bit",
     ) {
         Ok(d) => d,
@@ -547,10 +545,11 @@ fn render_mimo_template() {
 #[test]
 #[ignore]
 fn render_real_template() {
-    let dir = match lisa_engine::models::resolve_model_dir("agnosticeng/Qwen3.8-Flash-Next-4bit") {
-        Ok(d) => d,
-        Err(_) => return,
-    };
+    let dir =
+        match lisa_engine::checkpoint::resolve_model_dir("agnosticeng/Qwen3.8-Flash-Next-4bit") {
+            Ok(d) => d,
+            Err(_) => return,
+        };
     let src = match std::fs::read_to_string(dir.join("chat_template.jinja")) {
         Ok(s) => s,
         Err(_) => return,
@@ -584,4 +583,53 @@ fn render_real_template() {
     ];
     let out = t.render(&msgs, true, &[], true).expect("render");
     eprintln!("---RENDER---\n{out}\n---END---");
+}
+
+#[test]
+fn session_reuse_compares_tool_messages_and_render_options() {
+    let message = ChatMessage {
+        role: "assistant".into(),
+        content: String::new(),
+        reasoning_content: None,
+        tool_calls: vec![json!({"id":"call-1","function":{"name":"lookup","arguments":"a"}})],
+        tool_call_id: None,
+        parts: None,
+    };
+    let mut edited = message.clone();
+    edited.tool_calls[0]["function"]["arguments"] = json!("b");
+    assert_eq!(super::structural_prefix(&[message.clone()], &[edited]), 0);
+    let mut edited = message.clone();
+    edited.tool_call_id = Some("different-call".into());
+    assert_eq!(super::structural_prefix(&[message.clone()], &[edited]), 0);
+    assert_eq!(super::structural_prefix(&[message.clone()], &[message]), 1);
+    let tools = vec![json!({"type":"function","function":{"name":"lookup"}})];
+    assert!(super::session_render_options_match(
+        &tools, true, &tools, true
+    ));
+    assert!(!super::session_render_options_match(
+        &tools,
+        true,
+        &[],
+        true
+    ));
+    assert!(!super::session_render_options_match(
+        &tools, true, &tools, false
+    ));
+}
+
+#[test]
+fn http_preserves_explicit_dspine_depth_and_auto_policy() {
+    use lisa_engine::speculation::MtpDepth;
+    for depth in [0, 2, 6, 7, 15, 16] {
+        // Preserve the request, including an invalid depth: the engine validates
+        // it against the selected model instead of silently changing it.
+        assert_eq!(
+            super::configured_mtp_depth(depth, true),
+            MtpDepth::Fixed(depth)
+        );
+    }
+    assert_eq!(
+        super::configured_mtp_depth(lisa_engine::core::round_cost::AUTO_DEPTH, true),
+        MtpDepth::Auto
+    );
 }

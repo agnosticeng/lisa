@@ -910,15 +910,37 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
+name = "lisa-backend"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "smallvec",
+]
+
+[[package]]
 name = "lisa-bench"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "clap",
+ "half",
+ "image",
+ "lisa-backend",
+ "lisa-cpu",
  "lisa-engine",
  "lisa-gguf",
+ "lisa-metal",
  "lisa-mlx",
+ "lisa-models",
+ "lisa-serve",
+ "memmap2",
+ "rayon",
+ "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
+ "tokenizers",
 ]
 
 [[package]]
@@ -929,9 +951,20 @@ dependencies = [
  "clap",
  "lisa-engine",
  "lisa-gguf",
- "lisa-mlx",
+ "lisa-metal",
+ "lisa-models",
  "lisa-serve",
  "serde_json",
+]
+
+[[package]]
+name = "lisa-cpu"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libm",
+ "lisa-backend",
+ "rayon",
 ]
 
 [[package]]
@@ -944,9 +977,11 @@ dependencies = [
  "hf-hub",
  "image",
  "libc",
- "libm",
+ "lisa-backend",
+ "lisa-cpu",
  "lisa-gguf",
  "lisa-mlx",
+ "lisa-models",
  "memmap2",
  "rayon",
  "serde",
@@ -967,16 +1002,40 @@ dependencies = [
 ]
 
 [[package]]
-name = "lisa-mlx"
+name = "lisa-metal"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "block2",
  "half",
+ "lisa-backend",
  "miniz_oxide 0.9.1",
  "objc2",
  "objc2-foundation",
  "objc2-metal",
  "sha2",
+]
+
+[[package]]
+name = "lisa-mlx"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "memmap2",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "lisa-models"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "half",
+ "image",
+ "lisa-backend",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -986,9 +1045,13 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "hf-chat-template",
+ "lisa-backend",
+ "lisa-cpu",
  "lisa-engine",
- "lisa-mlx",
+ "lisa-metal",
+ "lisa-models",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -999,10 +1062,15 @@ dependencies = [
  "block2",
  "lisa-engine",
  "lisa-gguf",
+ "lisa-metal",
+ "lisa-mlx",
+ "lisa-models",
  "lisa-serve",
  "objc2",
  "objc2-app-kit",
+ "objc2-avf-audio",
  "objc2-foundation",
+ "objc2-speech",
  "objc2-web-kit",
  "serde",
  "serde_json",
@@ -1193,6 +1261,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "objc2-avf-audio"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13a380031deed8e99db00065c45937da434ca987c034e13b87e4441f9e4090be"
+dependencies = [
+ "bitflags",
+ "block2",
+ "objc2",
+ "objc2-foundation",
+]
+
+[[package]]
 name = "objc2-cloud-kit"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1347,6 +1427,18 @@ dependencies = [
  "bitflags",
  "objc2",
  "objc2-core-foundation",
+]
+
+[[package]]
+name = "objc2-speech"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9eb609f9d2a25e0f8b76954f3acaa58348ce2a91285fe867643b2224ac4d263"
+dependencies = [
+ "block2",
+ "objc2",
+ "objc2-avf-audio",
+ "objc2-foundation",
 ]
 
 [[package]]

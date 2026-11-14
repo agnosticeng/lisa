@@ -1,28 +1,28 @@
 //! Immutable, validated file-backed tensor views for resident model loading.
 //!
 //! The preparation tool verifies original payload bytes once. Load checks the
-//! recorded file identities and tensor bounds before wrapping a bounded number
-//! of shared Metal views; it never repairs alignment by copying a tensor.
+//! recorded file identities and tensor bounds before creating a bounded number
+//! of mapped or explicitly uploaded allocations. Mapping never silently copies.
 
 use std::collections::{HashMap, HashSet};
-use std::ffi::c_void;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::ptr::NonNull;
 use std::sync::Arc;
 
+use crate::weights::{ResidencyBytes, ResidencyPolicy};
 use anyhow::{Context, ensure};
-use lisa_mlx::{Array, Dtype};
+use lisa_backend::{ScalarType as Dtype, StorageDevice};
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
-pub(crate) struct FileIdentity {
-    pub(crate) path: PathBuf,
-    pub(crate) size: u64,
-    pub(crate) mtime_ns: i128,
-    pub(crate) inode: u64,
-    pub(crate) device: u64,
+pub struct FileIdentity {
+    pub path: PathBuf,
+    pub size: u64,
+    pub mtime_ns: i128,
+    pub inode: u64,
+    pub device: u64,
 }
 
 impl FileIdentity {
@@ -57,44 +57,67 @@ impl FileIdentity {
 }
 
 #[derive(Deserialize, Serialize)]
-pub(crate) struct ArenaIndex {
-    pub(crate) format: String,
-    pub(crate) source_files: Vec<FileIdentity>,
-    pub(crate) backing_files: Vec<FileIdentity>,
-    pub(crate) tensors: HashMap<String, TensorRecord>,
+pub struct ArenaIndex {
+    pub format: String,
+    pub source_files: Vec<FileIdentity>,
+    pub backing_files: Vec<FileIdentity>,
+    pub tensors: HashMap<String, TensorRecord>,
 }
 
 #[derive(Deserialize, Serialize)]
-pub(crate) struct TensorRecord {
-    pub(crate) file: usize,
-    pub(crate) offset: usize,
-    pub(crate) nbytes: usize,
-    pub(crate) dtype: String,
-    pub(crate) shape: Vec<i32>,
-    pub(crate) sha256: String,
+pub struct TensorRecord {
+    pub file: usize,
+    pub offset: usize,
+    pub nbytes: usize,
+    pub dtype: String,
+    pub shape: Vec<i32>,
+    pub sha256: String,
 }
 
-struct TensorView {
-    buffer: Arc<lisa_mlx::runtime::Buffer>,
+struct TensorView<T> {
+    buffer: T,
     offset: usize,
     nbytes: usize,
     dtype: Dtype,
     shape: Vec<i32>,
 }
 
-pub(crate) struct ResidentWeights {
-    tensors: HashMap<String, TensorView>,
-    buffers: Vec<Arc<lisa_mlx::runtime::Buffer>>,
+pub struct ResidentWeights<D: StorageDevice> {
+    device: D,
+    tensors: HashMap<String, TensorView<D::Tensor>>,
+    buffers: Vec<D::Tensor>,
     mapped_bytes: usize,
+    residency: ResidencyBytes,
 }
 
-impl ResidentWeights {
-    pub(crate) fn open(
+impl<D: StorageDevice> ResidentWeights<D>
+where
+    D::Tensor: Clone,
+{
+    #[cfg(test)]
+    pub fn open(
+        device: D,
         model_dir: &Path,
         index_path: &Path,
         expected_sources: &HashSet<PathBuf>,
     ) -> anyhow::Result<Self> {
-        let index_bytes = super::loader::read_index_bytes(index_path).with_context(|| {
+        Self::open_with_policy(
+            device,
+            model_dir,
+            index_path,
+            expected_sources,
+            ResidencyPolicy::Mapped,
+        )
+    }
+
+    pub fn open_with_policy(
+        device: D,
+        model_dir: &Path,
+        index_path: &Path,
+        expected_sources: &HashSet<PathBuf>,
+        policy: ResidencyPolicy,
+    ) -> anyhow::Result<Self> {
+        let index_bytes = lisa_mlx::read_index_bytes(index_path).with_context(|| {
             format!(
                 "cannot read resident weight index {}; run `lisa prepare --model '{}'` to create it",
                 index_path.display(), model_dir.display()
@@ -121,10 +144,11 @@ impl ResidentWeights {
         let page_size = unsafe { getpagesize() };
         ensure!(page_size > 0, "invalid OS page size");
         let page = page_size as usize;
-        let max_buffer = Array::max_buffer_length() / page * page;
+        let max_buffer = device.max_allocation_bytes() / page * page;
         let mut buffers = Vec::new();
         let mut file_views = Vec::new();
         let mut mapped_bytes = 0usize;
+        let mut residency = ResidencyBytes::default();
         let mut backing_identities = HashSet::new();
 
         for (file_index, identity) in index.backing_files.iter().enumerate() {
@@ -154,7 +178,7 @@ impl ResidentWeights {
             let overlap = overlap.checked_add(page).context("view overlap overflow")?;
             ensure!(
                 max_buffer > overlap,
-                "largest resident tensor exceeds Metal buffer capacity"
+                "largest resident tensor exceeds device allocation capacity"
             );
             let step = max_buffer - overlap;
             let rounded_len = map
@@ -166,15 +190,40 @@ impl ResidentWeights {
             mapped_bytes = mapped_bytes
                 .checked_add(rounded_len)
                 .context("resident byte count overflow")?;
+            match policy {
+                ResidencyPolicy::Mapped => residency.host_resident = mapped_bytes,
+                ResidencyPolicy::Uploaded => {
+                    residency.host_staging = residency.host_staging.max(rounded_len)
+                }
+            }
             let mut views = Vec::new();
             let mut start = 0;
             while start < map.len() {
                 let length = max_buffer.min(rounded_len - start);
-                let pointer =
-                    unsafe { NonNull::new_unchecked(map.as_ptr().add(start) as *mut c_void) };
+                let pointer = unsafe { NonNull::new_unchecked(map.as_ptr().add(start) as *mut u8) };
                 let owner: Arc<dyn std::any::Any + Send + Sync> = map.clone();
-                let buffer =
-                    Array::buffer_from_external(pointer, length, owner, "resident_model_view")?;
+                // Page-rounded immutable mmap storage is retained by the device
+                // allocation, including every queued indirect resource use.
+                let storage = unsafe { lisa_backend::HostStorage::new(pointer, length, owner) };
+                let shape = [i32::try_from(length / page)?, i32::try_from(page)?];
+                if policy == ResidencyPolicy::Uploaded {
+                    residency.device_resident = residency
+                        .device_resident
+                        .checked_add(length)
+                        .context("uploaded arena size overflow")?;
+                }
+                let imported = device.pull(
+                    lisa_backend::TensorSource::Shared {
+                        storage,
+                        offset: 0,
+                        shape: &shape,
+                        dtype: lisa_backend::ScalarType::U8,
+                    },
+                    lisa_backend::ImportOptions {
+                        mode: policy.import_mode(),
+                    },
+                )?;
+                let buffer = imported;
                 views.push((start, length, buffer.clone()));
                 buffers.push(buffer);
                 if start + length >= map.len() {
@@ -223,7 +272,7 @@ impl ResidentWeights {
             let (start, _, buffer) = views
                 .iter()
                 .find(|(start, length, _)| record.offset >= *start && end <= *start + *length)
-                .with_context(|| format!("no resident Metal view contains {name}"))?;
+                .with_context(|| format!("no resident device view contains {name}"))?;
             tensors.insert(
                 name,
                 TensorView {
@@ -236,69 +285,68 @@ impl ResidentWeights {
             );
         }
         Ok(Self {
+            device,
             tensors,
             buffers,
             mapped_bytes,
+            residency,
         })
     }
 
-    fn tensor(&self, name: &str) -> anyhow::Result<&TensorView> {
+    fn tensor(&self, name: &str) -> anyhow::Result<&TensorView<D::Tensor>> {
         self.tensors
             .get(name)
             .with_context(|| format!("resident tensor {name} missing"))
     }
 
-    pub(crate) fn contains(&self, name: &str) -> bool {
+    pub fn contains(&self, name: &str) -> bool {
         self.tensors.contains_key(name)
     }
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.tensors.len()
     }
-    pub(crate) fn get(&self, name: &str) -> anyhow::Result<Array> {
+    pub fn get(&self, name: &str) -> anyhow::Result<D::Tensor> {
         let t = self.tensor(name)?;
-        Ok(Array::from_buffer_offset(
-            t.buffer.clone(),
-            t.offset,
-            &t.shape,
-            t.dtype,
-        )?)
+        Ok(self
+            .device
+            .byte_view(&t.buffer, t.offset, &t.shape, t.dtype)?)
     }
-    pub(crate) fn get_bytes(&self, name: &str) -> anyhow::Result<Array> {
+    pub fn get_bytes(&self, name: &str) -> anyhow::Result<D::Tensor> {
         let t = self.tensor(name)?;
         let length = i32::try_from(t.nbytes).context("resident byte tensor exceeds array limit")?;
-        Ok(Array::from_buffer_offset(
-            t.buffer.clone(),
-            t.offset,
-            &[length],
-            Dtype::Uint8,
-        )?)
+        Ok(self
+            .device
+            .byte_view(&t.buffer, t.offset, &[length], Dtype::U8)?)
     }
-    pub(crate) fn nbytes(&self, name: &str) -> anyhow::Result<usize> {
+    pub fn nbytes(&self, name: &str) -> anyhow::Result<usize> {
         Ok(self.tensor(name)?.nbytes)
     }
-    pub(crate) fn dtype(&self, name: &str) -> anyhow::Result<Dtype> {
+    pub fn dtype(&self, name: &str) -> anyhow::Result<Dtype> {
         Ok(self.tensor(name)?.dtype)
     }
-    pub(crate) fn shape(&self, name: &str) -> anyhow::Result<Vec<i32>> {
+    pub fn shape(&self, name: &str) -> anyhow::Result<Vec<i32>> {
         Ok(self.tensor(name)?.shape.clone())
     }
-    pub(crate) fn buffers(&self) -> &[Arc<lisa_mlx::runtime::Buffer>] {
+    pub fn buffers(&self) -> &[D::Tensor] {
         &self.buffers
     }
-    pub(crate) fn mapped_bytes(&self) -> usize {
+    pub fn residency(&self) -> ResidencyBytes {
+        self.residency
+    }
+    pub fn mapped_bytes(&self) -> usize {
         self.mapped_bytes
     }
 }
 
 fn parse_dtype(dtype: &str) -> anyhow::Result<Dtype> {
     Ok(match dtype {
-        "BF16" => Dtype::Bfloat16,
-        "F16" => Dtype::Float16,
-        "F32" => Dtype::Float32,
-        "I64" => Dtype::Int64,
-        "I32" => Dtype::Int32,
-        "U32" => Dtype::Uint32,
-        "U8" => Dtype::Uint8,
+        "BF16" => Dtype::BF16,
+        "F16" => Dtype::F16,
+        "F32" => Dtype::F32,
+        "I64" => Dtype::I64,
+        "I32" => Dtype::I32,
+        "U32" => Dtype::U32,
+        "U8" => Dtype::U8,
         "BOOL" => Dtype::Bool,
         _ => anyhow::bail!("unsupported resident dtype {dtype}"),
     })

@@ -27,7 +27,7 @@ impl AsRef<std::path::Path> for ModelDir {
 impl std::str::FromStr for ModelDir {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        crate::models::resolve_model_dir(s)
+        crate::checkpoint::resolve_model_dir(s)
             .map(ModelDir)
             .map_err(|e| e.to_string())
     }
@@ -80,7 +80,7 @@ impl std::fmt::Display for DepthArg {
 /// Widest draft the verify fast path actually covers.
 ///
 /// The split-K verify lane gates `2..=7` rows — one precompiled kernel per M
-/// (`warm_verify_qmm` in `lisa-mlx/src/jit/matmul.rs:605-631`); the other
+/// (`warm_verify_qmm` in `lisa-metal/src/jit/matmul.rs:605-631`); the other
 /// row-fusions stop at 8 as well. A round's draft width is `S = depth + 1`, so a
 /// depth above `FAST_S_MAX - 1` lands every round on the stock qmm path
 /// (measured, bucket <2k: S7 = 78.0 ms → S8 = 108.0 → S9 = 136.8, i.e. 2.16× S5).
@@ -116,8 +116,8 @@ pub fn resolve_mtp_depth(
     depth: DepthArg,
     auto_enabled: bool,
     has_drafter: bool,
-) -> anyhow::Result<Option<crate::session::MtpDepth>> {
-    use crate::session::MtpDepth;
+) -> anyhow::Result<Option<crate::speculation::MtpDepth>> {
+    use crate::speculation::MtpDepth;
     match depth {
         DepthArg::Fixed(0) => Ok(None),
         DepthArg::Fixed(d) => Ok(Some(MtpDepth::Fixed(d))),
@@ -132,7 +132,7 @@ pub fn resolve_mtp_depth(
 #[cfg(test)]
 mod depth_tests {
     use super::{DepthArg, resolve_mtp_depth};
-    use crate::session::MtpDepth;
+    use crate::speculation::MtpDepth;
 
     #[test]
     fn auto_depth_requires_enabled_policy_and_model_mtp() {
@@ -151,22 +151,22 @@ mod depth_tests {
     }
 }
 
-pub fn build_sampler(
+pub fn build_sampler<D: crate::indexer_cache::CacheDevice>(
     temperature: f32,
     top_k: usize,
     top_p: f32,
     min_p: f32,
     rep_penalty: f32,
     seed: u64,
-) -> sampler::Sampler {
-    let mut s = sampler::Sampler {
+) -> sampler::Sampler<D> {
+    let mut s = sampler::Sampler::new(crate::sampling::Sampler {
         temperature,
         top_k,
         top_p,
         min_p,
         repetition_penalty: rep_penalty,
         ..Default::default()
-    };
+    });
     if seed != 0 {
         s.seed = seed;
     }

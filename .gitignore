@@ -7,5 +7,4 @@
 # Local development artifacts.
 /bench/
 /tools/
-/docs/glm53/
 /crates/*/bench/

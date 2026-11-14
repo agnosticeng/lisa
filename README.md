@@ -87,6 +87,19 @@ same automatic policy. For options, run `./target/release/lisa --help` or a
 subcommand's `--help`. Use `run` and `serve` across language-model families;
 the interactive CLI `chat` and cohort `batch` commands currently target Qwen4.
 
+Lisa UI uses Tencent's DSpine drafter by default for compatible Qwen 3.8 27B
+MLX targets. Qwen 27B downloads include the shared drafter and omit
+optional MLX MTP sidecars. Existing targets acquire the drafter on first load.
+For CLI use, select it by setting
+`LISA_QWEN_DSPINE_MODEL=tencent/Qwen3.8-27B-DSpine-b16` (or a local model
+directory) for the [DSpine checkpoint](https://huggingface.co/tencent/Qwen3.8-27B-DSpine-b16).
+This applies to MLX targets only. DSpine's checkpoint defines a
+16-token training block. `--depth auto` uses a measured device/checkpoint
+profile when available, otherwise the established seven-row snapshot schedule.
+Draft block size and target
+verification width are tuned separately; PLD retains its depth-six clamp.
+See [the Qwen model notes](specs/models/qwen.md#dspine-block-drafter).
+
 ## Supported models
 
 These are the desktop app's curated downloads. Model names link to their
@@ -100,7 +113,7 @@ Hugging Face checkpoints; exact selections live in
 | [Qwen 3.5 0.8B](https://huggingface.co/mlx-community/Qwen3.5-0.8B-MLX-4bit) | MLX 4-bit | Text and compatible image input |
 | [Qwen 3.5 4B](https://huggingface.co/mlx-community/Qwen3.5-4B-MLX-4bit) | MLX 4-bit | Text and compatible image input |
 | [Qwen 3.8 27B](https://huggingface.co/agnosticeng/Qwen3.8-27B-4bit) | MLX 4-bit | Text, compatible image input and MTP |
-| [Qwen 3.8 27B](https://huggingface.co/agnosticeng/Qwen3.8-27B-2bit) | MLX 2-bit | Text, compatible image input and MTP |
+| [Qwen 3.8 27B](https://huggingface.co/agnosticeng/Qwen3.8-27B-2bit) | MLX 2-bit · 8.70 GB | Text-only and MTP |
 | [Qwen 3.8 Flash-Next](https://huggingface.co/agnosticeng/Qwen3.8-Flash-Next-4bit) | MLX 4-bit | Hybrid MoE and MTP |
 | [GLM-5.3 Flash](https://huggingface.co/antirez/glm-5.3-flash-gguf) | DS4 Q2 GGUF | **Experimental** · text and MTP |
 | [DeepSeek V4.1 Flash Coder](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-GGUF) | Mixed IQ GGUF | **Experimental** · text and tools |
@@ -206,8 +219,11 @@ output, session/history limits and current compatibility boundaries.
 ## Under the hood
 
 LISA owns its tensor runtime, allocation, model execution and generation loop.
-The workspace separates Metal kernels (`lisa-mlx`), packed-weight storage
-(`lisa-gguf`), inference (`lisa-engine`) and the CLI, server and desktop front ends.
+The workspace separates model plans (`lisa-models`), engine execution
+(`lisa-engine`), portable device contracts (`lisa-backend`), Metal kernels
+(`lisa-metal`), portable MLX checkpoint
+reading (`lisa-mlx`), packed-weight storage
+(`lisa-gguf`), application provider composition (`lisa-serve::application`) and the CLI, server and desktop front ends.
 MLX and DS4 provide reference implementations and kernel sources; their
 attribution is preserved in [NOTICE](NOTICE).
 
@@ -219,8 +235,8 @@ This checks compilation without loading a model. Follow [AGENTS.md](AGENTS.md)
 for numerical validation and sequential GPU runs before committing engine changes.
 
 - [Architecture](specs/architecture.md) — components, checkpoint dispatch and ownership.
-- [Model status](specs/README.md#model-status) — implemented features and measured coverage.
-- [Performance](specs/performance.md) — scoped results and measurement conditions.
+- [Model status](specs/README.md#model-status) — supported paths and current limits.
+- [Performance](specs/performance.md) — optimization decisions and validation protocol.
 - [Roadmap](specs/roadmap.md) — remaining work and acceptance criteria.
 
 LISA is under active development. Model support does not imply every mode or

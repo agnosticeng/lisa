@@ -5,7 +5,7 @@ use super::*;
 fn glm53_gguf_checkpoint_and_ds4_tokenizer() -> Result<()> {
     let path = std::env::var("LISA_GLM53_GGUF").context("set LISA_GLM53_GGUF")?;
     let package = lisa_gguf::Package::open(std::path::Path::new(&path))?;
-    crate::models::glm53::gguf::weights::validate(&package)?;
+    crate::checkpoint::glm53::validate(&package)?;
     let tok = Tokenizer::from_header(&package.header)?;
     let cases: &[(&str, &[u32])] = &[
         ("Hi", &[13041]),

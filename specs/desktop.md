@@ -13,10 +13,11 @@ also reject unsupported macOS versions before allocating GPU resources. This
 keeps the existing arithmetic contracts; an older-OS compiler fallback would
 need separate numerical validation.
 
-The bundle script produces `target/dist/Lisa.app` and enforces a 10,000,000-byte
+The bundle script produces `target/dist/Lisa.app` and enforces a 12,000,000-byte
 limit for the complete bundle, including the engine, UI, kernel package, icon
 and notices. The `dist` profile uses full LTO; engine/runtime optimization stays
-at level 3 while UI and template rendering favor size. Only the bundled copy
+at level 3 while model schemas/plan construction, checkpoint parsing, UI, template rendering and
+network transfer/URL processing favor size. Only the bundled copy
 is stripped. Keep the matching `target/dist/lisa-ui.dSYM` and unstripped binary
 for symbolication and source-level debugging. Model weights are separate.
 
@@ -94,28 +95,9 @@ input. Closing the browser panel hides it; the next tool navigation shows it
 again. Search queries and requested URLs reach Google and the visited sites
 through normal browser requests; model inference remains local.
 
-November 9 integration validation: release workspace build; 356 library tests
-passed (26 existing tests ignored); eight UI tests passed; kernel smoke passed.
-The extraction scripts passed JavaScript syntax and Google prompt detection
-checks; a fresh consent prompt was not exercised live. The signed dist bundle
-is 9,895,697 bytes, with matching symbols outside the app. The UI crate uses
-size optimization `z`; inference crates retain their existing settings.
-
-Live UI checks confirmed the slash menu has no `/web` command, WebKit searches
-execute, and `web_open` reads example.com and produces a clickable source.
-The final 0.8B model run reported a 262,144-token metadata context in the UI
-log. Short CLI runs passed with the Qwen 27B GGUF metadata default and an
-explicit 512-token override. These checks do not certify long-context accuracy
-or reliable research: the 27B search run exhausted its action budget without
-opening a source, and the 0.8B model failed to browse for a Rust follow-up.
-The streaming regression check observed the 0.8B reply grow while Lisa was
-responding, then return to Ready. The response repeated itself until its token
-limit; this verifies delivery behavior, not answer quality. Boundary tests
-cover split tool markers, hidden reasoning and Unicode text.
-
 ## Models and downloads
 
-The allowlist is [catalog.rs](../crates/lisa-ui/src/catalog.rs), with seven
+The allowlist is [catalog.rs](../crates/lisa-ui/src/catalog.rs), with six
 language checkpoints and three image generators. Hub search does not add new
 catalog entries. Existing compatible local checkpoints remain discoverable.
 Type icons distinguish image generators; download actions use an icon.
@@ -127,6 +109,20 @@ chat. Local size accounting follows Hub links, counts each inode once and
 avoids directory cycles. The displayed RAM budget uses the engine's shared
 budget calculation.
 
+Compatible MLX Qwen 3.8 27B targets use DSpine by default. A curated Qwen 27B
+download first fetches the shared DSpine companion, then the target without
+its optional MLX `mtp/` sidecar; one progress indicator covers both packages.
+Completed companion downloads are reused across target quantizations. Existing
+local targets check their companion before every load, reusing a complete
+local copy without a network request. Missing or truncated companions start an
+automatic download with progress in the model row; target loading then resumes.
+Availability checks validate the config and safetensors payload bounds without
+allocating GPU weights. A failed companion
+download fails the operation instead of silently reverting to MTP. The UI
+includes DSpine in package/RAM estimates and excludes unused MTP residency.
+The BF16 companion adds roughly 3.8 GB over the curated MLX MTP sidecar; see
+[Qwen notes](models/qwen.md#dspine-block-drafter). This path remains experimental.
+
 Downloads use the official `hf-hub` 0.4 synchronous Rust client for authenticated
 metadata, resumable HTTP transfers and cache writes. Its async and native Xet
 transfer stacks are excluded to limit app size. The progress ring uses transfer callbacks
@@ -137,14 +133,6 @@ repairs truncated entries. `HF_HUB_CACHE`, `HF_HOME`, `HF_TOKEN`, token files an
 `HF_ENDPOINT` are supported. If ambient credentials
 are rejected, Lisa retries public metadata anonymously; private/gated access
 still reports the authentication failure.
-
-November 9 downloader validation: release workspace build, 358 library tests
-(26 existing tests ignored), eight UI tests and kernel smoke passed. Local Hub
-fixtures checked partial-transfer resumption, interrupted package discovery,
-cache reuse, truncated-file repair, nested files and stale-token fallback.
-A fresh 12,512,611-byte public repository download passed with expired ambient
-credentials. The lighter client's signed workspace bundle is 11,296,700 bytes;
-it fits the 12 MB packaging limit adopted for the synchronous Hub client.
 
 The list separates download size from resident memory estimates. DeepSeek's
 Engram table is disk-only. GGUF packages select the required files and skip
@@ -168,4 +156,36 @@ assistant response. The [README preview](../docs/images/screenshot.png) shows
 an actual local FLUX.2 Klein 9B generation in the current app, framed at 16:10.
 It is a product preview, not a performance measurement.
 
-Detailed inference limits and integration evidence are in [media](media.md).
+Detailed inference limits are in [media](media.md).
+
+The icon shares duplicate representations and losslessly compresses PNGs;
+physical resolutions and pixel values are preserved.
+
+## Shared Apple app
+
+[apps/Lisa](../apps/Lisa/README.md) provides a shared SwiftUI interface for macOS
+and iOS/iPadOS. The size-limited AppKit bundle remains the shipping desktop path;
+SwiftUI has not reached full desktop or physical-device inference acceptance.
+
+`backend.rs` owns the model worker, session replay and streamed events for both
+UIs. Models never cross the worker-thread boundary. `browser.rs` owns extraction
+and browser messages; each platform supplies its WebKit presentation/lifecycle.
+`bridge.rs` exposes owned UTF-8 JSON requests/responses through two C functions.
+Swift calls on a serial queue and releases returned Rust strings explicitly.
+SwiftUI owns navigation, view state and permissions, while chat persistence keeps
+the existing Rust schema. Only owned attachment paths may be relocated after
+an iOS application container changes.
+
+The Xcode build bundles matching kernels and licenses for its Rust target.
+iOS requires version 18+ for compiler APIs and retains the physical-RAM-minus-8-GiB
+policy plus the current per-app limit. Simulator uses the Mac host budget; it
+does not certify a physical iPhone/iPad's capabilities. The current Simulator
+BF16 compiler-service failure blocks inference acceptance; do not change weights
+or arithmetic to hide it.
+
+Cancellation occurs at generation callbacks, not inside an active forward.
+An inactive iOS scene requests cancellation/model release; returning reloads and
+replays saved history. Incomplete turns are not committed. Suspension, browser,
+voice, image generation and serving need physical-device acceptance. SwiftUI
+currently renders inline Markdown and fenced code, without AppKit's custom
+math/table renderer or slash picker.

@@ -17,7 +17,7 @@ decode batching are unsupported.
 | Package | Five transformer shards plus `DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf` |
 
 Full identities and adaptation scope live in
-[provenance](../../crates/lisa-engine/src/models/deepseek41/provenance.json).
+[provenance](../../crates/lisa-models/src/deepseek41/provenance.json).
 All six files are required at the snapshot root. The downloader preserves
 notices and expert-selection metadata. No MLX conversion or prepared index is
 needed.
@@ -46,8 +46,7 @@ their existence does not certify those real-context workloads.
 
 CLI and UI default to the checkpoint metadata limit of 1,048,576 tokens.
 `--ctx-size` can override it in the CLI; allocation remains subject to memory
-admission. Only the measured contexts
-below have model-level comparison evidence.
+admission. Advertised capacity does not certify numerical parity at every context length.
 
 The native cache supports copy-on-write RAM snapshots bound to model/file and
 numerical identity. Admission accounts for configured cache capacity. The generic
@@ -58,7 +57,7 @@ chat and streaming. Persistent continuation compares exact token prefixes,
 including the final EOS token when it has not yet been fed into the model.
 Desktop chats can resume text history after reopening or app restart.
 
-## Reference and evidence
+## Reference contract
 
 Stock DS4 does not load this exact mixed-format package. The pinned
 [reference adapter](../../crates/lisa-bench/reference/deepseek41/README.md)
@@ -66,31 +65,10 @@ adds its formats while retaining DS4 execution. Some Metal format helpers are
 shared with LISA. Therefore adapter agreement, independent CPU/GPU format
 validation and stock upstream performance are distinct claims.
 
-Recorded on November 4, Apple M5 Max with 128 GiB unified memory:
-
-| Check | Recorded result | Limit |
-| --- | --- | --- |
-| Short all-layer capture | 4,045/4,045 arrays bit-exact, twice | Five prompt tokens and three generated forwards |
-| DS4 decode-loop logits | Bit-exact | Tested same-weight adapter path |
-| Real 149-token history | Eight final-logit arrays bit-exact, twice | Includes snapshot/ring-wrap coverage |
-| Real 8,199-token prompt | Two compared arrays bit-exact | One repetitive prompt, 8,200 teacher-forced inputs; first wide gate only |
-| Interleaved short decode | LISA 37.5199 vs adapter 36.1603 tok/s | Three runs per arm, 64 output tokens / 63 timed forwards; IDs identical |
-| Integration | HTTP/SSE, DSML round trip, prefix reuse, seed zero, two UI turns | Disconnect recovery was checked; end-to-end cancellation was not |
-
-The adapter's large C unit used `-O1` because Clang 21 crashed at `-O3`;
-other units used `-O3` and original Metal. Its prefill computes scalar prompt
-logits and is excluded from prefill performance comparisons. These caveats
-prevent presenting the short decode table as universal DS4 equivalence.
-
-The recorded closure build/library/smoke checks passed; the library count was
-338 passed and 22 ignored at that revision. Affected model tests were enabled
-separately. Subsequent GLM integration also rechecked DeepSeek tokenization.
-Counts describe their recorded revisions, not a new run during this doc review.
-
-Within-LISA comparisons recorded grouped output projection improvement from
-33.1037 to 36.0588 tok/s, paired Q8 from 35.7502 to 36.8193, and 149-token
-prefill from 4.6648 to 4.1255 seconds. These are separate measurements and must
-not be added together or substituted for a matched DS4 prefill comparison.
+The reference adapter uses `-O1` for its large C unit because Clang 21 fails
+at `-O3`; other units retain `-O3` and original Metal. Its scalar prompt-logit
+prefill is unsuitable as a matched prefill performance baseline. Preserve these
+adapter limits when making a future parity or throughput claim.
 
 ## Remaining acceptance
 

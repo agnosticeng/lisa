@@ -3,7 +3,7 @@
 //! Header parsing never maps or reads the weight payload. A resident tensor
 //! mapping and a disk-backed row reader are separate, explicit operations.
 //! This crate has no dependency on LISA's engine or Metal runtime. GPU weight
-//! views and RAM admission belong to `lisa-engine::core::gguf_resident`.
+//! views and RAM admission belong to `lisa-engine::weights::gguf`.
 
 mod header;
 mod package;

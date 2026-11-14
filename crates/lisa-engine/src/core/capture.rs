@@ -6,29 +6,28 @@
 //! 0..3) on the first forward. The NPZ archive supports stage-by-stage
 //! comparison with the DS4 reference execution.
 
-use lisa_mlx::{Array, Dtype};
+use lisa_backend::TensorAccess;
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-#[derive(Default)]
-pub struct Capture {
+pub struct Capture<T> {
     pub layers: Vec<usize>,
     /// Optional substring filter for targeted parity captures. Empty keeps
     /// the historical all-stages behavior for selected layers.
     pub key_filters: Vec<String>,
     pub state_only: bool,
     pub kda_prefill_only: bool,
-    pub(crate) preserve_dispatch: bool,
+    pub preserve_dispatch: bool,
     pub entries: Mutex<HashMap<String, Vec<f32>>>,
     pub shapes: Mutex<HashMap<String, Vec<i64>>>,
-    pub(crate) pending: Mutex<HashMap<String, Array>>,
+    pub pending: Mutex<HashMap<String, T>>,
     /// One-shot flush: the first forward's captures are the comparison
     /// target; later (generation re-prefill) forwards overwrite entries.
     pub flushed: std::sync::atomic::AtomicBool,
 }
 
-impl Capture {
+impl<T: TensorAccess> Capture<T> {
     pub fn from_env() -> Option<Self> {
         std::env::var("LISA_GLM53_CAPTURE").ok()?;
         let layers: Vec<usize> = std::env::var("LISA_GLM53_LAYERS")
@@ -57,7 +56,7 @@ impl Capture {
         self.preserve_dispatch
     }
 
-    pub(crate) fn accepts_key(&self, key: &str) -> bool {
+    pub fn accepts_key(&self, key: &str) -> bool {
         !self.flushed.load(std::sync::atomic::Ordering::Relaxed)
             && (self.key_filters.is_empty()
                 || self.key_filters.iter().any(|filter| key.contains(filter)))
@@ -66,7 +65,7 @@ impl Capture {
     }
 
     /// Store a module output (flattened to F32 on host); skipped once flushed.
-    pub fn store(&self, key: &str, a: &Array) {
+    pub fn store(&self, key: &str, a: &T) {
         if !self.accepts_key(key) {
             return;
         }
@@ -82,11 +81,9 @@ impl Capture {
                 .insert(key.to_string(), shape);
             return;
         }
-        let Ok(v) = a.as_dtype(Dtype::Float32) else {
+        let Ok(data) = a.read_f32() else {
             return;
         };
-        let _ = v.eval();
-        let data: Vec<f32> = v.as_slice::<f32>().to_vec();
         self.entries
             .lock()
             .expect("capture lock")
@@ -100,12 +97,12 @@ impl Capture {
     /// Preserve a transient tensor's value in a separate device buffer before
     /// later dispatches can recycle its scratch storage. The copy stays on the
     /// same command stream, so this does not add a host synchronization.
-    pub fn store_ephemeral(&self, key: &str, a: &Array) {
+    pub fn store_ephemeral(&self, key: &str, a: &T) {
         if !self.accepts_key(key) {
             return;
         }
         if self.preserves_dispatch()
-            && let Ok(snapshot) = a.copied()
+            && let Ok(snapshot) = a.independent_copy()
         {
             self.store(key, &snapshot);
         } else {
@@ -127,13 +124,10 @@ impl Capture {
             if !pending.is_empty() {
                 let mut entries = self.entries.lock().expect("capture lock");
                 for (key, array) in pending {
-                    let Ok(values) = array.as_dtype(Dtype::Float32) else {
+                    let Ok(values) = array.read_f32() else {
                         continue;
                     };
-                    if values.eval().is_err() {
-                        continue;
-                    }
-                    entries.insert(key, values.as_slice::<f32>().to_vec());
+                    entries.insert(key, values);
                 }
             }
         }
@@ -237,5 +231,21 @@ impl Capture {
 
         std::fs::File::create(path)?.write_all(&blob)?;
         Ok(())
+    }
+}
+
+impl<T> Default for Capture<T> {
+    fn default() -> Self {
+        Self {
+            layers: Vec::new(),
+            key_filters: Vec::new(),
+            state_only: false,
+            kda_prefill_only: false,
+            preserve_dispatch: false,
+            entries: Mutex::new(HashMap::new()),
+            shapes: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
+            flushed: std::sync::atomic::AtomicBool::new(false),
+        }
     }
 }

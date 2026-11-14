@@ -1,6 +1,7 @@
 //! Desktop model discovery, sizes and curated download metadata.
 
 use crate::catalog;
+use lisa_engine::core::config::ReadConfig;
 
 #[derive(Clone, Debug)]
 pub struct Model {
@@ -14,7 +15,7 @@ pub struct Model {
 }
 
 pub(super) fn config_model_type(dir: &std::path::Path) -> Option<String> {
-    lisa_engine::models::model_type_of(dir).ok()
+    lisa_engine::checkpoint::model_type_of(dir).ok()
 }
 
 pub(super) fn display_name(repo_id: &str) -> &str {
@@ -23,7 +24,7 @@ pub(super) fn display_name(repo_id: &str) -> &str {
 
 /// Scan the local Hugging Face hub cache for checkpoints the engine supports.
 pub(super) fn discover_models() -> Vec<Model> {
-    let hub = lisa_engine::models::hf::hub_root();
+    let hub = lisa_engine::checkpoint::hf::hub_root();
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(&hub) else {
         return out;
@@ -34,12 +35,31 @@ pub(super) fn discover_models() -> Vec<Model> {
             continue;
         };
         let repo_id = rest.replacen("--", "/", 1);
-        for path in lisa_engine::models::hf::cached_snapshots(&repo_id) {
-            let glm = path.join(lisa_engine::models::glm53::gguf::ENTRY);
+        if repo_id == lisa_engine::bindings::qwen35_gguf::REPO {
+            continue;
+        }
+        for path in lisa_engine::checkpoint::hf::cached_snapshots(&repo_id) {
+            let qwen = path.join(lisa_engine::bindings::qwen35_gguf::ENTRY);
+            if qwen.is_file() {
+                if let Ok(resident_bytes) = lisa_engine::bindings::qwen35_gguf::inspect(&qwen) {
+                    out.push(Model {
+                        repo_id: repo_id.clone(),
+                        model_type: "qwen35".into(),
+                        path: path.to_string_lossy().into(),
+                        local: true,
+                        size: std::fs::metadata(&qwen).map(|m| m.len()).unwrap_or(0),
+                        resident_bytes: Some(resident_bytes),
+                        too_big: false,
+                    });
+                    break;
+                }
+                continue;
+            }
+            let glm = path.join(lisa_engine::checkpoint::catalog::glm53::ENTRY);
             if glm.is_file() {
                 let info = (|| -> anyhow::Result<u64> {
                     let package = lisa_gguf::Package::open(&glm)?;
-                    lisa_engine::models::glm53::gguf::weights::validate(&package)?;
+                    lisa_engine::checkpoint::glm53::validate(&package)?;
                     Ok(std::fs::metadata(&glm)?.len())
                 })();
                 if let Ok(size) = info {
@@ -56,17 +76,15 @@ pub(super) fn discover_models() -> Vec<Model> {
                 }
                 continue;
             }
-            let gguf = path.join(lisa_engine::models::deepseek41::GGUF_ENTRY);
+            let gguf = path.join(lisa_engine::checkpoint::catalog::deepseek41::GGUF_ENTRY);
             if gguf.is_file() {
                 let info = (|| -> anyhow::Result<(u64, u64)> {
-                    use lisa_engine::models::deepseek41::{
-                        config::Config, engram::Layout, weights::WeightPlan,
-                    };
+                    use lisa_engine::bindings::deepseek41_weights::WeightPlan;
                     let package = lisa_gguf::Package::open(&gguf)?;
                     let plan = WeightPlan::inspect(
                         &package,
-                        &Config::from_header(&package.header)?,
-                        &Layout::from_header(&package.header)?,
+                        &lisa_engine::checkpoint::deepseek41::config(&package.header)?,
+                        &lisa_engine::checkpoint::deepseek41::engram_layout(&package.header)?,
                     )?;
                     let size = package.shards.iter().try_fold(0u64, |total, file| {
                         Ok::<_, std::io::Error>(total + std::fs::metadata(file)?.len())
@@ -88,8 +106,8 @@ pub(super) fn discover_models() -> Vec<Model> {
                 continue;
             }
             if let Some(mt) = config_model_type(&path) {
-                if lisa_engine::models::ModelKind::from_model_type(&mt)
-                    .is_ok_and(|kind| kind != lisa_engine::models::ModelKind::Laya)
+                if lisa_engine::checkpoint::ModelKind::from_model_type(&mt)
+                    .is_ok_and(|kind| kind != lisa_engine::checkpoint::ModelKind::Laya)
                     && has_model_weights(&path, &mt)
                 {
                     let size = model_weight_size(&path, &mt);
@@ -105,6 +123,21 @@ pub(super) fn discover_models() -> Vec<Model> {
                     break;
                 }
             }
+        }
+    }
+    let draft_bytes =
+        cached_dspine().map_or(catalog::DSPINE_DOWNLOAD_BYTES, |path| dir_size(&path));
+    for model in &mut out {
+        if uses_dspine_path(std::path::Path::new(&model.path)).unwrap_or(false) {
+            let mtp = dir_size(&std::path::Path::new(&model.path).join("mtp"));
+            let target = model.size.saturating_sub(mtp);
+            model.resident_bytes = Some(
+                model
+                    .resident_bytes
+                    .unwrap_or(target)
+                    .saturating_add(catalog::DSPINE_WEIGHT_BYTES),
+            );
+            model.size = target.saturating_add(draft_bytes);
         }
     }
     out.sort_by(|a, b| a.repo_id.cmp(&b.repo_id));
@@ -199,12 +232,169 @@ pub(super) fn model_ram_budget() -> u64 {
 
 /// Refresh sizes for the explicit catalog; network results cannot add models.
 pub(super) fn fetch_remote_models() -> Vec<(String, u64)> {
+    use lisa_engine::checkpoint::hf::{download_size, download_size_with_profile};
+    let draft_bytes = download_size(lisa_engine::bindings::dspine::REPO)
+        .unwrap_or(catalog::DSPINE_DOWNLOAD_BYTES);
     catalog::MODELS
         .iter()
         .map(|entry| {
-            let size = lisa_engine::models::hf::download_size(entry.repo_id)
-                .unwrap_or(entry.download_bytes);
+            let target = download_size_with_profile(entry.repo_id, download_profile(entry.repo_id))
+                .unwrap_or_else(|_| catalog::target_download_bytes(entry));
+            let size = target
+                + if catalog::uses_dspine(entry.repo_id) {
+                    draft_bytes
+                } else {
+                    0
+                };
             (entry.repo_id.to_string(), size)
         })
         .collect()
+}
+
+fn download_profile(repo: &str) -> lisa_engine::checkpoint::hf::DownloadProfile {
+    use lisa_engine::checkpoint::hf::DownloadProfile;
+    if catalog::uses_dspine(repo) {
+        DownloadProfile::WithoutMtp
+    } else {
+        DownloadProfile::Complete
+    }
+}
+
+/// Inspect metadata rather than applying the 27B draft to smaller dense Qwens.
+pub(super) fn uses_dspine_path(path: &std::path::Path) -> anyhow::Result<bool> {
+    use lisa_engine::{bindings::dspine, checkpoint};
+    use lisa_models::qwen3_5::config::Qwen35Config;
+    let path = checkpoint::hf::checkpoint_path(path.to_path_buf());
+    match checkpoint::model_type_of(&path)?.as_str() {
+        "qwen3_5" | "qwen3_5_text" => Ok(dspine::supports_target(
+            &Qwen35Config::from_json(&path.join("config.json"))?,
+        )),
+        _ => Ok(false),
+    }
+}
+
+fn draft_checkpoint_available(path: &std::path::Path) -> bool {
+    // Read metadata and mapped shard headers only; this does not initialize Metal
+    // or load tensor payloads. Nonempty files alone can still be truncated.
+    let config_ok = std::fs::read(path.join("config.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .is_some_and(|config| config["model_type"] == "qwen3" && config["num_hidden_layers"] == 5);
+    if !config_ok || !has_model_weights(path, "qwen3") {
+        return false;
+    }
+    std::fs::read_dir(path).is_ok_and(|entries| {
+        let shards: Vec<_> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|file| file.extension().is_some_and(|ext| ext == "safetensors"))
+            .collect();
+        !shards.is_empty()
+            && shards.iter().all(|file| {
+                lisa_mlx::Shard::open(file)
+                    .is_ok_and(|shard| shard.tensor_names().next().is_some())
+            })
+    })
+}
+
+fn cached_draft_repo(repo: &str) -> Option<std::path::PathBuf> {
+    lisa_engine::checkpoint::hf::cached_snapshots(repo)
+        .into_iter()
+        .find(|path| draft_checkpoint_available(path))
+}
+
+fn cached_dspine() -> Option<std::path::PathBuf> {
+    cached_draft_repo(lisa_engine::bindings::dspine::REPO)
+}
+
+/// Check locally first so complete cached drafts also work offline. Missing or
+/// interrupted downloads use the Hub client's resume/size-repair path.
+fn ensure_draft_repo(
+    repo: &str,
+    progress: impl Fn(u64, u64) + Send + Sync + 'static,
+) -> anyhow::Result<std::path::PathBuf> {
+    if let Some(path) = cached_draft_repo(repo) {
+        let size = dir_size(&path);
+        progress(size, size);
+        return Ok(path);
+    }
+    let path = lisa_engine::checkpoint::hf::download_repo_with_progress(repo, progress)?;
+    anyhow::ensure!(
+        draft_checkpoint_available(&path),
+        "downloaded drafter is incomplete or invalid: {}",
+        path.display()
+    );
+    Ok(path)
+}
+
+/// Existing target downloads acquire the missing companion on their next load.
+/// Progress is emitted only while fetching a missing companion, then cleared
+/// before loading the target. Explicit local overrides remain user-owned.
+pub(super) fn load_model(
+    path: &std::path::Path,
+    progress: impl Fn(Option<(u64, u64)>) + Send + Sync + 'static,
+) -> anyhow::Result<lisa_serve::application::loading::Loaded> {
+    use lisa_engine::{bindings::dspine, checkpoint};
+    use lisa_serve::application::loading;
+    if !uses_dspine_path(path)? {
+        return loading::load_dir(path);
+    }
+    let selection = match std::env::var("LISA_QWEN_DSPINE_MODEL") {
+        Ok(model) => model,
+        Err(std::env::VarError::NotPresent) => dspine::REPO.to_owned(),
+        Err(error) => return Err(error.into()),
+    };
+    let draft =
+        if checkpoint::hf::is_repo_id(&selection) && !std::path::Path::new(&selection).exists() {
+            match cached_draft_repo(&selection) {
+                Some(path) => path,
+                None => {
+                    let progress = std::sync::Arc::new(progress);
+                    progress(Some((0, 0)));
+                    let download_progress = progress.clone();
+                    let result = ensure_draft_repo(&selection, move |done, total| {
+                        download_progress(Some((done, total)))
+                    });
+                    progress(None);
+                    result?
+                }
+            }
+        } else {
+            checkpoint::resolve_model_dir(&selection)?
+        };
+    loading::load_dir_with_dspine(path, &draft)
+}
+
+/// Download the shared draft first, then the target without optional MTP files.
+/// The model row only completes when both packages have succeeded. Hub cache
+/// hits are reused and both phases contribute to the same progress indicator.
+pub(super) fn download_model_with_progress(
+    repo: &str,
+    progress: impl Fn(u64, u64) + Send + Sync + 'static,
+) -> anyhow::Result<std::path::PathBuf> {
+    use lisa_engine::{bindings::dspine, checkpoint::hf};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+    let profile = download_profile(repo);
+    if !catalog::uses_dspine(repo) {
+        return hf::download_repo_with_progress(repo, progress);
+    }
+    let target_size = hf::download_size_with_profile(repo, profile)?;
+    let progress = Arc::new(progress);
+    let draft_size = Arc::new(AtomicU64::new(0));
+    let draft_completed = draft_size.clone();
+    let draft_progress = progress.clone();
+    ensure_draft_repo(dspine::REPO, move |done, total| {
+        draft_completed.store(total, Ordering::Relaxed);
+        draft_progress(done, total.saturating_add(target_size));
+    })?;
+    let draft_bytes = draft_size.load(Ordering::Relaxed);
+    hf::download_repo_with_profile(repo, profile, move |done, total| {
+        progress(
+            draft_bytes.saturating_add(done),
+            draft_bytes.saturating_add(total),
+        );
+    })
 }

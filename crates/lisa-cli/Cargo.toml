@@ -11,10 +11,11 @@ name = "lisa"
 path = "src/main.rs"
 
 [dependencies]
+lisa-models.workspace = true
+lisa-engine.workspace = true
 lisa-gguf.workspace = true
 anyhow.workspace = true
 clap.workspace = true
-lisa-mlx.workspace = true
+lisa-metal.workspace = true
 serde_json.workspace = true
-lisa-engine.workspace = true
 lisa-serve.workspace = true
