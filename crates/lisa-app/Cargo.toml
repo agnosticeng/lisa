@@ -1,0 +1,22 @@
+[package]
+name = "lisa-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lisa-models.workspace = true
+lisa-mlx.workspace = true
+lisa-engine.workspace = true
+lisa-gguf.workspace = true
+lisa-metal.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+lisa-serve.workspace = true
+objc2-foundation = { workspace = true, features = ["NSDate"] }
+
+[lib]
+name = "lisa_app"
+crate-type = ["rlib", "staticlib"]
+path = "src/lib.rs"

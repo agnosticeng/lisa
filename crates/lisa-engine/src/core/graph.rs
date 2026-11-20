@@ -157,6 +157,35 @@ where
             self.device.dispatch(handle, args, &self.stream)
         })
     }
+    /// Bound in-flight allocations for memory-constrained application paths.
+    /// Completion barriers change scheduling, never graph arithmetic or lifetimes.
+    pub fn run_bounded(
+        &self,
+        inputs: &[&D::Tensor],
+        states: &mut [D::Tensor],
+        cadence: usize,
+    ) -> anyhow::Result<Outputs<D::Tensor>>
+    where
+        D: lisa_backend::ManagedDevice,
+    {
+        anyhow::ensure!(
+            !self.resources && cadence > 0,
+            "invalid bounded graph execution"
+        );
+        let mut count = 0;
+        self.run_dispatch(inputs, states, |handle, args| {
+            let result = self.device.dispatch(handle, args, &self.stream)?;
+            count += 1;
+            if count % cadence == 0 {
+                if let Some(result) = &result {
+                    self.device.wait(&result.completion)?;
+                }
+                self.device.clear_unused();
+            }
+            Ok(result)
+        })
+    }
+
     /// Bind opaque resources for indirect operations. The provider validates the
     /// context and retains allocations until their encoded users complete.
     pub fn run_with_resources(
@@ -177,7 +206,7 @@ where
         &self,
         inputs: &[&D::Tensor],
         states: &mut [D::Tensor],
-        dispatch: impl Fn(
+        mut dispatch: impl FnMut(
             &D::KernelHandle,
             &[&D::Tensor],
         ) -> Result<

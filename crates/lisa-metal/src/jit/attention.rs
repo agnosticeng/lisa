@@ -963,7 +963,7 @@ pub fn sdpa(
         }
         let (q, k, v) = (q.contiguous()?, k.contiguous()?, v.contiguous()?);
         let (q, k, v) = (&q, &k, &v);
-        if mask.is_some() && !matches!(d, 192 | 256) {
+        if mask.is_some() && ql * gqa > 32 && !matches!(d, 192 | 256) {
             // Unchanged legacy semantics: the dense chain only takes array
             // masks for head_dim 192/256 (the fused vector kernels above
             // handle masks at qL <= 8 for every d).

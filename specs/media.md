@@ -122,3 +122,67 @@ External stage tests use `LISA_FLUX2_MODEL`, `LISA_FLUX2_FIXTURES`,
 `LISA_FLUX3_MODEL` and `LISA_FLUX3_FIXTURES`. The `reference.py` beside each
 binding generates inputs. Enabled tests fail if required data is missing.
 Follow the [validation protocol](performance.md#validation-protocol).
+
+### Bonsai Image Binary 4B
+
+The native FLUX.2 family also accepts
+`prism-ml/bonsai-image-binary-4B-mlx-1bit`. This is the image checkpoint, not
+the similarly named Bonsai language model. It retains original U32 1-bit
+transformer payloads, BF16 affine scales/biases (groups of 128), dense skip
+layers, and the original 4-bit Qwen3 text encoder. Diffusers VAE convolution
+layouts and checkpoint names are adapted without requantization.
+
+- Checkpoint revision: `d1b3ac11a7f1ba61d84b277339daeeed4a98e0e2`.
+- PrismML MLX kernel reference: `bbc151c6360ee79a7412fa23cfc5c5fc63ced1ca`.
+- PrismML mflux reference: `bcd13e83b7fcfd76186c98ef322dd9cf28e996c1`.
+- Swift fork inspected: `2a673fa8324ca9900f37445db1f66f4400e4af15`, which pins
+  core `a10ad3bf31d7700d464a993e90636ca4446c6639`. No Swift MLX runtime is linked.
+
+The 3.43 GB package includes a 965 MB transformer, 2.26 GB encoder and 168 MB
+VAE. Tensor hashes were verified against the published manifest; its README
+hash is stale at this revision. Four denoising steps use the executable
+mflux empirical FLUX.2 schedule, rather than interpreting the scheduler's
+exported `shift: 3` as a different fixed schedule. Binary Q/K normalization
+uses the reference's epsilon of 1e-6; existing FLUX.2 retains 1e-5.
+
+Binary affine projections use the portable Metal GEMM path (including on M5),
+with on-the-fly bit decoding; packed weights are never expanded permanently.
+Only the first 27 encoder layers are loaded and executed, since the requested
+hidden states are layers 9, 18 and 27. Later layers cannot contribute to those
+outputs. The encoder and denoiser introduce completion barriers every 24 graph calls
+and sweep unleased buffers to bound queued temporaries without changing arithmetic. Each stage releases
+its weights before the next loads. VAE decoding uses 128px tiles, 64px
+overlap and cosine blending, matching the reference tile policy.
+
+Admission requires 2.6 GiB of available model budget, including scratch.
+Supported output sizes are multiples of 32 between 64 and 512 pixels.
+The model is hidden when this budget does not fit. The iOS per-app memory
+allowance and 512 MiB reserve remain in force.
+
+Validation on 2026-11-19: binary affine unpacking and GEMM matched an exact
+integer oracle twice in BF16 and FP32, including partial row/output tiles;
+rectangular tile blending passed coverage/constant-image checks. A native
+512×512 four-step generation produced a valid PNG on Mac, with 2,697,775,936
+bytes peak physical footprint reported by `time -l` (maximum RSS
+3,678,306,304 bytes). This is functional and bounded-memory evidence, not
+full numerical parity with PrismML's fused transformer or a speed comparison.
+
+The full-encoder, compact-encoder and compact-encoder/cache-sweep generations
+produced byte-identical PNGs at seed 42 for the same 512px prompt
+(SHA-256 `6cbcfbb6acf9d159c6cbfd20dc0c1a985c1003917bca769e2f27ff7a309c64ca`).
+The 2.6 GiB admission allowance is above the measured peak footprint and is
+checked against the live iOS app allowance after the separate 512 MiB reserve.
+
+The existing FLUX.2 Klein 4B path also produced byte-identical 512px seed-42
+PNGs before/after this change; traces retained 30,478 dispatches. No existing
+FLUX arithmetic or scheduling path was changed. The workspace release build,
+574 library tests (32 explicitly ignored) and smoke suite passed. The denoiser
+plan test compares bounded and ordinary execution against the retained oracle.
+
+Generated images in the Apple app are written beneath the explicit Application
+Support/Lisa/generated-images directory supplied at initialization. The worker
+creates this directory before starting inference; it does not derive iOS
+output paths from `HOME`. Saved chat paths are relocated when iOS changes the
+container UUID during updates. The first physical-device generation completed
+the compute stages but exposed the former HOME/Pictures permission error; the
+subsequent end-to-end save check is recorded in the desktop validation notes.

@@ -151,7 +151,7 @@ layout from https://github.com/ddalcu/mlx-serve
 Revision: 6c4306145b7331f6b962b97e145fd9ac46e9e14a
 Copyright (c) 2026 David Dalcu. License: MIT (full text below).
 LISA supplies its own Rust execution, bounded attention and convolution storage,
-request isolation, image decoding, HTTP handling and AppKit integration.
+request isolation, image decoding, HTTP handling and Apple app integration.
 
 The LayerNorm source common/attention/layer_norm.metal comes from MLX revision
 1f8e74e3f12f31365464a6867c6579f0e9b29d85,
@@ -253,3 +253,51 @@ DSpine fixture provenance.
 The explicit DS4 MXFP8 row decoder in crates/lisa-gguf/src/quant/ds4.rs
 is ported from ds4_engram.c at b3f50180ec2c7324892be1f50bc83555ccb8d5e7.
 Its MIT license is preserved at crates/lisa-gguf/src/LICENSE-DS4.
+
+LFM3 model plans
+----------------
+crates/lisa-models/src/lfm3/ adapts the text architecture from MLX-VLM's
+LFM3 and LFM2 ShortConv implementations at revision
+ a22a364af9d7ee5e7e063881923cf18a3f42533d:
+https://github.com/Blaizzy/mlx-vlm/tree/a22a364af9d7ee5e7e063881923cf18a3f42533d/mlx_vlm/models/lfm3
+Copyright 2026 The HuggingFace Team. All rights reserved.
+License: Apache-2.0; retained at crates/lisa-models/src/lfm3/LICENSE.
+Local modifications express the model as portable Rust graphs with explicit
+immutable state, bounded sliding attention and original packed MLX weights.
+The LiquidAI checkpoint weights are downloaded separately under their own
+LFM Open License v1.0; their license is retained with the downloaded package.
+
+PrismML Bonsai image support
+---------------------------
+The 1-bit decode additions in common/matmul/quantized.metal follow
+PrismML-Eng/mlx revision bbc151c6360ee79a7412fa23cfc5c5fc63ced1ca,
+mlx/backend/metal/kernels/quantized.h (Apple MLX MIT attribution above).
+https://github.com/PrismML-Eng/mlx
+The overlapping VAE tile geometry and cosine blending in
+crates/lisa-models/src/flux/tiles.rs adapt VAETiler from
+https://github.com/PrismML-Eng/mflux-prism
+Revision bcd13e83b7fcfd76186c98ef322dd9cf28e996c1.
+The checkpoint adapter retains original binary packs and BF16 parameters.
+Model weights are downloaded separately under the publisher's license.
+
+MIT License
+
+Copyright (c) 2026 Filip Strand
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

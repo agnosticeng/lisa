@@ -73,10 +73,12 @@ impl App {
         );
         lisa_metal::runtime::check_platform_support()?;
         lisa_metal::shader_pack::initialize()?;
+        #[cfg(target_os = "ios")]
+        lisa_engine::checkpoint::hf::configure_cache_root(storage.join("models"))?;
         let (commands, rx) = mpsc::channel();
         let events = Arc::new(Mutex::new(Vec::new()));
         let cancel = Arc::new(AtomicBool::new(false));
-        let worker = backend::spawn_controlled(rx, events.clone(), cancel.clone())?;
+        let worker = backend::spawn_controlled(rx, events.clone(), cancel.clone(), storage.join("generated-images"))?;
         Ok(Self {
             commands,
             events,
@@ -161,6 +163,10 @@ impl App {
                     self.downloading = false;
                     ("models_changed", Value::Null)
                 }
+                UiEvent::DownloadFailed(message) => {
+                    self.downloading = false;
+                    ("download_failed", json!(message))
+                }
                 UiEvent::DownloadProgress {
                     repo,
                     completed,
@@ -187,12 +193,6 @@ impl App {
                         "script":format!("(() => {{ {} return {}; }})()",browser::GOOGLE_PROMPT_SCRIPT,script)}),
                     )
                 }
-                // Speech is provided directly by the Swift platform adapter.
-                UiEvent::RemoteModels(_)
-                | UiEvent::VoiceMicrophoneAccess(_)
-                | UiEvent::VoiceSpeechAccess(_)
-                | UiEvent::VoiceTranscript { .. }
-                | UiEvent::VoiceError(_) => continue,
             };
             output.push(json!({"kind":kind,"value":value}));
         }
@@ -230,15 +230,10 @@ impl App {
                     .find(|model| model.repo_id == id)
                     .context("Download the model first")?;
                 let bytes = model.resident_bytes.unwrap_or(model.size);
+                let budget = models::model_ram_budget();
                 ensure!(
-                    models::model_ram_budget() > 0 && bytes <= models::model_ram_budget(),
+                    budget > 0 && bytes <= budget,
                     "This model exceeds the device memory budget"
-                );
-                #[cfg(all(target_os = "ios", not(target_abi = "sim")))]
-                ensure!(
-                    lisa_engine::memory::available_ram()
-                        .is_some_and(|free| bytes as usize <= free.saturating_sub(512 << 20)),
-                    "Not enough app memory to load this model"
                 );
                 self.cancel.store(false, Ordering::Release);
                 self.send(Command::Load(model.path.into()))?;

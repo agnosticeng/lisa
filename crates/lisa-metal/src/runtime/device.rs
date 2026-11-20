@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::NonNull;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use block2::RcBlock;
@@ -177,6 +177,7 @@ pub struct MetalRuntime {
     pub pool: Arc<BufferPool>,
     pub commands: Arc<Commands>,
     pipelines: Mutex<HashMap<String, ComputePipeline>>,
+    allocation_limit: AtomicUsize,
     /// Whether the MetalPerformancePrimitives tensor ops (the M5/Apple10
     /// "NAX" path) are usable on this GPU. False on M1–M4, where the runtime
     /// routes to the non-NAX steel/vector kernels instead.
@@ -321,8 +322,21 @@ impl MetalRuntime {
             pool,
             commands,
             pipelines: Mutex::new(HashMap::new()),
+            allocation_limit: AtomicUsize::new(0),
             nax,
         })
+    }
+
+    /// Native allocations include resources still retained by submitted work,
+    /// even after their Array and pool leases have been released.
+    pub fn allocated_bytes(&self) -> usize {
+        self.device.currentAllocatedSize()
+    }
+
+    /// Application-supplied total native allocation limit; zero disables it.
+    /// No platform or model admission policy belongs in the device runtime.
+    pub fn swap_allocation_limit(&self, bytes: usize) -> usize {
+        self.allocation_limit.swap(bytes, Ordering::AcqRel)
     }
 
     pub fn device(&self) -> &ProtocolObject<dyn MTLDevice> {
@@ -504,6 +518,22 @@ impl MetalRuntime {
                 unsafe { std::ptr::write_bytes(b.contents(), 0, b.length()) };
             }
             return Ok(b);
+        }
+        let limit = self.allocation_limit.load(Ordering::Acquire);
+        let mut completed = completed;
+        if limit > 0 && self.allocated_bytes().saturating_add(allocation_bytes) > limit {
+            // End pending GPU users before reclaiming their buffers. This is
+            // outside both allocator locks and keeps every kernel/shape intact.
+            self.synchronize()?;
+            completed = self.commands.completed_watermark();
+            self.pool.sweep_completed(completed);
+            let allocated = self.allocated_bytes();
+            if allocated.saturating_add(allocation_bytes) > limit {
+                return Err(err(format!(
+                    "Metal memory budget exceeded: {} MiB allocated + {} MiB requested > {} MiB limit",
+                    allocated >> 20, allocation_bytes >> 20, limit >> 20
+                )));
+            }
         }
         self.pool.allocate_new(allocation_bytes, completed, || {
             let raw = self

@@ -104,10 +104,17 @@ also uses the shared resident adapter.
 
 ## 3. Machine safety and memory ownership
 
-- Default budget: detected physical RAM minus **8 GiB**. Read
+- Default macOS/Simulator budget: detected physical RAM minus **8 GiB**. Read
   `sysctl hw.memsize` and `memory_pressure` before a measured run. Use
   `LISA_RAM_CAP_GB` to choose a lower explicit budget. Never substitute a fixed
   machine capacity or assume detection succeeded.
+- Physical iOS admission uses `min(physical RAM, os_proc_available_memory())`
+  minus **512 MiB**, lowered by `LISA_RAM_CAP_GB`. Read the live allowance for
+  each admission; zero or failed detection refuses loading. This is headroom
+  for new work, not the total size of an already loaded model. The allowance
+  is advisory and can shrink; it does not guarantee arbitrary context lengths
+  fit. Memory warnings cancel work and release the model through the serial
+  worker, without automatically reloading it.
 - Load one model at a time. GPU tests, benchmark arms and inference runs are
   sequential. Stop residual processes after an abort before another load.
 - Attribute memory by owner: mapped model storage, private tensor buffers,

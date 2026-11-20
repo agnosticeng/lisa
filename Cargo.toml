@@ -10,7 +10,7 @@ members = [
     "crates/lisa-bench",
     "crates/lisa-metal",
     "crates/lisa-mlx",
-    "crates/lisa-ui",
+    "crates/lisa-app",
 ]
 resolver = "3"
 
@@ -35,10 +35,8 @@ libm = "0.2.15"
 libc = "0.2"
 memmap2 = "0.9.11"
 objc2 = "0.6"
-objc2-app-kit = "0.3"
 objc2-foundation = "0.3"
 objc2-metal = "0.3"
-objc2-web-kit = "0.3.2"
 rayon = "1.11.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
@@ -64,7 +62,7 @@ split-debuginfo = "packed"
 
 # Presentation and template rendering favor compact code. Inference, sampling,
 # tokenization and the tensor runtime retain release optimization level 3.
-[profile.dist.package.lisa-ui]
+[profile.dist.package.lisa-app]
 opt-level = "z"
 
 [profile.dist.package.minijinja]

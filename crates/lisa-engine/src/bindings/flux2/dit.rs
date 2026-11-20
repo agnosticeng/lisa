@@ -9,10 +9,34 @@ pub struct Dit<D: BindingDevice> {
     weights: Weights<D>,
     schema: Schema,
     geometry: model::Geometry,
+    bounded: bool,
 }
-impl<D: BindingDevice> Dit<D> {
+impl<D: BindingDevice + lisa_backend::ManagedDevice> Dit<D> {
     pub fn load(context: DeviceContext<D>, dir: &Path) -> anyhow::Result<Self> {
-        let weights = Weights::load(context.clone(), &dir.join("transformer"))?;
+        let bounded = crate::checkpoint::catalog::bonsai::is_checkpoint(dir);
+        let mut weights = if bounded {
+            Weights::load_file(
+                context.clone(),
+                &dir.join("transformer-packed-mflux/diffusion_pytorch_model.safetensors"),
+                |_| true,
+            )?
+        } else {
+            Weights::load(context.clone(), &dir.join("transformer"))?
+        };
+        weights.0 = weights
+            .0
+            .into_iter()
+            .map(|(name, value)| {
+                (
+                    name.replace(
+                        "time_guidance_embed.timestep_embedder.",
+                        "time_guidance_embed.",
+                    )
+                    .replace(".to_out.0.", ".to_out."),
+                    value,
+                )
+            })
+            .collect();
         let schema = weights.schema()?;
         let geometry = model::Geometry::from_schema(&schema)?;
         Ok(Self {
@@ -20,6 +44,7 @@ impl<D: BindingDevice> Dit<D> {
             weights,
             schema,
             geometry,
+            bounded,
         })
     }
     pub fn forward(
@@ -39,10 +64,12 @@ impl<D: BindingDevice> Dit<D> {
             h,
             w,
         )?;
-        self.weights
-            .prepare(program)?
-            .run(&[latent, enc], &mut [])?
-            .into_one()
-            .map_err(anyhow::Error::msg)
+        let prepared = self.weights.prepare(program)?;
+        let output = if self.bounded {
+            prepared.run_bounded(&[latent, enc], &mut [], 24)?
+        } else {
+            prepared.run(&[latent, enc], &mut [])?
+        };
+        output.into_one().map_err(anyhow::Error::msg)
     }
 }

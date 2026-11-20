@@ -60,7 +60,7 @@ fn safety() -> Result<()> {
         ensure!(result.status.success(), "{name} failed");
         eprintln!("{}", String::from_utf8_lossy(&result.stdout));
     }
-    let app = Command::new("pgrep").args(["-x", "lisa-ui"]).output()?;
+    let app = Command::new("pgrep").args(["-x", "Lisa|lisa-ui"]).output()?;
     ensure!(
         app.status.code() == Some(1),
         "stop Lisa before benchmarking"

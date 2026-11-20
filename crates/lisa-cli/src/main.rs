@@ -1005,6 +1005,8 @@ fn run() -> anyhow::Result<()> {
                 }
             } else if raw {
                 tok.encode_plain(&text)?
+            } else if tok.is_lfm3() {
+                tok.encode(&lisa_models::lfm3::prompt::turn(system.as_deref(), &prompt, true, think || think_max), false)?
             } else if special {
                 tok.encode_special(&text)?
             } else {

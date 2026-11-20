@@ -490,14 +490,21 @@ qouter(const thread uint8_t* w, U x, U scale, U bias, thread U* result) {
 template <typename U, int N, int bits, typename W>
 inline void dequantize(const device uint8_t* w, U scale, U bias, W w_local) {
   static_assert(
-      bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
+      bits == 1 || bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
           bits == 8,
-      "Template undefined for bits not in {2, 3, 4, 5, 6, 8}");
+      "Template undefined for bits not in {1, 2, 3, 4, 5, 6, 8}");
 
   const float s = float(scale);
   const float b = float(bias);
 
-  if (bits == 2) {
+  // PrismML MLX bbc151c6, quantized.h: preserve binary affine decode order.
+  if (bits == 1) {
+    for (int i = 0; i < (N / 8); i++) {
+      for (int j = 0; j < 8; j++) {
+        w_local[8 * i + j] = static_cast<U>(s * ((w[i] >> j) & 1) + b);
+      }
+    }
+  } else if (bits == 2) {
     float sc[4] = {s, s / 4.0f, s / 16.0f, s / 64.0f};
     for (int i = 0; i < (N / 4); i++) {
       w_local[4 * i] = static_cast<U>(sc[0] * (w[i] & 0x03) + b);
@@ -590,9 +597,9 @@ struct QuantizedBlockLoader {
       group_size % BCOLS == 0,
       "The group size should be divisible by the columns");
   static_assert(
-      bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
+      bits == 1 || bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
           bits == 8,
-      "Template undefined for bits not in {2, 3, 4, 5, 6, 8}");
+      "Template undefined for bits not in {1, 2, 3, 4, 5, 6, 8}");
 
   MLX_MTL_CONST short pack_factor = get_pack_factor<bits, 8>();
   MLX_MTL_CONST short bytes_per_pack = get_bytes_per_pack<bits>();
@@ -2781,7 +2788,9 @@ template <typename T, int group_size, int bits, bool has_global_scale = false>
 #pragma clang loop unroll(full)
     for (int i = 0; i < pack_factor; i++) {
       uint8_t d;
-      if (bits == 2) {
+      if (bits == 1) {
+        d = (val >> i) & 0x01;
+      } else if (bits == 2) {
         d = (val >> (bits * i)) & 0x03;
       } else if (bits == 4) {
         d = (val >> (bits * i)) & 0x0f;

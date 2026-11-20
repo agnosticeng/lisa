@@ -307,6 +307,54 @@ using namespace metal;
     }
 
     #[test]
+    fn allocation_budget_drains_pending_work_without_changing_results() {
+        fn run(bounded: bool) -> (Vec<f32>, u64) {
+            let rt = MetalRuntime::new(10000).unwrap();
+            rt.pool.set_limit(0);
+            let pipe = rt.compile(CHAIN_KERNEL, "add_one").unwrap();
+            let bytes = 64 * 1024;
+            let mut value = rt.buffer(bytes, "budget_input").unwrap();
+            if bounded { rt.swap_allocation_limit(rt.allocated_bytes() + 3 * bytes); }
+            let start = rt.commands.current_cb_id();
+            for _ in 0..24 {
+                let output = rt.buffer(bytes, "budget_output").unwrap();
+                {
+                    let guard = rt.commands.encoder().unwrap();
+                    let encoder = guard.encoder();
+                    encoder.set_pipeline(&pipe);
+                    encoder.set_input(0, Some(&value), 0);
+                    encoder.set_output(1, Some(&output), 0);
+                    encoder.dispatch_threads((bytes / 4, 1, 1), (256, 1, 1));
+                }
+                value = output;
+            }
+            let rotations = rt.commands.current_cb_id() - start;
+            rt.synchronize().unwrap();
+            let result = unsafe { std::slice::from_raw_parts(value.contents().cast::<f32>(), bytes / 4) }.to_vec();
+            (result, rotations)
+        }
+        let (reference, _) = run(false);
+        for _ in 0..2 {
+            let (actual, rotations) = run(true);
+            assert!(rotations > 0, "the budget must drain work before the final readback");
+            assert_eq!(actual, reference);
+            assert!(actual.iter().all(|&value| value == 24.0));
+        }
+    }
+
+    #[test]
+    fn allocation_budget_refuses_live_storage_instead_of_overcommitting() {
+        let rt = MetalRuntime::new(4).unwrap();
+        let held = rt.buffer(64 * 1024, "budget_held").unwrap();
+        rt.swap_allocation_limit(rt.allocated_bytes() + 64 * 1024);
+        let error = rt.buffer(128 * 1024, "budget_excess").err().expect("must refuse an oversized allocation");
+        assert!(error.to_string().contains("Metal memory budget exceeded"));
+        assert_eq!(held.length(), 64 * 1024);
+        rt.swap_allocation_limit(0);
+        assert!(rt.buffer(128 * 1024, "budget_reset").is_ok());
+    }
+
+    #[test]
     fn pool_reuses_then_caps() {
         let rt = MetalRuntime::new(4).unwrap();
         rt.pool.set_limit(1 << 20);

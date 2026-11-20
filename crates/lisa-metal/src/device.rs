@@ -100,7 +100,7 @@ static CAPABILITIES: [KernelCapability; 3] = [
         shape: ShapeRelation::Affine,
         encoding: Some(AffineEncoding {
             word: ScalarType::U32,
-            bits: &[2, 4, 8],
+            bits: &[1, 2, 4, 8],
             group_sizes: &[32, 64, 128],
         }),
         workspace: Workspace::ProviderManaged,
@@ -171,7 +171,7 @@ impl Device for MetalDevice {
                 shape: ShapeRelation::TensorOperation,
                 encoding: Some(AffineEncoding {
                     word: ScalarType::U32,
-                    bits: &[2, 4, 8],
+                    bits: &[1, 2, 4, 8],
                     group_sizes: &[32, 64, 128],
                 }),
                 workspace: Workspace::ProviderManaged,
@@ -382,7 +382,7 @@ fn affine(kernel: &Kernel, inputs: &[&Array], _stream: &Stream) -> Result<Option
                 "affine linear expects a ranked input and matrix weights",
             ));
         }
-        if group_size <= 0 || !matches!(bits, 2 | 4 | 8) || x.shape().iter().any(|&d| d <= 0) {
+        if group_size <= 0 || !matches!(bits, 1 | 2 | 4 | 8) || x.shape().iter().any(|&d| d <= 0) {
             return Err(Error::msg(
                 "affine linear: invalid shape or quantization geometry",
             ));

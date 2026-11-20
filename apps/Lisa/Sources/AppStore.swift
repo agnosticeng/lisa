@@ -15,9 +15,11 @@ struct Conversation: Codable, Identifiable {
     var updated: UInt64
     var turns: [Turn]
     var draft: String
+    var hasContent: Bool { !turns.isEmpty || !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
     var title: String {
-        let value = turns.first?.user ?? draft
-        return value.isEmpty ? "New chat" : String(value.prefix(60))
+        let value = (turns.first?.user ?? draft).trimmingCharacters(in: .whitespacesAndNewlines)
+        let firstLine = value.split(whereSeparator: \.isNewline).first.map(String.init) ?? ""
+        return firstLine.isEmpty ? "New chat" : String(firstLine.prefix(60))
     }
 }
 struct ModelChoice: Decodable, Identifiable {
@@ -64,10 +66,14 @@ struct ModelChoice: Decodable, Identifiable {
 }
 
 @MainActor final class AppStore: ObservableObject {
+    static let defaultModel = "mlx-community/Qwen3.5-0.8B-MLX-4bit"
     static let defaultSystem = "You are Lisa, a helpful and knowledgeable AI assistant. Answer clearly and concisely."
     let bridge = NativeBridge()
     let browser = BrowserController()
     let speech = SpeechController()
+    let backgroundGeneration = BackgroundGeneration()
+    private var generationSucceeded = false
+    private var generationCancelled = false
     @Published var chats: [Conversation] = []
     @Published var activeID: String?
     @Published var models: [ModelChoice] = []
@@ -96,15 +102,35 @@ struct ModelChoice: Decodable, Identifiable {
     private var backgrounded = false
     private var suspending = false
     private var restoreOnForeground = false
+    private var memoryPressure = false
+    private var loadAfterDownload: String?
 
+    var visibleChats: [Conversation] { chats.filter(\.hasContent) }
     var current: Conversation? { chats.first { $0.id == activeID } }
-    var canSend: Bool { ready && !busy && !switching && loadedModel != nil && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    var canSend: Bool { ready && !busy && !switching && !backgrounded && !suspending && loadedModel != nil && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
 
     func start() async {
         guard !started else { return }; started = true
+        backgroundGeneration.onLog = { [weak self] in self?.logs.append($0) }
+        backgroundGeneration.onExpiration = { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                self.error = "iOS stopped the background task. You can retry the request."
+                await self.releaseForBackground()
+            }
+        }
         do {
             let support = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true).appendingPathComponent("Lisa")
             try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+            #if os(iOS)
+            // Keep downloaded weights in this sandbox across launches, but do
+            // not upload reproducible model files into the user's iCloud backup.
+            var modelCache = support.appendingPathComponent("models", isDirectory: true)
+            try FileManager.default.createDirectory(at: modelCache, withIntermediateDirectories: true)
+            var cacheValues = URLResourceValues()
+            cacheValues.isExcludedFromBackup = true
+            try modelCache.setResourceValues(cacheValues)
+            #endif
             _ = try await bridge.call(["op":"initialize", "storage":support.path])
             let saved = try await bridge.call(["op":"chats"]) as? [String:Any] ?? [:]
             chats = try bridge.decoded([Conversation].self, saved["chats"] ?? [])
@@ -120,20 +146,44 @@ struct ModelChoice: Decodable, Identifiable {
                     do {
                         let events = try await self.bridge.call(["op":"poll"]) as? [[String:Any]] ?? []
                         for event in events { await self.receive(event) }
-                    } catch { self.error = error.localizedDescription; self.ready = false; self.busy = false; self.loadingModel = nil; self.loadedModel = nil; self.status = "Inference worker stopped"; return }
+                    } catch { self.error = error.localizedDescription; self.ready = false; self.busy = false; self.loadingModel = nil; self.loadedModel = nil; self.status = "Inference worker stopped"; self.backgroundGeneration.finish(success: false); return }
                     try? await Task.sleep(for: .milliseconds(60))
                 }
             }
-            #if DEBUG && targetEnvironment(simulator)
-            await runSimulatorCheckIfRequested()
+            #if DEBUG
+            if await runIntegrationCheckIfRequested() { return }
             #endif
+            await loadPreferredModel()
         } catch { self.error = error.localizedDescription; status = "Lisa could not start" }
     }
 
     func refreshModels() async throws {
         let result = try await bridge.call(["op":"models"]) as? [String:Any] ?? [:]
-        models = try bridge.decoded([ModelChoice].self, result["models"] ?? [])
-        models.sort { if $0.local != $1.local { return $0.local }; return false }
+        let choices = try bridge.decoded([ModelChoice].self, result["models"] ?? [])
+        models = choices.enumerated().sorted {
+            if $0.element.fits != $1.element.fits { return $0.element.fits }
+            if $0.element.local != $1.element.local { return $0.element.local }
+            return $0.offset < $1.offset
+        }.map(\.element)
+    }
+
+    private func loadPreferredModel() async {
+        let id = current?.model ?? Self.defaultModel
+        if models.contains(where: { $0.id == id && $0.local }) {
+            await loadModel(id)
+        } else if id == Self.defaultModel, models.contains(where: { $0.id == id && $0.fits }) {
+            loadAfterDownload = id
+            await download(id)
+        } else {
+            error = "The conversation’s model is unavailable on this device. Open Models to choose one."
+        }
+    }
+
+    private func loadDownloadedModelIfReady() async {
+        guard !busy && !backgrounded && !memoryPressure,
+              let id = loadAfterDownload, models.contains(where: { $0.id == id && $0.local }) else { return }
+        loadAfterDownload = nil
+        await loadModel(id)
     }
 
     private func updateCurrent(_ edit: (inout Conversation) -> Void) {
@@ -156,22 +206,30 @@ struct ModelChoice: Decodable, Identifiable {
     }
     func newChat() async {
         guard !busy && !switching else { return }; switching = true; defer { switching = false }
+        if current?.turns.isEmpty == true && draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            draft = ""; attachments = []; speech.stop()
+            return
+        }
         await save(); attachments = []; speech.stop()
         do {
             _ = try await bridge.call(["op":"clear"])
-            let value = try await bridge.call(["op":"new_chat", "model":loadedModel as Any? ?? NSNull(), "system":Self.defaultSystem])
+            let value = try await bridge.call(["op":"new_chat", "model":loadedModel ?? Self.defaultModel, "system":Self.defaultSystem])
             let chat = try bridge.decoded(Conversation.self, value)
             chats.insert(chat, at: 0); activeID = chat.id; draft = ""; system = chat.system
             await save()
         } catch { self.error = error.localizedDescription }
     }
     func selectChat(_ id: String) async {
-        guard !busy && !switching, id != activeID, let chat = chats.first(where: { $0.id == id }) else { return }
+        guard !busy && !switching, let chat = chats.first(where: { $0.id == id }) else { return }
+        if id == activeID {
+            if (chat.model ?? Self.defaultModel) != loadedModel { await loadPreferredModel() }
+            return
+        }
         switching = true; defer { switching = false }
         await save(); speech.stop(); attachments = []; activeID = id; draft = chat.draft; system = chat.system
         do {
             _ = try await bridge.call(["op":"restore", "turns":try bridge.object(chat.turns), "system":system])
-            if let id = chat.model, id != loadedModel { await loadModel(id) }
+            if (chat.model ?? Self.defaultModel) != loadedModel { await loadPreferredModel() }
         } catch { self.error = error.localizedDescription }
     }
     func deleteChat(_ id: String) async {
@@ -184,7 +242,9 @@ struct ModelChoice: Decodable, Identifiable {
         } catch { self.error = error.localizedDescription }
     }
     func loadModel(_ id: String) async {
-        guard ready && !busy else { return }
+        guard ready && !busy && !backgrounded && !suspending else { return }
+        loadAfterDownload = nil
+        memoryPressure = false
         busy = true; loadingModel = id; supportsImages = false; status = "Loading model…"
         do {
             // Restore persisted history before loading, including on the first launch.
@@ -197,19 +257,27 @@ struct ModelChoice: Decodable, Identifiable {
     }
     func download(_ id: String) async {
         guard downloading == nil else { return }
+        error = nil
         downloading = id; downloadProgress = 0
         do { _ = try await bridge.call(["op":"download", "id":id]) }
-        catch { self.error = error.localizedDescription; downloading = nil }
+        catch { self.error = error.localizedDescription; downloading = nil; loadAfterDownload = nil }
     }
     func send() async {
         guard canSend else { return }
         speech.stop()
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         busy = true
+        generationSucceeded = false; generationCancelled = false
+        await backgroundGeneration.begin(image: imageMode)
+        if generationCancelled { busy = suspending; backgroundGeneration.finish(success: false); return }
         do {
+            guard !suspending && (!backgrounded || backgroundGeneration.isActive) else {
+                throw NSError(domain: "Lisa", code: 1, userInfo: [NSLocalizedDescriptionKey:"Keep Lisa open: background GPU execution is unavailable for this request."])
+            }
             guard activeID != nil else { throw CocoaError(.fileNoSuchFile) }
             let kept = attachments
-            updateCurrent { $0.turns.append(Turn(user:text, images:kept)) }
+            let model = loadedModel
+            updateCurrent { $0.model = model; $0.turns.append(Turn(user:text, images:kept)) }
             do {
                 _ = try await bridge.call(["op":"chat", "text":text, "system":system, "images":kept, "browse":webEnabled && !imageMode])
             } catch {
@@ -217,9 +285,11 @@ struct ModelChoice: Decodable, Identifiable {
                 throw error
             }
             draft = ""; attachments = []; status = "Generating…"; await save()
-        } catch { self.error = error.localizedDescription; busy = false }
+        } catch { self.error = error.localizedDescription; busy = suspending; backgroundGeneration.finish(success: false) }
     }
     func cancel() async {
+        generationCancelled = true
+        backgroundGeneration.cancelAdmission()
         browser.cancel(); speech.stop()
         do { _ = try await bridge.call(["op":"cancel"]) } catch { self.error = error.localizedDescription }
     }
@@ -239,18 +309,17 @@ struct ModelChoice: Decodable, Identifiable {
     }
     func sceneChanged(_ phase: ScenePhase) async {
         guard ready else { return }
-        #if os(iOS)
-        let leaving = phase != .active
-        #else
+        logs.append("Scene changed: \(phase)")
+        // Transient inactive states (system controls, interruptions) are not backgrounding.
         let leaving = phase == .background
-        #endif
         if leaving && !backgrounded {
-            backgrounded = true; restoreOnForeground = loadedModel != nil || loadingModel != nil
-            speech.stop(); browser.cancel()
+            backgrounded = true
+            restoreOnForeground = !memoryPressure && (loadedModel != nil || loadingModel != nil)
+            speech.stop()
             #if os(iOS)
-            suspending = true; busy = true
-            do { _ = try await bridge.call(["op":"unload"]) }
-            catch { self.error = error.localizedDescription; suspending = false; busy = false }
+            if !backgroundGeneration.isActive { await releaseForBackground() }
+            #else
+            browser.cancel()
             #endif
             await save()
         } else if phase == .active, backgrounded {
@@ -258,8 +327,40 @@ struct ModelChoice: Decodable, Identifiable {
             #if os(iOS)
             if restoreOnForeground && !suspending && !busy, let id = current?.model { restoreOnForeground = false; await loadModel(id) }
             #endif
+            await loadDownloadedModelIfReady()
         }
     }
+    private func releaseForBackground() async {
+        #if os(iOS)
+        guard !suspending else { return }
+        restoreOnForeground = !memoryPressure && (loadedModel != nil || loadingModel != nil)
+        browser.cancel(); speech.stop()
+        suspending = true; busy = true
+        do { _ = try await bridge.call(["op":"unload"]) }
+        catch {
+            self.error = error.localizedDescription; suspending = false; busy = false
+            backgroundGeneration.finish(success: false)
+        }
+        await save()
+        #endif
+    }
+    #if os(iOS)
+    /// Release through the serial worker so in-flight GPU users finish before
+    /// their storage is freed. Memory pressure never triggers an automatic reload.
+    func memoryWarning() async {
+        guard ready else { return }
+        logs.append("iOS memory warning: releasing the model")
+        memoryPressure = true
+        loadAfterDownload = nil
+        restoreOnForeground = false
+        speech.stop(); browser.cancel()
+        guard !suspending else { return }
+        suspending = true; busy = true; status = "Releasing model to free memory…"
+        do { _ = try await bridge.call(["op":"unload"]) }
+        catch { self.error = error.localizedDescription; suspending = false; busy = false }
+        await save()
+    }
+    #endif
     private func receive(_ event: [String:Any]) async {
         let kind = event["kind"] as? String ?? ""
         let value = event["value"] ?? NSNull()
@@ -268,6 +369,7 @@ struct ModelChoice: Decodable, Identifiable {
             status = value as? String ?? status; logs.append(status); if logs.count > 500 { logs.removeFirst(logs.count - 500) }
         case "replace", "delta", "committed":
             guard let text = value as? String else { break }
+            backgroundGeneration.update(text, delta: kind == "delta")
             updateCurrent { chat in
                 guard !chat.turns.isEmpty else { return }
                 let i = chat.turns.count - 1
@@ -277,21 +379,28 @@ struct ModelChoice: Decodable, Identifiable {
         case "image":
             updateCurrent { chat in if !chat.turns.isEmpty { chat.turns[chat.turns.count - 1].generated_image = value as? String } }
         case "done":
+            generationSucceeded = current?.turns.last?.complete == true
             busy = suspending; status = suspending ? "Releasing model…" : "Ready"; await save()
-            if speakReplies, let turn = current?.turns.last, turn.complete { speech.speak(turn.assistant) }
+            if backgrounded && !suspending { await releaseForBackground() }
+            if !suspending { backgroundGeneration.finish(success: generationSucceeded) }
+            if !backgrounded && speakReplies, let turn = current?.turns.last, turn.complete { speech.speak(turn.assistant) }
         case "loaded":
             busy = false
             if value as? Bool == true { loadedModel = loadingModel; status = "Ready" }
-            else { loadedModel = nil }
+            else { loadedModel = nil; error = logs.last ?? "The model could not be loaded. See Activity for details." }
             loadingModel = nil
         case "unloaded":
+            backgroundGeneration.finish(success: generationSucceeded)
             suspending = false; busy = false; loadedModel = nil; loadingModel = nil
+            supportsImages = false; imageMode = false
             status = "Model released"
+            do { try await refreshModels() } catch { self.error = error.localizedDescription }
             #if os(iOS)
             if !backgrounded && restoreOnForeground, let id = current?.model {
                 restoreOnForeground = false; await loadModel(id)
             }
             #endif
+            await loadDownloadedModelIfReady()
         case "supports_images": supportsImages = value as? Bool ?? false
         case "image_mode": imageMode = !(value is NSNull)
         case "serving": serverURL = value as? String
@@ -300,13 +409,28 @@ struct ModelChoice: Decodable, Identifiable {
                 downloadProgress = (progress["completed"] as? Double ?? 0) / total
             }
         case "models_changed":
-            downloading = nil
             do { try await refreshModels() } catch { self.error = error.localizedDescription }
+            downloading = nil
+            await loadDownloadedModelIfReady()
+        case "download_failed":
+            downloading = nil
+            loadAfterDownload = nil
+            error = value as? String ?? "Model download failed"
         case "browse":
             guard let request = value as? [String:Any] else { break }
-            showBrowser = true
             browser.navigate(request) { [weak self] response in
                 guard let self else { return }
+                if let message = response["error"] as? String {
+                    self.showBrowser = false
+                    self.logs.append("Browser failed: \(message)")
+                } else if let message = response["needs_input"] as? String {
+                    self.showBrowser = true
+                    self.logs.append("Browser needs input: \(message)")
+                } else {
+                    self.showBrowser = false
+                    let kind = response["search"] as? Bool == true ? "search" : "page"
+                    self.logs.append("Browser \(kind) read: \(self.browser.address)")
+                }
                 do { _ = try await self.bridge.call(response) } catch { self.error = error.localizedDescription }
             }
         default: break

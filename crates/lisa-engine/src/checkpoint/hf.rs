@@ -5,7 +5,7 @@
 //! file is present with its advertised size, including after an interrupted run.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, bail};
 use hf_hub::api::sync::{Api, ApiBuilder, ApiRepo};
@@ -13,8 +13,26 @@ use hf_hub::{Repo, RepoType};
 
 const INCOMPLETE_MARKER: &str = ".lisa-incomplete";
 
-/// Use the same environment-based cache root as the Hub client.
+static APPLICATION_CACHE_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+/// Set a sandbox-owned Hub cache before starting application workers. This
+/// avoids changing process environment variables after Swift has spawned threads.
+/// Explicit application configuration takes precedence over desktop environment
+/// defaults and remains fixed for the process lifetime.
+pub fn configure_cache_root(root: PathBuf) -> Result<()> {
+    anyhow::ensure!(root.is_absolute(), "Hub cache path must be absolute");
+    std::fs::create_dir_all(&root)
+        .with_context(|| format!("creating application model cache {}", root.display()))?;
+    APPLICATION_CACHE_ROOT
+        .set(root)
+        .map_err(|_| anyhow::anyhow!("Application model cache is already configured"))
+}
+
+/// Use the same cache root for Hub downloads and local discovery.
 pub fn hub_root() -> PathBuf {
+    if let Some(root) = APPLICATION_CACHE_ROOT.get() {
+        return root.clone();
+    }
     std::env::var_os("HF_HUB_CACHE")
         .or_else(|| std::env::var_os("HUGGINGFACE_HUB_CACHE"))
         .map(PathBuf::from)
@@ -411,12 +429,14 @@ fn download_with_client_profile(
     // exercise exactly the same download/discovery boundary as production.
     let root = cache_root.join(format!("models--{}", repo.replace('/', "--")));
     let snap = root.join("snapshots").join(rev);
-    std::fs::create_dir_all(&snap)?;
+    std::fs::create_dir_all(&snap)
+        .with_context(|| format!("creating model snapshot {}", snap.display()))?;
     let marker = snap.join(INCOMPLETE_MARKER);
     std::fs::write(
         &marker,
         b"Download in progress; retry to complete this snapshot.\n",
-    )?;
+    )
+    .with_context(|| format!("marking incomplete snapshot {}", snap.display()))?;
     let mut completed = 0;
     progress(0, total);
     for file in &files {

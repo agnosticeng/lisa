@@ -18,7 +18,7 @@ if [ "${CONFIGURATION:-Release}" = Debug ]; then PROFILE=dev; fi
 CARGO_TARGET_DIR="$ROOT/target/apple-rust"
 export CARGO_TARGET_DIR
 cd "$ROOT"
-"$CARGO" build --locked -p lisa-ui --lib --target "$RUST_TARGET" --profile "$PROFILE"
+"$CARGO" build --locked -p lisa-app --lib --target "$RUST_TARGET" --profile "$PROFILE"
 OUTPUT=dist
 if [ "$PROFILE" = dev ]; then OUTPUT=debug; fi
 LINK_DIR="$ROOT/apps/Lisa/build/${PLATFORM_NAME:-macosx}/${CONFIGURATION:-Release}"
@@ -32,5 +32,5 @@ cp crates/lisa-metal/src/shaders/deepseek41/LICENSE "$RESOURCES/Licenses/DS4.txt
 cp crates/lisa-gguf/src/LICENSE-GGML "$RESOURCES/Licenses/GGML.txt"
 cp crates/lisa-models/src/flux/LICENSE.flux3 "$RESOURCES/Licenses/Apache-2.0.txt"
 if [ "${PLATFORM_NAME:-macosx}" = macosx ]; then
-    cp crates/lisa-ui/assets/Lisa.icns "$RESOURCES/Lisa.icns"
+    cp apps/Lisa/assets/Lisa.icns "$RESOURCES/Lisa.icns"
 fi

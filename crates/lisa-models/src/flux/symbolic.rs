@@ -371,8 +371,25 @@ impl Tensor {
     pub fn affine(&self, weight: &Self, scales: &Self, biases: &Self) -> anyhow::Result<Self> {
         ensure!(
             weight.rank() == 2
-                && self.dim(-1) == scales.dim(-1) * 64
-                && weight.dim(-1) * 8 == self.dim(-1),
+                && scales.rank() == 2
+                && biases.shape == scales.shape
+                && scales.dim(0) == weight.dim(0)
+                && weight.dim(-1) > 0
+                && scales.dim(-1) > 0,
+            "invalid FLUX affine metadata"
+        );
+        let k = self.dim(-1);
+        ensure!(k > 0, "empty FLUX projection input");
+        let bits = weight
+            .dim(-1)
+            .checked_mul(32)
+            .context("packed width overflow")?
+            / k;
+        let group_size = k / scales.dim(-1);
+        ensure!(
+            matches!((bits, group_size), (4, 64) | (1, 128))
+                && weight.dim(-1) * 32 == k * bits
+                && scales.dim(-1) * group_size == k,
             "invalid FLUX affine geometry"
         );
         let mut shape = self.shape.clone();
@@ -380,10 +397,7 @@ impl Tensor {
         {
             let dtype = promote(self.dtype, scales.dtype);
             self.record(
-                Kernel::AffineLinear {
-                    group_size: 64,
-                    bits: 4,
-                },
+                Kernel::AffineLinear { group_size, bits },
                 &[
                     &self.as_dtype(dtype)?,
                     weight,
@@ -508,7 +522,10 @@ impl Weights<'_> {
     }
     pub fn lin(&self, key: &str, x: &Tensor) -> anyhow::Result<Tensor> {
         let name = format!("{key}.weight");
-        let info = self.schema.get(&name).context("missing FLUX projection")?;
+        let info = self
+            .schema
+            .get(&name)
+            .with_context(|| format!("missing FLUX projection {name}"))?;
         let mut y = if info.dtype == Dtype::U32 {
             x.affine(
                 &self.get(&name)?,

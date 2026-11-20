@@ -402,7 +402,11 @@ pub fn quantized_matmul(
     if !matches!(dt, Dtype::Bfloat16 | Dtype::Float16 | Dtype::Float32) {
         crate::bail!("quantized_matmul: unsupported compute dtype {dt:?}");
     }
-    let out = if m == 1 {
+    let out = if bits == 1 {
+        // Binary image projections use the ordinary ordered GEMM path on every
+        // Apple GPU. Existing language-model dispatch and arithmetic stay intact.
+        crate::jit::affine_qmm(x.t.device(), &x2, &w.t, &sc, &b2, group_size, bits)?
+    } else if m == 1 {
         // Serial split-K qmv (`jit::affine_qmv_splitk`, the reference's
         // split-K accumulation at MROWS=1) is FALSIFIED in situ: goldens
         // pass 310/310 with the lane wired, but the serial step is a wash
@@ -645,6 +649,69 @@ pub fn gather_qmm(
 mod tests {
     use super::*;
     use crate::ops::quantize;
+
+    #[test]
+    fn binary_affine_packed_bits_and_gemm_match_exact_integer_oracle() {
+        // Exactly representable values isolate packing, group boundaries, tails,
+        // and final BF16 casts from unrelated floating-point reduction choices.
+        for (m, n, k) in [(1usize, 32usize, 128usize), (33, 35, 384), (77, 64, 512)] {
+            let packed: Vec<u32> = (0..n * k / 32)
+                .map(|i| (i as u32).wrapping_mul(0x9e3779b9) ^ 0xa5c35a3c)
+                .collect();
+            let scales: Vec<f32> = (0..n * k / 128)
+                .map(|i| if i % 2 == 0 { 0.5 } else { 1.0 })
+                .collect();
+            let biases: Vec<f32> = (0..scales.len())
+                .map(|i| if i % 3 == 0 { -0.25 } else { -0.5 })
+                .collect();
+            let input: Vec<f32> = (0..m * k).map(|i| (i % 7) as f32 - 3.0).collect();
+            let dense: Vec<f32> = (0..n * k)
+                .map(|i| {
+                    scales[i / 128] * ((packed[i / 32] >> (i % 32)) & 1) as f32 + biases[i / 128]
+                })
+                .collect();
+            for dtype in [Dtype::Bfloat16, Dtype::Float32] {
+                let w = Array::from_slice(&packed, &[n as i32, (k / 32) as i32]);
+                let sc = Array::from_slice(&scales, &[n as i32, (k / 128) as i32])
+                    .as_dtype(dtype)
+                    .unwrap();
+                let bi = Array::from_slice(&biases, &[n as i32, (k / 128) as i32])
+                    .as_dtype(dtype)
+                    .unwrap();
+                let x = Array::from_slice(&input, &[m as i32, k as i32])
+                    .as_dtype(dtype)
+                    .unwrap();
+                let decoded = dequantize(&w, &sc, &bi, 128, 1)
+                    .unwrap()
+                    .as_dtype(Dtype::Float32)
+                    .unwrap();
+                decoded.eval().unwrap();
+                assert_eq!(decoded.as_slice::<f32>(), dense.as_slice());
+                let actual = quantized_matmul(&x, &w, &sc, Some(&bi), true, 128, 1)
+                    .unwrap()
+                    .as_dtype(Dtype::Float32)
+                    .unwrap();
+                actual.eval().unwrap();
+                for row in 0..m {
+                    for col in 0..n {
+                        let sum: f32 = (0..k)
+                            .map(|i| input[row * k + i] * dense[col * k + i])
+                            .sum();
+                        let expected = if dtype == Dtype::Bfloat16 {
+                            half::bf16::from_f32(sum).to_f32()
+                        } else {
+                            sum
+                        };
+                        assert_eq!(
+                            actual.as_slice::<f32>()[row * n + col],
+                            expected,
+                            "{dtype:?} M={m} N={n} K={k} row={row} col={col}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn affine_qmv_row_batch_matches_independent_serial_calls() {

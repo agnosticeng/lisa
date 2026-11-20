@@ -40,7 +40,7 @@ format adapters, measured checks and remaining parity work are recorded in
 | `lisa-serve` | HTTP APIs, request handling and application provider composition |
 | `lisa-cli` | `lisa` CLI |
 | `lisa-bench` | Compiled diagnostics, benchmarks and embedded goldens |
-| `lisa-ui` | Native macOS app |
+| `lisa-app` | Shared Apple app services and C bridge; SwiftUI interface in `apps/Lisa` |
 
 Put Metal sources under `crates/lisa-metal/src/shaders/` and their Rust wrappers
 under `jit/` or operation modules in `kernels/`. Device crates have no model
@@ -67,7 +67,7 @@ and result summaries in `specs/`, `docs/` or alongside source.
 
 Cargo builds generate a matching `kernels.bin` beside the executables. Preserve
 it when copying standalone binaries; the app bundle places it in Resources.
-`sh crates/lisa-ui/bundle.sh` builds the size-limited `dist` bundle and retains
+`sh apps/Lisa/bundle.sh` builds the SwiftUI `dist` bundle and retains
 the matching dSYM outside it. See [desktop packaging](specs/desktop.md).
 
 Before committing, run the following sequence with the machine-safety checks
@@ -101,9 +101,12 @@ data do not certify those cases.
 
 ## Machine safety
 
-- Compute the budget from detected physical RAM minus **8 GiB**. Read
+- On macOS and Simulator, compute the budget from detected physical RAM minus **8 GiB**. Read
   `sysctl hw.memsize` and `memory_pressure` before every benchmark. Never
   hardcode a machine's capacity. Use `LISA_RAM_CAP_GB` for a lower run limit.
+- Physical iOS devices use the smaller of detected physical RAM and the live
+  `os_proc_available_memory()` allowance, minus **512 MiB**. Never cache the
+  allowance or let `LISA_RAM_CAP_GB` raise it. Release the model on memory warnings.
 - Load one model at a time. Run GPU tests, inference and benchmarks
   sequentially; other GPU activity invalidates timing comparisons.
 - After an abort, stop residual processes from that run before loading again.

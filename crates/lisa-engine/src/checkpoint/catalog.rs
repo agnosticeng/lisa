@@ -17,7 +17,35 @@ pub mod flux3 {
     pub const REPO: &str = "black-forest-labs/flux-3-image-klein";
 }
 
+pub mod bonsai {
+    pub const REPO: &str = "prism-ml/bonsai-image-binary-4B-mlx-1bit";
+    /// Conservative staged 512px working-set admission, including encoder scratch.
+    pub const REQUIRED_RAM: usize = (26usize << 30) / 10;
+    pub fn is_checkpoint(dir: &std::path::Path) -> bool {
+        let config = dir.join("transformer-packed-mflux/quantization_config.json");
+        std::fs::read(config)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .is_some_and(|v| {
+                v["format"] == "prism-packed-affine" && v["bits"] == 1 && v["group_size"] == 128
+            })
+            && dir
+                .join("transformer-packed-mflux/diffusion_pytorch_model.safetensors")
+                .is_file()
+            && dir
+                .join("text_encoder-mlx-4bit/model.safetensors")
+                .is_file()
+            && dir
+                .join("vae/diffusion_pytorch_model.safetensors")
+                .is_file()
+            && dir.join("tokenizer/tokenizer.json").is_file()
+    }
+}
+
 pub fn is_flux2(dir: &Path) -> bool {
+    if bonsai::is_checkpoint(dir) {
+        return true;
+    }
     let Ok(bytes) = std::fs::read(dir.join("transformer/model.safetensors.index.json")) else {
         return false;
     };

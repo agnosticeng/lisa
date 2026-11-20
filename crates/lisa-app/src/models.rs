@@ -1,4 +1,4 @@
-//! Desktop model discovery, sizes and curated download metadata.
+//! Apple app model discovery, sizes and curated download metadata.
 
 use crate::catalog;
 use lisa_engine::core::config::ReadConfig;
@@ -8,10 +8,8 @@ pub struct Model {
     pub repo_id: String,
     pub model_type: String,
     pub path: String,
-    pub local: bool,
     pub size: u64,
     pub resident_bytes: Option<u64>,
-    pub too_big: bool,
 }
 
 pub(super) fn config_model_type(dir: &std::path::Path) -> Option<String> {
@@ -46,10 +44,8 @@ pub(super) fn discover_models() -> Vec<Model> {
                         repo_id: repo_id.clone(),
                         model_type: "qwen35".into(),
                         path: path.to_string_lossy().into(),
-                        local: true,
                         size: std::fs::metadata(&qwen).map(|m| m.len()).unwrap_or(0),
                         resident_bytes: Some(resident_bytes),
-                        too_big: false,
                     });
                     break;
                 }
@@ -67,10 +63,8 @@ pub(super) fn discover_models() -> Vec<Model> {
                         repo_id: repo_id.clone(),
                         model_type: "glm5-next".into(),
                         path: path.to_string_lossy().to_string(),
-                        local: true,
                         size,
                         resident_bytes: Some(size),
-                        too_big: false,
                     });
                     break;
                 }
@@ -96,10 +90,8 @@ pub(super) fn discover_models() -> Vec<Model> {
                         repo_id: repo_id.clone(),
                         model_type: "deepseek41".into(),
                         path: path.to_string_lossy().to_string(),
-                        local: true,
                         size,
                         resident_bytes: Some(resident_bytes),
-                        too_big: false,
                     });
                     break;
                 }
@@ -115,10 +107,11 @@ pub(super) fn discover_models() -> Vec<Model> {
                         repo_id: repo_id.clone(),
                         model_type: mt,
                         path: path.to_string_lossy().to_string(),
-                        local: true,
                         size,
-                        resident_bytes: None,
-                        too_big: false,
+                        resident_bytes: lisa_engine::checkpoint::catalog::bonsai::is_checkpoint(
+                            &path,
+                        )
+                        .then_some(lisa_engine::checkpoint::catalog::bonsai::REQUIRED_RAM as u64),
                     });
                     break;
                 }
@@ -145,6 +138,9 @@ pub(super) fn discover_models() -> Vec<Model> {
 }
 
 fn has_model_weights(path: &std::path::Path, model_type: &str) -> bool {
+    if lisa_engine::checkpoint::catalog::bonsai::is_checkpoint(path) {
+        return true;
+    }
     if model_type == "flux3-klein" {
         return path.join("model.safetensors").is_file()
             && path.join("ae.safetensors").is_file()
@@ -230,27 +226,6 @@ pub(super) fn model_ram_budget() -> u64 {
     lisa_engine::core::admission::MemoryBudget::from_host().budget() as u64
 }
 
-/// Refresh sizes for the explicit catalog; network results cannot add models.
-pub(super) fn fetch_remote_models() -> Vec<(String, u64)> {
-    use lisa_engine::checkpoint::hf::{download_size, download_size_with_profile};
-    let draft_bytes = download_size(lisa_engine::bindings::dspine::REPO)
-        .unwrap_or(catalog::DSPINE_DOWNLOAD_BYTES);
-    catalog::MODELS
-        .iter()
-        .map(|entry| {
-            let target = download_size_with_profile(entry.repo_id, download_profile(entry.repo_id))
-                .unwrap_or_else(|_| catalog::target_download_bytes(entry));
-            let size = target
-                + if catalog::uses_dspine(entry.repo_id) {
-                    draft_bytes
-                } else {
-                    0
-                };
-            (entry.repo_id.to_string(), size)
-        })
-        .collect()
-}
-
 fn download_profile(repo: &str) -> lisa_engine::checkpoint::hf::DownloadProfile {
     use lisa_engine::checkpoint::hf::DownloadProfile;
     if catalog::uses_dspine(repo) {
@@ -266,9 +241,9 @@ pub(super) fn uses_dspine_path(path: &std::path::Path) -> anyhow::Result<bool> {
     use lisa_models::qwen3_5::config::Qwen35Config;
     let path = checkpoint::hf::checkpoint_path(path.to_path_buf());
     match checkpoint::model_type_of(&path)?.as_str() {
-        "qwen3_5" | "qwen3_5_text" => Ok(dspine::supports_target(
-            &Qwen35Config::from_json(&path.join("config.json"))?,
-        )),
+        "qwen3_5" | "qwen3_5_text" => Ok(dspine::supports_target(&Qwen35Config::from_json(
+            &path.join("config.json"),
+        )?)),
         _ => Ok(false),
     }
 }
@@ -291,8 +266,7 @@ fn draft_checkpoint_available(path: &std::path::Path) -> bool {
             .collect();
         !shards.is_empty()
             && shards.iter().all(|file| {
-                lisa_mlx::Shard::open(file)
-                    .is_ok_and(|shard| shard.tensor_names().next().is_some())
+                lisa_mlx::Shard::open(file).is_ok_and(|shard| shard.tensor_names().next().is_some())
             })
     })
 }

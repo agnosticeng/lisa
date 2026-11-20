@@ -16,7 +16,7 @@ they never receive a model or choose its next operation.
 | `lisa-engine` | File resolution, portable weight binding, generic execution, host memory admission, sampling and session policy |
 | `lisa-serve` | HTTP adapters, request admission and shared application composition |
 | `lisa-cli`, `lisa-bench` | User commands and compiled diagnostic instruments |
-| `lisa-ui` | Shared Apple app worker, chat storage and platform UI integration |
+| `lisa-app` | Shared Apple app worker, chat storage and C bridge; SwiftUI in `apps/Lisa` |
 
 Models depend on backend contracts, not formats or device implementations. They
 perform no filesystem, environment, networking or device-allocation work.

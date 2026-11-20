@@ -28,6 +28,7 @@ where
         "DSpine requires a compatible MLX Qwen 3.8 27B checkpoint"
     );
     let mut model: Language<D> = match kind {
+        ModelKind::Lfm3 => Box::new(crate::bindings::lfm3::Tower::load(runtime, path)?),
         ModelKind::Qwen35 => {
             let cfg =
                 lisa_models::qwen3_5::config::Qwen35Config::from_json(&path.join("config.json"))?;

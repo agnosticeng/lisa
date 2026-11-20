@@ -123,3 +123,5 @@ pub mod metadata;
 pub mod sequence;
 
 pub mod checkpoint;
+
+pub mod lfm3;

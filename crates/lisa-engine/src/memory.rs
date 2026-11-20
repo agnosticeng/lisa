@@ -2,11 +2,23 @@
 
 /// Default head-room kept free for the OS, the desktop and the driver when no
 /// explicit cap is given (GiB).
+#[cfg(any(test, not(all(target_os = "ios", not(target_abi = "sim")))))]
 const RAM_RESERVE_GIB: usize = 8;
+
+/// Headroom for the UI, driver and transient work inside an iOS app's limit.
+#[cfg(any(test, all(target_os = "ios", not(target_abi = "sim"))))]
+const IOS_RESERVE_BYTES: usize = 512 << 20;
 
 /// Minimum live headroom kept outside a model's working set.
 pub fn ram_reserve_bytes() -> usize {
-    RAM_RESERVE_GIB << 30
+    #[cfg(all(target_os = "ios", not(target_abi = "sim")))]
+    {
+        IOS_RESERVE_BYTES
+    }
+    #[cfg(not(all(target_os = "ios", not(target_abi = "sim"))))]
+    {
+        RAM_RESERVE_GIB << 30
+    }
 }
 
 /// `LISA_RAM_CAP_GB` parsed to bytes, if set to a positive integer.
@@ -66,15 +78,35 @@ pub fn physical_ram() -> usize {
 /// The admission budget in bytes. Zero means RAM detection failed or the host
 /// cannot provide the required reserve; admission then refuses new allocations.
 ///
-/// Physical RAM minus `RAM_RESERVE_GIB`, lowered by `LISA_RAM_CAP_GB` when set. This is
-/// the number an admission layer must refuse against: the machine-safety rule is
-/// that allocations beyond the budget are refused, not attempted.
+/// Mac/Simulator: physical RAM minus 8 GiB. Physical iOS devices: the smaller
+/// of physical RAM and the current additional per-app allowance, minus 512 MiB.
+/// `LISA_RAM_CAP_GB` can only lower either budget. The iOS allowance is read on
+/// every call, never cached; this is a conservative budget for new admissions,
+/// not a measurement of total memory owned by an already loaded model.
 pub fn ram_budget() -> usize {
-    admission_budget(physical_ram(), env_cap_bytes())
+    #[cfg(all(target_os = "ios", not(target_abi = "sim")))]
+    {
+        ios_admission_budget(
+            physical_ram(),
+            available_ram().unwrap_or(0),
+            env_cap_bytes(),
+        )
+    }
+    #[cfg(not(all(target_os = "ios", not(target_abi = "sim"))))]
+    {
+        admission_budget(physical_ram(), env_cap_bytes())
+    }
 }
 
+#[cfg(any(test, not(all(target_os = "ios", not(target_abi = "sim")))))]
 fn admission_budget(physical: usize, cap: Option<usize>) -> usize {
-    let safe = physical.saturating_sub(ram_reserve_bytes());
+    let safe = physical.saturating_sub(RAM_RESERVE_GIB << 30);
+    cap.map_or(safe, |cap| cap.min(safe))
+}
+
+#[cfg(any(test, all(target_os = "ios", not(target_abi = "sim"))))]
+fn ios_admission_budget(physical: usize, available: usize, cap: Option<usize>) -> usize {
+    let safe = physical.min(available).saturating_sub(IOS_RESERVE_BYTES);
     cap.map_or(safe, |cap| cap.min(safe))
 }
 
@@ -89,6 +121,28 @@ mod budget_tests {
         assert_eq!(admission_budget(64 * gib, Some(128 * gib)), 56 * gib);
         assert_eq!(admission_budget(0, Some(128 * gib)), 0);
         assert_eq!(admission_budget(4 * gib, None), 0);
+    }
+
+    #[test]
+    fn ios_admits_small_models_within_the_live_app_allowance() {
+        let gib = 1usize << 30;
+        assert_eq!(ios_admission_budget(8 * gib, 3 * gib, None), 5 * gib / 2);
+        assert_eq!(ios_admission_budget(8 * gib, 3 * gib, Some(gib)), gib);
+        assert_eq!(
+            ios_admission_budget(8 * gib, 3 * gib, Some(16 * gib)),
+            5 * gib / 2
+        );
+        assert_eq!(ios_admission_budget(8 * gib, gib, None), gib / 2);
+    }
+
+    #[test]
+    fn ios_refuses_missing_or_exhausted_memory_and_bounds_by_physical_ram() {
+        let gib = 1usize << 30;
+        for available in [0, IOS_RESERVE_BYTES - 1, IOS_RESERVE_BYTES] {
+            assert_eq!(ios_admission_budget(8 * gib, available, Some(gib)), 0);
+        }
+        assert_eq!(ios_admission_budget(0, 3 * gib, None), 0);
+        assert_eq!(ios_admission_budget(2 * gib, 3 * gib, None), 3 * gib / 2);
     }
 }
 
@@ -109,9 +163,9 @@ fn parse_available_ram(report: &str, total_ram: usize) -> Option<usize> {
     total_ram.checked_mul(percent)?.checked_div(100)
 }
 
-/// Best-effort currently available physical memory in bytes, based on the
-/// free-memory percentage `memory_pressure` reports after accounting for
-/// reclaimable inactive and purgeable pages.
+/// Current additional memory allowance. macOS uses `memory_pressure` including
+/// reclaimable pages; physical iOS uses the live per-app limit minus footprint.
+/// The latter can shrink during the app lifetime and must never be cached.
 pub fn available_ram() -> Option<usize> {
     #[cfg(target_os = "macos")]
     {

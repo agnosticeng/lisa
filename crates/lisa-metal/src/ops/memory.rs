@@ -96,3 +96,30 @@ pub fn peak_memory() -> Result<usize> {
 pub fn cache_memory() -> Result<usize> {
     Ok(0)
 }
+
+/// A caller-owned allowance for additional Metal allocations. Nested scopes
+/// may only lower the limit. The caller must serialize work on this runtime
+/// and drop nested scopes in reverse order. Kernel arithmetic/shapes are unchanged.
+pub struct AllocationBudget {
+    runtime: std::sync::Arc<crate::runtime::MetalRuntime>,
+    previous: usize,
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+impl Drop for AllocationBudget {
+    fn drop(&mut self) {
+        self.runtime.swap_allocation_limit(self.previous);
+    }
+}
+pub fn allocation_budget(additional_bytes: usize) -> Result<AllocationBudget> {
+    let runtime = Stream::thread_local_or_default().runtime().clone();
+    // Retire old sessions before measuring a new allowance: otherwise unused
+    // pages can consume most of the process limit before this scope begins.
+    runtime.synchronize()?;
+    runtime.pool.sweep_completed(runtime.commands.completed_watermark());
+    let limit = runtime.allocated_bytes().saturating_add(additional_bytes).max(1);
+    let previous = runtime.swap_allocation_limit(limit);
+    if previous != 0 && previous < limit {
+        runtime.swap_allocation_limit(previous);
+    }
+    Ok(AllocationBudget { runtime, previous, _thread_bound: std::marker::PhantomData })
+}

@@ -1,5 +1,5 @@
 // Regenerate Lisa.png and Lisa.icns from the editable SVG using macOS only.
-// Run: swift crates/lisa-ui/assets/export.swift
+// Run: swift apps/Lisa/assets/export.swift
 import AppKit
 
 let assets = URL(fileURLWithPath: #filePath).deletingLastPathComponent()

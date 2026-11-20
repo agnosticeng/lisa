@@ -35,7 +35,9 @@ impl Geometry {
         let kv = dim("layers.0.self_attn.k_proj.weight")? / hd;
         let depth = ops::count(schema, "layers", "input_layernorm.weight");
         ensure!(
-            heads == 32 && kv == 8 && matches!((depth, hidden), (36, 2560) | (36, 4096)),
+            heads == 32
+                && kv == 8
+                && matches!((depth, hidden), (27, 2560) | (36, 2560) | (36, 4096)),
             "expected the Klein 4B or 9B Qwen3 text encoder"
         );
         Ok(Self {
@@ -136,4 +138,32 @@ pub fn program(schema: &Schema, geometry: Geometry, real: usize) -> anyhow::Resu
     }
     let out = ops::concatenate(&taps.iter().collect::<Vec<_>>(), -1)?;
     trace.finish(&[out])
+}
+
+/// Only layers through the last requested hidden-state tap contribute to the
+/// conditioning tensor. Dropping later layers does not change those outputs.
+pub fn conditioning_weight(name: &str) -> bool {
+    name.starts_with("embed_tokens.")
+        || name
+            .strip_prefix("layers.")
+            .and_then(|s| s.split('.').next())
+            .and_then(|s| s.parse::<usize>().ok())
+            .is_some_and(|layer| layer < 27)
+}
+
+#[cfg(test)]
+mod compact_tests {
+    use super::*;
+    #[test]
+    fn conditioning_keeps_all_three_taps_and_excludes_unused_layers() {
+        assert!(conditioning_weight("embed_tokens.weight"));
+        for i in 0..36 {
+            assert_eq!(
+                conditioning_weight(&format!("layers.{i}.self_attn.q_proj.weight")),
+                i < 27
+            );
+        }
+        assert!(!conditioning_weight("lm_head.weight"));
+        assert!(!conditioning_weight("norm.weight"));
+    }
 }

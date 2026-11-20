@@ -1,108 +1,66 @@
-# Desktop app
+# Apple app
 
-The native AppKit app lives in [lisa-ui](../crates/lisa-ui/src/). Launch
-`lisa-ui` directly or build the signed local bundle with
-`sh crates/lisa-ui/bundle.sh`. The editable icon and generated assets live in
-[assets](../crates/lisa-ui/assets/).
+The shared SwiftUI app lives in [apps/Lisa](../apps/Lisa/README.md); its Rust
+worker, storage, downloads and C bridge live in [lisa-app](../crates/lisa-app/src/).
+Open the Xcode project for macOS 15+ or iOS/iPadOS 18+, or build the local Mac
+bundle with `sh apps/Lisa/bundle.sh`. Xcode and an Apple Silicon host are required.
+The editable icon and generated desktop assets live in [assets](../apps/Lisa/assets/).
 
-Metal inference requires macOS 15 or later, including on M1–M4 Macs. The
-compiler's separate math controls and MSL 3.2 are unavailable on macOS 14.
-The bundle declares this minimum, and standalone launches show an upgrade
-message before starting the engine. Shared model loading and runtime creation
-also reject unsupported macOS versions before allocating GPU resources. This
-keeps the existing arithmetic contracts; an older-OS compiler fallback would
-need separate numerical validation.
+The bundle script produces `target/dist/Lisa.app` and reports its complete size,
+including UI, engine, kernels, icon and notices. The retired AppKit bundle's
+12 MB limit does not apply to the SwiftUI distribution. The `dist` profile uses
+full LTO; inference/runtime optimization remains at level 3. The matching
+`target/dist/Lisa.app.dSYM` stays outside the stripped app for symbolication.
+Model weights are separate. Xcode bundles the Rust target's matching `kernels.bin`;
+never copy a kernel package from another build.
 
-The bundle script produces `target/dist/Lisa.app` and enforces a 12,000,000-byte
-limit for the complete bundle, including the engine, UI, kernel package, icon
-and notices. The `dist` profile uses full LTO; engine/runtime optimization stays
-at level 3 while model schemas/plan construction, checkpoint parsing, UI, template rendering and
-network transfer/URL processing favor size. Only the bundled copy
-is stripped. Keep the matching `target/dist/lisa-ui.dSYM` and unstripped binary
-for symbolication and source-level debugging. Model weights are separate.
+## Navigation and saved chats
 
-## Navigation and selection
+Both platforms show New chat, Models, Settings, Activity and Search, followed by
+saved conversations. Search expands its input on demand. Mac and iPad use a split
+sidebar; iPhone uses a sliding drawer opened by its sidebar icon or a right swipe.
+Activity uses a terminal icon and holds diagnostic logs outside the composer.
+iOS chat rows support swipe-to-delete; Mac rows expose deletion in their context menu.
+Empty unsent chats do not clutter the history list.
 
-The sidebar contains **New chat**, **Chats** and **Models**. Chats and Models
-collapse independently, with the preference retained locally. Disclosure
-controls appear on hover. Downloaded models sort before catalog-only entries.
+[Chat storage](../crates/lisa-app/src/chats.rs) retains the existing JSON format,
+model identity, drafts and owned attachments under Application Support/Lisa/chats.
+The Mac uses its existing unsandboxed location; iOS uses its application container.
+Reopening a conversation reloads its pinned model and replays history. GPU cache
+state does not persist across restarts. New installations default to Qwen3.5 0.8B
+MLX 4-bit when it fits. Downloaded models appear first; models exceeding the live
+memory budget are hidden. Runtime admission remains authoritative.
 
-There is one active chat ID. Selection is derived from it when rows are rebuilt;
-hover uses each row's actual pointer bounds. New chat is an action and only has
-a hover background. Model selection follows the active model identity after
-list sorting. Chat/model icons and padded row backgrounds should remain visually
-consistent.
+SwiftUI owns image display, WebKit, speech and permissions. Generated images and
+attachments use the shared Rust services. Voice, image generation, serving and
+browser interstitials need separate device acceptance; do not infer those from
+text-chat checks. The README image shows a real FLUX.2 Klein 4B generation in
+the shared SwiftUI app, alongside saved Qwen 3.8 Flash-Next conversations.
+Generated images use rounded, proportionally sized cards with preview, save,
+share and (on Mac) Finder actions.
 
-Models use a vertical stack of native clickable rows in a flipped scroll
-document. Bottom clearance belongs to that document, so the last row and its
-subtitle can be brought fully into view. Selection, loading and download
-updates preserve the scroll position. Resizing preserves the bottom position
-when the list is scrolled to the end, and otherwise retains the current offset.
+On iOS 26+, user-started generations request a continued-processing task with
+background GPU access when supported. Authorized work retains its model across
+background transitions and reports progress through the system Live Activity.
+Completion saves the chat, releases a backgrounded model and finishes the task.
+Expiration or memory pressure requests cancellation and ordered model release.
+Force-quitting still terminates work; interrupted generation is not resumed.
 
-Settings and Activity buttons have been removed from the sidebar. **Settings**
-in the chat header and **View > Model Settings** open the inspector;
-**View > Toggle Logs Panel** (Control-Command-L) opens logs. Window/sidebar
-resizing preserves the user's inspector visibility choice. Logs use the shared
-workspace background.
-
-These are the intended interaction invariants as well as the current code
-structure. Future sidebar edits need focused checks for stale hover after
-scrolling/rebuilding, exclusive selection, collapse layout and resize behavior.
-
-## Saved chats
-
-[Chat storage](../crates/lisa-ui/src/chats.rs) persists messages, drafts, model
-identity and copied input attachments under
-`~/Library/Application Support/Lisa/chats`. Reopening a chat restores its
-content and selects/loads its model as needed. Text history can be continued
-after an app restart; this does not imply that GPU cache state survives restart.
-
-Chat deletion is available from the row action and menu, with confirmation.
-The app removes the chat record and owned attachment copies; it reports partial
-cleanup failures in the log. The active chat is replaced safely when deleted.
-**New chat** (Command-N) starts a separate conversation. Return sends and
-Shift-Return inserts a line break.
-
-Every language-model chat turn gives the model access to the `web_search` and
-`web_open` tools. It can search for sources, read page text and follow links
-before answering. The model chooses when to browse from ordinary messages;
-there is no browser slash command or keyword-triggered navigation.
-Image-generation turns do not use the language-model agent.
-Lisa loads normal web pages in a visible WebKit browser panel and extracts
-readable text and links from the rendered page; it does not send whole HTML documents to the model or use a search API key.
-If Google shows consent or verification, Lisa asks in the chat for the user to
-review and resolve the prompt in the visible browser. It does not accept
-cookies or solve verification automatically. The pending navigation waits up
-to five minutes, then reports a timeout; it resumes after the prompt is gone.
-
-Each turn has a budget of six browser actions, executed sequentially in the
-same WebKit view. Multiple tool calls each receive a result; invalid arguments
-and navigation failures are returned to the model so it can correct or report
-them. Navigation callbacks prevent a failed load from returning stale page
-content. A page read returns up to 12,000 characters and 24 links, preferring
-main/article content. Search returns up to eight result cards. Before each
-model pass, long excerpts are shortened to fit its context limit while keeping
-page headers and trailing links; older complete chat pairs are dropped only
-when needed. The current question and tool-call associations remain intact. Sources added by
-the UI come only from opened pages, and Markdown source links are clickable.
-Answer text streams during generation. Partial control markers, reasoning
-and tool arguments are withheld; final tool parsing and source formatting
-settle the completed reply.
-
-Extraction depends on the page DOM and can fail if a site blocks access or
-changes its page structure. Google verification challenges require manual
-input. Closing the browser panel hides it; the next tool navigation shows it
-again. Search queries and requested URLs reach Google and the visited sites
-through normal browser requests; model inference remains local.
+The default personal-team build omits the optional GPU entitlement: Xcode rejects
+Background GPU Access for personal development teams. This build remains
+foreground-only and disables automatic screen locking during generation. Brief
+inactive transitions do not unload the model; entering the background without
+GPU authorization cancels work. See the [signing instructions](../apps/Lisa/README.md#background-generation)
+for eligible-team builds. Background GPU execution has not been device-validated
+with an entitled provisioning profile.
 
 ## Models and downloads
 
-The allowlist is [catalog.rs](../crates/lisa-ui/src/catalog.rs), with six
-language checkpoints and three image generators. Hub search does not add new
+The allowlist is [catalog.rs](../crates/lisa-app/src/catalog.rs). Hub search does not add new
 catalog entries. Existing compatible local checkpoints remain discoverable.
 Type icons distinguish image generators; download actions use an icon.
 
-[Discovery](../crates/lisa-ui/src/models.rs) shares checkpoint identities and
+[Discovery](../crates/lisa-app/src/models.rs) shares checkpoint identities and
 snapshot ordering with the engine. It validates available package/shard files
 before listing a local model and excludes decision-only Laya checkpoints from
 chat. Local size accounting follows Hub links, counts each inode once and
@@ -144,31 +102,15 @@ Text chat and the app server use automatic MTP where the checkpoint supports
 it. This enables GLM's embedded head; it does not create an absent DeepSeek
 head or prove a speedup. Refer to [model status](README.md#model-status).
 
-## Images
-
-Attach is enabled for supported vision/text models. Message thumbnails retain
-their own images. Selecting an image generator enables Generate and disables
-Attach; default steps come from the loaded pipeline.
-
-Generated PNGs are saved under `~/Pictures/Lisa` and displayed as image cards,
-with Open and Show in Finder actions. A raw saved-file path is not the main
-assistant response. The [README preview](../docs/images/screenshot.png) shows
-an actual local FLUX.2 Klein 9B generation in the current app, framed at 16:10.
-It is a product preview, not a performance measurement.
-
-Detailed inference limits are in [media](media.md).
-
-The icon shares duplicate representations and losslessly compresses PNGs;
-physical resolutions and pixel values are preserved.
-
 ## Shared Apple app
 
-[apps/Lisa](../apps/Lisa/README.md) provides a shared SwiftUI interface for macOS
-and iOS/iPadOS. The size-limited AppKit bundle remains the shipping desktop path;
-SwiftUI has not reached full desktop or physical-device inference acceptance.
+[apps/Lisa](../apps/Lisa/README.md) is the single SwiftUI interface for macOS
+and iOS/iPadOS. [lisa-app](../crates/lisa-app/src/) supplies the shared Rust
+services as `liblisa_app.a`. The retired AppKit executable and its UI dependencies
+have been removed.
 
 `backend.rs` owns the model worker, session replay and streamed events for both
-UIs. Models never cross the worker-thread boundary. `browser.rs` owns extraction
+platforms. Models never cross the worker-thread boundary. `browser.rs` owns extraction
 and browser messages; each platform supplies its WebKit presentation/lifecycle.
 `bridge.rs` exposes owned UTF-8 JSON requests/responses through two C functions.
 Swift calls on a serial queue and releases returned Rust strings explicitly.
@@ -176,16 +118,152 @@ SwiftUI owns navigation, view state and permissions, while chat persistence keep
 the existing Rust schema. Only owned attachment paths may be relocated after
 an iOS application container changes.
 
+On iOS, Swift supplies Application Support/Lisa and excludes its `models`
+directory from backups. The bridge configures the engine's process-lifetime Hub
+cache there before starting workers; downloads and discovery use the same root.
+This avoids the unwritable desktop `~/.cache` default without mutating environment
+variables in a multithreaded Swift process. Download errors reach the UI and
+device console, with filesystem paths retained in diagnostic errors.
+
 The Xcode build bundles matching kernels and licenses for its Rust target.
-iOS requires version 18+ for compiler APIs and retains the physical-RAM-minus-8-GiB
-policy plus the current per-app limit. Simulator uses the Mac host budget; it
+iOS requires version 18+ for compiler APIs. Physical devices use the smaller of
+physical RAM and the current additional per-app allowance, minus 512 MiB;
+`LISA_RAM_CAP_GB` can only lower it. The allowance is read on every admission,
+using Apple's [os_proc_available_memory](https://developer.apple.com/documentation/os/os_proc_available_memory)
+contract, and is not a guarantee against memory pressure during generation.
+Simulator uses the Mac host physical-RAM-minus-8-GiB budget; it
 does not certify a physical iPhone/iPad's capabilities. The current Simulator
 BF16 compiler-service failure blocks inference acceptance; do not change weights
 or arithmetic to hide it.
 
 Cancellation occurs at generation callbacks, not inside an active forward.
-An inactive iOS scene requests cancellation/model release; returning reloads and
-replays saved history. Incomplete turns are not committed. Suspension, browser,
+An iOS background scene without authorized continued processing requests
+cancellation/model release; returning reloads and replays saved history. Memory warnings release through the same worker and
+disable automatic reload. Incomplete turns are not committed. Suspension, browser,
 voice, image generation and serving need physical-device acceptance. SwiftUI
-currently renders inline Markdown and fenced code, without AppKit's custom
-math/table renderer or slash picker.
+renders headings, nested lists, quotes, fenced code and tables. Custom mathematical
+typesetting and a slash-command picker are not implemented.
+
+### Apple validation — 2026-11-19
+
+Xcode 27.2 Debug builds passed for Apple Silicon macOS, arm64 Simulator and a
+signed physical iPhone. The shared app's real Qwen3.5 0.8B MLX 4-bit check passed
+on macOS 27.0.1 with a 4 GiB cap and iPhone 15 Pro Max / iOS 27.2.1 with a 2 GiB
+cap. Both exercised model load, streamed replies, multi-turn recall,
+cancellation, persisted chats and replay excluding the cancelled turn. The phone
+also passed direct inactive/active and memory-warning handler checks: model
+release, reload/history replay and no automatic reload after memory pressure.
+The phone downloaded the checkpoint through the normal app downloader into its
+Application Support cache. These are functional checks, not performance or
+strict cross-device numerical parity measurements.
+
+The iOS 27.2 Simulator float32 copy probe passed; both default-language and
+explicit-MSL-3.2 BF16 copies failed with `XPC_ERROR_CONNECTION_INTERRUPTED`.
+Physical-device chat success does not remove this independent Simulator blocker.
+Actual OS suspension, delivered low-memory warnings, long contexts, additional
+devices, voice, browser, image generation and serving remain separate acceptance
+work. The Debug check briefly disables auto-lock and restores its prior setting.
+
+The compact iPhone UI was inspected in the iOS 27.2 simulator: sidebar-button and
+horizontal-swipe drawer navigation, chat selection, swipe-left Delete, a clear
+empty conversation, centered composer controls and model availability under a
+2 GiB test cap. The final library hides models that exceed the live budget.
+Model pins persist in the existing
+chat JSON. Startup reloads the selected chat's model; a fresh install downloads
+and loads Qwen3.5 0.8B when its admission check passes. Runtime model failures are
+shown as alerts; diagnostic logs remain in Activity.
+
+### Web search correction — 2026-11-19
+
+The iPhone 15 Pro Max / iOS 27.2.1 reproduction used Qwen3.5 0.8B MLX
+4-bit and the French movie-search request after two saved conversation turns.
+The original 932-token web prefill ended with signal 9 on two runs. Delivered
+memory warnings were also observed during an intermediate unrestricted run.
+The bounded Metal path completed web prefills up to 2,034 tokens without a
+memory warning or process termination. It drains work outside allocator locks
+before reclaiming completed buffers, with a 512 MiB transient allowance. No
+shader arithmetic, reduction order or forward shapes were changed. The focused
+allocation test compares an unbounded 24-dispatch chain with two bounded runs,
+bit for bit, and checks rejection while live storage remains owned. These checks
+are functional/lifetime evidence, not a throughput claim; the failing unbounded
+phone path cannot supply a completed interleaved performance baseline.
+
+Google mobile cards use ARIA headings and opaque `/goto` redirects. Both are
+now extracted, including cards whose offscreen `innerText` is empty. WebKit keeps
+a nonzero viewport while hidden. Navigation is restricted to exact Google result
+links; the model selects result numbers instead of constructing URLs. Google
+consent/verification alone presents the browser. Consent is never automated.
+
+Reading valid pages did not make the 0.8B checkpoint's summaries reliable: it
+confused page titles with films and drifted to 2025 despite November 2026 source
+dates. Web replies therefore use bounded verbatim source excerpts with links,
+not unchecked generated summaries. Release listings render extracted titles and
+dates/genres as a clean list, excluding site navigation, ratings and buttons. Direct searches open the first Google result;
+other requests can select tools, but return quoted evidence once a page is read.
+Failure to read sources cannot produce an answer from model memory. This scopes
+web answer capability to source excerpts; arbitrary synthesis is not certified.
+The current UTC date lives in every chat's runtime system prompt and refreshes
+on a new day, including saved-chat replay, without editing visible messages.
+
+Validation: release workspace build, 567 library tests passed (32 ignored), and
+`lisa-bench smoke` passed after detecting 128 GiB physical RAM and a 120 GiB
+maximum host budget. The ignored model-dependent cases remain unvalidated.
+Desktop/mobile/offscreen WebKit extraction and Swift Markdown checks passed.
+Debug Xcode builds passed for macOS, Simulator and the signed iPhone. The real
+phone's original movie query passed Google extraction, source-page reading,
+completed source excerpt, hidden-browser and no-memory-warning checks. A live
+consent challenge was not encountered; Simulator inference retains the bf16
+compiler blocker described above.
+
+### Frontend cleanup — 2026-11-19
+
+The retired AppKit frontend was removed and the shared Rust library moved from
+`lisa-ui` to `lisa-app`. Its C ABI and persisted chat schema remain unchanged.
+The SwiftUI release bundle is 14,493,120 bytes; its signature verifies, its dSYM
+UUID matches the executable, and its kernel package matches the Rust build.
+The former 12 MB packaging gate was removed with user approval.
+
+The release workspace build, all 571 library tests (32 ignored), GPU smoke,
+Markdown rendering checks and WebKit extraction checks passed. Debug builds
+passed for macOS and the signed physical iPhone. LFM3 1.7B's real Mac app check
+passed download/discovery, loading, committed replies, multi-turn context,
+cancellation, saved-history replay and persisted model identity.
+The physical iPhone passed those checks plus foreground reload/history replay
+and memory-warning release without automatic reload. These remain functional
+checks, not new numerical parity or performance measurements.
+
+### Bonsai image generation — 2026-11-20
+
+The signed physical iPhone 15 Pro Max (A17 Pro, iOS 27.2.1) downloaded and loaded
+Bonsai Binary 4B, generated a 512×512 four-step observatory image, and saved a
+440,169-byte PNG under Application Support/Lisa/generated-images. The file was
+copied back and visually inspected. Generation took 199.55 seconds in one
+foreground run with optimized Release Rust and the Swift DEBUG integration
+hook enabled. No memory warning was reported. This is functional evidence,
+not a throughput benchmark or full PrismML numerical-parity certification.
+
+The live admission budget was 2,970,761,376 bytes after the 512 MiB reserve;
+the model requires 2.6 GiB. Download size is independent of that working budget.
+An earlier run completed compute but failed at the old HOME/Pictures output
+path; the explicit application-storage path fixes that failure. Another run
+was cancelled when the app became inactive, as expected for the then-current
+foreground-only lifecycle. The successful run remained active throughout.
+
+macOS and signed iOS builds passed. The release workspace build, 574 library
+tests (32 ignored), and GPU smoke suite passed. Kernel, tiling and retained
+FLUX image checks are detailed in [media support](media.md#bonsai-image-binary-4b).
+
+### Continued-processing integration — 2026-11-20
+
+macOS and the personal-team signed iPhone Release builds passed with the shared
+background-generation coordinator. The physical iPhone check passed local replies,
+multi-turn context, cancellation, persisted history, transient inactivity without
+unloading, foreground reload, and memory-warning release. Lifecycle transitions
+in this check were invoked directly; this does not validate OS background GPU use.
+The runtime reported no available background GPU resource for this build/device.
+
+Xcode explicitly rejected the GPU entitlement for the personal development team.
+The user chose to retain that team, so the installed app omits the entitlement
+and remains foreground-only. An eligible signed build still needs the real
+background image check, system cancellation, and lock-screen completion checks.
+The release workspace build, 574 library tests (32 ignored), and smoke suite passed.

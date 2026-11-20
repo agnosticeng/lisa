@@ -12,6 +12,7 @@ pub struct Geometry {
     pub hd: i32,
     pub doubles: usize,
     pub singles: usize,
+    pub rms_epsilon: f32,
 }
 impl Geometry {
     pub fn from_schema(schema: &Schema) -> anyhow::Result<Self> {
@@ -36,6 +37,14 @@ impl Geometry {
             hd,
             doubles,
             singles,
+            rms_epsilon: if schema
+                .get("transformer_blocks.0.attn.to_q.weight")
+                .is_some_and(|w| w.dtype == Dtype::U32 && w.shape == [inner, inner / 32])
+            {
+                1e-6
+            } else {
+                1e-5
+            },
         })
     }
 }
@@ -106,8 +115,10 @@ impl Dit<'_> {
     }
     fn heads_norm(&self, x: Array, key: &str) -> anyhow::Result<Array> {
         let x = self.heads(x)?.as_dtype(Dtype::F32)?.contiguous()?;
-        Ok(x.rms(&self.w.get(key)?.as_dtype(Dtype::F32)?, 1e-5)?
-            .as_dtype(Dtype::BF16)?)
+        Ok(
+            x.rms(&self.w.get(key)?.as_dtype(Dtype::F32)?, self.rms_epsilon)?
+                .as_dtype(Dtype::BF16)?,
+        )
     }
     fn attention(
         &self,

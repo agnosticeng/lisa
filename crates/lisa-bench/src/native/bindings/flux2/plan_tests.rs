@@ -213,7 +213,7 @@ fn dit2_check(reference: bool) -> anyhow::Result<()> {
             let expected = reference
                 .then(|| oracle.forward(&latent, &enc, time, 2, 3))
                 .transpose()?;
-            for _ in 0..2 {
+            for repetition in 0..2 {
                 let p = dit2::program(
                     &schema,
                     dit2::Geometry {
@@ -222,6 +222,7 @@ fn dit2_check(reference: bool) -> anyhow::Result<()> {
                         hd: 128,
                         doubles: 1,
                         singles: 1,
+                        rms_epsilon: 1e-5,
                     },
                     info(&latent)?,
                     info(&enc)?,
@@ -229,11 +230,13 @@ fn dit2_check(reference: bool) -> anyhow::Result<()> {
                     2,
                     3,
                 )?;
-                let out = weights
-                    .prepare(p)?
-                    .run(&[&latent, &enc], &mut [])?
-                    .into_one()
-                    .map_err(anyhow::Error::msg)?;
+                let prepared = weights.prepare(p)?;
+                let result = if repetition == 0 {
+                    prepared.run(&[&latent, &enc], &mut [])?
+                } else {
+                    prepared.run_bounded(&[&latent, &enc], &mut [], 24)?
+                };
+                let out = result.into_one().map_err(anyhow::Error::msg)?;
                 verify(
                     &format!("dit2-q{quantized}-t{time}"),
                     &out,

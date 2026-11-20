@@ -46,7 +46,19 @@ impl<D: BindingDevice + ManagedDevice> Pipeline<D> {
         );
         // Leave room for convolution intermediates, attention, and allocator
         // overlap. Check both the configured cap and current system headroom.
-        let needed = 8usize << 30;
+        let binary = crate::checkpoint::catalog::bonsai::is_checkpoint(&self.dir);
+        if binary {
+            self.context.device().clear_unused();
+            ensure!(
+                options.width <= 512 && options.height <= 512,
+                "Bonsai currently supports up to 512 × 512 pixels"
+            );
+        }
+        let needed = if binary {
+            crate::checkpoint::catalog::bonsai::REQUIRED_RAM
+        } else {
+            8usize << 30
+        };
         ensure!(
             self.context
                 .device()
@@ -67,6 +79,9 @@ impl<D: BindingDevice + ManagedDevice> Pipeline<D> {
             let _trace = self.context.trace("image.text_encoder");
             text::encode(&self.context, &self.dir, prompt)?
         };
+        if binary {
+            self.context.device().clear_unused();
+        }
         let (h, w) = ((options.height / 16) as i32, (options.width / 16) as i32);
         let noise = model::normal_noise((128 * h * w) as usize, options.seed);
         let noise = weights::pull(
@@ -102,18 +117,29 @@ impl<D: BindingDevice + ManagedDevice> Pipeline<D> {
             }
         }
         drop(enc);
+        if binary {
+            self.context.device().clear_unused();
+        }
         progress("Decoding image", steps, steps)?;
-        let pixels = {
-            let _trace = self.context.trace("image.vae");
-            vae::decode(
+        let values = if binary {
+            let _trace = self.context.trace("image.vae.tiled");
+            vae::decode_binary(
                 &self.context,
                 &self.dir,
                 &run(&self.context, model::decoder_input(h, w), &[&latents])?,
+                progress,
             )?
+        } else {
+            let _trace = self.context.trace("image.vae");
+            let pixels = vae::decode(
+                &self.context,
+                &self.dir,
+                &run(&self.context, model::decoder_input(h, w), &[&latents])?,
+            )?;
+            let pixels = run(&self.context, model::pixel_readback(), &[&pixels])?;
+            pixels.eval()?;
+            pixels.read_f32()?
         };
-        let pixels = run(&self.context, model::pixel_readback(), &[&pixels])?;
-        pixels.eval()?;
-        let values = pixels.read_f32()?;
         let rgb = model::rgb(Family::Klein2, &values)?;
         let image = image::RgbImage::from_raw(options.width, options.height, rgb)
             .ok_or_else(|| anyhow::anyhow!("VAE output dimensions do not match request"))?;

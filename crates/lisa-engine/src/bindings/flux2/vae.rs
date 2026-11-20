@@ -48,3 +48,56 @@ pub fn decode_weights<D: BindingDevice>(
     output.eval()?;
     Ok(output)
 }
+
+/// Decode Bonsai's original Diffusers VAE in overlapping 128px tiles. Only one
+/// tile's activations is live; the final RGB-sized accumulation stays on host.
+pub fn decode_binary<D: BindingDevice + lisa_backend::ManagedDevice>(
+    context: &DeviceContext<D>,
+    dir: &Path,
+    packed: &D::Tensor,
+    progress: &mut dyn FnMut(&str, u32, u32) -> anyhow::Result<()>,
+) -> anyhow::Result<Vec<f32>> {
+    use super::weights::run;
+    use lisa_models::flux::{pipeline, tiles};
+    let original = Weights::load_file(
+        context.clone(),
+        &dir.join("vae/diffusion_pytorch_model.safetensors"),
+        |key| {
+            key.starts_with("decoder.")
+                || key.starts_with("post_quant_conv.")
+                || key.starts_with("bn.running_")
+        },
+    )?;
+    let mut tensors = std::collections::HashMap::new();
+    for (name, value) in original.0 {
+        let (name, prepare) =
+            pipeline::decoder_weight(&name.replace(".to_out.0.", ".to_out."), value.shape())?;
+        let value = if let Some(graph) = prepare {
+            run(context, graph, &[&value])?
+        } else {
+            value
+        };
+        tensors.insert(name, value);
+    }
+    let weights = Weights::from_map(context.clone(), tensors);
+    let (h, w) = (packed.dim(2) as usize, packed.dim(3) as usize);
+    let mut output = vec![0.0; h * w * 256 * 3];
+    let mut count = vec![0.0; h * w * 256];
+    let tiles = tiles::tiles(h, w);
+    for (i, tile) in tiles.iter().enumerate() {
+        progress("Decoding image", i as u32, tiles.len() as u32)?;
+        let input = run(context, tile.graph(), &[packed])?;
+        let decoded = decode_weights(&weights, &input, ScalarType::BF16)?;
+        let pixels = run(context, pipeline::pixel_readback(), &[&decoded])?;
+        pixels.eval()?;
+        tile.blend(h * 16, w * 16, &pixels.read_f32()?, &mut output, &mut count)?;
+        drop(pixels);
+        drop(decoded);
+        drop(input);
+        context.device().clear_unused();
+    }
+    for (i, value) in output.iter_mut().enumerate() {
+        *value /= count[i / 3].max(1e-6);
+    }
+    Ok(output)
+}

@@ -2,9 +2,11 @@ import SwiftUI
 import WebKit
 
 @MainActor final class BrowserController: NSObject, ObservableObject, WKNavigationDelegate {
-    let webView = WKWebView()
+    // A nonzero viewport keeps offscreen WebKit result cards laid out.
+    let webView = WKWebView(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
     @Published var address = ""
     @Published var status = ""
+    @Published private(set) var needsInput = false
     private var navigation: WKNavigation?
     private var ready = false
     private var generation = UUID()
@@ -36,7 +38,7 @@ import WebKit
                             self.finish(["error":"The page returned no readable content"]); return
                         }
                         if let message = page["needs_input"] as? String {
-                            self.status = message
+                            self.status = message; self.needsInput = true
                             if !prompted {
                                 prompted = true
                                 await completion(["op":"browser_result", "id":request["id"] ?? NSNull(), "needs_input":message])
@@ -58,6 +60,7 @@ import WebKit
     }
     private func finish(_ result: [String:Any]) {
         guard let completion, let id = requestID else { return }
+        needsInput = false
         self.completion = nil; requestID = nil; extraction?.cancel(); extraction = nil
         var response = result; response["op"] = "browser_result"; response["id"] = id
         Task { await completion(response) }

@@ -1,24 +1,24 @@
 <p align="center">
-  <img src="crates/lisa-ui/assets/Lisa.png" alt="LISA app icon" width="128" height="128">
+  <img src="apps/Lisa/assets/Lisa.png" alt="LISA app icon" width="128" height="128">
 </p>
 
 <h1 align="center">LISA</h1>
 
-<p align="center"><strong>Local AI, built for your Mac.</strong></p>
+<p align="center"><strong>Local AI, built for your Mac and iPhone.</strong></p>
 
-Chat, write code, understand images and generate them — in a native macOS app,
+Chat, write code, understand images and generate them — in a shared macOS and iOS app,
 from your terminal, or through a local API. LISA runs inference on Apple Silicon
 with its own Rust engine and Metal runtime.
 
 [Get started](#get-started) · [Models](#supported-models) · [Images](#images) ·
 [API](#local-api) · [Documentation](specs/README.md)
 
-![LISA on macOS, displaying an image generated locally with FLUX.2 Klein 9B](docs/images/screenshot.png)
+![LISA on macOS with saved Qwen Flash-Next chats and a locally generated FLUX.2 Klein 4B image](docs/images/screenshot.png)
 
-*An actual FLUX.2 Klein 9B generation in LISA.*
+*A real FLUX.2 Klein 4B generation in the shared SwiftUI app, alongside Qwen 3.8 Flash-Next conversations.*
 
 - **A native workspace.** Saved chats, image attachments, generated-image
-  previews and a curated model library in an AppKit interface.
+  previews and a curated model library in a shared SwiftUI interface.
 - **Your models, running locally.** Qwen, GLM, DeepSeek and FLUX, using supported
   MLX-format safetensors and original packed GGUF weights.
 - **An engine of its own.** Rust model execution, memory management and
@@ -28,7 +28,7 @@ with its own Rust engine and Metal runtime.
 
 ## Get started
 
-Requires **macOS 15 or later on Apple Silicon**, Apple command line developer
+Requires **macOS 15 or later on Apple Silicon**, Xcode and Apple command line developer
 tools and a Rust toolchain supporting edition 2024. Choose a model that leaves enough
 unified memory for its weights, context, working buffers and macOS.
 
@@ -40,13 +40,13 @@ cd lisa
 ### Open the app
 
 ```sh
-sh crates/lisa-ui/bundle.sh
+sh apps/Lisa/bundle.sh
 open target/dist/Lisa.app
 ```
 
 The script builds and locally signs the app, keeping debug symbols separately
-in `target/dist/lisa-ui.dSYM`. The complete app includes its compressed Metal
-source package, `kernels.bin`; the bundle build enforces a 12 MB size limit.
+in `target/dist/Lisa.app.dSYM`. The complete app includes its compressed Metal
+source package, `kernels.bin`; the bundle build reports its complete size.
 In **Models**, download a checkpoint, then select it to load. Choose a language model to chat or an image
 model to generate. Downloaded models appear first; compatible checkpoints
 already in your Hugging Face cache are discovered automatically.
@@ -55,13 +55,25 @@ Chats and attachments stay in `~/Library/Application Support/Lisa/chats`.
 Generated images appear as preview cards and are saved to `~/Pictures/Lisa`.
 Use **⌘N** for a new chat, **Return** to send and **Shift-Return** for a new line.
 The model can use the browser in any language-model chat when it needs current
-information. It can search the web, open useful pages and follow links; the
-browser panel stays visible while it works. Ask naturally; no browser command
+information. It searches Google and opens result links; the
+browser stays hidden unless Google requires consent or verification. Replies
+show excerpts from retrieved sources. Ask naturally; no browser command
 is needed.
 
 Language-model context capacity defaults to the checkpoint metadata in both
 the app and CLI. Use `--ctx-size` with `lisa run` or `lisa serve` to override
 it where the model supports runtime context configuration.
+
+### Build for iPhone, iPad or Mac
+
+The [shared SwiftUI app](apps/Lisa/README.md) targets iOS/iPadOS 18+ and Apple
+Silicon macOS 15+. Open `apps/Lisa/Lisa.xcodeproj`, select **Lisa**, and choose
+your destination and signing team. It uses the same in-process Rust engine.
+Physical iOS devices admit models against their live per-app memory allowance;
+small checkpoints are available in the model library. Local Qwen 0.8B and
+[LFM3 1.7B](specs/models/lfm3.md) chat are validated on iPhone 15 Pro Max; broader device and media coverage remains open.
+Simulator BF16 compilation is currently blocked.
+The bundle command above packages this same SwiftUI app for macOS.
 
 ### Use the terminal
 
@@ -104,12 +116,13 @@ See [the Qwen model notes](specs/models/qwen.md#dspine-block-drafter).
 
 These are the desktop app's curated downloads. Model names link to their
 Hugging Face checkpoints; exact selections live in
-[the catalog](crates/lisa-ui/src/catalog.rs).
+[the catalog](crates/lisa-app/src/catalog.rs).
 
 ### Chat and code
 
 | Model | Weights | Implementation |
 | --- | --- | --- |
+| [LFM3 1.7B](https://huggingface.co/LiquidAI/LFM3-1.7B-MLX-4bit) | MLX 4-bit · 991 MB | Text and tools on iPhone and Mac |
 | [Qwen 3.5 0.8B](https://huggingface.co/mlx-community/Qwen3.5-0.8B-MLX-4bit) | MLX 4-bit | Text and compatible image input |
 | [Qwen 3.5 4B](https://huggingface.co/mlx-community/Qwen3.5-4B-MLX-4bit) | MLX 4-bit | Text and compatible image input |
 | [Qwen 3.8 27B](https://huggingface.co/agnosticeng/Qwen3.8-27B-4bit) | MLX 4-bit | Text, compatible image input and MTP |
@@ -132,6 +145,7 @@ and performance acceptance remains open. [DeepSeek status →](specs/models/deep
 
 | Model | Weights | Default steps |
 | --- | --- | ---: |
+| [Bonsai Binary 4B](https://huggingface.co/prism-ml/bonsai-image-binary-4B-mlx-1bit) | MLX 1-bit transformer | 4 |
 | [FLUX.2 Klein 4B](https://huggingface.co/mlx-community/flux2-klein-4b-4bit) | MLX 4-bit | 4 |
 | [FLUX.2 Klein 9B](https://huggingface.co/mlx-community/flux2-klein-9b-4bit) | MLX 4-bit | 4 |
 | [FLUX 3 Image Klein](https://huggingface.co/black-forest-labs/flux-3-image-klein) | BF16 | 16 |
@@ -172,7 +186,12 @@ Select an image model in the app and use **Generate**, or write a PNG directly:
 ```
 
 The default is FLUX.2 Klein 4B. Use `--model` to select another image checkpoint.
-Dimensions must be multiples of 32, from 64 to 1024 pixels per side. FLUX 3
+Bonsai Binary 4B is the compact image option for iPhone and Mac: a roughly
+3.43 GB download, with a 2.6 GiB working-memory admission requirement. It runs
+encoder, transformer and tiled decoder separately and supports up to 512×512.
+Use `--model prism-ml/bonsai-image-binary-4B-mlx-1bit` or select it in Models.
+Other image models support dimensions from 64 to 1024 pixels per side; all
+sizes must be multiples of 32. FLUX 3
 expands short prompts locally; `--prompt-is-caption` uses your caption directly.
 
 Image generation is text-to-image; editing and LoRA are not implemented.

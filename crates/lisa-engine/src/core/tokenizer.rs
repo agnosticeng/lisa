@@ -5,6 +5,7 @@ use tokenizers::Tokenizer as HfTokenizer;
 pub struct Tokenizer {
     pub inner: HfTokenizer,
     pub im_end_ids: Vec<u32>,
+    lfm3: bool,
     native: Option<crate::core::gguf_tokenizer::Tokenizer>,
 }
 
@@ -135,6 +136,9 @@ impl<'a> IncrementalDecoder<'a> {
 }
 
 impl Tokenizer {
+    pub fn is_lfm3(&self) -> bool {
+        self.lfm3
+    }
     pub fn load(dir: &std::path::Path) -> anyhow::Result<Self> {
         if dir.is_file() {
             let header = lisa_gguf::Header::open(dir)?;
@@ -148,6 +152,7 @@ impl Tokenizer {
                     inner,
                     im_end_ids,
                     native: None,
+                    lfm3: false,
                 });
             }
             anyhow::ensure!(
@@ -168,6 +173,7 @@ impl Tokenizer {
                 inner: native.decoder_view()?,
                 im_end_ids,
                 native: Some(native),
+                lfm3: false,
             });
         }
         Self::load_file(&dir.join("tokenizer.json"))
@@ -192,10 +198,17 @@ impl Tokenizer {
                 im_end_ids.push(id);
             }
         }
+        let lfm3 = path
+            .parent()
+            .and_then(|dir| std::fs::read(dir.join("config.json")).ok())
+            .map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes))
+            .transpose()?
+            .is_some_and(|config| config["model_type"] == "lfm3");
         Ok(Self {
             inner,
             im_end_ids,
             native: None,
+            lfm3,
         })
     }
 
@@ -348,7 +361,29 @@ pub fn load_chat_template(model: &std::path::Path) -> anyhow::Result<Option<Stri
             .map(str::to_owned));
     }
     match std::fs::read_to_string(model.join("chat_template.jinja")) {
-        Ok(template) => Ok(Some(template)),
+        Ok(template) => {
+            // Standalone templates still obtain their special tokens from tokenizer_config.json.
+            let config_path = model.join("tokenizer_config.json");
+            let config: serde_json::Value = if config_path.is_file() {
+                serde_json::from_slice(&std::fs::read(config_path)?)?
+            } else {
+                serde_json::Value::Null
+            };
+            let mut source = String::new();
+            for name in ["bos_token", "eos_token", "pad_token"] {
+                let token = config[name]
+                    .as_str()
+                    .or_else(|| config[name]["content"].as_str());
+                if let Some(token) = token {
+                    source.push_str(&format!(
+                        "{{%- set {name} = {} -%}}",
+                        serde_json::to_string(token)?
+                    ));
+                }
+            }
+            source.push_str(&template);
+            Ok(Some(source))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
     }
@@ -363,6 +398,12 @@ impl Tokenizer {
         prompt: &str,
         first: bool,
     ) -> anyhow::Result<Option<Vec<u32>>> {
+        if self.lfm3 {
+            return Ok(Some(self.encode(
+                &lisa_models::lfm3::prompt::turn(system, prompt, first, false),
+                false,
+            )?));
+        }
         let Some(native) = &self.native else {
             return Ok(None);
         };
@@ -632,6 +673,7 @@ mod tests {
             .map_err(|error| anyhow::anyhow!("{error}"))?;
         let tokenizer = Tokenizer {
             native: None,
+            lfm3: false,
             inner,
             im_end_ids: vec![],
         };

@@ -119,3 +119,5 @@ pub mod glm53_affine_moe;
 
 pub mod glm53_affine_tower;
 pub mod glm53_law;
+
+pub mod lfm3;

@@ -41,8 +41,9 @@ actual AMD hardware; an enum case or portable build is insufficient.
 
 ## Product and validation
 
-- Qualify physical iOS inference, suspension/reload, cancellation and saved-chat
-  replay. Resolve Simulator BF16 compilation independently of model arithmetic.
+- Extend the [iPhone 15 Pro Max Qwen 0.8B checks](desktop.md#apple-validation--2026-11-19)
+  to other devices, real OS suspension/memory warnings and media/serving paths.
+  Resolve Simulator BF16 compilation independently of model arithmetic.
   Bring SwiftUI feature coverage and distribution size to its shipping target.
 - Maintain a durable external legacy GLM capture inventory: filenames, sizes,
   hashes and exact reference/generator identity. Do not restore large tracked

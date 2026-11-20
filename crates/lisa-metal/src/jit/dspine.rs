@@ -181,7 +181,7 @@ pub fn dspine_affine(
         || scales.dtype() != Dtype::Bfloat16
         || biases.dtype() != Dtype::Bfloat16
         || k % 512 != 0
-        || n % 32 != 0
+        || (n % 32 != 0 && !(n == 16 && m <= 8))
         || w.dim(1) * 8 != k
         || scales.dims() != [n, k / 64]
         || biases.dims() != scales.dims()
@@ -192,10 +192,10 @@ pub fn dspine_affine(
     while split > 1 && k % (split * 64) != 0 {
         split -= 1;
     }
-    if m > 1 && m < super::qmv_batch_limit(k, n) {
+    if n != 16 && m > 1 && m < super::qmv_batch_limit(k, n) {
         return super::qmv_wide(device, x, w, scales, biases, 64, 4);
     }
-    if m > 1 && split <= 1 {
+    if n != 16 && m > 1 && split <= 1 {
         return if device.nax() {
             super::qmm_nax(device, x, w, scales, biases, 64, 4)
         } else {
@@ -215,18 +215,21 @@ pub fn dspine_affine(
             &["float", "bfloat16_t"].map(String::from));
         format!("{MLX_UTILS_PREAMBLE}{MLX_GEMM_PREAMBLE}{MLX_QUANTIZED_UTILS_PREAMBLE}{QUANT}{qmv}{qmm}{sum}")
     });
-    let name = if m == 1 {
+    // A 16-output projection uses the same complete eight-row QMV tiles.
+    // M <= 8 stays below MLX's vector threshold on supported Apple GPUs.
+    let vector = m == 1 || n == 16;
+    let name = if vector {
         "dspine_affine_qmv"
     } else {
         "dspine_affine_splitk"
     };
     let pipeline = super::compile_builtin(device, source, name)?;
-    let out_dtype = if m == 1 {
+    let out_dtype = if vector {
         Dtype::Bfloat16
     } else {
         Dtype::Float32
     };
-    let partitions = if m == 1 { 1 } else { split };
+    let partitions = if vector { 1 } else { split };
     let buffer = device
         .buffer_for_full_gpu_write(partitions * m * n * out_dtype.size_of(), "dspine_affine")?;
     let out = Array::from_parts(device, buffer.clone(), &[partitions, m, n], out_dtype);
@@ -243,8 +246,8 @@ pub fn dspine_affine(
     enc.set_output(4, Some(&buffer), 0);
     enc.set_bytes(5, &(k as i32));
     enc.set_bytes(6, &(n as i32));
-    if m == 1 {
-        enc.dispatch_groups((1, n / 8, 1), (32, 2, 1));
+    if vector {
+        enc.dispatch_groups((m, n / 8, 1), (32, 2, 1));
         return out.reshape(&[m, n]);
     }
     enc.set_bytes(7, &(m as i32));

@@ -2,7 +2,9 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-use std::path::{Path, PathBuf};
+#[cfg(any(test, target_os = "ios"))]
+use std::path::Path;
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, ensure};
@@ -43,23 +45,6 @@ impl Chat {
             draft: String::new(),
         }
     }
-
-    pub fn title(&self) -> String {
-        let text = self
-            .turns
-            .first()
-            .map(|t| t.user.as_str())
-            .unwrap_or(&self.draft);
-        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-        if text.is_empty() {
-            return "Image conversation".into();
-        }
-        let mut title: String = text.chars().take(60).collect();
-        if text.chars().count() > 60 {
-            title.push('…');
-        }
-        title
-    }
 }
 
 pub fn timestamp() -> u64 {
@@ -71,32 +56,19 @@ pub fn timestamp() -> u64 {
 
 #[derive(Debug)]
 pub struct Store {
-    root: Option<PathBuf>,
+    root: PathBuf,
 }
 
 impl Store {
-    pub fn new() -> Self {
-        Self {
-            root: std::env::var_os("HOME")
-                .map(|home| PathBuf::from(home).join("Library/Application Support/Lisa/chats")),
-        }
-    }
-
     pub fn at(root: PathBuf) -> Self {
-        Self { root: Some(root) }
-    }
-
-    fn root(&self) -> Result<&Path> {
-        self.root
-            .as_deref()
-            .context("HOME is not set; chats cannot be saved")
+        Self { root }
     }
 
     /// iOS can change the application container UUID during an app update.
     /// Repair only missing paths belonging to this app's own attachment stores.
     #[cfg(target_os = "ios")]
     fn relocate_owned_images(&self, mut chat: Chat) -> Chat {
-        let Some(root) = &self.root else { return chat };
+        let root = &self.root;
         for turn in &mut chat.turns {
             for path in &mut turn.images {
                 if let Some(suffix) =
@@ -115,6 +87,12 @@ impl Store {
                 }
             }
             if let Some(path) = &mut turn.generated_image {
+                if let Some(suffix) = owned_suffix(path, "/Library/Application Support/Lisa/generated-images/") {
+                    if let Some(storage) = root.parent() {
+                        let candidate = storage.join("generated-images").join(suffix);
+                        if candidate.is_file() { *path = candidate; }
+                    }
+                }
                 if let Some(suffix) = owned_suffix(path, "/Pictures/Lisa/") {
                     if let Some(home) = std::env::var_os("HOME") {
                         let candidate = PathBuf::from(home).join("Pictures/Lisa").join(suffix);
@@ -133,7 +111,7 @@ impl Store {
         let mut chats = Vec::new();
         let mut errors = Vec::new();
         let result = (|| -> Result<()> {
-            let root = self.root()?;
+            let root = &self.root;
             if !root.exists() {
                 return Ok(());
             }
@@ -172,7 +150,7 @@ impl Store {
 
     pub fn save(&self, chat: &Chat) -> Result<()> {
         ensure!(valid_id(&chat.id), "invalid chat id");
-        let root = self.root()?;
+        let root = &self.root;
         fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
@@ -200,7 +178,7 @@ impl Store {
     /// cleanup failures are warnings: the conversation has already been deleted.
     pub fn delete(&self, id: &str) -> Result<Option<String>> {
         ensure!(valid_id(id), "invalid chat id");
-        let root = self.root()?;
+        let root = &self.root;
         match fs::remove_file(root.join(format!("{id}.json"))) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -223,7 +201,7 @@ impl Store {
             return Ok(Vec::new());
         }
         ensure!(valid_id(chat_id), "invalid chat id");
-        let directory = self.root()?.join("attachments").join(chat_id);
+        let directory = self.root.join("attachments").join(chat_id);
         fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
