@@ -28,6 +28,7 @@ where
         "DSpine requires a compatible MLX Qwen 3.8 27B checkpoint"
     );
     let mut model: Language<D> = match kind {
+        ModelKind::Olala => Box::new(crate::bindings::olala::Tower::load(runtime, path)?),
         ModelKind::Lfm3 => Box::new(crate::bindings::lfm3::Tower::load(runtime, path)?),
         ModelKind::Qwen35 => {
             let cfg =

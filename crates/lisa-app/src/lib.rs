@@ -5,3 +5,4 @@ mod browser;
 mod catalog;
 mod chats;
 mod models;
+mod prompt_cache;

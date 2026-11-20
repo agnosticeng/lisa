@@ -55,6 +55,7 @@ pub fn decode(kind: TensorType, packed: &[u8], output: &mut [f32]) -> Result<()>
             TensorType::Q2_K => q2_k(b, out),
             TensorType::Q4_K => q4_k(b, out),
             TensorType::Q5_K => q5_k(b, out),
+            TensorType::Q6_K => q6_k(b, out),
             _ => bail!("CPU row decoder not implemented for {}", kind.layout()?.0),
         }
     }
@@ -181,6 +182,27 @@ fn q5_k(b: &[u8], out: &mut [f32]) {
     }
 }
 
+// GGML Q6_K: two 128-value halves, signed 8-bit group scales and a trailing FP16 scale.
+fn q6_k(b: &[u8], out: &mut [f32]) {
+    let d = f16_at(b, 208);
+    for half in 0..2 {
+        for l in 0..32 {
+            let lo = 64 * half + l;
+            let hi = b[128 + 32 * half + l];
+            let values = [
+                (b[lo] & 15) | ((hi & 3) << 4),
+                (b[lo + 32] & 15) | (((hi >> 2) & 3) << 4),
+                (b[lo] >> 4) | (((hi >> 4) & 3) << 4),
+                (b[lo + 32] >> 4) | (((hi >> 6) & 3) << 4),
+            ];
+            for (group, q) in values.into_iter().enumerate() {
+                let scale = b[192 + 8 * half + l / 16 + 2 * group] as i8;
+                out[128 * half + 32 * group + l] = d * scale as f32 * (q as i32 - 32) as f32;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,6 +216,7 @@ mod tests {
         for (kind, expected) in [
             (TensorType::Q8_0, 0xc0087397958e8331u64),
             (TensorType::Q5_K, 0xf8a0e7f3f1b1aee0),
+            (TensorType::Q6_K, 0x0e7652a7d72e10ee),
             (TensorType::Q2_K, 0x92f0e7a5daf379e9),
             (TensorType::Q4_K, 0xa8fd5258d144add5),
             (TensorType::IQ2_XXS, 0xef5d016f9a4d2e0f),
@@ -213,7 +236,9 @@ mod tests {
                     *byte = (state >> 24) as u8;
                 }
                 let scale = (0x2800 + (block % 8) * 0x200) as u16;
-                if kind == TensorType::Q2_K {
+                if kind == TensorType::Q6_K {
+                    packed[208..210].copy_from_slice(&scale.to_le_bytes());
+                } else if kind == TensorType::Q2_K {
                     packed[80..82].copy_from_slice(&scale.to_le_bytes());
                     packed[82..84].copy_from_slice(&0x2400u16.to_le_bytes());
                 } else if kind == TensorType::IQ1_M {

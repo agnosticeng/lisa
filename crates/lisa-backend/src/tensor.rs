@@ -93,6 +93,12 @@ pub enum TensorOperation {
         bias: bool,
     },
     SequentialAttention,
+    /// F32 MIMO recurrence. Inputs: dynamic/static projections, B/C biases,
+    /// x/z factors, output factors, norms, dt/D, immutable [S,K,V,phase] state.
+    /// Outputs: mixed rows and replacement state; Dqk=128, Dv=64, rank=4.
+    Mamba3Mimo { heads: u32, epsilon: u32 },
+    /// Rotate an F32 residual towards an update, with learned scalar scale/bias.
+    GeodesicResidual { inverse_depth: u32 },
     Matmul,
     /// Whole-tensor reductions retain their own reduction and cast order.
     SumAll,
@@ -179,6 +185,8 @@ pub enum TensorOperationKind {
     SequentialLinear(bool),
     SequentialLayerNorm(bool),
     SequentialAttention,
+    Mamba3Mimo,
+    GeodesicResidual,
     Matmul,
     SumAll,
     MaxAll,
@@ -207,6 +215,8 @@ pub enum TensorOperationKind {
 impl TensorOperation {
     pub fn validate(&self) -> bool {
         match self {
+            Self::Mamba3Mimo { heads, epsilon } => (1..=256).contains(heads) && f32::from_bits(*epsilon).is_finite() && f32::from_bits(*epsilon) > 0.0,
+            Self::GeodesicResidual { inverse_depth } => f32::from_bits(*inverse_depth).is_finite() && f32::from_bits(*inverse_depth) > 0.0,
             Self::ArgPartition { kth, .. } => *kth >= 0,
             Self::Reshape(shape) => {
                 shape.iter().all(|&d| d >= -1) && shape.iter().filter(|&&d| d == -1).count() <= 1
@@ -274,6 +284,8 @@ impl TensorOperation {
                 TensorOperationKind::SequentialLayerNorm(*bias)
             }
             Self::SequentialAttention => TensorOperationKind::SequentialAttention,
+            Self::Mamba3Mimo { .. } => TensorOperationKind::Mamba3Mimo,
+            Self::GeodesicResidual { .. } => TensorOperationKind::GeodesicResidual,
             Self::Matmul => TensorOperationKind::Matmul,
             Self::SumAll => TensorOperationKind::SumAll,
             Self::MaxAll => TensorOperationKind::MaxAll,
@@ -305,7 +317,8 @@ impl TensorOperation {
             Self::SequentialLinear { bias } | Self::SequentialLayerNorm { bias, .. } => {
                 2 + usize::from(*bias)
             }
-            Self::SequentialAttention => 4,
+            Self::SequentialAttention | Self::GeodesicResidual { .. } => 4,
+            Self::Mamba3Mimo { .. } => 8,
             Self::Where | Self::PutAlong { .. } => 3,
             Self::Compare(_) | Self::LogicalAnd | Self::LogicalOr => 2,
             Self::Concatenate { inputs, .. } => *inputs,
@@ -328,7 +341,7 @@ impl TensorOperation {
         }
     }
     pub fn outputs(&self) -> usize {
-        if matches!(self, Self::AddRmsNorm { .. }) {
+        if matches!(self, Self::AddRmsNorm { .. } | Self::Mamba3Mimo { .. }) {
             2
         } else {
             1

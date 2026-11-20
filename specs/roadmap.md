@@ -23,6 +23,7 @@ actual AMD hardware; an enum case or portable build is insufficient.
 | Qwen 0.8B | Attribute the serial/PLD discrepancy without replacing the serial golden |
 | Qwen Flash-Next | Attribute chunked/full-prefill state drift before claiming strict equivalence; broader batching shapes/contexts and full-checkpoint vision qualification |
 | DSpine | Full sampled conditional-q/rejection and residual sampling, exact sparse target support, graph replay and multi-request ragged SPS; independent oracle/state checks for each |
+| Olala | Full per-layer pinned-reference parity, long-context/cache qualification, device UI qualification and efficient packed expert dispatch; see [status](models/olala.md) |
 | FLUX | Broader full-checkpoint stage/image/size coverage and isolated performance acceptance |
 
 ## Shared engine and serving

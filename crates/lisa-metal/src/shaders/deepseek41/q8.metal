@@ -610,3 +610,33 @@ kernel void kernel_mul_mv_q8_0_f32_bf16_pair_qa_kv(
     }
 }
 
+
+// LISA indirect addressing adapter. The original dense helper above owns every
+// multiply, accumulation and reduction; only the selected base pointers change.
+kernel void lisa_q8_expert_f32(
+        constant ds4_metal_args_mul_mv & args [[buffer(0)]],
+        device const char * weights [[buffer(1)]],
+        device const char * input [[buffer(2)]],
+        device char * output [[buffer(3)]],
+        device const int * ids [[buffer(4)]],
+        constant uint4 & routing [[buffer(5)]],
+        threadgroup char * shmem [[threadgroup(0)]],
+        uint3 tg [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort group [[simdgroup_index_in_threadgroup]]) {
+    const uint token = tg.z / routing.x;
+    const uint slot = tg.z % routing.x;
+    const int expert = ids[tg.z];
+    device char * dst = output + ulong(tg.z) * args.ne01 * sizeof(float);
+    if (expert < 0 || uint(expert) >= routing.z) {
+        if (lane == 0 && group == 0) {
+            ((device float *)dst)[tg.x * 2] = 0.0f;
+            ((device float *)dst)[tg.x * 2 + 1] = 0.0f;
+        }
+        return;
+    }
+    const ulong input_row = ulong(token) * routing.y + (routing.y == 1 ? 0 : slot);
+    kernel_mul_mv_q8_0_f32_plain_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &>(
+        args, weights + ulong(expert) * args.nb02,
+        input + input_row * args.nb11, dst, shmem, uint3(tg.x, 0, 0), lane, group);
+}

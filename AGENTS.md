@@ -16,6 +16,7 @@ adjacent licenses and [NOTICE](NOTICE) when changing them.
 | `qwen3_5`, `qwen3_5_text`, GGUF `qwen35` | `qwen3_5` | Qwen 3.8 27B, dense hybrid GDN/attention |
 | `glm5_next`, `glm5_next_text`, GGUF `glm5-next` | `glm53` | GLM-5.3 Flash, KDA + sparse attention + MoE + MTP |
 | GGUF `general.architecture=deepseek41` | `deepseek41` | DeepSeek V4.1 Flash Coder, mixed IQ GGUF, experimental |
+| GGUF `general.architecture=olala` | `olala` | Olala v1.0 mini 7A1B, original Q5_K_M, experimental |
 | `flux2-klein`, `flux3-klein` | `flux2`, `flux3` | Local image generation |
 | `laya` | `laya` | Decision model |
 

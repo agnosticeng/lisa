@@ -8,3 +8,8 @@
 /bench/
 /tools/
 /crates/*/bench/
+
+# Python reference-harness bytecode is disposable.
+__pycache__/
+*.pyc
+*.pyo

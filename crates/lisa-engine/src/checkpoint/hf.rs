@@ -52,6 +52,7 @@ pub fn is_model_dir(dir: &Path) -> bool {
             .join(crate::checkpoint::catalog::deepseek41::GGUF_ENTRY)
             .is_file()
         || dir.join(crate::checkpoint::catalog::glm53::ENTRY).is_file()
+        || dir.join(crate::checkpoint::catalog::olala::ENTRY).is_file()
         || dir
             .join(crate::checkpoint::catalog::qwen35::ENTRY)
             .is_file()
@@ -68,6 +69,7 @@ pub fn checkpoint_path(dir: PathBuf) -> PathBuf {
             crate::checkpoint::catalog::deepseek41::GGUF_ENTRY,
             crate::checkpoint::catalog::glm53::ENTRY,
             crate::checkpoint::catalog::qwen35::ENTRY,
+            crate::checkpoint::catalog::olala::ENTRY,
         ] {
             let file = dir.join(name);
             if file.is_file() {
@@ -288,6 +290,9 @@ pub fn download_size_with_profile(repo: &str, profile: DownloadProfile) -> Resul
 }
 
 fn include_download_file(repo: &str, path: &str) -> bool {
+    if repo == crate::checkpoint::catalog::olala::REPO {
+        return path == crate::checkpoint::catalog::olala::ENTRY || matches!(path,"README.md"|"LICENSE"|"NOTICE");
+    }
     if repo == crate::checkpoint::catalog::qwen35::REPO {
         return path == crate::checkpoint::catalog::qwen35::ENTRY
             || matches!(
@@ -479,6 +484,17 @@ fn download_with_client_profile(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn olala_download_selects_only_q5_k_m_and_notices() {
+        let repo = crate::checkpoint::catalog::olala::REPO;
+        for path in [crate::checkpoint::catalog::olala::ENTRY, "README.md", "LICENSE", "NOTICE"] {
+            assert!(include_download_file(repo, path), "{path}");
+        }
+        for path in ["Olala-v1.0-mini-7A1B-q4_k_m.gguf", "Olala-v1.0-mini-7A1B-q8_0.gguf", "model.safetensors", "tokenizer.json"] {
+            assert!(!include_download_file(repo, path), "{path}");
+        }
+    }
+
     #[test]
     fn qwen_download_selects_exact_quant_without_extra_draft_or_vision() {
         let repo = crate::checkpoint::catalog::qwen35::REPO;

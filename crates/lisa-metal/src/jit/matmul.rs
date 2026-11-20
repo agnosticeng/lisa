@@ -1580,6 +1580,67 @@ pub fn dense_gemm(
     out: &crate::array::Array,
     dt: Dtype,
 ) -> Result<()> {
+    dense_gemm_impl(
+        rt,
+        (b, m, n, k),
+        lhs_stride,
+        lhs_offset,
+        lhs_buffer,
+        rhs_stride,
+        rhs_offset,
+        rhs_buffer,
+        out,
+        dt,
+        false,
+    )
+}
+
+/// Explicit small-row F32 schedule; retain the original eight-wide MMA chain
+/// and BK=16, but remove unused output-row tiles. Transposed RHS views stay in
+/// their original storage, avoiding a full copy of the attention keys.
+pub fn dense_gemm_small_rows(
+    lhs: &Tensor,
+    rhs: &Tensor,
+    out: &Tensor,
+    transpose_rhs: bool,
+) -> Result<()> {
+    let (b, m, k) = (lhs.dim(0), lhs.dim(1), lhs.dim(2));
+    let n = rhs.dim(if transpose_rhs { 1 } else { 2 });
+    let (lb, ll) = lhs.buffer_and_layout();
+    let (rb, rl) = rhs.buffer_and_layout();
+    let mut strides = rl.strides.to_vec();
+    if transpose_rhs {
+        strides.swap(1, 2);
+    }
+    dense_gemm_impl(
+        lhs.device(),
+        (b, m, n, k),
+        &ll.strides,
+        ll.offset * 4,
+        lb,
+        &strides,
+        rl.offset * 4,
+        rb,
+        out,
+        Dtype::Float32,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dense_gemm_impl(
+    rt: &Arc<MetalRuntime>,
+    (b, m, n, k): (usize, usize, usize, usize),
+    lhs_stride: &[usize],
+    lhs_offset: usize,
+    lhs_buffer: &Arc<Buffer>,
+    rhs_stride: &[usize],
+    rhs_offset: usize,
+    rhs_buffer: &Arc<Buffer>,
+    out: &crate::array::Array,
+    dt: Dtype,
+    compact: bool,
+) -> Result<()> {
     let rhs_m1 = rhs_stride[rhs_stride.len() - 1];
     let rhs_m2 = rhs_stride[rhs_stride.len() - 2];
     let lhs_m1 = lhs_stride[lhs_stride.len() - 1];
@@ -1650,7 +1711,10 @@ pub fn dense_gemm(
     let total_output = b * m * n;
     let is_large = total_output >= (1 << 20);
     let devc = device_type(rt);
-    let (bm, bn, bk, wm, wn) = if m < 16 {
+    let use_compact = compact && dt == Dtype::Float32 && (2..=8).contains(&m) && !a_trans;
+    let (bm, bn, bk, wm, wn) = if use_compact {
+        (8, 32, 16, 1, 2)
+    } else if m < 16 {
         (32, 32, 16, 2, 2)
     } else if devc == 's' || devc == 'm' {
         if dt == Dtype::Float32 {

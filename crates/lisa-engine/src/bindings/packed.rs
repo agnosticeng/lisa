@@ -10,6 +10,7 @@ pub fn projection(kind: T) -> anyhow::Result<P> {
         T::IQ2_XS => P::Block(E::Iq2Xs),
         T::IQ1_M => P::Block(E::Iq1M),
         T::Q5_K => P::Block(E::Q5K),
+        T::Q6_K => P::Block(E::Q6K),
         T::Q2_K => P::Block(E::Q2K),
         T::Q4_K => P::Block(E::Q4K),
         _ => anyhow::bail!("unsupported packed compute encoding {kind:?}"),

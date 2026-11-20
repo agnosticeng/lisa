@@ -26,6 +26,7 @@ impl TensorType {
     pub const Q2_K: Self = Self(10);
     pub const Q4_K: Self = Self(12);
     pub const Q5_K: Self = Self(13);
+    pub const Q6_K: Self = Self(14);
     pub const IQ2_XXS: Self = Self(16);
     pub const IQ2_XS: Self = Self(17);
     pub const IQ4_NL: Self = Self(20);

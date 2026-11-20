@@ -142,8 +142,8 @@ impl Tokenizer {
     pub fn load(dir: &std::path::Path) -> anyhow::Result<Self> {
         if dir.is_file() {
             let header = lisa_gguf::Header::open(dir)?;
-            if header.architecture()? == "qwen35" {
-                let inner = crate::checkpoint::qwen35_tokenizer::from_header(&header)?;
+            if matches!(header.architecture()?, "qwen35" | "olala") {
+                let inner = if header.architecture()? == "olala" { crate::checkpoint::qwen35_tokenizer::from_qwen2_header(&header)? } else { crate::checkpoint::qwen35_tokenizer::from_header(&header)? };
                 let im_end_ids = ["<|im_end|>", "<|endoftext|>"]
                     .iter()
                     .filter_map(|t| inner.token_to_id(t))

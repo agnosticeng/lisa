@@ -1,0 +1,10 @@
+{
+  "repository": "https://github.com/OVHai-LLM/llama.cpp",
+  "revision": "55c22dca0c987f247c21b427c3b3a09e1a28187f",
+  "source": "ggml/src/ggml-metal/kernels/mamba3.metal",
+  "source_sha256": "4a8066adf709c98a1f84c0a0fa60a229449fb3ada5ae14a7023d5a88e5632dd1",
+  "abi_source": "ggml/src/ggml-metal/ggml-metal-impl.h",
+  "abi_sha256": "57e567778451ef75acf7e67b022974b79cdf7040a8e30ccf776c57d1a8f9339a",
+  "local_sha256": "2ef6991c549936d2246d0ab98b0e4f408a9644ae5b8e0f5730316a5ff7a98d87",
+  "changes": "Retained MIMO operand helpers, serial recurrence template and geodesic kernel verbatim. Supplied original constants and only the two required ABI structs; omitted chunk-scan, MoE and attention dispatches. Serial fixed geometry Dqk=128, Dv=64, R=4; F32 immutable input state and separate replacement output. Compiler-default math as upstream."
+}

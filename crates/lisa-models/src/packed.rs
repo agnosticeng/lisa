@@ -21,11 +21,12 @@ impl Projection {
         })
     }
     pub fn experts(self) -> anyhow::Result<Kernel> {
-        let Self::Block(encoding) = self else {
-            anyhow::bail!("expert projection requires original packed block storage");
-        };
-        Ok(Kernel::PackedCompute(PackedCompute::ExpertLinear {
-            encoding,
+        Ok(Kernel::PackedCompute(match self {
+            Self::Block(encoding) => PackedCompute::ExpertLinear { encoding },
+            Self::Q8 => PackedCompute::Q8ExpertLinear,
+            Self::Plain => {
+                anyhow::bail!("expert projection requires original packed block storage")
+            }
         }))
     }
 }

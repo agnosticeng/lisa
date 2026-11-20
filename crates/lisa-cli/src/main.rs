@@ -23,6 +23,16 @@ fn require_qwen4_command(model: &std::path::Path, command: &str) -> anyhow::Resu
     Ok(())
 }
 
+fn olala_prompt(model: &std::path::Path, prompt: &str, system: Option<&str>, thinking: bool) -> anyhow::Result<String> {
+    let source = tokenizer::load_chat_template(model)?.ok_or_else(|| anyhow::anyhow!("Olala GGUF has no chat template"))?;
+    let template = lisa_serve::ChatTemplate::new(&source)?;
+    let mut messages = Vec::new();
+    for (role, content) in system.map(|s| ("system", s)).into_iter().chain(std::iter::once(("user", prompt))) {
+        messages.push(lisa_serve::ChatMessage { role: role.into(), content: content.into(), reasoning_content: None, tool_calls: vec![], tool_call_id: None, parts: None });
+    }
+    template.render(&messages, true, &[], thinking)
+}
+
 fn tokenize(model: &std::path::Path, prompt: &str, raw: bool) -> anyhow::Result<()> {
     let tok = tokenizer::Tokenizer::load(model)?;
     if lisa_engine::checkpoint::model_type_of(model)? == "deepseek41" {
@@ -40,6 +50,8 @@ fn tokenize(model: &std::path::Path, prompt: &str, raw: bool) -> anyhow::Result<
     );
     let text = if raw {
         prompt.to_owned()
+    } else if lisa_engine::checkpoint::model_type_of(model)? == "olala" {
+        olala_prompt(model, prompt, None, false)?
     } else if is_glm {
         tokenizer::glm_generation_prompt(
             &prompt,
@@ -923,17 +935,18 @@ fn run() -> anyhow::Result<()> {
                 .as_str()
                 .starts_with("glm5");
             let is_deepseek = lisa_engine::checkpoint::model_type_of(&model)? == "deepseek41";
+            let is_olala = lisa_engine::checkpoint::model_type_of(&model)? == "olala";
             anyhow::ensure!(
-                !is_deepseek || (pld == 0 && !router),
-                "DeepSeek GGUF currently supports serial generation; omit --pld and --router"
+                !(is_deepseek || is_olala) || (pld == 0 && !router),
+                "This GGUF model currently supports serial generation; omit --pld and --router"
             );
             anyhow::ensure!(
                 !mtp_exact_sampling || (is_glm && tower.has_target_mtp()),
                 "--mtp-exact-sampling requires a GLM model with target MTP"
             );
             anyhow::ensure!(
-                is_glm || is_deepseek || (!think_max && !nothink && !think),
-                "--think, --think-max, and --nothink require GLM or DeepSeek"
+                is_glm || is_deepseek || is_olala || (!think_max && !nothink && !think),
+                "--think, --think-max, and --nothink require GLM, DeepSeek or Olala"
             );
             let temperature = temperature.unwrap_or(if is_glm { 1.0 } else { 0.0 });
             let top_p = top_p.unwrap_or(if is_glm { 0.95 } else { 1.0 });
@@ -963,6 +976,8 @@ fn run() -> anyhow::Result<()> {
             }
             let (text, special) = if raw {
                 (prompt.clone(), false)
+            } else if is_olala {
+                (olala_prompt(&model, &prompt, system.as_deref(), think || think_max)?, false)
             } else if is_glm {
                 (
                     tokenizer::glm_generation_prompt(
@@ -1027,13 +1042,24 @@ fn run() -> anyhow::Result<()> {
             let mut sampler = build_sampler(temperature, top_k, top_p, min_p, rep_penalty, seed);
             sampler.mtp_exact_sampling = mtp_exact_sampling;
             let mut first_tok: Option<std::time::Instant> = None;
+            let output_template = if is_olala && !raw {
+                Some(lisa_serve::ChatTemplate::new(&tokenizer::load_chat_template(&model)?.ok_or_else(|| anyhow::anyhow!("missing Olala template"))?)?)
+            } else { None };
+            let mut decoder = tokenizer::IncrementalDecoder::new(&tok, false);
+            let mut displayed = String::new();
             let emit = &mut |t: u32| -> anyhow::Result<()> {
                 if first_tok.is_none() {
                     first_tok = Some(std::time::Instant::now());
                     lisa_engine::ttft_mark("FIRST TOKEN (decode step returned)");
                 }
-                let piece = tok.decode(&[t])?;
-                print!("{piece}");
+                if let Some(template) = &output_template {
+                    decoder.push(t)?;
+                    let (_, content) = template.streaming_sections(decoder.stable_text(), think || think_max);
+                    if let Some(delta) = content.strip_prefix(&displayed) { print!("{delta}"); }
+                    displayed = content.to_owned();
+                } else {
+                    print!("{}", tok.decode(&[t])?);
+                }
                 use std::io::Write;
                 std::io::stdout().flush().ok();
                 Ok(())

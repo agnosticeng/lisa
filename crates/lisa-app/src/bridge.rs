@@ -53,15 +53,6 @@ fn model_list() -> Value {
             "fits":budget > 0 && resident <= budget}),
         );
     }
-    for model in &local {
-        if catalog::find(&model.repo_id).is_none() {
-            result.push(
-                json!({"id":model.repo_id,"name":models::display_name(&model.repo_id),
-                "detail":model.model_type,"size":model.size,"local":true,"path":model.path,
-                "fits":budget > 0 && model.resident_bytes.unwrap_or(model.size) <= budget}),
-            );
-        }
-    }
     json!({"models":result,"budget":budget,"physical_ram":lisa_engine::memory::physical_ram(),"available_ram":lisa_engine::memory::available_ram()})
 }
 
@@ -225,6 +216,7 @@ impl App {
             "load" => {
                 ensure!(!self.busy, "Wait for the current operation to finish");
                 let id = text(request, "id")?;
+                ensure!(catalog::find(id).is_some(), "Unknown model");
                 let model = models::discover_models()
                     .into_iter()
                     .find(|model| model.repo_id == id)

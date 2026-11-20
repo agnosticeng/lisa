@@ -2,11 +2,16 @@
 use anyhow::{Context, Result, ensure};
 use lisa_gguf::{Header, Value};
 pub fn from_header(h: &Header) -> Result<tokenizers::Tokenizer> {
+    from_header_with_pre(h, "qwen35")
+}
+pub fn from_qwen2_header(h: &Header) -> Result<tokenizers::Tokenizer> {
+    from_header_with_pre(h, "qwen2")
+}
+fn from_header_with_pre(h: &Header, pre: &str) -> Result<tokenizers::Tokenizer> {
     let text = |key: &str| h.metadata.get(key).and_then(Value::as_str);
     ensure!(
-        text("tokenizer.ggml.model") == Some("gpt2")
-            && text("tokenizer.ggml.pre") == Some("qwen35"),
-        "expected Qwen35 GGUF BPE"
+        text("tokenizer.ggml.model") == Some("gpt2") && text("tokenizer.ggml.pre") == Some(pre),
+        "expected {pre} GGUF BPE"
     );
     let arr = |key: &str| {
         h.metadata
@@ -38,6 +43,13 @@ pub fn from_header(h: &Header) -> Result<tokenizers::Tokenizer> {
         .collect::<Result<_>>()?;
     // Original Qwen35 regex, including Unicode combining marks and single digits.
     let regex = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+    let regex = if pre == "qwen2" {
+        regex
+            .replace(r"[\p{L}\p{M}]+", r"\p{L}+")
+            .replace(r"\p{M}", "")
+    } else {
+        regex.to_owned()
+    };
     let data = serde_json::json!({"version":"1.0","added_tokens":added,"normalizer":null,"post_processor":null,"truncation":null,"padding":null,
         "pre_tokenizer":{"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":regex},"behavior":"Isolated","invert":false},{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}]},
         "decoder":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},

@@ -122,11 +122,12 @@ fn deepseek41_graph_long_cache_schedule_snapshot() -> anyhow::Result<()> {
     Ok(())
 }
 
-const FORMATS: [(TensorType, BlockFormat); 6] = [
+const FORMATS: [(TensorType, BlockFormat); 7] = [
     (TensorType::IQ2_XXS, BlockFormat::Iq2Xxs),
     (TensorType::IQ2_XS, BlockFormat::Iq2Xs),
     (TensorType::IQ1_M, BlockFormat::Iq1M),
     (TensorType::Q5_K, BlockFormat::Q5K),
+    (TensorType::Q6_K, BlockFormat::Q6K),
     (TensorType::Q2_K, BlockFormat::Q2K),
     (TensorType::Q4_K, BlockFormat::Q4K),
 ];
@@ -142,7 +143,9 @@ fn blocks(kind: TensorType, count: usize) -> Vec<u8> {
             state ^= state << 5;
             *byte = (state >> 24) as u8;
         }
-        if kind == TensorType::Q2_K {
+        if kind == TensorType::Q6_K {
+            block[208..210].copy_from_slice(&0x1800u16.to_le_bytes());
+        } else if kind == TensorType::Q2_K {
             block[80..82].copy_from_slice(&0x1800u16.to_le_bytes());
             block[82..84].copy_from_slice(&0x1400u16.to_le_bytes());
         } else if kind == TensorType::IQ1_M {

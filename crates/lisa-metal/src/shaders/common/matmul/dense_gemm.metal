@@ -1482,3 +1482,8 @@ instantiate_gemm_transpose_helper(f16, half, f16, half, 32, 64, 16, 1, 2)
 #if defined(__HAVE_BFLOAT__)
 instantiate_gemm_transpose_helper(bf16, bfloat, bf16, bfloat, 32, 64, 16, 1, 2)
 #endif
+
+// LISA opt-in small-row F32 tiles. The MMA helper, BK=16 and K traversal are
+// unchanged; only unused output-row tiles and SIMD groups are removed.
+instantiate_gemm(nn, false, false, f32, float, f32, float, 8, 32, 16, 1, 2)
+instantiate_gemm(nt, false, true,  f32, float, f32, float, 8, 32, 16, 1, 2)

@@ -57,15 +57,16 @@ with an entitled provisioning profile.
 ## Models and downloads
 
 The allowlist is [catalog.rs](../crates/lisa-app/src/catalog.rs). Hub search does not add new
-catalog entries. Existing compatible local checkpoints remain discoverable.
+catalog entries. Locally cached checkpoints are shown only when their repository
+is in the same allowlist.
 Type icons distinguish image generators; download actions use an icon.
 
 [Discovery](../crates/lisa-app/src/models.rs) shares checkpoint identities and
 snapshot ordering with the engine. It validates available package/shard files
-before listing a local model and excludes decision-only Laya checkpoints from
-chat. Local size accounting follows Hub links, counts each inode once and
-avoids directory cycles. The displayed RAM budget uses the engine's shared
-budget calculation.
+before listing an allowed local model and excludes decision-only Laya checkpoints
+from chat. Filtering the list does not delete cached files. Local size accounting
+follows Hub links, counts each inode once and avoids directory cycles. The
+displayed RAM budget uses the engine's shared budget calculation.
 
 Compatible MLX Qwen 3.8 27B targets use DSpine by default. A curated Qwen 27B
 download first fetches the shared DSpine companion, then the target without
@@ -267,3 +268,14 @@ The user chose to retain that team, so the installed app omits the entitlement
 and remains foreground-only. An eligible signed build still needs the real
 background image check, system cancellation, and lock-screen completion checks.
 The release workspace build, 574 library tests (32 ignored), and smoke suite passed.
+
+### Generation activity
+
+Text generation logs the user-observed output rate for ordinary chat,
+image-assisted chat and each browser-agent pass, across model families. The
+rate uses tokens after the first divided by time from the first to the last
+emitted token. Time to first token is reported separately; it includes prefill
+and first-token sampling. Counts include reasoning and control tokens but
+exclude EOS. Fewer than two tokens have no meaningful decode rate. These
+interactive measurements include application overhead and are not isolated
+engine benchmarks.

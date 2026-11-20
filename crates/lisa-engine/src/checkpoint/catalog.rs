@@ -68,3 +68,8 @@ pub fn is_flux3(dir: &Path) -> bool {
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
         .is_some_and(|v| v["model"] == "flux-3-image-klein" && v["dit"]["flow_map"] == true)
 }
+
+pub mod olala {
+    pub const REPO: &str = "OVHaiLLM/Olala-v1.0-mini-7A1B-GGUF";
+    pub const ENTRY: &str = "Olala-v1.0-mini-7A1B-q5_k_m.gguf";
+}

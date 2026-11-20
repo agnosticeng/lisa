@@ -9,6 +9,8 @@ mod base;
 pub use base::*;
 mod q8_pair;
 pub use q8_pair::*;
+mod pointwise;
+pub use pointwise::*;
 mod moe;
 pub use moe::*;
 mod attention;
@@ -27,6 +29,7 @@ pub enum BlockFormat {
     Iq2Xs,
     Iq1M,
     Q5K,
+    Q6K,
     Q2K,
     Q4K,
 }
@@ -38,6 +41,7 @@ impl BlockFormat {
             Self::Iq2Xs => (74, "lisa_gguf_iq2_xs_mv", "lisa_gguf_iq2_xs_id", 4224),
             Self::Iq1M => (56, "lisa_gguf_iq1_m_mv", "lisa_gguf_iq1_m_id", 16),
             Self::Q5K => (176, "lisa_gguf_q5_K_mv", "lisa_gguf_q5_K_id", 16),
+            Self::Q6K => (210, "lisa_gguf_q6_K_mv", "lisa_gguf_q6_K_id", 16),
             Self::Q2K => (84, "lisa_gguf_q2_K_mv", "lisa_gguf_q2_K_id", 32),
             Self::Q4K => (144, "lisa_gguf_q4_K_mv", "lisa_gguf_q4_K_id", 32),
         }
@@ -397,6 +401,109 @@ pub fn q8_matvec(
     Ok(out)
 }
 
+/// GPU-selected Q8_0 projections with the exact dense scalar reduction.
+/// Weights `[experts, rows, bytes]`, inputs `[tokens, 1 or top_k, columns]`,
+/// indices `[tokens, top_k]`. No selected weight payloads are copied.
+pub fn q8_expert_matvec(
+    weights: &Array,
+    input: &Array,
+    ids: &Array,
+    stream: &Stream,
+) -> Result<Array> {
+    if weights.rank() != 3
+        || weights.dtype() != Dtype::Uint8
+        || weights.shape().iter().any(|&n| n <= 0)
+        || weights.dim(1) % 2 != 0
+        || weights.dim(2) % 34 != 0
+        || !weights.t.buffer_and_layout().1.is_contiguous()
+        || weights.t.buffer_and_layout().1.offset % 2 != 0
+        || ids.rank() != 2
+        || ids.dtype() != Dtype::Int32
+        || ids.dim(0) < 1
+        || ids.dim(0) > 65535
+        || ids.dim(1) < 1
+        || ids.dim(1) > 32
+        || !ids.t.buffer_and_layout().1.is_contiguous()
+        || input.rank() != 3
+        || (input.dim(1) != 1 && input.dim(1) != ids.dim(1))
+    {
+        return Err(Error::msg("invalid Q8 expert matvec geometry"));
+    }
+    let columns = weights
+        .dim(2)
+        .checked_div(34)
+        .and_then(|n| n.checked_mul(32))
+        .ok_or_else(|| Error::msg("Q8 expert input width overflow"))?;
+    let rows = weights.dim(1);
+    let tokens = ids.dim(0);
+    let top_k = ids.dim(1);
+    f32_input(input, &[tokens, input.dim(1), columns])?;
+    weights.eval_enqueue()?;
+    ids.eval_enqueue()?;
+    let row_bytes = weights.dim(2) as u64;
+    let args = MatvecArgs {
+        ne00: columns,
+        ne01: rows,
+        ne02: 1,
+        nb00: 34,
+        nb01: row_bytes,
+        nb02: row_bytes * rows as u64,
+        nb03: row_bytes * rows as u64,
+        ne10: columns,
+        ne11: 1,
+        ne12: 1,
+        nb10: 4,
+        nb11: columns as u64 * 4,
+        nb12: columns as u64 * 4,
+        nb13: columns as u64 * 4,
+        ne0: rows,
+        ne1: tokens,
+        nr0: 2,
+        r2: 1,
+        r3: 1,
+    };
+    // At K <= 512, the old extra SIMD groups only contributed positive zeros.
+    // Active groups still visit exactly the same blocks once, and the final
+    // 32-lane sum still has the same positive-zero padding. Wider inputs keep
+    // the original schedule because changing its stride would reorder sums.
+    let groups = if columns <= 256 {
+        1
+    } else if columns <= 512 {
+        2
+    } else if rows > 65536 {
+        8
+    } else {
+        4
+    };
+    let pipeline = stream.runtime().compile_with_constants(
+        Q8_SOURCE,
+        "lisa_q8_expert_f32",
+        Math::CompilerDefault,
+        &[(600, crate::runtime::ConstVal::Short(groups))],
+    )?;
+    let out = output(stream, &[tokens, top_k, rows], Dtype::Float32)?;
+    let guard = stream.runtime().commands.encoder()?;
+    let encoder = guard.encoder();
+    encoder.set_pipeline(&pipeline);
+    encoder.set_bytes(0, &args);
+    encoder.set_bytes(
+        5,
+        &[top_k as u32, input.dim(1) as u32, weights.dim(0) as u32, 0],
+    );
+    for (slot, array) in [(1, weights), (2, input), (4, ids)] {
+        let (buffer, layout) = array.t.buffer_and_layout();
+        encoder.set_input(slot, Some(buffer), layout.offset * array.dtype().size_of());
+    }
+    let (buffer, layout) = out.t.buffer_and_layout();
+    encoder.set_output(3, Some(buffer), layout.offset * 4);
+    encoder.set_threadgroup_memory_length(0, 32 * 2 * 4);
+    encoder.dispatch_groups(
+        (rows as usize / 2, 1, tokens as usize * top_k as usize),
+        (32, groups as usize, 1),
+    );
+    Ok(out)
+}
+
 fn f32_input(x: &Array, shape: &[i32]) -> Result<()> {
     if x.dtype() != Dtype::Float32
         || x.shape() != shape
@@ -665,6 +772,110 @@ fn fixture_frequencies(compressed: bool) -> [f32; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn indirect_experts_match_dense_reductions_bitwise() {
+        let stream = Stream::gpu();
+        // Non-dyadic activations exercise rounding and cancellation, not merely
+        // exactly representable sums. Include duplicate, reordered and invalid ids.
+        let ids_data = [3, 0, 2, 3, -1, 4, 1, 3, 0, 2, 1, 0];
+        let mut seed = 0x1783a9d5u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for (format, columns, rows) in [
+            (None, 32, 16),
+            (None, 256, 16),
+            (None, 384, 768),
+            (None, 512, 16),
+            (None, 544, 16),
+            (None, 1280, 16),
+            (Some(BlockFormat::Q5K), 768, 384),
+            (Some(BlockFormat::Q6K), 768, 384),
+        ] {
+            let (block, block_bytes, scale_offset) = match format {
+                None => (32, 34, 0),
+                Some(BlockFormat::Q5K) => (256, 176, 0),
+                Some(BlockFormat::Q6K) => (256, 210, 208),
+                _ => unreachable!(),
+            };
+            let row_bytes = columns / block * block_bytes;
+            let mut bytes = vec![0u8; 2 + 4 * rows * row_bytes];
+            for b in &mut bytes {
+                *b = next() as u8;
+            }
+            for b in bytes[2..].chunks_exact_mut(block_bytes) {
+                let scale = half::f16::from_f32((next() % 127 + 1) as f32 / 3971.);
+                b[scale_offset..scale_offset + 2].copy_from_slice(&scale.to_bits().to_le_bytes());
+                if matches!(format, Some(BlockFormat::Q5K)) {
+                    b[2..4].copy_from_slice(&half::f16::from_f32(0.0137).to_bits().to_le_bytes());
+                }
+            }
+            let storage = Array::from_slice(&bytes, &[bytes.len() as i32]);
+            let (buffer, _) = storage.t.buffer_and_layout();
+            let weights = Array::from_buffer_offset(
+                buffer.clone(),
+                2,
+                &[4, rows as i32, row_bytes as i32],
+                Dtype::Uint8,
+            )
+            .unwrap();
+            for tokens in [1, 2] {
+                let ids = Array::from_slice(&ids_data[..tokens * 6], &[tokens as i32, 6]);
+                for slots in [1, 6] {
+                    let values = (0..tokens * slots * columns)
+                        .map(|_| (next() as i32 as f32) / 765432109.)
+                        .collect::<Vec<_>>();
+                    let input =
+                        Array::from_slice(&values, &[tokens as i32, slots as i32, columns as i32]);
+                    let actual = match format {
+                        None => q8_expert_matvec(&weights, &input, &ids, &stream),
+                        Some(f) => expert_matvec(f, &weights, &input, &ids, &stream),
+                    }
+                    .unwrap();
+                    let got = actual.as_slice::<f32>();
+                    for token in 0..tokens {
+                        for slot in 0..6 {
+                            let expert = ids_data[token * 6 + slot];
+                            let range = (token * 6 + slot) * rows..(token * 6 + slot + 1) * rows;
+                            if !(0..4).contains(&expert) {
+                                assert!(got[range].iter().all(|v| v.to_bits() == 0));
+                                continue;
+                            }
+                            let w = Array::from_buffer_offset(
+                                buffer.clone(),
+                                2 + expert as usize * rows * row_bytes,
+                                &[rows as i32, row_bytes as i32],
+                                Dtype::Uint8,
+                            )
+                            .unwrap();
+                            let start =
+                                (token * slots + if slots == 1 { 0 } else { slot }) * columns;
+                            let x = Array::from_slice(
+                                &values[start..start + columns],
+                                &[1, columns as i32],
+                            );
+                            let expected = match format {
+                                None => q8_matvec(&w, &x, false, false, &stream),
+                                Some(f) => packed_matvec(f, &w, &x, &stream),
+                            }
+                            .unwrap();
+                            assert!(
+                                got[range]
+                                    .iter()
+                                    .map(|v| v.to_bits())
+                                    .eq(expected.as_slice::<f32>().iter().map(|v| v.to_bits())),
+                                "format={format:?} tokens={tokens} slots={slots} token={token} slot={slot}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn deepseek41_engram_split_matches_original_lane_chains() {

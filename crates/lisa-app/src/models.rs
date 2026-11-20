@@ -6,7 +6,6 @@ use lisa_engine::core::config::ReadConfig;
 #[derive(Clone, Debug)]
 pub struct Model {
     pub repo_id: String,
-    pub model_type: String,
     pub path: String,
     pub size: u64,
     pub resident_bytes: Option<u64>,
@@ -16,11 +15,7 @@ pub(super) fn config_model_type(dir: &std::path::Path) -> Option<String> {
     lisa_engine::checkpoint::model_type_of(dir).ok()
 }
 
-pub(super) fn display_name(repo_id: &str) -> &str {
-    repo_id.rsplit('/').next().unwrap_or(repo_id)
-}
-
-/// Scan the local Hugging Face hub cache for checkpoints the engine supports.
+/// Scan the local Hub cache for supported checkpoints in the app allowlist.
 pub(super) fn discover_models() -> Vec<Model> {
     let hub = lisa_engine::checkpoint::hf::hub_root();
     let mut out = Vec::new();
@@ -33,7 +28,7 @@ pub(super) fn discover_models() -> Vec<Model> {
             continue;
         };
         let repo_id = rest.replacen("--", "/", 1);
-        if repo_id == lisa_engine::bindings::qwen35_gguf::REPO {
+        if catalog::find(&repo_id).is_none() {
             continue;
         }
         for path in lisa_engine::checkpoint::hf::cached_snapshots(&repo_id) {
@@ -42,11 +37,23 @@ pub(super) fn discover_models() -> Vec<Model> {
                 if let Ok(resident_bytes) = lisa_engine::bindings::qwen35_gguf::inspect(&qwen) {
                     out.push(Model {
                         repo_id: repo_id.clone(),
-                        model_type: "qwen35".into(),
                         path: path.to_string_lossy().into(),
                         size: std::fs::metadata(&qwen).map(|m| m.len()).unwrap_or(0),
                         resident_bytes: Some(resident_bytes),
                     });
+                    break;
+                }
+                continue;
+            }
+            let olala = path.join(lisa_engine::checkpoint::catalog::olala::ENTRY);
+            if olala.is_file() {
+                let info = (|| -> anyhow::Result<u64> {
+                    let header = lisa_gguf::Header::open(&olala)?;
+                    lisa_engine::checkpoint::olala::config(&header)?;
+                    Ok(std::fs::metadata(&olala)?.len())
+                })();
+                if let Ok(size) = info {
+                    out.push(Model { repo_id: repo_id.clone(), path: path.to_string_lossy().into(), size, resident_bytes: Some(size) });
                     break;
                 }
                 continue;
@@ -61,7 +68,6 @@ pub(super) fn discover_models() -> Vec<Model> {
                 if let Ok(size) = info {
                     out.push(Model {
                         repo_id: repo_id.clone(),
-                        model_type: "glm5-next".into(),
                         path: path.to_string_lossy().to_string(),
                         size,
                         resident_bytes: Some(size),
@@ -88,7 +94,6 @@ pub(super) fn discover_models() -> Vec<Model> {
                 if let Ok((size, resident_bytes)) = info {
                     out.push(Model {
                         repo_id: repo_id.clone(),
-                        model_type: "deepseek41".into(),
                         path: path.to_string_lossy().to_string(),
                         size,
                         resident_bytes: Some(resident_bytes),
@@ -105,7 +110,6 @@ pub(super) fn discover_models() -> Vec<Model> {
                     let size = model_weight_size(&path, &mt);
                     out.push(Model {
                         repo_id: repo_id.clone(),
-                        model_type: mt,
                         path: path.to_string_lossy().to_string(),
                         size,
                         resident_bytes: lisa_engine::checkpoint::catalog::bonsai::is_checkpoint(
@@ -311,7 +315,15 @@ pub(super) fn load_model(
     use lisa_engine::{bindings::dspine, checkpoint};
     use lisa_serve::application::loading;
     if !uses_dspine_path(path)? {
-        return loading::load_dir(path);
+        let mut loaded = loading::load_dir(path)?;
+        if config_model_type(path).as_deref() == Some("olala") {
+            if let loading::Loaded::Language(model) = &mut loaded {
+                // Ready means the common serial kernels are compiled; this
+                // bounded warmup owns fresh caches, never conversation state.
+                model.warmup(&[])?;
+            }
+        }
+        return Ok(loaded);
     }
     let selection = match std::env::var("LISA_QWEN_DSPINE_MODEL") {
         Ok(model) => model,

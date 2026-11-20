@@ -1,0 +1,10 @@
+{
+  "repository": "https://huggingface.co/OVHaiLLM/Olala-v1.0-mini-7A1B-GGUF",
+  "revision": "b9f5d20adf2ac0aec05e9fa00b057cf26df263fc",
+  "file": "Olala-v1.0-mini-7A1B-q5_k_m.gguf",
+  "bytes": 5990551040,
+  "sha256": "ed353d2632c406be9ca2022b35e4c13049d6f8f7390b1c1bb61d6a7d6b971860",
+  "metadata_fixture_sha256": "04aedd5e2fb534d860d228f094b48f243fe9ab17ab4d5b3483c72fdae98bab16",
+  "chat_template_sha256": "6c51ff5a4b38aac80d1bad398a4b02854d5577ccf46b1417d8f9b7f85b481023",
+  "adaptation": "Metadata scalar values and tensor names, dimensions, and encodings extracted from GGUF. Vocabulary payloads omitted. Chat template copied unchanged from tokenizer.chat_template. No model tensor data redistributed."
+}

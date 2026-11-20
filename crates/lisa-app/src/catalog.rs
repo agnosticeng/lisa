@@ -15,6 +15,13 @@ pub struct CuratedModel {
 
 pub const MODELS: &[CuratedModel] = &[
     CuratedModel {
+        repo_id: lisa_engine::checkpoint::catalog::olala::REPO,
+        name: "Olala mini 7A1B · 5-bit",
+        description: "Multilingual text chat and tools. Original 5-bit GGUF, about 6 GB. Experimental native support.",
+        download_bytes: 5990583679,
+        resident_bytes: Some(5_990_551_040),
+    },
+    CuratedModel {
         repo_id: lisa_engine::checkpoint::catalog::bonsai::REPO,
         name: "Bonsai Binary 4B",
         description: "Compact local image generation. Four steps, up to 512 × 512 pixels.",

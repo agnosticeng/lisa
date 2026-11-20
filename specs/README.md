@@ -12,6 +12,7 @@ history, benchmark reports or audit diaries.
 | [Desktop](desktop.md) | SwiftUI/Rust ownership, local chats, downloads and packaging |
 | [Media](media.md) | Vision, voice and image-generation paths |
 | [Qwen](models/qwen.md) | Dense/MoE families, DSpine, MTP and GGUF policies |
+| [Olala](models/olala.md) | Original Q5_K_M GGUF, serial MIMO/attention/MoE and validation scope |
 | [LFM3](models/lfm3.md) | Compact hybrid text models, sliding state and reference scope |
 | [GLM](models/glm53.md) | Native GGUF and legacy MLX execution contracts |
 | [DeepSeek](models/deepseek41.md) | Mixed GGUF, Engram and native state |

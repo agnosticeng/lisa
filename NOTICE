@@ -7,7 +7,7 @@ MLX
 ---
 The MLX-derived kernels and helpers under crates/lisa-metal/src/shaders/common/,
 the flattened headers under crates/lisa-metal/src/shaders/nax/, and MLX-derived
-portions of shaders/qwen4/ originate in Apple's MLX:
+portions of shaders/qwen4/ and shaders/packed_pointwise/ originate in Apple's MLX:
 https://github.com/ml-explore/mlx
 Copyright (c) 2023-2025 Apple Inc. (individual sources retain their own years).
 License: MIT, with the embedded math notices below retained separately.
@@ -301,3 +301,14 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+Olala GGUF support
+------------------
+The Olala model plans and Mamba3-MIMO/geodesic Metal kernels are adapted from
+OVHai-LLM/llama.cpp, revision 55c22dca0c987f247c21b427c3b3a09e1a28187f.
+Copyright (c) 2023-2026 The ggml authors. MIT License, retained beside the
+model plans and kernels. The Q6_K Metal helper and CPU decoder come from the
+same revision. See recurrent_mimo/provenance.json and q6k_provenance.json.
+The checkpoint metadata fixture comes from OVHaiLLM/Olala-v1.0-mini-7A1B-GGUF,
+revision b9f5d20adf2ac0aec05e9fa00b057cf26df263fc (Apache-2.0).
+Copyright 2026 OVH LLM SAS. No model weights are redistributed.

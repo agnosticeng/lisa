@@ -53,3 +53,5 @@ pub fn warm_kernels() {
     indirect_moe::warm();
     block_attention::warm();
 }
+
+pub mod recurrent_mimo;

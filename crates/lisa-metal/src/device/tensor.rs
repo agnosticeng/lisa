@@ -99,6 +99,9 @@ pub(super) fn capabilities() -> Vec<KernelCapability> {
     ] {
         add(K::Binary(k), &[FLOATING, FLOATING], false);
     }
+    const STATE_F32: TensorConstraint = TensorConstraint { dtypes: &[ScalarType::F32], layout: LayoutSupport::RowContiguous, ..ANY };
+    add(K::Mamba3Mimo, &[STATE_F32; 8], false);
+    add(K::GeodesicResidual, &[STATE_F32; 4], false);
     add(K::Matmul, &[FLOATING, FLOATING], false);
     const SORTABLE: TensorConstraint = TensorConstraint {
         dtypes: &[
@@ -252,6 +255,11 @@ pub(super) fn invoke(
     }
 
     let output = match op {
+        TensorOperation::Mamba3Mimo { heads, epsilon } => {
+            let (y, state) = crate::kernels::recurrent_mimo::step(inputs, *heads as usize, f32::from_bits(*epsilon), stream)?;
+            return Ok(Some(Outputs::Two([y, state])));
+        }
+        TensorOperation::GeodesicResidual { inverse_depth } => crate::kernels::recurrent_mimo::geodesic(inputs, f32::from_bits(*inverse_depth), stream)?,
         TensorOperation::SequentialLinear { .. }
         | TensorOperation::SequentialLayerNorm { .. }
         | TensorOperation::SequentialAttention => {

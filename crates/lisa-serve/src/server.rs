@@ -874,7 +874,7 @@ fn run_wave(
             decoded[id].push(t)?;
             let text = decoded[id].stable_text();
             let thinking = request_thinking(&jobs.borrow()[id].body, cfg);
-            let (reasoning, content) = streaming_sections(&text, thinking);
+            let (reasoning, content) = template_sections(&text, thinking, tmpl);
             let reasoning = reasoning.to_string();
             let content = content.to_string();
             let content_delta = stream_delta(&last.borrow()[id], &content);
@@ -916,13 +916,16 @@ fn run_wave(
         // reasoning.
         let full = tok.decode(&acc.borrow()[id])?;
         let thinking = request_thinking(&jobs.borrow()[id].body, cfg);
-        let (reasoning, content) = split_reasoning_for_request(&full, thinking);
+        let (reasoning, content) = if tmpl.is_some_and(|t| t.olala) {
+            let (content, reasoning, _) = template_reply(&full, &[], true, &[], thinking, tmpl);
+            (reasoning, content)
+        } else { split_reasoning_for_request(&full, thinking) };
         if stream_flags.borrow()[id] {
             // Reconcile against the same request-mode parser used while
             // streaming. Completed-response shaping may classify a late
             // `</think>` marker differently; a stream cannot retract text
             // already sent in DS4's text mode.
-            let (stream_reasoning, stream_content) = streaming_reply_sections(&full, thinking, &[]);
+            let (stream_reasoning, stream_content) = template_stream_reply(&full, thinking, &[], tmpl);
             let content_delta = stream_delta(&last.borrow()[id], &stream_content);
             let reasoning_delta = stream_delta(&last_reasoning.borrow()[id], &stream_reasoning);
             if content_delta.is_some() || reasoning_delta.is_some() {
@@ -1118,7 +1121,7 @@ fn run_session(
                     // DS4 emits the safe prefix before ending the stream when
                     // a text stop is found. The normal holdback path runs
                     // after this check, so flush the trimmed prefix here.
-                    let (reasoning, content) = streaming_reply_sections(&text, thinking, &stops);
+                    let (reasoning, content) = template_stream_reply(&text, thinking, &stops, tmpl);
                     let content_delta = stream_delta(&last, &content);
                     let reasoning_delta = stream_delta(&last_reasoning, &reasoning);
                     if content_delta.is_some() || reasoning_delta.is_some() {
@@ -1137,7 +1140,7 @@ fn run_session(
         if streaming {
             let stable = decoded.stable_text();
             let safe_len = streaming_stop_safe_len(stable, &stops);
-            let (reasoning, answer) = streaming_sections(&stable[..safe_len], thinking);
+            let (reasoning, answer) = template_sections(&stable[..safe_len], thinking, tmpl);
             let shown = answer[..deepseek41::visible_end(answer)].to_string();
             let content_delta = stream_delta(&last, &shown);
             let reasoning_delta = stream_delta(&last_reasoning, reasoning);
@@ -1235,12 +1238,12 @@ fn run_session(
     };
     let stopped = generated.last().map(|&t| is_eos(t)).unwrap_or(false);
     let full = tok.decode(&acc)?;
-    let (content, reasoning, tool_calls) = shape_reply(&full, &tools, parallel, &stops, thinking);
+    let (content, reasoning, tool_calls) = template_reply(&full, &tools, parallel, &stops, thinking, tmpl);
     if streaming {
         // Completed-response shaping can reinterpret a late `</think>`
         // marker, but an SSE stream cannot retract its earlier text-mode
         // deltas. Reconcile with the incremental parser's final state.
-        let (stream_reasoning, stream_content) = streaming_reply_sections(&full, thinking, &stops);
+        let (stream_reasoning, stream_content) = template_stream_reply(&full, thinking, &stops, tmpl);
         let content_delta = stream_delta(&last, &stream_content);
         let reasoning_delta = stream_delta(&last_reasoning, &stream_reasoning);
         if content_delta.is_some() || reasoning_delta.is_some() {
@@ -2008,6 +2011,9 @@ fn complete_inner(
     prefix: &mut PrefixCache,
     tmpl: Option<&ChatTemplate>,
 ) -> anyhow::Result<()> {
+    // Raw completions have no channel prompt and must remain raw text.
+    let raw_olala = job.surface == Surface::Completions && tmpl.is_some_and(|t| t.olala);
+    let tmpl = if raw_olala { None } else { tmpl };
     let mut messages = parse_messages(&job.body)?;
     let json_schema = response_format_of(&job.body);
     if let Some(schema) = &json_schema {
@@ -2044,7 +2050,9 @@ fn complete_inner(
     // Anthropic semantics: a trailing assistant message is a prefill. Render the
     // generation header, then the partial assistant text, and let the model
     // continue it (rather than closing the turn and starting a new one).
-    let prompt = if job.surface == Surface::Messages
+    let prompt = if raw_olala {
+        messages.iter().map(|m| m.content.as_str()).collect::<String>()
+    } else if job.surface == Surface::Messages
         && messages
             .last()
             .map(|m| m.role == "assistant")
@@ -2184,7 +2192,7 @@ fn complete_inner(
                         hit_stop.set(true);
                         if streaming && json_schema.is_none() {
                             let visible = strip_stops(&text, &stops);
-                            let (reasoning, answer) = streaming_sections(visible, thinking);
+                            let (reasoning, answer) = template_sections(visible, thinking, tmpl);
                             let shown = match tool_call_start(answer) {
                                 Some(i) => answer[..i].to_string(),
                                 None => answer.to_string(),
@@ -2208,7 +2216,7 @@ fn complete_inner(
             if streaming && json_schema.is_none() {
                 let text = decoded.stable_text();
                 let safe_len = streaming_stop_safe_len(&text, &stops);
-                let (reasoning, answer) = streaming_sections(&text[..safe_len], thinking);
+                let (reasoning, answer) = template_sections(&text[..safe_len], thinking, tmpl);
                 // Past a `<tool_call>` the text is not assistant content; don't stream it.
                 let shown = answer[..deepseek41::visible_end(answer)].to_string();
                 let delta = stream_delta(&last_text, &shown);
@@ -2349,7 +2357,7 @@ fn complete_inner(
     let (content, reasoning, tool_calls) = if json_schema.is_some() {
         let sc = json_schema.clone().unwrap_or(json!({ "type": "object" }));
         let raw = strip_stops(&full, &stops);
-        let body = strip_think_prefix(raw);
+        let body = if tmpl.is_some_and(|t| t.olala) { olala::sections(raw, thinking).1 } else { strip_think_prefix(raw) };
         let (mut content, mut errors) = match extract_json(body) {
             Some(s) => {
                 let mut v: Value = serde_json::from_str(&s).unwrap_or(Value::String(s));
@@ -2389,7 +2397,8 @@ fn complete_inner(
             );
             if let Ok(retry) = retry {
                 let retry_text = tok.decode(&retry)?;
-                let rbody = strip_think_prefix(strip_stops(&retry_text, &stops));
+                let raw = strip_stops(&retry_text, &stops);
+                let rbody = if tmpl.is_some_and(|t| t.olala) { olala::sections(raw, thinking).1 } else { strip_think_prefix(raw) };
                 if let Some(s) = extract_json(rbody) {
                     let mut v: Value = serde_json::from_str(&s).unwrap_or(Value::String(s));
                     repair_json(&mut v, &sc);
@@ -2408,10 +2417,10 @@ fn complete_inner(
         );
         (content, None, Vec::new())
     } else {
-        shape_reply(&full, &tools, parallel, &stops, thinking)
+        template_reply(&full, &tools, parallel, &stops, thinking, tmpl)
     };
     if streaming && json_schema.is_none() {
-        let (stream_reasoning, stream_content) = streaming_reply_sections(&full, thinking, &stops);
+        let (stream_reasoning, stream_content) = template_stream_reply(&full, thinking, &stops, tmpl);
         let content_delta = stream_delta(&last_text, &stream_content);
         let reasoning_delta = stream_delta(&last_reasoning, &stream_reasoning);
         if content_delta.is_some() || reasoning_delta.is_some() {
@@ -2555,15 +2564,28 @@ pub struct ChatMessage {
 pub struct ChatTemplate {
     inner: hf_chat_template::ChatTemplate,
     deepseek41: bool,
+    olala: bool,
 }
 
 impl ChatTemplate {
+    /// Parse model control channels and declared tool calls before display cleanup.
+    pub fn parse_reply(&self, text: &str, tools: &[Value], thinking: bool) -> (String, Option<String>, Vec<Value>) {
+        template_reply(text, tools, true, &[], thinking, Some(self))
+    }
+    pub fn uses_olala_channels(&self) -> bool { self.olala }
+
+    /// Visible response sections, with incomplete control markers held back.
+    pub fn streaming_sections<'a>(&self, text: &'a str, thinking: bool) -> (&'a str, &'a str) {
+        template_sections(text, thinking, Some(self))
+    }
+
     pub fn new(src: &str) -> anyhow::Result<Self> {
         let inner = hf_chat_template::ChatTemplate::from_str(src)
             .map_err(|e| anyhow::anyhow!("chat template parse: {e}"))?;
         Ok(Self {
             inner,
             deepseek41: src.contains("<｜System｜>") && src.contains("reasoning_effort"),
+            olala: src.contains("<|channel_start|>"),
         })
     }
 
@@ -2616,7 +2638,7 @@ impl ChatTemplate {
             .insert("enable_thinking".to_string(), json!(thinking));
         input.extra.insert(
             "reasoning_effort".to_string(),
-            json!(if self.deepseek41 { "high" } else { "xhigh" }),
+            json!(if self.olala { if thinking { "medium" } else { "disabled" } } else if self.deepseek41 { "high" } else { "xhigh" }),
         );
         input
             .extra
@@ -2731,7 +2753,8 @@ fn render_prompt(
 }
 
 fn session_suffix_text(full_prompt: &str, rest: &str) -> String {
-    if full_prompt.starts_with("[gMASK]<sop>") {
+    if full_prompt.starts_with("[gMASK]<sop>")
+        || full_prompt.starts_with("<|endoftext|><|im_start|>system<|channel_start|>") {
         rest.to_string()
     } else {
         format!("\n{rest}")
@@ -3919,13 +3942,14 @@ fn request_thinking(body: &Value, cfg: &ServerConfig) -> bool {
     let effort = body
         .get("reasoning_effort")
         .and_then(|v| v.as_str())
+        .or_else(|| body.get("chat_template_kwargs").and_then(|c| c.get("reasoning_effort")).and_then(Value::as_str))
         .or_else(|| {
             body.get("reasoning")
                 .and_then(|r| r.get("effort"))
                 .and_then(|v| v.as_str())
         });
     if let Some(e) = effort {
-        return e != "none";
+        return !matches!(e, "none" | "disabled");
     }
     cfg.gen_defaults.thinking.unwrap_or(false)
 }
@@ -4028,3 +4052,16 @@ fn bad_request(stream: &mut TcpStream, msg: String) -> anyhow::Result<()> {
 #[cfg(test)]
 #[path = "tests.rs"]
 mod render_test;
+
+#[path = "olala.rs"]
+mod olala;
+
+fn template_sections<'a>(text:&'a str,thinking:bool,template:Option<&ChatTemplate>)->(&'a str,&'a str) {
+    if template.is_some_and(|t|t.olala) {olala::sections(text,thinking)} else {streaming_sections(text,thinking)}
+}
+fn template_stream_reply(text:&str,thinking:bool,stops:&[String],template:Option<&ChatTemplate>)->(String,String) {
+    if template.is_some_and(|t|t.olala) {let(r,c)=olala::sections(strip_stops(text,stops),thinking);(r.into(),c.into())} else {streaming_reply_sections(text,thinking,stops)}
+}
+fn template_reply(text:&str,tools:&[Value],parallel:bool,stops:&[String],thinking:bool,template:Option<&ChatTemplate>)->(String,Option<String>,Vec<Value>) {
+    if template.is_some_and(|t|t.olala) {olala::reply(strip_stops(text,stops),thinking,tools,parallel)} else {shape_reply(text,tools,parallel,stops,thinking)}
+}

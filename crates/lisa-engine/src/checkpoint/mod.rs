@@ -10,3 +10,5 @@ pub use resolver::default_context_capacity;
 pub use resolver::{ModelKind, model_type_of, resolve_model_dir};
 
 pub mod deepseek41;
+
+pub mod olala;

@@ -1,0 +1,6929 @@
+{
+  "metadata": {
+    "general.architecture": "olala",
+    "olala.block_count": 36,
+    "olala.context_length": 100000,
+    "olala.embedding_length": 1536,
+    "olala.feed_forward_length": 0,
+    "olala.attention.head_count": 48,
+    "olala.attention.head_count_kv": 12,
+    "olala.attention.key_length": 128,
+    "olala.attention.value_length": 128,
+    "olala.attention.layer_norm_rms_epsilon": 9.999999974752427e-07,
+    "olala.attention.sliding_window": 32768,
+    "olala.attn_logit_softcapping": 150.0,
+    "olala.expert_count": 256,
+    "olala.expert_used_count": 6,
+    "olala.expert_feed_forward_length": 768,
+    "olala.expert_shared_feed_forward_length": 1536,
+    "olala.expert_shared_count": 1,
+    "olala.expert_weights_scale": 2.450000047683716,
+    "olala.expert_gating_func": 2,
+    "olala.moe_latent_size": 384,
+    "olala.ssm.inner_size": 3072,
+    "olala.ssm.state_size": 128,
+    "olala.ssm.group_count": 1,
+    "olala.ssm.time_step_rank": 64,
+    "olala.mamba_mimo_dim": 4,
+    "olala.mamba_headdim": 64,
+    "olala.num_signal_heads": 36,
+    "olala.num_noise_heads": 12,
+    "olala.tpa_rank": 4,
+    "olala.num_rope_angles": 32,
+    "olala.layer_types": "MMMMVMMMMVMMMMVMMMMVMMMMVMMMMVMMMMVM",
+    "olala.zero_centered_gamma": true,
+    "olala.gate_bias": 1.149999976158142,
+    "olala.gate_attn": true,
+    "olala.gate_gdn": true,
+    "olala.geodesic_update": true,
+    "olala.final_norm": false,
+    "tokenizer.ggml.model": "gpt2",
+    "tokenizer.ggml.pre": "qwen2",
+    "tokenizer.ggml.eos_token_id": 151645,
+    "tokenizer.ggml.add_bos_token": false,
+    "tokenizer.ggml.add_eos_token": false
+  },
+  "tensors": {
+    "output.weight": {
+      "dimensions": [
+        1536,
+        151936
+      ],
+      "kind": 14
+    },
+    "token_embd.weight": {
+      "dimensions": [
+        1536,
+        151936
+      ],
+      "kind": 13
+    },
+    "blk.0.attn_output.weight": {
+      "dimensions": [
+        3072,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.0.exp_probs_b": {
+      "dimensions": [
+        256
+      ],
+      "kind": 0
+    },
+    "blk.0.ffn_down_exps.weight": {
+      "dimensions": [
+        768,
+        384,
+        256
+      ],
+      "kind": 14
+    },
+    "blk.0.ffn_down_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 14
+    },
+    "blk.0.ffn_gate_inp.weight": {
+      "dimensions": [
+        1536,
+        256
+      ],
+      "kind": 0
+    },
+    "blk.0.ffn_latent_down.weight": {
+      "dimensions": [
+        1536,
+        384
+      ],
+      "kind": 13
+    },
+    "blk.0.ffn_latent_up.weight": {
+      "dimensions": [
+        384,
+        1536
+      ],
+      "kind": 30
+    },
+    "blk.0.ffn_up_exps.weight": {
+      "dimensions": [
+        384,
+        768,
+        256
+      ],
+      "kind": 8
+    },
+    "blk.0.ffn_up_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.0.geo_mixer_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.0.geo_mixer_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.0.geo_mlp_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.0.geo_mlp_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.0.ssm_b_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.0.ssm_b_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.0.ssm_c_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.0.ssm_c_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.0.ssm_d": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.0.ssm_dt_bias": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.0.ssm_in.weight": {
+      "dimensions": [
+        1536,
+        6288
+      ],
+      "kind": 13
+    },
+    "blk.0.ssm_in_dyn.weight": {
+      "dimensions": [
+        1536,
+        1056
+      ],
+      "kind": 13
+    },
+    "blk.0.ssm_m3_bias": {
+      "dimensions": [
+        128,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.0.ssm_m3_misc": {
+      "dimensions": [
+        48,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.0.ssm_m3_mxz": {
+      "dimensions": [
+        64,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.0.ssm_m3_norms": {
+      "dimensions": [
+        128,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.0.ssm_mimo_o": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.0.ssm_mimo_x": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.0.ssm_mimo_z": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.1.attn_output.weight": {
+      "dimensions": [
+        3072,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.1.exp_probs_b": {
+      "dimensions": [
+        256
+      ],
+      "kind": 0
+    },
+    "blk.1.ffn_down_exps.weight": {
+      "dimensions": [
+        768,
+        384,
+        256
+      ],
+      "kind": 14
+    },
+    "blk.1.ffn_down_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 14
+    },
+    "blk.1.ffn_gate_inp.weight": {
+      "dimensions": [
+        1536,
+        256
+      ],
+      "kind": 0
+    },
+    "blk.1.ffn_latent_down.weight": {
+      "dimensions": [
+        1536,
+        384
+      ],
+      "kind": 13
+    },
+    "blk.1.ffn_latent_up.weight": {
+      "dimensions": [
+        384,
+        1536
+      ],
+      "kind": 30
+    },
+    "blk.1.ffn_up_exps.weight": {
+      "dimensions": [
+        384,
+        768,
+        256
+      ],
+      "kind": 8
+    },
+    "blk.1.ffn_up_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.1.geo_mixer_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.1.geo_mixer_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.1.geo_mlp_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.1.geo_mlp_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.1.ssm_b_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.1.ssm_b_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.1.ssm_c_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.1.ssm_c_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.1.ssm_d": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.1.ssm_dt_bias": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.1.ssm_in.weight": {
+      "dimensions": [
+        1536,
+        6288
+      ],
+      "kind": 13
+    },
+    "blk.1.ssm_in_dyn.weight": {
+      "dimensions": [
+        1536,
+        1056
+      ],
+      "kind": 13
+    },
+    "blk.1.ssm_m3_bias": {
+      "dimensions": [
+        128,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.1.ssm_m3_misc": {
+      "dimensions": [
+        48,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.1.ssm_m3_mxz": {
+      "dimensions": [
+        64,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.1.ssm_m3_norms": {
+      "dimensions": [
+        128,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.1.ssm_mimo_o": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.1.ssm_mimo_x": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.1.ssm_mimo_z": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.2.attn_output.weight": {
+      "dimensions": [
+        3072,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.2.exp_probs_b": {
+      "dimensions": [
+        256
+      ],
+      "kind": 0
+    },
+    "blk.2.ffn_down_exps.weight": {
+      "dimensions": [
+        768,
+        384,
+        256
+      ],
+      "kind": 14
+    },
+    "blk.2.ffn_down_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 14
+    },
+    "blk.2.ffn_gate_inp.weight": {
+      "dimensions": [
+        1536,
+        256
+      ],
+      "kind": 0
+    },
+    "blk.2.ffn_latent_down.weight": {
+      "dimensions": [
+        1536,
+        384
+      ],
+      "kind": 13
+    },
+    "blk.2.ffn_latent_up.weight": {
+      "dimensions": [
+        384,
+        1536
+      ],
+      "kind": 30
+    },
+    "blk.2.ffn_up_exps.weight": {
+      "dimensions": [
+        384,
+        768,
+        256
+      ],
+      "kind": 8
+    },
+    "blk.2.ffn_up_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.2.geo_mixer_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.2.geo_mixer_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.2.geo_mlp_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.2.geo_mlp_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.2.ssm_b_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.2.ssm_b_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.2.ssm_c_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.2.ssm_c_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.2.ssm_d": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.2.ssm_dt_bias": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.2.ssm_in.weight": {
+      "dimensions": [
+        1536,
+        6288
+      ],
+      "kind": 13
+    },
+    "blk.2.ssm_in_dyn.weight": {
+      "dimensions": [
+        1536,
+        1056
+      ],
+      "kind": 13
+    },
+    "blk.2.ssm_m3_bias": {
+      "dimensions": [
+        128,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.2.ssm_m3_misc": {
+      "dimensions": [
+        48,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.2.ssm_m3_mxz": {
+      "dimensions": [
+        64,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.2.ssm_m3_norms": {
+      "dimensions": [
+        128,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.2.ssm_mimo_o": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.2.ssm_mimo_x": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.2.ssm_mimo_z": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.3.attn_output.weight": {
+      "dimensions": [
+        3072,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.3.exp_probs_b": {
+      "dimensions": [
+        256
+      ],
+      "kind": 0
+    },
+    "blk.3.ffn_down_exps.weight": {
+      "dimensions": [
+        768,
+        384,
+        256
+      ],
+      "kind": 14
+    },
+    "blk.3.ffn_down_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 14
+    },
+    "blk.3.ffn_gate_inp.weight": {
+      "dimensions": [
+        1536,
+        256
+      ],
+      "kind": 0
+    },
+    "blk.3.ffn_latent_down.weight": {
+      "dimensions": [
+        1536,
+        384
+      ],
+      "kind": 13
+    },
+    "blk.3.ffn_latent_up.weight": {
+      "dimensions": [
+        384,
+        1536
+      ],
+      "kind": 30
+    },
+    "blk.3.ffn_up_exps.weight": {
+      "dimensions": [
+        384,
+        768,
+        256
+      ],
+      "kind": 8
+    },
+    "blk.3.ffn_up_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.3.geo_mixer_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.3.geo_mixer_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.3.geo_mlp_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.3.geo_mlp_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.3.ssm_b_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.3.ssm_b_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.3.ssm_c_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.3.ssm_c_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.3.ssm_d": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.3.ssm_dt_bias": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.3.ssm_in.weight": {
+      "dimensions": [
+        1536,
+        6288
+      ],
+      "kind": 13
+    },
+    "blk.3.ssm_in_dyn.weight": {
+      "dimensions": [
+        1536,
+        1056
+      ],
+      "kind": 13
+    },
+    "blk.3.ssm_m3_bias": {
+      "dimensions": [
+        128,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.3.ssm_m3_misc": {
+      "dimensions": [
+        48,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.3.ssm_m3_mxz": {
+      "dimensions": [
+        64,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.3.ssm_m3_norms": {
+      "dimensions": [
+        128,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.3.ssm_mimo_o": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.3.ssm_mimo_x": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.3.ssm_mimo_z": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.4.attn_gate.weight": {
+      "dimensions": [
+        1536,
+        4608
+      ],
+      "kind": 13
+    },
+    "blk.4.attn_k_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.4.attn_lambda.weight": {
+      "dimensions": [
+        1536,
+        12
+      ],
+      "kind": 13
+    },
+    "blk.4.attn_output.weight": {
+      "dimensions": [
+        4608,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.4.attn_q.weight": {
+      "dimensions": [
+        1536,
+        6144
+      ],
+      "kind": 13
+    },
+    "blk.4.attn_q_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.4.attn_shift_k.weight": {
+      "dimensions": [
+        1536,
+        12
+      ],
+      "kind": 13
+    },
+    "blk.4.attn_shift_v.weight": {
+      "dimensions": [
+        1536,
+        12
+      ],
+      "kind": 13
+    },
+    "blk.4.attn_softmax_scaler": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.4.attn_wa_k.weight": {
+      "dimensions": [
+        1536,
+        48
+      ],
+      "kind": 13
+    },
+    "blk.4.attn_wa_v.weight": {
+      "dimensions": [
+        1536,
+        48
+      ],
+      "kind": 13
+    },
+    "blk.4.attn_wb_k.weight": {
+      "dimensions": [
+        1536,
+        512
+      ],
+      "kind": 13
+    },
+    "blk.4.attn_wb_v.weight": {
+      "dimensions": [
+        1536,
+        512
+      ],
+      "kind": 13
+    },
+    "blk.4.exp_probs_b": {
+      "dimensions": [
+        256
+      ],
+      "kind": 0
+    },
+    "blk.4.ffn_down_exps.weight": {
+      "dimensions": [
+        768,
+        384,
+        256
+      ],
+      "kind": 13
+    },
+    "blk.4.ffn_down_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.4.ffn_gate_inp.weight": {
+      "dimensions": [
+        1536,
+        256
+      ],
+      "kind": 0
+    },
+    "blk.4.ffn_latent_down.weight": {
+      "dimensions": [
+        1536,
+        384
+      ],
+      "kind": 13
+    },
+    "blk.4.ffn_latent_up.weight": {
+      "dimensions": [
+        384,
+        1536
+      ],
+      "kind": 30
+    },
+    "blk.4.ffn_up_exps.weight": {
+      "dimensions": [
+        384,
+        768,
+        256
+      ],
+      "kind": 8
+    },
+    "blk.4.ffn_up_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.4.geo_mixer_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.4.geo_mixer_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.4.geo_mlp_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.4.geo_mlp_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.5.attn_output.weight": {
+      "dimensions": [
+        3072,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.5.exp_probs_b": {
+      "dimensions": [
+        256
+      ],
+      "kind": 0
+    },
+    "blk.5.ffn_down_exps.weight": {
+      "dimensions": [
+        768,
+        384,
+        256
+      ],
+      "kind": 13
+    },
+    "blk.5.ffn_down_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.5.ffn_gate_inp.weight": {
+      "dimensions": [
+        1536,
+        256
+      ],
+      "kind": 0
+    },
+    "blk.5.ffn_latent_down.weight": {
+      "dimensions": [
+        1536,
+        384
+      ],
+      "kind": 13
+    },
+    "blk.5.ffn_latent_up.weight": {
+      "dimensions": [
+        384,
+        1536
+      ],
+      "kind": 30
+    },
+    "blk.5.ffn_up_exps.weight": {
+      "dimensions": [
+        384,
+        768,
+        256
+      ],
+      "kind": 8
+    },
+    "blk.5.ffn_up_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.5.geo_mixer_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.5.geo_mixer_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.5.geo_mlp_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.5.geo_mlp_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.5.ssm_b_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.5.ssm_b_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.5.ssm_c_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.5.ssm_c_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.5.ssm_d": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.5.ssm_dt_bias": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.5.ssm_in.weight": {
+      "dimensions": [
+        1536,
+        6288
+      ],
+      "kind": 13
+    },
+    "blk.5.ssm_in_dyn.weight": {
+      "dimensions": [
+        1536,
+        1056
+      ],
+      "kind": 13
+    },
+    "blk.5.ssm_m3_bias": {
+      "dimensions": [
+        128,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.5.ssm_m3_misc": {
+      "dimensions": [
+        48,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.5.ssm_m3_mxz": {
+      "dimensions": [
+        64,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.5.ssm_m3_norms": {
+      "dimensions": [
+        128,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.5.ssm_mimo_o": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.5.ssm_mimo_x": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.5.ssm_mimo_z": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.6.attn_output.weight": {
+      "dimensions": [
+        3072,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.6.exp_probs_b": {
+      "dimensions": [
+        256
+      ],
+      "kind": 0
+    },
+    "blk.6.ffn_down_exps.weight": {
+      "dimensions": [
+        768,
+        384,
+        256
+      ],
+      "kind": 14
+    },
+    "blk.6.ffn_down_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 14
+    },
+    "blk.6.ffn_gate_inp.weight": {
+      "dimensions": [
+        1536,
+        256
+      ],
+      "kind": 0
+    },
+    "blk.6.ffn_latent_down.weight": {
+      "dimensions": [
+        1536,
+        384
+      ],
+      "kind": 13
+    },
+    "blk.6.ffn_latent_up.weight": {
+      "dimensions": [
+        384,
+        1536
+      ],
+      "kind": 30
+    },
+    "blk.6.ffn_up_exps.weight": {
+      "dimensions": [
+        384,
+        768,
+        256
+      ],
+      "kind": 8
+    },
+    "blk.6.ffn_up_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.6.geo_mixer_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.6.geo_mixer_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.6.geo_mlp_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.6.geo_mlp_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.6.ssm_b_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.6.ssm_b_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.6.ssm_c_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.6.ssm_c_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.6.ssm_d": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.6.ssm_dt_bias": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.6.ssm_in.weight": {
+      "dimensions": [
+        1536,
+        6288
+      ],
+      "kind": 13
+    },
+    "blk.6.ssm_in_dyn.weight": {
+      "dimensions": [
+        1536,
+        1056
+      ],
+      "kind": 13
+    },
+    "blk.6.ssm_m3_bias": {
+      "dimensions": [
+        128,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.6.ssm_m3_misc": {
+      "dimensions": [
+        48,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.6.ssm_m3_mxz": {
+      "dimensions": [
+        64,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.6.ssm_m3_norms": {
+      "dimensions": [
+        128,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.6.ssm_mimo_o": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.6.ssm_mimo_x": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.6.ssm_mimo_z": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.7.attn_output.weight": {
+      "dimensions": [
+        3072,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.7.exp_probs_b": {
+      "dimensions": [
+        256
+      ],
+      "kind": 0
+    },
+    "blk.7.ffn_down_exps.weight": {
+      "dimensions": [
+        768,
+        384,
+        256
+      ],
+      "kind": 13
+    },
+    "blk.7.ffn_down_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.7.ffn_gate_inp.weight": {
+      "dimensions": [
+        1536,
+        256
+      ],
+      "kind": 0
+    },
+    "blk.7.ffn_latent_down.weight": {
+      "dimensions": [
+        1536,
+        384
+      ],
+      "kind": 13
+    },
+    "blk.7.ffn_latent_up.weight": {
+      "dimensions": [
+        384,
+        1536
+      ],
+      "kind": 30
+    },
+    "blk.7.ffn_up_exps.weight": {
+      "dimensions": [
+        384,
+        768,
+        256
+      ],
+      "kind": 8
+    },
+    "blk.7.ffn_up_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.7.geo_mixer_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.7.geo_mixer_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.7.geo_mlp_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.7.geo_mlp_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.7.ssm_b_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.7.ssm_b_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.7.ssm_c_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.7.ssm_c_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.7.ssm_d": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.7.ssm_dt_bias": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.7.ssm_in.weight": {
+      "dimensions": [
+        1536,
+        6288
+      ],
+      "kind": 13
+    },
+    "blk.7.ssm_in_dyn.weight": {
+      "dimensions": [
+        1536,
+        1056
+      ],
+      "kind": 13
+    },
+    "blk.7.ssm_m3_bias": {
+      "dimensions": [
+        128,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.7.ssm_m3_misc": {
+      "dimensions": [
+        48,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.7.ssm_m3_mxz": {
+      "dimensions": [
+        64,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.7.ssm_m3_norms": {
+      "dimensions": [
+        128,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.7.ssm_mimo_o": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.7.ssm_mimo_x": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.7.ssm_mimo_z": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.8.attn_output.weight": {
+      "dimensions": [
+        3072,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.8.exp_probs_b": {
+      "dimensions": [
+        256
+      ],
+      "kind": 0
+    },
+    "blk.8.ffn_down_exps.weight": {
+      "dimensions": [
+        768,
+        384,
+        256
+      ],
+      "kind": 13
+    },
+    "blk.8.ffn_down_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.8.ffn_gate_inp.weight": {
+      "dimensions": [
+        1536,
+        256
+      ],
+      "kind": 0
+    },
+    "blk.8.ffn_latent_down.weight": {
+      "dimensions": [
+        1536,
+        384
+      ],
+      "kind": 13
+    },
+    "blk.8.ffn_latent_up.weight": {
+      "dimensions": [
+        384,
+        1536
+      ],
+      "kind": 30
+    },
+    "blk.8.ffn_up_exps.weight": {
+      "dimensions": [
+        384,
+        768,
+        256
+      ],
+      "kind": 8
+    },
+    "blk.8.ffn_up_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.8.geo_mixer_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.8.geo_mixer_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.8.geo_mlp_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.8.geo_mlp_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.8.ssm_b_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.8.ssm_b_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.8.ssm_c_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.8.ssm_c_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.8.ssm_d": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.8.ssm_dt_bias": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.8.ssm_in.weight": {
+      "dimensions": [
+        1536,
+        6288
+      ],
+      "kind": 13
+    },
+    "blk.8.ssm_in_dyn.weight": {
+      "dimensions": [
+        1536,
+        1056
+      ],
+      "kind": 13
+    },
+    "blk.8.ssm_m3_bias": {
+      "dimensions": [
+        128,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.8.ssm_m3_misc": {
+      "dimensions": [
+        48,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.8.ssm_m3_mxz": {
+      "dimensions": [
+        64,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.8.ssm_m3_norms": {
+      "dimensions": [
+        128,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.8.ssm_mimo_o": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.8.ssm_mimo_x": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.8.ssm_mimo_z": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.9.attn_gate.weight": {
+      "dimensions": [
+        1536,
+        4608
+      ],
+      "kind": 13
+    },
+    "blk.9.attn_k_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.9.attn_lambda.weight": {
+      "dimensions": [
+        1536,
+        12
+      ],
+      "kind": 13
+    },
+    "blk.9.attn_output.weight": {
+      "dimensions": [
+        4608,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.9.attn_q.weight": {
+      "dimensions": [
+        1536,
+        6144
+      ],
+      "kind": 13
+    },
+    "blk.9.attn_q_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.9.attn_shift_k.weight": {
+      "dimensions": [
+        1536,
+        12
+      ],
+      "kind": 13
+    },
+    "blk.9.attn_shift_v.weight": {
+      "dimensions": [
+        1536,
+        12
+      ],
+      "kind": 13
+    },
+    "blk.9.attn_softmax_scaler": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.9.attn_wa_k.weight": {
+      "dimensions": [
+        1536,
+        48
+      ],
+      "kind": 13
+    },
+    "blk.9.attn_wa_v.weight": {
+      "dimensions": [
+        1536,
+        48
+      ],
+      "kind": 13
+    },
+    "blk.9.attn_wb_k.weight": {
+      "dimensions": [
+        1536,
+        512
+      ],
+      "kind": 13
+    },
+    "blk.9.attn_wb_v.weight": {
+      "dimensions": [
+        1536,
+        512
+      ],
+      "kind": 13
+    },
+    "blk.9.exp_probs_b": {
+      "dimensions": [
+        256
+      ],
+      "kind": 0
+    },
+    "blk.9.ffn_down_exps.weight": {
+      "dimensions": [
+        768,
+        384,
+        256
+      ],
+      "kind": 14
+    },
+    "blk.9.ffn_down_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 14
+    },
+    "blk.9.ffn_gate_inp.weight": {
+      "dimensions": [
+        1536,
+        256
+      ],
+      "kind": 0
+    },
+    "blk.9.ffn_latent_down.weight": {
+      "dimensions": [
+        1536,
+        384
+      ],
+      "kind": 13
+    },
+    "blk.9.ffn_latent_up.weight": {
+      "dimensions": [
+        384,
+        1536
+      ],
+      "kind": 30
+    },
+    "blk.9.ffn_up_exps.weight": {
+      "dimensions": [
+        384,
+        768,
+        256
+      ],
+      "kind": 8
+    },
+    "blk.9.ffn_up_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.9.geo_mixer_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.9.geo_mixer_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.9.geo_mlp_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.9.geo_mlp_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.10.attn_output.weight": {
+      "dimensions": [
+        3072,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.10.exp_probs_b": {
+      "dimensions": [
+        256
+      ],
+      "kind": 0
+    },
+    "blk.10.ffn_down_exps.weight": {
+      "dimensions": [
+        768,
+        384,
+        256
+      ],
+      "kind": 13
+    },
+    "blk.10.ffn_down_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.10.ffn_gate_inp.weight": {
+      "dimensions": [
+        1536,
+        256
+      ],
+      "kind": 0
+    },
+    "blk.10.ffn_latent_down.weight": {
+      "dimensions": [
+        1536,
+        384
+      ],
+      "kind": 13
+    },
+    "blk.10.ffn_latent_up.weight": {
+      "dimensions": [
+        384,
+        1536
+      ],
+      "kind": 30
+    },
+    "blk.10.ffn_up_exps.weight": {
+      "dimensions": [
+        384,
+        768,
+        256
+      ],
+      "kind": 8
+    },
+    "blk.10.ffn_up_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.10.geo_mixer_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.10.geo_mixer_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.10.geo_mlp_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.10.geo_mlp_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.10.ssm_b_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.10.ssm_b_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.10.ssm_c_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.10.ssm_c_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.10.ssm_d": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.10.ssm_dt_bias": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.10.ssm_in.weight": {
+      "dimensions": [
+        1536,
+        6288
+      ],
+      "kind": 13
+    },
+    "blk.10.ssm_in_dyn.weight": {
+      "dimensions": [
+        1536,
+        1056
+      ],
+      "kind": 13
+    },
+    "blk.10.ssm_m3_bias": {
+      "dimensions": [
+        128,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.10.ssm_m3_misc": {
+      "dimensions": [
+        48,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.10.ssm_m3_mxz": {
+      "dimensions": [
+        64,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.10.ssm_m3_norms": {
+      "dimensions": [
+        128,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.10.ssm_mimo_o": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.10.ssm_mimo_x": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.10.ssm_mimo_z": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.11.attn_output.weight": {
+      "dimensions": [
+        3072,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.11.exp_probs_b": {
+      "dimensions": [
+        256
+      ],
+      "kind": 0
+    },
+    "blk.11.ffn_down_exps.weight": {
+      "dimensions": [
+        768,
+        384,
+        256
+      ],
+      "kind": 13
+    },
+    "blk.11.ffn_down_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.11.ffn_gate_inp.weight": {
+      "dimensions": [
+        1536,
+        256
+      ],
+      "kind": 0
+    },
+    "blk.11.ffn_latent_down.weight": {
+      "dimensions": [
+        1536,
+        384
+      ],
+      "kind": 13
+    },
+    "blk.11.ffn_latent_up.weight": {
+      "dimensions": [
+        384,
+        1536
+      ],
+      "kind": 30
+    },
+    "blk.11.ffn_up_exps.weight": {
+      "dimensions": [
+        384,
+        768,
+        256
+      ],
+      "kind": 8
+    },
+    "blk.11.ffn_up_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.11.geo_mixer_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.11.geo_mixer_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.11.geo_mlp_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.11.geo_mlp_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.11.ssm_b_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.11.ssm_b_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.11.ssm_c_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.11.ssm_c_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.11.ssm_d": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.11.ssm_dt_bias": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.11.ssm_in.weight": {
+      "dimensions": [
+        1536,
+        6288
+      ],
+      "kind": 13
+    },
+    "blk.11.ssm_in_dyn.weight": {
+      "dimensions": [
+        1536,
+        1056
+      ],
+      "kind": 13
+    },
+    "blk.11.ssm_m3_bias": {
+      "dimensions": [
+        128,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.11.ssm_m3_misc": {
+      "dimensions": [
+        48,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.11.ssm_m3_mxz": {
+      "dimensions": [
+        64,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.11.ssm_m3_norms": {
+      "dimensions": [
+        128,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.11.ssm_mimo_o": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.11.ssm_mimo_x": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.11.ssm_mimo_z": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.12.attn_output.weight": {
+      "dimensions": [
+        3072,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.12.exp_probs_b": {
+      "dimensions": [
+        256
+      ],
+      "kind": 0
+    },
+    "blk.12.ffn_down_exps.weight": {
+      "dimensions": [
+        768,
+        384,
+        256
+      ],
+      "kind": 14
+    },
+    "blk.12.ffn_down_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 14
+    },
+    "blk.12.ffn_gate_inp.weight": {
+      "dimensions": [
+        1536,
+        256
+      ],
+      "kind": 0
+    },
+    "blk.12.ffn_latent_down.weight": {
+      "dimensions": [
+        1536,
+        384
+      ],
+      "kind": 13
+    },
+    "blk.12.ffn_latent_up.weight": {
+      "dimensions": [
+        384,
+        1536
+      ],
+      "kind": 30
+    },
+    "blk.12.ffn_up_exps.weight": {
+      "dimensions": [
+        384,
+        768,
+        256
+      ],
+      "kind": 8
+    },
+    "blk.12.ffn_up_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.12.geo_mixer_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.12.geo_mixer_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.12.geo_mlp_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.12.geo_mlp_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.12.ssm_b_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.12.ssm_b_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.12.ssm_c_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.12.ssm_c_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.12.ssm_d": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.12.ssm_dt_bias": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.12.ssm_in.weight": {
+      "dimensions": [
+        1536,
+        6288
+      ],
+      "kind": 13
+    },
+    "blk.12.ssm_in_dyn.weight": {
+      "dimensions": [
+        1536,
+        1056
+      ],
+      "kind": 13
+    },
+    "blk.12.ssm_m3_bias": {
+      "dimensions": [
+        128,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.12.ssm_m3_misc": {
+      "dimensions": [
+        48,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.12.ssm_m3_mxz": {
+      "dimensions": [
+        64,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.12.ssm_m3_norms": {
+      "dimensions": [
+        128,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.12.ssm_mimo_o": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.12.ssm_mimo_x": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.12.ssm_mimo_z": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.13.attn_output.weight": {
+      "dimensions": [
+        3072,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.13.exp_probs_b": {
+      "dimensions": [
+        256
+      ],
+      "kind": 0
+    },
+    "blk.13.ffn_down_exps.weight": {
+      "dimensions": [
+        768,
+        384,
+        256
+      ],
+      "kind": 13
+    },
+    "blk.13.ffn_down_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.13.ffn_gate_inp.weight": {
+      "dimensions": [
+        1536,
+        256
+      ],
+      "kind": 0
+    },
+    "blk.13.ffn_latent_down.weight": {
+      "dimensions": [
+        1536,
+        384
+      ],
+      "kind": 13
+    },
+    "blk.13.ffn_latent_up.weight": {
+      "dimensions": [
+        384,
+        1536
+      ],
+      "kind": 30
+    },
+    "blk.13.ffn_up_exps.weight": {
+      "dimensions": [
+        384,
+        768,
+        256
+      ],
+      "kind": 8
+    },
+    "blk.13.ffn_up_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.13.geo_mixer_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.13.geo_mixer_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.13.geo_mlp_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.13.geo_mlp_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.13.ssm_b_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.13.ssm_b_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.13.ssm_c_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.13.ssm_c_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.13.ssm_d": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.13.ssm_dt_bias": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.13.ssm_in.weight": {
+      "dimensions": [
+        1536,
+        6288
+      ],
+      "kind": 13
+    },
+    "blk.13.ssm_in_dyn.weight": {
+      "dimensions": [
+        1536,
+        1056
+      ],
+      "kind": 13
+    },
+    "blk.13.ssm_m3_bias": {
+      "dimensions": [
+        128,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.13.ssm_m3_misc": {
+      "dimensions": [
+        48,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.13.ssm_m3_mxz": {
+      "dimensions": [
+        64,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.13.ssm_m3_norms": {
+      "dimensions": [
+        128,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.13.ssm_mimo_o": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.13.ssm_mimo_x": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.13.ssm_mimo_z": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.14.attn_gate.weight": {
+      "dimensions": [
+        1536,
+        4608
+      ],
+      "kind": 13
+    },
+    "blk.14.attn_k_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.14.attn_lambda.weight": {
+      "dimensions": [
+        1536,
+        12
+      ],
+      "kind": 13
+    },
+    "blk.14.attn_output.weight": {
+      "dimensions": [
+        4608,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.14.attn_q.weight": {
+      "dimensions": [
+        1536,
+        6144
+      ],
+      "kind": 13
+    },
+    "blk.14.attn_q_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.14.attn_shift_k.weight": {
+      "dimensions": [
+        1536,
+        12
+      ],
+      "kind": 13
+    },
+    "blk.14.attn_shift_v.weight": {
+      "dimensions": [
+        1536,
+        12
+      ],
+      "kind": 13
+    },
+    "blk.14.attn_softmax_scaler": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.14.attn_wa_k.weight": {
+      "dimensions": [
+        1536,
+        48
+      ],
+      "kind": 13
+    },
+    "blk.14.attn_wa_v.weight": {
+      "dimensions": [
+        1536,
+        48
+      ],
+      "kind": 13
+    },
+    "blk.14.attn_wb_k.weight": {
+      "dimensions": [
+        1536,
+        512
+      ],
+      "kind": 13
+    },
+    "blk.14.attn_wb_v.weight": {
+      "dimensions": [
+        1536,
+        512
+      ],
+      "kind": 13
+    },
+    "blk.14.exp_probs_b": {
+      "dimensions": [
+        256
+      ],
+      "kind": 0
+    },
+    "blk.14.ffn_down_exps.weight": {
+      "dimensions": [
+        768,
+        384,
+        256
+      ],
+      "kind": 13
+    },
+    "blk.14.ffn_down_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.14.ffn_gate_inp.weight": {
+      "dimensions": [
+        1536,
+        256
+      ],
+      "kind": 0
+    },
+    "blk.14.ffn_latent_down.weight": {
+      "dimensions": [
+        1536,
+        384
+      ],
+      "kind": 13
+    },
+    "blk.14.ffn_latent_up.weight": {
+      "dimensions": [
+        384,
+        1536
+      ],
+      "kind": 30
+    },
+    "blk.14.ffn_up_exps.weight": {
+      "dimensions": [
+        384,
+        768,
+        256
+      ],
+      "kind": 8
+    },
+    "blk.14.ffn_up_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.14.geo_mixer_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.14.geo_mixer_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.14.geo_mlp_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.14.geo_mlp_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.15.attn_output.weight": {
+      "dimensions": [
+        3072,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.15.exp_probs_b": {
+      "dimensions": [
+        256
+      ],
+      "kind": 0
+    },
+    "blk.15.ffn_down_exps.weight": {
+      "dimensions": [
+        768,
+        384,
+        256
+      ],
+      "kind": 14
+    },
+    "blk.15.ffn_down_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 14
+    },
+    "blk.15.ffn_gate_inp.weight": {
+      "dimensions": [
+        1536,
+        256
+      ],
+      "kind": 0
+    },
+    "blk.15.ffn_latent_down.weight": {
+      "dimensions": [
+        1536,
+        384
+      ],
+      "kind": 13
+    },
+    "blk.15.ffn_latent_up.weight": {
+      "dimensions": [
+        384,
+        1536
+      ],
+      "kind": 30
+    },
+    "blk.15.ffn_up_exps.weight": {
+      "dimensions": [
+        384,
+        768,
+        256
+      ],
+      "kind": 8
+    },
+    "blk.15.ffn_up_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.15.geo_mixer_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.15.geo_mixer_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.15.geo_mlp_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.15.geo_mlp_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.15.ssm_b_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.15.ssm_b_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.15.ssm_c_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.15.ssm_c_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.15.ssm_d": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.15.ssm_dt_bias": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.15.ssm_in.weight": {
+      "dimensions": [
+        1536,
+        6288
+      ],
+      "kind": 13
+    },
+    "blk.15.ssm_in_dyn.weight": {
+      "dimensions": [
+        1536,
+        1056
+      ],
+      "kind": 13
+    },
+    "blk.15.ssm_m3_bias": {
+      "dimensions": [
+        128,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.15.ssm_m3_misc": {
+      "dimensions": [
+        48,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.15.ssm_m3_mxz": {
+      "dimensions": [
+        64,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.15.ssm_m3_norms": {
+      "dimensions": [
+        128,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.15.ssm_mimo_o": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.15.ssm_mimo_x": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.15.ssm_mimo_z": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.16.attn_output.weight": {
+      "dimensions": [
+        3072,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.16.exp_probs_b": {
+      "dimensions": [
+        256
+      ],
+      "kind": 0
+    },
+    "blk.16.ffn_down_exps.weight": {
+      "dimensions": [
+        768,
+        384,
+        256
+      ],
+      "kind": 13
+    },
+    "blk.16.ffn_down_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.16.ffn_gate_inp.weight": {
+      "dimensions": [
+        1536,
+        256
+      ],
+      "kind": 0
+    },
+    "blk.16.ffn_latent_down.weight": {
+      "dimensions": [
+        1536,
+        384
+      ],
+      "kind": 13
+    },
+    "blk.16.ffn_latent_up.weight": {
+      "dimensions": [
+        384,
+        1536
+      ],
+      "kind": 30
+    },
+    "blk.16.ffn_up_exps.weight": {
+      "dimensions": [
+        384,
+        768,
+        256
+      ],
+      "kind": 8
+    },
+    "blk.16.ffn_up_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.16.geo_mixer_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.16.geo_mixer_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.16.geo_mlp_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.16.geo_mlp_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.16.ssm_b_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.16.ssm_b_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.16.ssm_c_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.16.ssm_c_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.16.ssm_d": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.16.ssm_dt_bias": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.16.ssm_in.weight": {
+      "dimensions": [
+        1536,
+        6288
+      ],
+      "kind": 13
+    },
+    "blk.16.ssm_in_dyn.weight": {
+      "dimensions": [
+        1536,
+        1056
+      ],
+      "kind": 13
+    },
+    "blk.16.ssm_m3_bias": {
+      "dimensions": [
+        128,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.16.ssm_m3_misc": {
+      "dimensions": [
+        48,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.16.ssm_m3_mxz": {
+      "dimensions": [
+        64,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.16.ssm_m3_norms": {
+      "dimensions": [
+        128,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.16.ssm_mimo_o": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.16.ssm_mimo_x": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.16.ssm_mimo_z": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.17.attn_output.weight": {
+      "dimensions": [
+        3072,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.17.exp_probs_b": {
+      "dimensions": [
+        256
+      ],
+      "kind": 0
+    },
+    "blk.17.ffn_down_exps.weight": {
+      "dimensions": [
+        768,
+        384,
+        256
+      ],
+      "kind": 13
+    },
+    "blk.17.ffn_down_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.17.ffn_gate_inp.weight": {
+      "dimensions": [
+        1536,
+        256
+      ],
+      "kind": 0
+    },
+    "blk.17.ffn_latent_down.weight": {
+      "dimensions": [
+        1536,
+        384
+      ],
+      "kind": 13
+    },
+    "blk.17.ffn_latent_up.weight": {
+      "dimensions": [
+        384,
+        1536
+      ],
+      "kind": 30
+    },
+    "blk.17.ffn_up_exps.weight": {
+      "dimensions": [
+        384,
+        768,
+        256
+      ],
+      "kind": 8
+    },
+    "blk.17.ffn_up_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.17.geo_mixer_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.17.geo_mixer_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.17.geo_mlp_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.17.geo_mlp_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.17.ssm_b_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.17.ssm_b_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.17.ssm_c_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.17.ssm_c_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.17.ssm_d": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.17.ssm_dt_bias": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.17.ssm_in.weight": {
+      "dimensions": [
+        1536,
+        6288
+      ],
+      "kind": 13
+    },
+    "blk.17.ssm_in_dyn.weight": {
+      "dimensions": [
+        1536,
+        1056
+      ],
+      "kind": 13
+    },
+    "blk.17.ssm_m3_bias": {
+      "dimensions": [
+        128,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.17.ssm_m3_misc": {
+      "dimensions": [
+        48,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.17.ssm_m3_mxz": {
+      "dimensions": [
+        64,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.17.ssm_m3_norms": {
+      "dimensions": [
+        128,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.17.ssm_mimo_o": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.17.ssm_mimo_x": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.17.ssm_mimo_z": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.18.attn_output.weight": {
+      "dimensions": [
+        3072,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.18.exp_probs_b": {
+      "dimensions": [
+        256
+      ],
+      "kind": 0
+    },
+    "blk.18.ffn_down_exps.weight": {
+      "dimensions": [
+        768,
+        384,
+        256
+      ],
+      "kind": 14
+    },
+    "blk.18.ffn_down_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 14
+    },
+    "blk.18.ffn_gate_inp.weight": {
+      "dimensions": [
+        1536,
+        256
+      ],
+      "kind": 0
+    },
+    "blk.18.ffn_latent_down.weight": {
+      "dimensions": [
+        1536,
+        384
+      ],
+      "kind": 13
+    },
+    "blk.18.ffn_latent_up.weight": {
+      "dimensions": [
+        384,
+        1536
+      ],
+      "kind": 30
+    },
+    "blk.18.ffn_up_exps.weight": {
+      "dimensions": [
+        384,
+        768,
+        256
+      ],
+      "kind": 8
+    },
+    "blk.18.ffn_up_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.18.geo_mixer_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.18.geo_mixer_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.18.geo_mlp_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.18.geo_mlp_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.18.ssm_b_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.18.ssm_b_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.18.ssm_c_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.18.ssm_c_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.18.ssm_d": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.18.ssm_dt_bias": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.18.ssm_in.weight": {
+      "dimensions": [
+        1536,
+        6288
+      ],
+      "kind": 13
+    },
+    "blk.18.ssm_in_dyn.weight": {
+      "dimensions": [
+        1536,
+        1056
+      ],
+      "kind": 13
+    },
+    "blk.18.ssm_m3_bias": {
+      "dimensions": [
+        128,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.18.ssm_m3_misc": {
+      "dimensions": [
+        48,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.18.ssm_m3_mxz": {
+      "dimensions": [
+        64,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.18.ssm_m3_norms": {
+      "dimensions": [
+        128,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.18.ssm_mimo_o": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.18.ssm_mimo_x": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.18.ssm_mimo_z": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.19.attn_gate.weight": {
+      "dimensions": [
+        1536,
+        4608
+      ],
+      "kind": 13
+    },
+    "blk.19.attn_k_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.19.attn_lambda.weight": {
+      "dimensions": [
+        1536,
+        12
+      ],
+      "kind": 13
+    },
+    "blk.19.attn_output.weight": {
+      "dimensions": [
+        4608,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.19.attn_q.weight": {
+      "dimensions": [
+        1536,
+        6144
+      ],
+      "kind": 13
+    },
+    "blk.19.attn_q_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.19.attn_shift_k.weight": {
+      "dimensions": [
+        1536,
+        12
+      ],
+      "kind": 13
+    },
+    "blk.19.attn_shift_v.weight": {
+      "dimensions": [
+        1536,
+        12
+      ],
+      "kind": 13
+    },
+    "blk.19.attn_softmax_scaler": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.19.attn_wa_k.weight": {
+      "dimensions": [
+        1536,
+        48
+      ],
+      "kind": 13
+    },
+    "blk.19.attn_wa_v.weight": {
+      "dimensions": [
+        1536,
+        48
+      ],
+      "kind": 13
+    },
+    "blk.19.attn_wb_k.weight": {
+      "dimensions": [
+        1536,
+        512
+      ],
+      "kind": 13
+    },
+    "blk.19.attn_wb_v.weight": {
+      "dimensions": [
+        1536,
+        512
+      ],
+      "kind": 13
+    },
+    "blk.19.exp_probs_b": {
+      "dimensions": [
+        256
+      ],
+      "kind": 0
+    },
+    "blk.19.ffn_down_exps.weight": {
+      "dimensions": [
+        768,
+        384,
+        256
+      ],
+      "kind": 13
+    },
+    "blk.19.ffn_down_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.19.ffn_gate_inp.weight": {
+      "dimensions": [
+        1536,
+        256
+      ],
+      "kind": 0
+    },
+    "blk.19.ffn_latent_down.weight": {
+      "dimensions": [
+        1536,
+        384
+      ],
+      "kind": 13
+    },
+    "blk.19.ffn_latent_up.weight": {
+      "dimensions": [
+        384,
+        1536
+      ],
+      "kind": 30
+    },
+    "blk.19.ffn_up_exps.weight": {
+      "dimensions": [
+        384,
+        768,
+        256
+      ],
+      "kind": 8
+    },
+    "blk.19.ffn_up_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.19.geo_mixer_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.19.geo_mixer_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.19.geo_mlp_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.19.geo_mlp_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.20.attn_output.weight": {
+      "dimensions": [
+        3072,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.20.exp_probs_b": {
+      "dimensions": [
+        256
+      ],
+      "kind": 0
+    },
+    "blk.20.ffn_down_exps.weight": {
+      "dimensions": [
+        768,
+        384,
+        256
+      ],
+      "kind": 13
+    },
+    "blk.20.ffn_down_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.20.ffn_gate_inp.weight": {
+      "dimensions": [
+        1536,
+        256
+      ],
+      "kind": 0
+    },
+    "blk.20.ffn_latent_down.weight": {
+      "dimensions": [
+        1536,
+        384
+      ],
+      "kind": 13
+    },
+    "blk.20.ffn_latent_up.weight": {
+      "dimensions": [
+        384,
+        1536
+      ],
+      "kind": 30
+    },
+    "blk.20.ffn_up_exps.weight": {
+      "dimensions": [
+        384,
+        768,
+        256
+      ],
+      "kind": 8
+    },
+    "blk.20.ffn_up_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.20.geo_mixer_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.20.geo_mixer_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.20.geo_mlp_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.20.geo_mlp_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.20.ssm_b_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.20.ssm_b_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.20.ssm_c_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.20.ssm_c_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.20.ssm_d": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.20.ssm_dt_bias": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.20.ssm_in.weight": {
+      "dimensions": [
+        1536,
+        6288
+      ],
+      "kind": 13
+    },
+    "blk.20.ssm_in_dyn.weight": {
+      "dimensions": [
+        1536,
+        1056
+      ],
+      "kind": 13
+    },
+    "blk.20.ssm_m3_bias": {
+      "dimensions": [
+        128,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.20.ssm_m3_misc": {
+      "dimensions": [
+        48,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.20.ssm_m3_mxz": {
+      "dimensions": [
+        64,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.20.ssm_m3_norms": {
+      "dimensions": [
+        128,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.20.ssm_mimo_o": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.20.ssm_mimo_x": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.20.ssm_mimo_z": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.21.attn_output.weight": {
+      "dimensions": [
+        3072,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.21.exp_probs_b": {
+      "dimensions": [
+        256
+      ],
+      "kind": 0
+    },
+    "blk.21.ffn_down_exps.weight": {
+      "dimensions": [
+        768,
+        384,
+        256
+      ],
+      "kind": 14
+    },
+    "blk.21.ffn_down_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 14
+    },
+    "blk.21.ffn_gate_inp.weight": {
+      "dimensions": [
+        1536,
+        256
+      ],
+      "kind": 0
+    },
+    "blk.21.ffn_latent_down.weight": {
+      "dimensions": [
+        1536,
+        384
+      ],
+      "kind": 13
+    },
+    "blk.21.ffn_latent_up.weight": {
+      "dimensions": [
+        384,
+        1536
+      ],
+      "kind": 30
+    },
+    "blk.21.ffn_up_exps.weight": {
+      "dimensions": [
+        384,
+        768,
+        256
+      ],
+      "kind": 8
+    },
+    "blk.21.ffn_up_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.21.geo_mixer_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.21.geo_mixer_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.21.geo_mlp_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.21.geo_mlp_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.21.ssm_b_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.21.ssm_b_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.21.ssm_c_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.21.ssm_c_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.21.ssm_d": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.21.ssm_dt_bias": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.21.ssm_in.weight": {
+      "dimensions": [
+        1536,
+        6288
+      ],
+      "kind": 13
+    },
+    "blk.21.ssm_in_dyn.weight": {
+      "dimensions": [
+        1536,
+        1056
+      ],
+      "kind": 13
+    },
+    "blk.21.ssm_m3_bias": {
+      "dimensions": [
+        128,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.21.ssm_m3_misc": {
+      "dimensions": [
+        48,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.21.ssm_m3_mxz": {
+      "dimensions": [
+        64,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.21.ssm_m3_norms": {
+      "dimensions": [
+        128,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.21.ssm_mimo_o": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.21.ssm_mimo_x": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.21.ssm_mimo_z": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.22.attn_output.weight": {
+      "dimensions": [
+        3072,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.22.exp_probs_b": {
+      "dimensions": [
+        256
+      ],
+      "kind": 0
+    },
+    "blk.22.ffn_down_exps.weight": {
+      "dimensions": [
+        768,
+        384,
+        256
+      ],
+      "kind": 13
+    },
+    "blk.22.ffn_down_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.22.ffn_gate_inp.weight": {
+      "dimensions": [
+        1536,
+        256
+      ],
+      "kind": 0
+    },
+    "blk.22.ffn_latent_down.weight": {
+      "dimensions": [
+        1536,
+        384
+      ],
+      "kind": 13
+    },
+    "blk.22.ffn_latent_up.weight": {
+      "dimensions": [
+        384,
+        1536
+      ],
+      "kind": 30
+    },
+    "blk.22.ffn_up_exps.weight": {
+      "dimensions": [
+        384,
+        768,
+        256
+      ],
+      "kind": 8
+    },
+    "blk.22.ffn_up_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.22.geo_mixer_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.22.geo_mixer_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.22.geo_mlp_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.22.geo_mlp_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.22.ssm_b_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.22.ssm_b_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.22.ssm_c_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.22.ssm_c_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.22.ssm_d": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.22.ssm_dt_bias": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.22.ssm_in.weight": {
+      "dimensions": [
+        1536,
+        6288
+      ],
+      "kind": 13
+    },
+    "blk.22.ssm_in_dyn.weight": {
+      "dimensions": [
+        1536,
+        1056
+      ],
+      "kind": 13
+    },
+    "blk.22.ssm_m3_bias": {
+      "dimensions": [
+        128,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.22.ssm_m3_misc": {
+      "dimensions": [
+        48,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.22.ssm_m3_mxz": {
+      "dimensions": [
+        64,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.22.ssm_m3_norms": {
+      "dimensions": [
+        128,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.22.ssm_mimo_o": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.22.ssm_mimo_x": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.22.ssm_mimo_z": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.23.attn_output.weight": {
+      "dimensions": [
+        3072,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.23.exp_probs_b": {
+      "dimensions": [
+        256
+      ],
+      "kind": 0
+    },
+    "blk.23.ffn_down_exps.weight": {
+      "dimensions": [
+        768,
+        384,
+        256
+      ],
+      "kind": 13
+    },
+    "blk.23.ffn_down_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.23.ffn_gate_inp.weight": {
+      "dimensions": [
+        1536,
+        256
+      ],
+      "kind": 0
+    },
+    "blk.23.ffn_latent_down.weight": {
+      "dimensions": [
+        1536,
+        384
+      ],
+      "kind": 13
+    },
+    "blk.23.ffn_latent_up.weight": {
+      "dimensions": [
+        384,
+        1536
+      ],
+      "kind": 30
+    },
+    "blk.23.ffn_up_exps.weight": {
+      "dimensions": [
+        384,
+        768,
+        256
+      ],
+      "kind": 8
+    },
+    "blk.23.ffn_up_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.23.geo_mixer_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.23.geo_mixer_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.23.geo_mlp_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.23.geo_mlp_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.23.ssm_b_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.23.ssm_b_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.23.ssm_c_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.23.ssm_c_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.23.ssm_d": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.23.ssm_dt_bias": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.23.ssm_in.weight": {
+      "dimensions": [
+        1536,
+        6288
+      ],
+      "kind": 13
+    },
+    "blk.23.ssm_in_dyn.weight": {
+      "dimensions": [
+        1536,
+        1056
+      ],
+      "kind": 13
+    },
+    "blk.23.ssm_m3_bias": {
+      "dimensions": [
+        128,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.23.ssm_m3_misc": {
+      "dimensions": [
+        48,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.23.ssm_m3_mxz": {
+      "dimensions": [
+        64,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.23.ssm_m3_norms": {
+      "dimensions": [
+        128,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.23.ssm_mimo_o": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.23.ssm_mimo_x": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.23.ssm_mimo_z": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.24.attn_gate.weight": {
+      "dimensions": [
+        1536,
+        4608
+      ],
+      "kind": 13
+    },
+    "blk.24.attn_k_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.24.attn_lambda.weight": {
+      "dimensions": [
+        1536,
+        12
+      ],
+      "kind": 13
+    },
+    "blk.24.attn_output.weight": {
+      "dimensions": [
+        4608,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.24.attn_q.weight": {
+      "dimensions": [
+        1536,
+        6144
+      ],
+      "kind": 13
+    },
+    "blk.24.attn_q_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.24.attn_shift_k.weight": {
+      "dimensions": [
+        1536,
+        12
+      ],
+      "kind": 13
+    },
+    "blk.24.attn_shift_v.weight": {
+      "dimensions": [
+        1536,
+        12
+      ],
+      "kind": 13
+    },
+    "blk.24.attn_softmax_scaler": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.24.attn_wa_k.weight": {
+      "dimensions": [
+        1536,
+        48
+      ],
+      "kind": 13
+    },
+    "blk.24.attn_wa_v.weight": {
+      "dimensions": [
+        1536,
+        48
+      ],
+      "kind": 13
+    },
+    "blk.24.attn_wb_k.weight": {
+      "dimensions": [
+        1536,
+        512
+      ],
+      "kind": 13
+    },
+    "blk.24.attn_wb_v.weight": {
+      "dimensions": [
+        1536,
+        512
+      ],
+      "kind": 13
+    },
+    "blk.24.exp_probs_b": {
+      "dimensions": [
+        256
+      ],
+      "kind": 0
+    },
+    "blk.24.ffn_down_exps.weight": {
+      "dimensions": [
+        768,
+        384,
+        256
+      ],
+      "kind": 14
+    },
+    "blk.24.ffn_down_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 14
+    },
+    "blk.24.ffn_gate_inp.weight": {
+      "dimensions": [
+        1536,
+        256
+      ],
+      "kind": 0
+    },
+    "blk.24.ffn_latent_down.weight": {
+      "dimensions": [
+        1536,
+        384
+      ],
+      "kind": 13
+    },
+    "blk.24.ffn_latent_up.weight": {
+      "dimensions": [
+        384,
+        1536
+      ],
+      "kind": 30
+    },
+    "blk.24.ffn_up_exps.weight": {
+      "dimensions": [
+        384,
+        768,
+        256
+      ],
+      "kind": 8
+    },
+    "blk.24.ffn_up_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.24.geo_mixer_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.24.geo_mixer_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.24.geo_mlp_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.24.geo_mlp_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.25.attn_output.weight": {
+      "dimensions": [
+        3072,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.25.exp_probs_b": {
+      "dimensions": [
+        256
+      ],
+      "kind": 0
+    },
+    "blk.25.ffn_down_exps.weight": {
+      "dimensions": [
+        768,
+        384,
+        256
+      ],
+      "kind": 13
+    },
+    "blk.25.ffn_down_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.25.ffn_gate_inp.weight": {
+      "dimensions": [
+        1536,
+        256
+      ],
+      "kind": 0
+    },
+    "blk.25.ffn_latent_down.weight": {
+      "dimensions": [
+        1536,
+        384
+      ],
+      "kind": 13
+    },
+    "blk.25.ffn_latent_up.weight": {
+      "dimensions": [
+        384,
+        1536
+      ],
+      "kind": 30
+    },
+    "blk.25.ffn_up_exps.weight": {
+      "dimensions": [
+        384,
+        768,
+        256
+      ],
+      "kind": 8
+    },
+    "blk.25.ffn_up_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.25.geo_mixer_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.25.geo_mixer_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.25.geo_mlp_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.25.geo_mlp_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.25.ssm_b_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.25.ssm_b_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.25.ssm_c_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.25.ssm_c_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.25.ssm_d": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.25.ssm_dt_bias": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.25.ssm_in.weight": {
+      "dimensions": [
+        1536,
+        6288
+      ],
+      "kind": 13
+    },
+    "blk.25.ssm_in_dyn.weight": {
+      "dimensions": [
+        1536,
+        1056
+      ],
+      "kind": 13
+    },
+    "blk.25.ssm_m3_bias": {
+      "dimensions": [
+        128,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.25.ssm_m3_misc": {
+      "dimensions": [
+        48,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.25.ssm_m3_mxz": {
+      "dimensions": [
+        64,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.25.ssm_m3_norms": {
+      "dimensions": [
+        128,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.25.ssm_mimo_o": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.25.ssm_mimo_x": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.25.ssm_mimo_z": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.26.attn_output.weight": {
+      "dimensions": [
+        3072,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.26.exp_probs_b": {
+      "dimensions": [
+        256
+      ],
+      "kind": 0
+    },
+    "blk.26.ffn_down_exps.weight": {
+      "dimensions": [
+        768,
+        384,
+        256
+      ],
+      "kind": 13
+    },
+    "blk.26.ffn_down_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.26.ffn_gate_inp.weight": {
+      "dimensions": [
+        1536,
+        256
+      ],
+      "kind": 0
+    },
+    "blk.26.ffn_latent_down.weight": {
+      "dimensions": [
+        1536,
+        384
+      ],
+      "kind": 13
+    },
+    "blk.26.ffn_latent_up.weight": {
+      "dimensions": [
+        384,
+        1536
+      ],
+      "kind": 30
+    },
+    "blk.26.ffn_up_exps.weight": {
+      "dimensions": [
+        384,
+        768,
+        256
+      ],
+      "kind": 8
+    },
+    "blk.26.ffn_up_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.26.geo_mixer_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.26.geo_mixer_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.26.geo_mlp_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.26.geo_mlp_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.26.ssm_b_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.26.ssm_b_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.26.ssm_c_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.26.ssm_c_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.26.ssm_d": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.26.ssm_dt_bias": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.26.ssm_in.weight": {
+      "dimensions": [
+        1536,
+        6288
+      ],
+      "kind": 13
+    },
+    "blk.26.ssm_in_dyn.weight": {
+      "dimensions": [
+        1536,
+        1056
+      ],
+      "kind": 13
+    },
+    "blk.26.ssm_m3_bias": {
+      "dimensions": [
+        128,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.26.ssm_m3_misc": {
+      "dimensions": [
+        48,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.26.ssm_m3_mxz": {
+      "dimensions": [
+        64,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.26.ssm_m3_norms": {
+      "dimensions": [
+        128,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.26.ssm_mimo_o": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.26.ssm_mimo_x": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.26.ssm_mimo_z": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.27.attn_output.weight": {
+      "dimensions": [
+        3072,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.27.exp_probs_b": {
+      "dimensions": [
+        256
+      ],
+      "kind": 0
+    },
+    "blk.27.ffn_down_exps.weight": {
+      "dimensions": [
+        768,
+        384,
+        256
+      ],
+      "kind": 14
+    },
+    "blk.27.ffn_down_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 14
+    },
+    "blk.27.ffn_gate_inp.weight": {
+      "dimensions": [
+        1536,
+        256
+      ],
+      "kind": 0
+    },
+    "blk.27.ffn_latent_down.weight": {
+      "dimensions": [
+        1536,
+        384
+      ],
+      "kind": 13
+    },
+    "blk.27.ffn_latent_up.weight": {
+      "dimensions": [
+        384,
+        1536
+      ],
+      "kind": 30
+    },
+    "blk.27.ffn_up_exps.weight": {
+      "dimensions": [
+        384,
+        768,
+        256
+      ],
+      "kind": 8
+    },
+    "blk.27.ffn_up_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.27.geo_mixer_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.27.geo_mixer_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.27.geo_mlp_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.27.geo_mlp_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.27.ssm_b_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.27.ssm_b_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.27.ssm_c_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.27.ssm_c_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.27.ssm_d": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.27.ssm_dt_bias": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.27.ssm_in.weight": {
+      "dimensions": [
+        1536,
+        6288
+      ],
+      "kind": 13
+    },
+    "blk.27.ssm_in_dyn.weight": {
+      "dimensions": [
+        1536,
+        1056
+      ],
+      "kind": 13
+    },
+    "blk.27.ssm_m3_bias": {
+      "dimensions": [
+        128,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.27.ssm_m3_misc": {
+      "dimensions": [
+        48,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.27.ssm_m3_mxz": {
+      "dimensions": [
+        64,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.27.ssm_m3_norms": {
+      "dimensions": [
+        128,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.27.ssm_mimo_o": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.27.ssm_mimo_x": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.27.ssm_mimo_z": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.28.attn_output.weight": {
+      "dimensions": [
+        3072,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.28.exp_probs_b": {
+      "dimensions": [
+        256
+      ],
+      "kind": 0
+    },
+    "blk.28.ffn_down_exps.weight": {
+      "dimensions": [
+        768,
+        384,
+        256
+      ],
+      "kind": 13
+    },
+    "blk.28.ffn_down_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.28.ffn_gate_inp.weight": {
+      "dimensions": [
+        1536,
+        256
+      ],
+      "kind": 0
+    },
+    "blk.28.ffn_latent_down.weight": {
+      "dimensions": [
+        1536,
+        384
+      ],
+      "kind": 13
+    },
+    "blk.28.ffn_latent_up.weight": {
+      "dimensions": [
+        384,
+        1536
+      ],
+      "kind": 30
+    },
+    "blk.28.ffn_up_exps.weight": {
+      "dimensions": [
+        384,
+        768,
+        256
+      ],
+      "kind": 8
+    },
+    "blk.28.ffn_up_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.28.geo_mixer_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.28.geo_mixer_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.28.geo_mlp_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.28.geo_mlp_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.28.ssm_b_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.28.ssm_b_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.28.ssm_c_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.28.ssm_c_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.28.ssm_d": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.28.ssm_dt_bias": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.28.ssm_in.weight": {
+      "dimensions": [
+        1536,
+        6288
+      ],
+      "kind": 13
+    },
+    "blk.28.ssm_in_dyn.weight": {
+      "dimensions": [
+        1536,
+        1056
+      ],
+      "kind": 13
+    },
+    "blk.28.ssm_m3_bias": {
+      "dimensions": [
+        128,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.28.ssm_m3_misc": {
+      "dimensions": [
+        48,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.28.ssm_m3_mxz": {
+      "dimensions": [
+        64,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.28.ssm_m3_norms": {
+      "dimensions": [
+        128,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.28.ssm_mimo_o": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.28.ssm_mimo_x": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.28.ssm_mimo_z": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.29.attn_gate.weight": {
+      "dimensions": [
+        1536,
+        4608
+      ],
+      "kind": 13
+    },
+    "blk.29.attn_k_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.29.attn_lambda.weight": {
+      "dimensions": [
+        1536,
+        12
+      ],
+      "kind": 13
+    },
+    "blk.29.attn_output.weight": {
+      "dimensions": [
+        4608,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.29.attn_q.weight": {
+      "dimensions": [
+        1536,
+        6144
+      ],
+      "kind": 13
+    },
+    "blk.29.attn_q_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.29.attn_shift_k.weight": {
+      "dimensions": [
+        1536,
+        12
+      ],
+      "kind": 13
+    },
+    "blk.29.attn_shift_v.weight": {
+      "dimensions": [
+        1536,
+        12
+      ],
+      "kind": 13
+    },
+    "blk.29.attn_softmax_scaler": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.29.attn_wa_k.weight": {
+      "dimensions": [
+        1536,
+        48
+      ],
+      "kind": 13
+    },
+    "blk.29.attn_wa_v.weight": {
+      "dimensions": [
+        1536,
+        48
+      ],
+      "kind": 13
+    },
+    "blk.29.attn_wb_k.weight": {
+      "dimensions": [
+        1536,
+        512
+      ],
+      "kind": 13
+    },
+    "blk.29.attn_wb_v.weight": {
+      "dimensions": [
+        1536,
+        512
+      ],
+      "kind": 13
+    },
+    "blk.29.exp_probs_b": {
+      "dimensions": [
+        256
+      ],
+      "kind": 0
+    },
+    "blk.29.ffn_down_exps.weight": {
+      "dimensions": [
+        768,
+        384,
+        256
+      ],
+      "kind": 13
+    },
+    "blk.29.ffn_down_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.29.ffn_gate_inp.weight": {
+      "dimensions": [
+        1536,
+        256
+      ],
+      "kind": 0
+    },
+    "blk.29.ffn_latent_down.weight": {
+      "dimensions": [
+        1536,
+        384
+      ],
+      "kind": 13
+    },
+    "blk.29.ffn_latent_up.weight": {
+      "dimensions": [
+        384,
+        1536
+      ],
+      "kind": 30
+    },
+    "blk.29.ffn_up_exps.weight": {
+      "dimensions": [
+        384,
+        768,
+        256
+      ],
+      "kind": 8
+    },
+    "blk.29.ffn_up_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.29.geo_mixer_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.29.geo_mixer_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.29.geo_mlp_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.29.geo_mlp_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.30.attn_output.weight": {
+      "dimensions": [
+        3072,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.30.exp_probs_b": {
+      "dimensions": [
+        256
+      ],
+      "kind": 0
+    },
+    "blk.30.ffn_down_exps.weight": {
+      "dimensions": [
+        768,
+        384,
+        256
+      ],
+      "kind": 14
+    },
+    "blk.30.ffn_down_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 14
+    },
+    "blk.30.ffn_gate_inp.weight": {
+      "dimensions": [
+        1536,
+        256
+      ],
+      "kind": 0
+    },
+    "blk.30.ffn_latent_down.weight": {
+      "dimensions": [
+        1536,
+        384
+      ],
+      "kind": 13
+    },
+    "blk.30.ffn_latent_up.weight": {
+      "dimensions": [
+        384,
+        1536
+      ],
+      "kind": 30
+    },
+    "blk.30.ffn_up_exps.weight": {
+      "dimensions": [
+        384,
+        768,
+        256
+      ],
+      "kind": 8
+    },
+    "blk.30.ffn_up_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.30.geo_mixer_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.30.geo_mixer_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.30.geo_mlp_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.30.geo_mlp_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.30.ssm_b_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.30.ssm_b_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.30.ssm_c_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.30.ssm_c_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.30.ssm_d": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.30.ssm_dt_bias": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.30.ssm_in.weight": {
+      "dimensions": [
+        1536,
+        6288
+      ],
+      "kind": 13
+    },
+    "blk.30.ssm_in_dyn.weight": {
+      "dimensions": [
+        1536,
+        1056
+      ],
+      "kind": 13
+    },
+    "blk.30.ssm_m3_bias": {
+      "dimensions": [
+        128,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.30.ssm_m3_misc": {
+      "dimensions": [
+        48,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.30.ssm_m3_mxz": {
+      "dimensions": [
+        64,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.30.ssm_m3_norms": {
+      "dimensions": [
+        128,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.30.ssm_mimo_o": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.30.ssm_mimo_x": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.30.ssm_mimo_z": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.31.attn_output.weight": {
+      "dimensions": [
+        3072,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.31.exp_probs_b": {
+      "dimensions": [
+        256
+      ],
+      "kind": 0
+    },
+    "blk.31.ffn_down_exps.weight": {
+      "dimensions": [
+        768,
+        384,
+        256
+      ],
+      "kind": 14
+    },
+    "blk.31.ffn_down_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 14
+    },
+    "blk.31.ffn_gate_inp.weight": {
+      "dimensions": [
+        1536,
+        256
+      ],
+      "kind": 0
+    },
+    "blk.31.ffn_latent_down.weight": {
+      "dimensions": [
+        1536,
+        384
+      ],
+      "kind": 13
+    },
+    "blk.31.ffn_latent_up.weight": {
+      "dimensions": [
+        384,
+        1536
+      ],
+      "kind": 30
+    },
+    "blk.31.ffn_up_exps.weight": {
+      "dimensions": [
+        384,
+        768,
+        256
+      ],
+      "kind": 8
+    },
+    "blk.31.ffn_up_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.31.geo_mixer_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.31.geo_mixer_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.31.geo_mlp_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.31.geo_mlp_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.31.ssm_b_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.31.ssm_b_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.31.ssm_c_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.31.ssm_c_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.31.ssm_d": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.31.ssm_dt_bias": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.31.ssm_in.weight": {
+      "dimensions": [
+        1536,
+        6288
+      ],
+      "kind": 13
+    },
+    "blk.31.ssm_in_dyn.weight": {
+      "dimensions": [
+        1536,
+        1056
+      ],
+      "kind": 13
+    },
+    "blk.31.ssm_m3_bias": {
+      "dimensions": [
+        128,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.31.ssm_m3_misc": {
+      "dimensions": [
+        48,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.31.ssm_m3_mxz": {
+      "dimensions": [
+        64,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.31.ssm_m3_norms": {
+      "dimensions": [
+        128,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.31.ssm_mimo_o": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.31.ssm_mimo_x": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.31.ssm_mimo_z": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.32.attn_output.weight": {
+      "dimensions": [
+        3072,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.32.exp_probs_b": {
+      "dimensions": [
+        256
+      ],
+      "kind": 0
+    },
+    "blk.32.ffn_down_exps.weight": {
+      "dimensions": [
+        768,
+        384,
+        256
+      ],
+      "kind": 14
+    },
+    "blk.32.ffn_down_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 14
+    },
+    "blk.32.ffn_gate_inp.weight": {
+      "dimensions": [
+        1536,
+        256
+      ],
+      "kind": 0
+    },
+    "blk.32.ffn_latent_down.weight": {
+      "dimensions": [
+        1536,
+        384
+      ],
+      "kind": 13
+    },
+    "blk.32.ffn_latent_up.weight": {
+      "dimensions": [
+        384,
+        1536
+      ],
+      "kind": 30
+    },
+    "blk.32.ffn_up_exps.weight": {
+      "dimensions": [
+        384,
+        768,
+        256
+      ],
+      "kind": 8
+    },
+    "blk.32.ffn_up_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.32.geo_mixer_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.32.geo_mixer_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.32.geo_mlp_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.32.geo_mlp_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.32.ssm_b_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.32.ssm_b_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.32.ssm_c_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.32.ssm_c_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.32.ssm_d": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.32.ssm_dt_bias": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.32.ssm_in.weight": {
+      "dimensions": [
+        1536,
+        6288
+      ],
+      "kind": 13
+    },
+    "blk.32.ssm_in_dyn.weight": {
+      "dimensions": [
+        1536,
+        1056
+      ],
+      "kind": 13
+    },
+    "blk.32.ssm_m3_bias": {
+      "dimensions": [
+        128,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.32.ssm_m3_misc": {
+      "dimensions": [
+        48,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.32.ssm_m3_mxz": {
+      "dimensions": [
+        64,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.32.ssm_m3_norms": {
+      "dimensions": [
+        128,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.32.ssm_mimo_o": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.32.ssm_mimo_x": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.32.ssm_mimo_z": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.33.attn_output.weight": {
+      "dimensions": [
+        3072,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.33.exp_probs_b": {
+      "dimensions": [
+        256
+      ],
+      "kind": 0
+    },
+    "blk.33.ffn_down_exps.weight": {
+      "dimensions": [
+        768,
+        384,
+        256
+      ],
+      "kind": 14
+    },
+    "blk.33.ffn_down_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 14
+    },
+    "blk.33.ffn_gate_inp.weight": {
+      "dimensions": [
+        1536,
+        256
+      ],
+      "kind": 0
+    },
+    "blk.33.ffn_latent_down.weight": {
+      "dimensions": [
+        1536,
+        384
+      ],
+      "kind": 13
+    },
+    "blk.33.ffn_latent_up.weight": {
+      "dimensions": [
+        384,
+        1536
+      ],
+      "kind": 30
+    },
+    "blk.33.ffn_up_exps.weight": {
+      "dimensions": [
+        384,
+        768,
+        256
+      ],
+      "kind": 8
+    },
+    "blk.33.ffn_up_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.33.geo_mixer_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.33.geo_mixer_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.33.geo_mlp_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.33.geo_mlp_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.33.ssm_b_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.33.ssm_b_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.33.ssm_c_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.33.ssm_c_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.33.ssm_d": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.33.ssm_dt_bias": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.33.ssm_in.weight": {
+      "dimensions": [
+        1536,
+        6288
+      ],
+      "kind": 13
+    },
+    "blk.33.ssm_in_dyn.weight": {
+      "dimensions": [
+        1536,
+        1056
+      ],
+      "kind": 13
+    },
+    "blk.33.ssm_m3_bias": {
+      "dimensions": [
+        128,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.33.ssm_m3_misc": {
+      "dimensions": [
+        48,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.33.ssm_m3_mxz": {
+      "dimensions": [
+        64,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.33.ssm_m3_norms": {
+      "dimensions": [
+        128,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.33.ssm_mimo_o": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.33.ssm_mimo_x": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.33.ssm_mimo_z": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.34.attn_gate.weight": {
+      "dimensions": [
+        1536,
+        4608
+      ],
+      "kind": 13
+    },
+    "blk.34.attn_k_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.34.attn_lambda.weight": {
+      "dimensions": [
+        1536,
+        12
+      ],
+      "kind": 13
+    },
+    "blk.34.attn_output.weight": {
+      "dimensions": [
+        4608,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.34.attn_q.weight": {
+      "dimensions": [
+        1536,
+        6144
+      ],
+      "kind": 13
+    },
+    "blk.34.attn_q_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.34.attn_shift_k.weight": {
+      "dimensions": [
+        1536,
+        12
+      ],
+      "kind": 13
+    },
+    "blk.34.attn_shift_v.weight": {
+      "dimensions": [
+        1536,
+        12
+      ],
+      "kind": 13
+    },
+    "blk.34.attn_softmax_scaler": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.34.attn_wa_k.weight": {
+      "dimensions": [
+        1536,
+        48
+      ],
+      "kind": 13
+    },
+    "blk.34.attn_wa_v.weight": {
+      "dimensions": [
+        1536,
+        48
+      ],
+      "kind": 13
+    },
+    "blk.34.attn_wb_k.weight": {
+      "dimensions": [
+        1536,
+        512
+      ],
+      "kind": 13
+    },
+    "blk.34.attn_wb_v.weight": {
+      "dimensions": [
+        1536,
+        512
+      ],
+      "kind": 13
+    },
+    "blk.34.exp_probs_b": {
+      "dimensions": [
+        256
+      ],
+      "kind": 0
+    },
+    "blk.34.ffn_down_exps.weight": {
+      "dimensions": [
+        768,
+        384,
+        256
+      ],
+      "kind": 14
+    },
+    "blk.34.ffn_down_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 14
+    },
+    "blk.34.ffn_gate_inp.weight": {
+      "dimensions": [
+        1536,
+        256
+      ],
+      "kind": 0
+    },
+    "blk.34.ffn_latent_down.weight": {
+      "dimensions": [
+        1536,
+        384
+      ],
+      "kind": 13
+    },
+    "blk.34.ffn_latent_up.weight": {
+      "dimensions": [
+        384,
+        1536
+      ],
+      "kind": 30
+    },
+    "blk.34.ffn_up_exps.weight": {
+      "dimensions": [
+        384,
+        768,
+        256
+      ],
+      "kind": 8
+    },
+    "blk.34.ffn_up_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.34.geo_mixer_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.34.geo_mixer_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.34.geo_mlp_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.34.geo_mlp_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.35.attn_output.weight": {
+      "dimensions": [
+        3072,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.35.exp_probs_b": {
+      "dimensions": [
+        256
+      ],
+      "kind": 0
+    },
+    "blk.35.ffn_down_exps.weight": {
+      "dimensions": [
+        768,
+        384,
+        256
+      ],
+      "kind": 14
+    },
+    "blk.35.ffn_down_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 14
+    },
+    "blk.35.ffn_gate_inp.weight": {
+      "dimensions": [
+        1536,
+        256
+      ],
+      "kind": 0
+    },
+    "blk.35.ffn_latent_down.weight": {
+      "dimensions": [
+        1536,
+        384
+      ],
+      "kind": 13
+    },
+    "blk.35.ffn_latent_up.weight": {
+      "dimensions": [
+        384,
+        1536
+      ],
+      "kind": 30
+    },
+    "blk.35.ffn_up_exps.weight": {
+      "dimensions": [
+        384,
+        768,
+        256
+      ],
+      "kind": 8
+    },
+    "blk.35.ffn_up_shexp.weight": {
+      "dimensions": [
+        1536,
+        1536
+      ],
+      "kind": 13
+    },
+    "blk.35.geo_mixer_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.35.geo_mixer_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.35.geo_mlp_bias": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.35.geo_mlp_scale": {
+      "dimensions": [
+        1
+      ],
+      "kind": 0
+    },
+    "blk.35.ssm_b_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.35.ssm_b_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.35.ssm_c_bias": {
+      "dimensions": [
+        128,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.35.ssm_c_norm.weight": {
+      "dimensions": [
+        128
+      ],
+      "kind": 0
+    },
+    "blk.35.ssm_d": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.35.ssm_dt_bias": {
+      "dimensions": [
+        48
+      ],
+      "kind": 0
+    },
+    "blk.35.ssm_in.weight": {
+      "dimensions": [
+        1536,
+        6288
+      ],
+      "kind": 13
+    },
+    "blk.35.ssm_in_dyn.weight": {
+      "dimensions": [
+        1536,
+        1056
+      ],
+      "kind": 13
+    },
+    "blk.35.ssm_m3_bias": {
+      "dimensions": [
+        128,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.35.ssm_m3_misc": {
+      "dimensions": [
+        48,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.35.ssm_m3_mxz": {
+      "dimensions": [
+        64,
+        8,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.35.ssm_m3_norms": {
+      "dimensions": [
+        128,
+        2
+      ],
+      "kind": 0
+    },
+    "blk.35.ssm_mimo_o": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.35.ssm_mimo_x": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    },
+    "blk.35.ssm_mimo_z": {
+      "dimensions": [
+        64,
+        4,
+        48
+      ],
+      "kind": 0
+    }
+  }
+}

@@ -58,14 +58,21 @@ pub(super) fn capabilities() -> Vec<KernelCapability> {
         cap(K::ResidualCollapse4, &[F32, F32]),
         cap(K::PlainLinear, &[DENSE, F32]),
         cap(K::Q8Linear, &[BYTES, F32]),
+        cap(K::Q8ExpertLinear, &[BYTES, F32, INDICES]),
         cap(K::Q8Pair, &[BYTES, BYTES, F32]),
         cap(K::Router, &[F32, F32]),
         cap(K::SharedSwiGlu, &[F32, F32]),
         cap(K::WeightedSwiGlu, &[F32, F32, F32]),
+        cap(K::RowGateBlendPair, &[F32, F32, F32, F32, F32, F32]),
+        cap(K::DifferentialSiluGate, &[F32, F32, F32]),
+        cap(K::SmallRowMatmul, &[F32, F32]),
+        cap(K::ReluSquared, &[F32]),
+        cap(K::WeightedSumSix, &[F32, F32]),
+        cap(K::SigmoidRouter256, &[F32, F32]),
         cap(K::SumSix, &[F32]),
     ];
     use PackedEncoding::*;
-    for e in [Iq2Xxs, Iq2Xs, Iq1M, Q5K, Q2K, Q4K] {
+    for e in [Iq2Xxs, Iq2Xs, Iq1M, Q5K, Q6K, Q2K, Q4K] {
         caps.extend([
             cap(K::BlockLinear(e), &[BYTES, F32]),
             cap(K::GroupedLinear(e), &[BYTES, F32]),
@@ -81,6 +88,7 @@ fn encoding(e: PackedEncoding) -> native::BlockFormat {
         PackedEncoding::Iq2Xs => B::Iq2Xs,
         PackedEncoding::Iq1M => B::Iq1M,
         PackedEncoding::Q5K => B::Q5K,
+        PackedEncoding::Q6K => B::Q6K,
         PackedEncoding::Q2K => B::Q2K,
         PackedEncoding::Q4K => B::Q4K,
     }
@@ -198,6 +206,7 @@ pub(super) fn invoke(
             a[2],
             stream,
         )?),
+        K::Q8ExpertLinear => Outputs::One(native::q8_expert_matvec(a[0], a[1], a[2], stream)?),
         K::Q8Pair => {
             let (x, y) = native::q8_matvec_pair(a[0], a[1], a[2], stream)?;
             Outputs::Two([x, y])
@@ -218,6 +227,30 @@ pub(super) fn invoke(
             f32::from_bits(*clamp),
             stream,
         )?),
+        K::RowGateBlendPair { zero } => {
+            let (k, v) = native::row_gate_blend_pair(a, *zero, stream)?;
+            Outputs::Two([k, v])
+        }
+        K::DifferentialSiluGate { bias } => Outputs::One(native::differential_silu_gate(
+            a[0],
+            a[1],
+            a[2],
+            f32::from_bits(*bias),
+            stream,
+        )?),
+        K::SmallRowMatmul { transpose_rhs } => Outputs::One(native::small_row_matmul(
+            a[0],
+            a[1],
+            *transpose_rhs,
+            stream,
+        )?),
+        K::ReluSquared => Outputs::One(native::relu_squared(a[0], stream)?),
+        K::WeightedSumSix => Outputs::One(native::weighted_sum6(a[0], a[1], stream)?),
+        K::SigmoidRouter256 { scale } => {
+            let (ids, weights) =
+                native::sigmoid_router256(a[0], a[1], f32::from_bits(*scale), stream)?;
+            Outputs::Two([ids, weights])
+        }
         K::SumSix => Outputs::One(native::sum_six(a[0], stream)?),
     };
     Ok(Some(out))

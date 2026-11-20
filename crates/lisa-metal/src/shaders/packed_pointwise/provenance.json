@@ -1,0 +1,13 @@
+{
+  "oracle_commit": "a9d06df",
+  "oracle": "Standalone native F32 operations and dense Q8_0 expert reductions; no upstream fused-kernel parity claim.",
+  "sources": {
+    "crates/lisa-metal/src/shaders/common/elementwise/unary_ops.metal": "3d8468b33074b69de8925fc29c4f8ced98a89fde63c7ca7a20f396da8583f6af",
+    "crates/lisa-metal/src/shaders/common/elementwise/elementwise_binary.metal": "d36cd447c7a78fb1189e37ff20d49a158c14b8348ca37fcbcfe5707aa9473498",
+    "crates/lisa-metal/src/shaders/common/reduce/reduce.metal": "c92fcde69f7e38a46767e74586cae0ebc72707bba22feb2ca6ae9cbe8cad52b3",
+    "crates/lisa-metal/src/shaders/common/matmul/dense_gemm.metal": "67393cdce147d349988cdb41f631d802fff6e647bb051acd0b076dc6da78cb05"
+  },
+  "local_sha256": "6fd844caeaa46565e275e772f3215e0b18f414ca02facf7335b193655c32d70b",
+  "changes": "Native sigmoid, four-consecutive-read sum, stable top-six selection, separately rounded products/adds and original fast division. Safe + Precise compilation with FP contraction disabled and explicit metal::fast::divide for route normalization. No weight conversions. ReLU uses the original comparison maximum, including NaN -> positive zero.",
+  "small_row_matmul": "Two F32 NN/NT 8x32x16 instantiations of the unchanged native dense_gemm helper; original eight-wide MMA chain, BK=16, K traversal and SafeNoLang math. Transposed RHS uses original storage strides."
+}

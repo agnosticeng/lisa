@@ -48,8 +48,8 @@ The script builds and locally signs the app, keeping debug symbols separately
 in `target/dist/Lisa.app.dSYM`. The complete app includes its compressed Metal
 source package, `kernels.bin`; the bundle build reports its complete size.
 In **Models**, download a checkpoint, then select it to load. Choose a language model to chat or an image
-model to generate. Downloaded models appear first; compatible checkpoints
-already in your Hugging Face cache are discovered automatically.
+model to generate. Only curated models appear in this list. Allowed checkpoints
+already in your Hugging Face cache are discovered automatically and appear first.
 
 Chats and attachments stay in `~/Library/Application Support/Lisa/chats`.
 Generated images appear as preview cards and are saved to `~/Pictures/Lisa`.
@@ -112,6 +112,19 @@ Draft block size and target
 verification width are tuned separately; PLD retains its depth-six clamp.
 See [the Qwen model notes](specs/models/qwen.md#dspine-block-drafter).
 
+### Olala 5-bit preview
+
+The UI, CLI and HTTP API can run the original [Olala mini Q5_K_M GGUF](https://huggingface.co/OVHaiLLM/Olala-v1.0-mini-7A1B-GGUF):
+
+```sh
+./target/release/lisa run --model OVHaiLLM/Olala-v1.0-mini-7A1B-GGUF \
+  --prompt "Explain what a compiler does." --max-tokens 128
+```
+
+Support is experimental and serial. The original packed GGUF is shared across
+backend-independent loading and model plans; ROCm is not yet implemented.
+See [Olala status and limits](specs/models/olala.md).
+
 ## Supported models
 
 These are the desktop app's curated downloads. Model names link to their
@@ -122,6 +135,7 @@ Hugging Face checkpoints; exact selections live in
 
 | Model | Weights | Implementation |
 | --- | --- | --- |
+| [Olala mini 7A1B](https://huggingface.co/OVHaiLLM/Olala-v1.0-mini-7A1B-GGUF) | Original GGUF Q5_K_M · 5.99 GB | Experimental text chat and tools |
 | [LFM3 1.7B](https://huggingface.co/LiquidAI/LFM3-1.7B-MLX-4bit) | MLX 4-bit · 991 MB | Text and tools on iPhone and Mac |
 | [Qwen 3.5 0.8B](https://huggingface.co/mlx-community/Qwen3.5-0.8B-MLX-4bit) | MLX 4-bit | Text and compatible image input |
 | [Qwen 3.5 4B](https://huggingface.co/mlx-community/Qwen3.5-4B-MLX-4bit) | MLX 4-bit | Text and compatible image input |

@@ -4,6 +4,7 @@
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ModelKind {
     Lfm3,
+    Olala,
     Qwen4,
     Qwen35,
     Qwen35Gguf,
@@ -18,6 +19,7 @@ pub enum ModelKind {
 impl ModelKind {
     pub fn from_model_type(name: &str) -> anyhow::Result<Self> {
         match name {
+            "olala" => Ok(Self::Olala),
             "lfm3" => Ok(Self::Lfm3),
             "qwen4_exp" | "qwen4_exp_text" => Ok(Self::Qwen4),
             "qwen3_5" | "qwen3_5_text" => Ok(Self::Qwen35),

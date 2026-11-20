@@ -54,3 +54,6 @@ pub mod vision;
 
 #[cfg(all(test, feature = "metal"))]
 mod laya_plan_tests;
+
+#[cfg(all(test, feature = "metal"))]
+mod olala_tests;
