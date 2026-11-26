@@ -17,7 +17,7 @@ fn slice(x: &Array, start: i32, end: i32) -> Array {
 }
 fn modulate(x: &Array, m: &[Array], shift: usize, scale: usize) -> anyhow::Result<Array> {
     Ok(layer_norm(x)?
-        .multiply(&m[scale].add(&Array::from_f32(1.0))?)?
+        .multiply(&m[scale].add(Array::from_f32(1.0))?)?
         .add(&m[shift])?)
 }
 impl Dit {
@@ -88,7 +88,7 @@ impl Dit {
         let half = x.dim(-1) / 2;
         self.w.lin(
             &format!("{p}.linear_out"),
-            &silu(&slice(&x, 0, half))?.multiply(&slice(&x, half, 2 * half))?,
+            &silu(&slice(&x, 0, half))?.multiply(slice(&x, half, 2 * half))?,
         )
     }
     pub fn forward(
@@ -217,7 +217,7 @@ impl Dit {
             let k = self.heads_norm(slice(&proj, d, 2 * d), &format!("{p}.norm_k.weight"))?;
             let v = self.heads(slice(&proj, 2 * d, 3 * d))?;
             let attn = self.attention(q, k, v, &cos, &sin)?;
-            let act = silu(&slice(&proj, 3 * d, 3 * d + mlp))?.multiply(&slice(
+            let act = silu(&slice(&proj, 3 * d, 3 * d + mlp))?.multiply(slice(
                 &proj,
                 3 * d + mlp,
                 3 * d + 2 * mlp,
@@ -231,8 +231,8 @@ impl Dit {
         }
         let modulation = self.w.lin("norm_out.linear", &st)?;
         let x = layer_norm(&x.index((.., nt..nj, ..)))?
-            .multiply(&slice(&modulation, 0, self.inner).add(&Array::from_f32(1.0))?)?
-            .add(&slice(&modulation, self.inner, 2 * self.inner))?;
+            .multiply(&slice(&modulation, 0, self.inner).add(Array::from_f32(1.0))?)?
+            .add(slice(&modulation, self.inner, 2 * self.inner))?;
         self.w.lin("proj_out", &x)
     }
 }

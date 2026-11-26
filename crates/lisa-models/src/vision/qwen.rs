@@ -25,8 +25,8 @@ impl Config {
         anyhow::ensure!(
             self.hidden_size > 0
                 && self.num_heads > 0
-                && self.hidden_size % self.num_heads == 0
-                && self.hidden_size / self.num_heads % 4 == 0
+                && self.hidden_size.is_multiple_of(self.num_heads)
+                && (self.hidden_size / self.num_heads).is_multiple_of(4)
                 && self.depth > 0
                 && self.depth <= 128,
             "unsupported Qwen vision dimensions"
@@ -72,8 +72,8 @@ impl Config {
         anyhow::ensure!(
             gh > 0
                 && gw > 0
-                && gh % self.spatial_merge_size == 0
-                && gw % self.spatial_merge_size == 0
+                && gh.is_multiple_of(self.spatial_merge_size)
+                && gw.is_multiple_of(self.spatial_merge_size)
                 && n.checked_mul(width) == Some(len),
             "invalid vision patch shape"
         );
@@ -219,7 +219,10 @@ pub fn encoder(c: &Config, schema: &Schema, gh: usize, gw: usize) -> anyhow::Res
             .ok_or_else(|| anyhow::anyhow!("vision patch count overflow"))?,
     )?;
     anyhow::ensure!(
-        gh > 0 && gw > 0 && gh % c.spatial_merge_size == 0 && gw % c.spatial_merge_size == 0,
+        gh > 0
+            && gw > 0
+            && gh.is_multiple_of(c.spatial_merge_size)
+            && gw.is_multiple_of(c.spatial_merge_size),
         "invalid vision grid"
     );
     let h = c.hidden_size as i32;

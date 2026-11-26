@@ -1,5 +1,5 @@
 //! Checkpoint-defined rotary coefficients, independent of device kernels.
-/// The same host-side powf/reciprocal and YaRN operation order as DS4.
+/// The same host-side powf/reciprocal and YaRN operation order as the reference.
 pub fn rope_frequencies(compressed: bool) -> &'static [f32; 32] {
     static FREQUENCIES: std::sync::OnceLock<[[f32; 32]; 2]> = std::sync::OnceLock::new();
     &FREQUENCIES.get_or_init(|| {

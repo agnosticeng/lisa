@@ -7,8 +7,7 @@ use super::common::EXACT_HEADER;
 /// `track_gated_rms` (split-z form): the output gated RMS over `Dv` per value/// head (the engine's butterfly reduction), then `sigmoid(z) * out` in one
 /// launch. `y`, `zproj` and `out` are flat `[rows, Hv, Dv]`, `zproj` is
 /// `[rows, Hv*Dv]`, `w` is `[Dv]`.
-const GATED_RMS_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("qwen4/gated_rms.metal");
+const GATED_RMS_SOURCE: &crate::shader_pack::Source = crate::kernel_source!("gdn/gated_rms.metal");
 
 static GATED_RMS: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 
@@ -59,6 +58,7 @@ pub fn gated_rms(
         TemplateArg::Int("Dv", dv),
         TemplateArg::Int("EPS_BITS", eps.to_bits() as i32),
         TemplateArg::Bool("SIGLU", false),
+        TemplateArg::Bool("SERIAL_GATE", false),
     ];
     let outs = [OutputArg {
         shape: vec![rows * hv * dv],
@@ -79,7 +79,7 @@ pub fn gated_rms(
 }
 
 /// Run the fused gated RMS with the SILU gate (qwen3_5 `output_gate_type=swish`
-/// — specs/01): `silu(z) * RMSNorm(out)` in one launch, replacing the composed
+///): `silu(z) * RMSNorm(out)` in one launch, replacing the composed
 /// `fast::rms_norm` + `nn::silu` (= Sigmoid + bmul) + `multiply` chain — 4
 /// dispatches per GDN layer down to 1. The kernel's silu arm reproduces the
 /// composed rounding points (sigmoid→bf16, z·sig→bf16, gate·normed→bf16);
@@ -92,6 +92,22 @@ pub fn gated_rms_silu(
     hv: i32,
     dv: i32,
     eps: f32,
+    stream: &Stream,
+) -> Option<Array> {
+    gated_rms_silu_with_serial_gate(y, zproj, w, hv, dv, eps, false, stream)
+}
+
+/// Select the fused serial decoder's SiLU law for captured verification.
+/// The composed prefill law remains available through `gated_rms_silu`.
+#[allow(clippy::too_many_arguments)]
+pub fn gated_rms_silu_with_serial_gate(
+    y: &Array,
+    zproj: &Array,
+    w: &Array,
+    hv: i32,
+    dv: i32,
+    eps: f32,
+    serial_gate: bool,
     stream: &Stream,
 ) -> Option<Array> {
     let kernel = gated_rms_kernel().as_ref()?;
@@ -112,6 +128,7 @@ pub fn gated_rms_silu(
         TemplateArg::Int("Dv", dv),
         TemplateArg::Int("EPS_BITS", eps.to_bits() as i32),
         TemplateArg::Bool("SIGLU", true),
+        TemplateArg::Bool("SERIAL_GATE", serial_gate),
     ];
     let outs = [OutputArg {
         shape: vec![rows * hv * dv],
@@ -136,7 +153,7 @@ pub fn gated_rms_silu(
 ///
 /// `w`/`normed` are `[rows, HC*H]`, `inj` is `[rows, HC]` -> `input`
 /// `[rows, H]`, `inject` `[rows, HC]`.
-const HC_MIX_SOURCE: &crate::shader_pack::Source = crate::kernel_source!("qwen4/hc_mix.metal");
+const HC_MIX_SOURCE: &crate::shader_pack::Source = crate::kernel_source!("hyper/hc_mix.metal");
 
 static HC_MIX: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 
@@ -209,7 +226,8 @@ pub fn hc_mix(
     Some((it.next()?, it.next()?))
 }
 /// `track_swiglu2`: `mlx_silu(gate) * up` over separate gate/up arrays, bf16.
-const SWIGLU2_SOURCE: &crate::shader_pack::Source = crate::kernel_source!("qwen4/swiglu2.metal");
+const SWIGLU2_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("pointwise/swiglu2.metal");
 
 static SWIGLU2: std::sync::OnceLock<crate::error::Result<MetalKernel>> = std::sync::OnceLock::new();
 
@@ -232,7 +250,7 @@ pub(crate) fn swiglu2_kernel() -> crate::error::Result<&'static MetalKernel> {
 
 /// `track_silu_head`: `mlx_silu` over the leading `LMIX` columns of `lo`.
 const SILU_HEAD_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("qwen4/silu_head.metal");
+    crate::kernel_source!("pointwise/silu_head.metal");
 
 static SILU_HEAD: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 
@@ -325,7 +343,7 @@ pub fn silu_head(lo: &Array, width: i32, stream: &Stream) -> Option<Array> {
 /// `residual` is `[rows, W]` (or `[rows, H]` when `TILE`), `out` `[rows, H]`,
 /// `inject` `[rows, HC]`, `scale` `[W]` -> `stream`/`normed` `[rows, W]`.
 const INJECT_NORM_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("qwen4/inject_norm.metal");
+    crate::kernel_source!("hyper/inject_norm.metal");
 
 static INJECT_NORM: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 
@@ -400,7 +418,7 @@ pub fn inject_norm(
 /// `track_p12_attn_prep_split_inputs`: q/k RMS + partial rope + v passthrough.
 /// Inputs: `qkv` = [q|gate] rows `[B,S,2*HQ*D]`, `kproj`/`vproj` `[B,S,HK*D]`.
 const ATTN_PREP_SPLIT_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("qwen4/attn_prep_split.metal");
+    crate::kernel_source!("rope/attn_prep_split.metal");
 
 static ATTN_PREP_SPLIT: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 fn attn_prep_split_kernel() -> &'static Option<MetalKernel> {
@@ -479,7 +497,7 @@ pub fn attn_prep_split(
 }
 /// `track_attn_gate` (split-gate form): `out = att * sigmoid(gate)`.
 const ATTN_GATE_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("qwen4/attn_gate.metal");
+    crate::kernel_source!("pointwise/attn_gate.metal");
 
 static ATTN_GATE: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 fn attn_gate_kernel() -> &'static Option<MetalKernel> {
@@ -539,20 +557,20 @@ mod mixer_avail {
         // indirect probe: call with tiny inputs and see if the kernel path returns Some
         use lisa_metal::Array;
         let stream = lisa_metal::Stream::thread_local_or_default();
-        let w = Array::from_slice(&vec![0f32; 8], &[2, 2, 2])
+        let w = Array::from_slice(&[0f32; 8], &[2, 2, 2])
             .as_dtype(lisa_metal::Dtype::Bfloat16)
             .unwrap();
-        let normed = Array::from_slice(&vec![0f32; 8], &[1, 2, 4])
+        let normed = Array::from_slice(&[0f32; 8], &[1, 2, 4])
             .as_dtype(lisa_metal::Dtype::Bfloat16)
             .unwrap();
-        let inj = Array::from_slice(&vec![0f32; 4], &[1, 2, 2])
+        let inj = Array::from_slice(&[0f32; 4], &[1, 2, 2])
             .as_dtype(lisa_metal::Dtype::Bfloat16)
             .unwrap();
         eprintln!(
             "hc_mix: {}",
             super::hc_mix(&w, &normed, &inj, 2, 2, 2, true, &stream).is_some()
         );
-        let lo = Array::from_slice(&vec![0f32; 4], &[1, 2, 2])
+        let lo = Array::from_slice(&[0f32; 4], &[1, 2, 2])
             .as_dtype(lisa_metal::Dtype::Bfloat16)
             .unwrap();
         eprintln!("silu_head: {}", super::silu_head(&lo, 2, &stream).is_some());
@@ -585,6 +603,7 @@ mod mixer_mach_ab {
         let w = |name: &str, a: &Array| {
             let f = a.as_dtype(lisa_metal::Dtype::Float32).unwrap();
             let s = f.as_slice::<f32>();
+            // SAFETY: `s` is a live f32 slice; viewing its `len() * 4` bytes as u8 is valid.
             let _ = std::fs::write(format!("{dir}/{name}.bin"), unsafe {
                 std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 4)
             });
@@ -616,7 +635,7 @@ mod mixer_mach_ab {
 mod gated_rms_silu_parity {
     use lisa_metal::Array;
 
-    /// specs/01 pin: the SILU-gate arm of `track_gated_rms` vs the composed
+    /// Pin: the SILU-gate arm of `track_gated_rms` vs the composed
     /// chain it replaces on the qwen3_5 verify path (`fast::rms_norm` +
     /// `nn::silu` (= Sigmoid + bmul) + `multiply`). ~74k values per tensor,
     /// plus specials on the gate. The rms half must ALSO match the stock
@@ -684,7 +703,7 @@ mod gated_rms_silu_parity {
         );
     }
 
-    /// specs/04 pin: `gated_rms`/`gated_rms_silu` over a STRIDED z (a slice
+    /// Pin: `gated_rms`/`gated_rms_silu` over a STRIDED z (a slice
     /// view of a fused projection, bound through `zproj_strides`) must be
     /// word-exact vs the same kernel on the contiguous copy of that view —
     /// the addressing change is the only difference. ~65k gate values, plus
@@ -799,6 +818,7 @@ mod attn_mach_ab {
         if let Some(r) = super::attn_gate(&att, &gate, heads as i32, d as i32, &stream) {
             let f = r.as_dtype(lisa_metal::Dtype::Float32).unwrap();
             let s = f.as_slice::<f32>();
+            // SAFETY: `s` is a live f32 slice; viewing its `len() * 4` bytes as u8 is valid.
             let _ = std::fs::write(format!("{dir}/attn_gate.bin"), unsafe {
                 std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 4)
             });

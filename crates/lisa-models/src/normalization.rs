@@ -74,10 +74,9 @@ pub fn grouped_rms(
         "invalid grouped RMS shape"
     );
     anyhow::ensure!(
-        width >= 128
-            && width <= 4096
-            && width % 128 == 0
-            && shape[shape.len() - 1] as usize % width == 0,
+        (128..=4096).contains(&width)
+            && width.is_multiple_of(128)
+            && (shape[shape.len() - 1] as usize).is_multiple_of(width),
         "invalid grouped RMS width"
     );
     anyhow::ensure!(

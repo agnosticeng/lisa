@@ -1,25 +1,6 @@
 //! Application adapters and native oracles for the portable recurrent bindings.
 pub use crate::core::quant::QuantizedLinearExecution;
-use lisa_engine::recurrent::Replay;
 use lisa_metal::Array;
-pub fn capture(
-    q: &Array,
-    k: &Array,
-    v: &Array,
-    g: &Array,
-    beta: &Array,
-    state: &Array,
-) -> anyhow::Result<Option<(Array, Array, Replay<Array>)>> {
-    lisa_engine::recurrent::capture(
-        &crate::metal_context::execution_context(),
-        q,
-        k,
-        v,
-        g,
-        beta,
-        state,
-    )
-}
 pub fn snapshot_prefix(tensor: &Array, prefix: usize) -> anyhow::Result<Array> {
     lisa_engine::recurrent::snapshot_prefix(
         &crate::metal_context::execution_context(),
@@ -299,18 +280,17 @@ mod preparation_tests {
         Ok(())
     }
     #[test]
-    fn delta_recurrence_plan_preserves_reused_snapshots_and_replay() -> anyhow::Result<()> {
+    fn delta_recurrence_plan_preserves_reused_snapshots() -> anyhow::Result<()> {
         use lisa_metal::ops::indexing::IndexOp;
-        use lisa_models::gated_delta::{CaptureKind, RecurrencePlan, ReplayGeometry};
+        use lisa_models::gated_delta::{CaptureKind, RecurrenceGeometry, RecurrencePlan};
         for (batch, tokens) in [(1, 1), (1, 2), (1, 7), (1, 16), (1, 17), (2, 7)] {
-            for (capture, replay, swish, fusion) in [
-                (false, false, false, true),
-                (true, false, true, true),
-                (true, false, true, false),
-                (true, true, true, true),
+            for (capture, swish, fusion) in [
+                (false, false, true),
+                (true, true, true),
+                (true, true, false),
             ] {
                 let (hk, hv) = (4, 16);
-                let geometry = ReplayGeometry {
+                let geometry = RecurrenceGeometry {
                     batch,
                     tokens,
                     key_heads: hk,
@@ -347,10 +327,10 @@ mod preparation_tests {
                     let mut spec = RecurrencePlan {
                         geometry,
                         capture,
-                        replay,
                         cache: true,
                         swish,
                         verify_fusion: fusion,
+                        serial_gate: false,
                         epsilon: 1e-6f32.to_bits(),
                         state_present: true,
                         reuse: false,
@@ -360,7 +340,7 @@ mod preparation_tests {
                         workspace.as_ref().map(|(y, _)| y.shape()),
                         workspace.as_ref().map(|(_, s)| s.shape()),
                     );
-                    let fused = capture && !replay && swish && fusion && (2..=16).contains(&tokens);
+                    let fused = capture && swish && fusion && (2..=16).contains(&tokens);
                     let (y, states) = if fused {
                         lisa_metal::kernels::gated_delta::gdn_verify_fused(
                             &q,
@@ -448,39 +428,18 @@ mod preparation_tests {
                     assert_eq!(
                         got.to_vec1::<u16>()?,
                         expected.to_vec1::<u16>()?,
-                        "activation B={batch} S={tokens} capture={capture} replay={replay} round={round}"
+                        "activation B={batch} S={tokens} capture={capture} round={round}"
                     );
                     assert_eq!(
                         committed.to_vec1::<u32>()?,
                         next_state.to_vec1::<u32>()?,
                         "committed state"
                     );
-                    if spec.capture_kind() == CaptureKind::Replay {
-                        let history = Replay {
-                            geometry,
-                            tensors: std::array::from_fn(|_| outputs.next().unwrap()),
-                        };
-                        for prefix in 0..=tokens as usize {
-                            let expected = if prefix == 0 {
-                                expected_state.clone()
-                            } else {
-                                states.index((prefix as i32 - 1, .., .., ..)).contiguous()?
-                            };
-                            assert_eq!(
-                                history
-                                    .restore(&crate::metal_context::execution_context(), prefix)?
-                                    .to_vec1::<u32>()?,
-                                expected.to_vec1::<u32>()?,
-                                "prefix {prefix}"
-                            );
-                        }
-                    } else {
-                        assert_eq!(
-                            raw_state.to_vec1::<u32>()?,
-                            states.to_vec1::<u32>()?,
-                            "snapshot tape"
-                        );
-                    }
+                    assert_eq!(
+                        raw_state.to_vec1::<u32>()?,
+                        states.to_vec1::<u32>()?,
+                        "snapshot tape"
+                    );
                     if spec.capture_kind() == CaptureKind::Snapshots {
                         workspace = Some((raw_y, raw_state));
                     }

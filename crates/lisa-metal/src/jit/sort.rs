@@ -1,5 +1,6 @@
 use objc2_metal::MTLSize;
 
+use super::compile::compile_builtin_lazy;
 use crate::array::Array;
 
 use super::compile::{builtin_template_def, compile_builtin, type_string, type_to_name};
@@ -98,8 +99,19 @@ fn argsort_multi_block(
             st *= dims[i] as i64;
         }
     }
-    let nc_shape_a = Array::from_slice_dt(mdev, &nc_shape, &[nc_shape.len()], DType::Int32)?;
-    let nc_str_a = Array::from_slice_dt(mdev, &nc_str, &[nc_str.len()], DType::Int64)?;
+    // Metal setBytes accepts at most 4 KiB per binding. Keep the original
+    // tensor-backed metadata for unusually high ranks; imports also decline
+    // program capture, so a replay never silently retains host-written data.
+    let metadata_arrays = if std::mem::size_of_val(nc_shape.as_slice()) > 4096
+        || std::mem::size_of_val(nc_str.as_slice()) > 4096
+    {
+        Some((
+            Array::from_slice_dt(mdev, &nc_shape, &[nc_shape.len()], DType::Int32)?,
+            Array::from_slice_dt(mdev, &nc_str, &[nc_str.len()], DType::Int64)?,
+        ))
+    } else {
+        None
+    };
 
     let ssa = size_sorted_axis as i32;
     let stride: i32 = 1;
@@ -119,10 +131,25 @@ fn argsort_multi_block(
         enc.set_bytes(3, &ssa);
         enc.set_bytes(4, &stride);
         enc.set_bytes(5, &ncd);
-        let (ncs, ncl) = nc_shape_a.buffer_and_layout();
-        enc.set_input(6, Some(ncs), ncl.offset * DType::Int32.size_of());
-        let (nct, ntl) = nc_str_a.buffer_and_layout();
-        enc.set_input(7, Some(nct), ntl.offset * DType::Int64.size_of());
+        if let Some((nc_shape_a, nc_str_a)) = &metadata_arrays {
+            let (ncs, ncl) = nc_shape_a.buffer_and_layout();
+            enc.set_input(6, Some(ncs), ncl.offset * DType::Int32.size_of());
+            let (nct, ntl) = nc_str_a.buffer_and_layout();
+            enc.set_input(7, Some(nct), ntl.offset * DType::Int64.size_of());
+        } else {
+            // Same immutable bytes and pointer arguments as the host tensors,
+            // without per-sort import allocations for ordinary tensor ranks.
+            enc.set_bytes_directly(
+                6,
+                std::mem::size_of_val(nc_shape.as_slice()),
+                nc_shape.as_ptr().cast(),
+            );
+            enc.set_bytes_directly(
+                7,
+                std::mem::size_of_val(nc_str.as_slice()),
+                nc_str.as_ptr().cast(),
+            );
+        }
         enc.dispatch_groups_size(
             MTLSize {
                 width: n_blocks,
@@ -290,11 +317,11 @@ fn argsort_axis(device: &Device, x: &Tensor, argsort: bool) -> Result<Tensor> {
             ],
         ));
     }
-    let source = format!("{MLX_UTILS_PREAMBLE}{MLX_SORT_PREAMBLE}{defs}");
-    let pipeline = compile_builtin(device, &source, &kernel_name)?;
+    let source = || format!("{MLX_UTILS_PREAMBLE}{MLX_SORT_PREAMBLE}{defs}");
+    let pipeline = compile_builtin_lazy(device, &kernel_name, source)?;
 
     let count = x.elem_count();
-    let obuf = mdev.buffer_for_gpu_write((count) as usize * (DType::U32).size_of(), "sort_out")?;
+    let obuf = mdev.buffer_for_gpu_write((count) * (DType::U32).size_of(), "sort_out")?;
     let out = Array::from_parts(mdev, obuf.clone(), &dims.clone(), DType::U32);
 
     let guard = mdev.commands.encoder()?;
@@ -341,7 +368,7 @@ fn argsort_axis(device: &Device, x: &Tensor, argsort: bool) -> Result<Tensor> {
 #[cfg(test)]
 mod sort_tests {
     use super::*;
-    use crate::runtime::MetalRuntime;
+    use crate::runtime::{MetalRuntime, ProgramInput, ProgramOutput, capture_dispatch_program};
     use std::sync::Arc;
 
     fn lcg(seed: &mut u64) -> f32 {
@@ -390,5 +417,43 @@ mod sort_tests {
             let expect = host_argsort(&data[base..base + c]);
             assert_eq!(&got[base..base + c], expect.as_slice(), "row {row}");
         }
+    }
+
+    #[test]
+    fn multiblock_argsort_preserves_high_rank_metadata_beyond_inline_limit() -> Result<()> {
+        let rt = Arc::new(MetalRuntime::new(4)?);
+        let cols = 4096;
+        let data = (0..2 * cols)
+            .map(|i| ((i * 37 + i / cols * 13) % 127) as f32 - 63.)
+            .collect::<Vec<_>>();
+        let expected = data.chunks(cols).flat_map(host_argsort).collect::<Vec<_>>();
+        // Rank 513 has exactly 4096 stride bytes. At 514 only strides exceed
+        // setBytes' limit; at 1026 both shape and stride arrays exceed it.
+        for rank in [513, 514, 1026] {
+            let mut shape = vec![1; rank];
+            shape[0] = 2;
+            shape[rank - 1] = cols;
+            let x = Array::from_slice(&rt, &data, &shape)?;
+            let inputs = [ProgramInput {
+                buffer: x.buffer().clone(),
+                required_bytes: data.len() * std::mem::size_of::<f32>(),
+            }];
+            let (sorted, program) = capture_dispatch_program(&rt, &inputs, || -> Result<_> {
+                let sorted = argsort_last(&rt, &x)?;
+                let output = ProgramOutput {
+                    buffer: sorted.buffer().clone(),
+                    offset: 0,
+                };
+                Ok((sorted, vec![output]))
+            })?;
+            assert_eq!(sorted.shape(), shape);
+            assert_eq!(sorted.to_vec::<u32>()?, expected, "rank {rank}");
+            assert_eq!(
+                program.is_some(),
+                rank == 513,
+                "only inline metadata is capture-compatible, rank {rank}"
+            );
+        }
+        Ok(())
     }
 }

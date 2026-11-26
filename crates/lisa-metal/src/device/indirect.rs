@@ -24,7 +24,7 @@ struct AffineGeometry {
     metadata: ScalarType,
 }
 fn affine_geometry(slots: &[&Array]) -> Option<AffineGeometry> {
-    if slots.is_empty() || slots.len() % 9 != 0 {
+    if slots.is_empty() || !slots.len().is_multiple_of(9) {
         return None;
     }
     let first = slots.first()?;
@@ -42,10 +42,10 @@ fn affine_geometry(slots: &[&Array]) -> Option<AffineGeometry> {
         Dtype::Bfloat16 => ScalarType::BF16,
         _ => return None,
     };
-    if hidden == 0 || intermediate == 0 || hidden % 128 != 0 || intermediate % 128 != 0 {
+    if hidden == 0 || intermediate == 0 || hidden % 128 != 0 || !intermediate.is_multiple_of(128) {
         return None;
     }
-    for expert in slots.chunks_exact(9) {
+    for expert in slots.as_chunks::<9>().0 {
         for (p, (n, k)) in [
             (intermediate, hidden),
             (intermediate, hidden),
@@ -306,69 +306,69 @@ pub(super) fn invoke(
     if op.requires_resources() && r.is_none() {
         return Err(Error::msg("indirect operation requires resources"));
     }
-    if op.requires_resources() {
-        if let Some(geometry) = r.and_then(|r| r.geometry) {
-            let Some(g) = geometry else {
-                return Err(Error::msg(
-                    "indirect affine resources have incompatible payload geometry",
-                ));
-            };
-            let valid = match *op {
-                K::Pair {
-                    intermediate,
-                    metadata,
-                    ..
-                } => {
-                    intermediate == g.intermediate
-                        && metadata == g.metadata
-                        && a[0].dim(-1) as usize == g.hidden
-                }
-                K::Gather {
-                    hidden, metadata, ..
-                }
-                | K::DownSum8SharedProjection { hidden, metadata }
-                | K::DownSum8 {
-                    hidden, metadata, ..
-                } => {
-                    hidden == g.hidden
-                        && metadata == g.metadata
-                        && a[0].dim(-1) as usize == g.intermediate
-                }
-                K::GroupedProjection {
-                    experts,
-                    intermediate,
-                    metadata,
-                    ..
-                }
-                | K::GroupedPair {
-                    experts,
-                    intermediate,
-                    metadata,
-                    ..
-                } => {
-                    experts == g.experts
-                        && intermediate == g.intermediate
-                        && metadata == g.metadata
-                        && a[0].dim(-1) as usize == g.hidden
-                }
-                K::GroupedDown {
-                    experts,
-                    hidden,
-                    metadata,
-                    ..
-                } => {
-                    experts == g.experts
-                        && hidden == g.hidden
-                        && metadata == g.metadata
-                        && a[0].dim(-1) as usize == g.intermediate
-                }
-                _ => true,
-            };
-            if !valid {
-                return Err(Error::msg(
-                    "indirect affine invocation differs from resource geometry",
-                ));
+    if op.requires_resources()
+        && let Some(geometry) = r.and_then(|r| r.geometry)
+    {
+        let Some(g) = geometry else {
+            return Err(Error::msg(
+                "indirect affine resources have incompatible payload geometry",
+            ));
+        };
+        let valid = match *op {
+            K::Pair {
+                intermediate,
+                metadata,
+                ..
+            } => {
+                intermediate == g.intermediate
+                    && metadata == g.metadata
+                    && a[0].dim(-1) as usize == g.hidden
             }
+            K::Gather {
+                hidden, metadata, ..
+            }
+            | K::DownSum8SharedProjection { hidden, metadata }
+            | K::DownSum8 {
+                hidden, metadata, ..
+            } => {
+                hidden == g.hidden
+                    && metadata == g.metadata
+                    && a[0].dim(-1) as usize == g.intermediate
+            }
+            K::GroupedProjection {
+                experts,
+                intermediate,
+                metadata,
+                ..
+            }
+            | K::GroupedPair {
+                experts,
+                intermediate,
+                metadata,
+                ..
+            } => {
+                experts == g.experts
+                    && intermediate == g.intermediate
+                    && metadata == g.metadata
+                    && a[0].dim(-1) as usize == g.hidden
+            }
+            K::GroupedDown {
+                experts,
+                hidden,
+                metadata,
+                ..
+            } => {
+                experts == g.experts
+                    && hidden == g.hidden
+                    && metadata == g.metadata
+                    && a[0].dim(-1) as usize == g.intermediate
+            }
+            _ => true,
+        };
+        if !valid {
+            return Err(Error::msg(
+                "indirect affine invocation differs from resource geometry",
+            ));
         }
     }
     let keepalive = r
@@ -477,7 +477,7 @@ pub(super) fn invoke(
             metadata,
             workspace,
         } => Some(Array::new(
-            crate::jit::glm53_moe_q2_mm_grouped_ds4_prefill_with_output(
+            crate::jit::moe_q2_mm_grouped_ds4_prefill_with_output(
                 a[0].t.device(),
                 &table().t,
                 &a[0].t,
@@ -506,7 +506,7 @@ pub(super) fn invoke(
             metadata,
             workspace,
         } => Some(Array::new(
-            crate::jit::glm53_moe_q2_pair_grouped_ds4_prefill_with_output(
+            crate::jit::moe_q2_pair_grouped_ds4_prefill_with_output(
                 a[0].t.device(),
                 &table().t,
                 &a[0].t,
@@ -532,7 +532,7 @@ pub(super) fn invoke(
             limit,
             workspace,
         } => Some(Array::new(
-            crate::jit::glm53_moe_grouped_swiglu_weight_prefill_with_output(
+            crate::jit::moe_grouped_swiglu_weight_prefill_with_output(
                 a[0].t.device(),
                 &a[0].t,
                 &a[1].t,
@@ -553,7 +553,7 @@ pub(super) fn invoke(
             metadata,
             workspace,
         } => Some(Array::new(
-            crate::jit::glm53_moe_q2_down_grouped_ds4_prefill_with_output(
+            crate::jit::moe_q2_down_grouped_ds4_prefill_with_output(
                 a[0].t.device(),
                 &table().t,
                 &a[0].t,

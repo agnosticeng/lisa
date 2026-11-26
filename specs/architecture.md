@@ -1,197 +1,192 @@
 # Architecture
 
-`lisa-models` describes how inference is computed. `lisa-engine` imports weights,
-binds model plans and executes them through `lisa-backend`. Applications select
-and construct providers. Devices import tensors and execute individual kernels;
-they never receive a model or choose its next operation.
+LISA separates four concerns: checkpoint storage, model computation, execution
+policy and device operations. Format readers expose original bytes and
+metadata. Model crates describe computation as plans. The engine binds tensors
+to plans and owns every policy decision. Devices run operations they are given
+and never see a model.
 
-## Workspace boundaries
+## Crates
 
-| Crate | Responsibility |
+```mermaid
+flowchart BT
+  backend[lisa-backend<br/>device contracts]
+  models[lisa-models<br/>schemas and plans]
+  mlx[lisa-mlx<br/>safetensors]
+  gguf[lisa-gguf<br/>GGUF]
+  metal[lisa-metal<br/>Metal runtime]
+  cpu[lisa-cpu<br/>host kernels]
+  engine[lisa-engine<br/>binding, execution, policy]
+  serve[lisa-serve<br/>HTTP and composition]
+
+  models --> backend
+  metal --> backend
+  cpu --> backend
+  engine --> backend
+  engine --> models
+  engine --> mlx
+  engine --> gguf
+  serve --> engine
+  serve --> models
+  serve --> backend
+  serve --> cpu
+  serve --> metal
+```
+
+The front ends sit on top: `lisa-cli` and `lisa-app` depend on `lisa-serve`,
+`lisa-engine`, `lisa-models` and the format and Metal crates they call
+directly; `lisa-bench` depends on every crate.
+
+| Crate | Owns | Never does |
+| --- | --- | --- |
+| `lisa-backend` | Tensor import, storage views, kernel capabilities, prepared handles, completion | Model or format knowledge |
+| `lisa-models` | Model schemas, computation plans, shape rules, numerical alternatives, memory formulas | File access, environment, devices, format crates |
+| `lisa-mlx`, `lisa-gguf` | Checkpoint parsing, original encodings, mapped host storage | Depend on the engine or any device |
+| `lisa-metal`, `lisa-cpu` | Device storage, kernels, queues, completion | Traverse models, choose policy, read checkpoints |
+| `lisa-engine` | Resolution, weight binding, plan execution, memory admission, sampling, sessions, speculation | Depend on a concrete device |
+| `lisa-serve` | HTTP adapters, request admission, provider composition (`application`) | — |
+| `lisa-cli`, `lisa-app` | User commands; Apple app services and C bridge | — |
+| `lisa-bench` | Diagnostics, benchmarks, goldens and real-device conformance tests | — |
+
+Providers are constructed in `lisa-serve::application`, which exports the
+device-specific type aliases the applications use; the engine and everything
+below it stay generic. Applications may call runtime lifecycle functions
+(platform check, kernel package initialization, memory limits, tracing)
+directly. CI enforces the portable edges
+([workflow](../.github/workflows/checkpoint-formats.yml)).
+
+## Engine layout
+
+| Module | Contents |
 | --- | --- |
-| `lisa-backend` | Tensor import, storage views, kernel capabilities, prepared handles and completion contracts |
-| `lisa-models` | Checkpoint schemas, model dataflow, numerical alternatives, shape gates and memory formulas |
-| `lisa-mlx`, `lisa-gguf` | Format parsing, original encodings and immutable mapped host storage |
-| `lisa-metal`, `lisa-cpu` | Device storage, kernels, queues and completion |
-| `lisa-engine` | File resolution, portable weight binding, generic execution, host memory admission, sampling and session policy |
-| `lisa-serve` | HTTP adapters, request admission and shared application composition |
-| `lisa-cli`, `lisa-bench` | User commands and compiled diagnostic instruments |
-| `lisa-app` | Shared Apple app worker, chat storage and C bridge; SwiftUI in `apps/Lisa` |
+| `checkpoint/` | Resolution of directories, GGUF files and Hub IDs; configs, tokenizers, downloads |
+| `weights/<model>/` | Checkpoint import for one model family |
+| `bindings/<model>/` | Execution adapters and state for one model family |
+| `bindings/shared/` | Operations shared by several families (affine, norms, gated delta, capture) |
+| `language/` | The `LanguageModel` contract and its runtime adapter |
+| `conversation/`, `cache/` | Sessions, prefix reuse, attention/recurrent/indexer state, batch cache packing |
+| `generation.rs`, `batching.rs`, `scheduling.rs` | Serial generation, continuous batching, wave scheduling |
+| `sampling/`, `speculation/` | Samplers and RNG; speculative transactions |
+| `core/` | Model-independent graph execution, traversal, tokenization, scheduling helpers |
 
-Models depend on backend contracts, not formats or device implementations. They
-perform no filesystem, environment, networking or device-allocation work.
-Formats depend on neither engine nor device. Devices depend on neither models
-nor formats. Engine and device crates have no `src/models` namespace.
-Metal shaders live under `lisa-metal/src/shaders`; launch wrappers live in `jit`
-and operation-based `kernels` modules. Keep attribution and licenses beside
-ported sources and in [NOTICE](../NOTICE).
+Model-specific logic lives under `bindings/<model>/` and `weights/<model>/`.
+Shared modules speak in capabilities (`target_mtp`, block drafter, host
+sampling), not model names. LISA reads no environment variables of its own:
+the application sets the device, the RAM cap and Metal diagnostics once at
+startup from command-line flags.
 
 ## Plans and execution
 
-Models supply symbolic inputs, weights, intermediates, dependencies and legal
-alternatives. The engine's generic graph/plan/program/traversal executors validate
-references, arities, shapes and encodings, prepare handles, bind storage and run
-operations in order. They do not switch on model families or read activations
-back to the host to decide model dataflow.
+```mermaid
+flowchart LR
+  plan[Model plan<br/>lisa-models] --> prep[PreparedGraph<br/>engine]
+  weights[Prepared weights] --> prep
+  prep --> dispatch[Device::dispatch<br/>ordered]
+  prep --> replay[Recorded replay<br/>fixed layouts]
+  replay --> dispatch
+```
 
-Required unsupported operations fail preparation. Optional implementations can
-decline eligible shapes and use the model's fallback; compilation, allocation
-and dispatch errors propagate. A backend cannot silently substitute a different
-arithmetic law. Output/workspace effects and last-use information govern storage
-reuse. Indirect resources retain all referenced allocations through completion.
+A plan declares symbolic inputs, weight slots, dependencies, output shapes and
+the legal implementation alternatives. The engine validates and prepares it,
+binds storage, and dispatches operations in dependency order. Unsupported
+required operations fail. An optional operation may decline a geometry before
+encoding and use the plan's declared fallback; it never substitutes another
+arithmetic law silently.
 
-`lisa-engine::bindings` connects model slots and state to generic device tensors.
-Language, vision, DSpine and image bindings are parameterized by their provider;
-there is no separate Metal model implementation. Laya executes the same plans on
-CPU and Metal with explicitly selected arithmetic laws.
+**Recorded replay.** Fixed-shape regions can be recorded once and replayed with
+new tensor inputs. Each recorded graph keeps up to eight exact layouts in
+least-recently-used order; a miss executes normally and may replace the oldest
+entry once it seals successfully. Replay re-checks layout, dtype, device and
+storage aliases every time. Eviction never invalidates returned tensors or
+their queued GPU users.
 
-`DeviceContext<D>` retains the selected device, optional diagnostics and typed
-prepared-state slots. Loaded models, caches and samplers receive that owner
-explicitly. The engine has no active-context thread local, implicit default
-device or native downcast. Dropping the owner releases its prepared state.
-Native arithmetic comparators and their fixture harness live in `lisa-bench`;
-applications do not depend on that harness.
+**Scheduling.** `ProgramScheduling::Ordered` is the default.
+`DependencyParallel` lets a provider overlap independent dispatches after it
+proves their storage dependencies. Metal builds an immutable hazard plan from
+physical buffer aliases and inserts barriers for read-after-write,
+write-after-read and write-after-write conflicts. Arithmetic, dispatch order
+within a dependency chain and allocation admission do not change.
+
+**Scratch.** Internal full-write tensors may share a 1 KiB-aligned arena.
+Ranges overlap only when one tensor's last use precedes the other's first use.
+Escaping outputs stay independent. An arena lease belongs to one command queue
+and is reused only after every prior access is encoded on that queue.
+
+`DeviceContext<D>` owns the device, optional diagnostics and typed prepared
+state. Bindings, caches and samplers receive it explicitly; there is no global
+or thread-local device.
 
 ## Device API
 
-`Device` exposes capabilities, `pull`, `prepare`, `dispatch`, streams and `wait`.
-Capabilities identify dtype, encoding, layout, geometry, numerical law and
-workspace requirements. Preparation resolves context-bound operation handles;
-shape-specific Metal pipeline compilation can remain lazy. Dispatch enqueues
-one operation and returns outputs plus a completion handle.
+`lisa-backend::Device` exposes capabilities, `pull`, `prepare`, `dispatch`,
+streams and `wait`. Capabilities describe dtype, encoding, layout, geometry,
+numerical law and workspace needs.
 
-`TensorAccess` supplies tensor views and explicit readback operations for shared
-session algorithms. `ReadbackDevice` supplies synchronized f32 readback for
-generic decision bindings. `HostAccessDevice` exposes raw readback, layout and
-explicit enqueue/wait boundaries. These contracts contain no inference policy.
-
-`DeviceHandle` erases concrete Rust provider types and checks the ownership of
-tensors, prepared kernels, streams, completions and indirect resources before
-forwarding operations. No native downcast is exposed to the engine. Applications
-use it for CPU/Metal Laya loading; a second Laya runtime wrapper is unnecessary.
-Indirect-capable handles retain the provider's resource leases. Unsupported
-contracts remain unsupported, including different arithmetic laws.
-
-`StorageDevice` adds the maximum allocation size and checked, byte-preserving
-tensor views. `IndirectDevice` provides opaque retained resource sets for
-indirect kernel operands. Neither interface knows filenames, layer numbers,
-checkpoint types, tensor roles, sampling policy or model topology.
-
-Copy imports preserve bytes and finish reading the source before returning.
-`SharedRequired` retains immutable owned storage and never silently copies.
-The engine chooses mapping windows, validates identities and ranges, performs
-prefetch, and decides whether a separate copy is allowed. MLX shard/lazy stores,
-prepared resident arenas and GGUF imports use these generic contracts.
-`ResidencyPolicy::Mapped` requires shared storage; `Uploaded` copies original
-bytes into private device allocations. GGUF admission reports host residency,
-device residency and temporary host mapping needs separately before importing.
-Prepared resident arenas expose the same explicit policy and footprint. Metal
-selects mapped imports; no unsupported-sharing fallback silently copies a
-resident checkpoint.
-
-Host RAM detection, the OS reserve and `LISA_RAM_CAP_GB` admission policy live
-in `lisa-engine::memory`. The environment cap only lowers detected physical RAM
-minus 8 GiB; failed detection refuses admission. Device allocators receive explicit
-byte budgets and retain their allocation/completion mechanisms.
-
-Mappings and buffers outlive queued uses. Dropping a completion handle does not
-wait or release in-flight resources. Never wait for completion while holding
-an allocator lock. Partial writers need a clear; reuse is limited to the
-ordered and completion-safe cases in [contracts](contracts.md).
-
-## Sessions and scheduling
-
-`LanguageModel<R>`, `Conversation<R>` and batching use runtime-associated tensor,
-cache, draft-cache and sampler types. Shared PLD, independent MTP, target-MTP,
-DSpine verification, scheduling and round-cost measurement are generic engine
-policy. `SpeculativeRuntime` supplies engine tensor/sampling/rollback actions;
-it is not a device API. The generic `language_runtime::Runtime<D, S>` supplies storage operations and diagnostic hooks. Cache packing,
-survivor extraction, per-row sampling, checkpoints and verified rollback live
-in the engine. Rollback uses the loaded cache's history extent.
-
-Attention/indexer caches, recurrent capture/rollback bindings, per-layer
-snapshots, the byte-preserving spill codec and prefix LRU policy live in
-`lisa-engine`. Cache constructors receive an explicit `DeviceContext<D>`;
-allocation, row copies and recurrent plans execute through backend contracts.
-The prefix store receives its device and spill directory at construction and
-its numerical law on each operation. Its policy tests run on CPU; Metal cache
-oracles exercise compaction, batching and speculative rollback. Existing spill
-tags remain readable, with checked payload sizes before tensor import.
-
-`sampling::Sampler` owns filtering, acceptance and RNG state. Its execution
-context supplies a device, an explicit native or ordered-host tensor law, and
-an optional trace observer. Kernels expose individual reductions, selection and
-keyed Gumbel operations; they receive neither sampler configuration nor token
-history. Producer-bounded F32 readback preserves the GLM queue boundary, including
-through an erased device handle. Shared C-reference sampling fixtures run on CPU
-and Metal. The generic sampler receives the loaded model runtime on every draw.
-
-Sessions own committed history and state. Restore only under the same numerical
-law, including loaded arithmetic modes. Target and private draft state share a
-commit boundary. Failed forward/head transactions invalidate the conversation.
-API response history, chat storage and GPU prefix snapshots are separate owners;
-see [serving](serving.md).
-
-## Checkpoint dispatch
-
-The engine resolves local directories, supported GGUF files and Hub repository
-IDs. Config/tensor geometry determines support. `ModelKind` centralizes aliases;
-product names never replace checkpoint identifiers.
-
-| Identity | Model plan |
+| Contract | Mechanism |
 | --- | --- |
-| `qwen4_exp`, `qwen4_exp_text` | Qwen Flash-Next GDN/attention + MoE |
-| `qwen3_5`, `qwen3_5_text`, GGUF `qwen35` | Qwen dense hybrid |
-| `glm5_next`, `glm5_next_text`, GGUF `glm5-next` | GLM KDA/sparse attention + MoE |
-| GGUF `deepseek41` | DeepSeek mixed-format/Engram |
-| `flux2-klein`, `flux3-klein` | Image generation |
-| `laya` | Decision model |
+| `TensorAccess` | Views, copies, evaluation, explicit readback |
+| `StorageDevice` | Allocation limits and checked byte-preserving views |
+| `HostAccessDevice`, `ReadbackDevice` | Layout inspection, host reads, synchronization |
+| `ManagedDevice` | Memory accounting, residency reservations, submission, reuse scopes |
+| `IndirectDevice`, `ResourceDevice` | Retained indirect operands, residency sets, full-write workspace |
 
-`lisa-engine::loading::ModelProvider` admits a resolved checkpoint before weight
-access and returns `Loaded<L, I>` without knowing concrete provider types.
-`lisa-serve::application::device` resolves backend policy; application `LoadOptions` carries
-explicit backend and drafter choices and binds through that shared interface. `LISA_DEVICE` selects implemented providers. Loading applies
-checkpoint context limits before warmup; an explicit CLI capacity override still
-undergoes model validation and memory admission.
+The engine decides when to use each mechanism. `DeviceHandle` erases the
+provider type while checking ownership of every tensor, handle and resource it
+forwards.
 
-MLX/GGUF payloads retain original bytes, scales, biases and quantization groups.
-Legacy MLX GLM needs its prepared resident index; native GGUF does not. DeepSeek
-Engram stays on disk. Only one model is loaded at a time; a switch releases the
-previous model before loading the next.
+Storage obligations:
 
-## Adding a backend
+- Copy imports finish reading their source before returning. `SharedRequired`
+  retains immutable owned storage and never copies silently.
+- Dropping a completion handle neither cancels work nor frees in-flight
+  resources. Mappings and buffers outlive every queued user.
+- No allocator lock is held while waiting for GPU completion.
+- Only individually audited full writers may use uncleared storage; partial
+  writers require initialization. Allocation padding is never tensor data.
 
-Implement the required `lisa-backend` contracts in a device crate, including
-kernel capabilities, original-byte tensor imports, views/readback, allocation,
-completion and indirect resource ownership. `ManagedDevice` exposes mechanisms
-for reservations, queue boundaries and reuse; `ResourceDevice` exposes opaque
-residency sets, indirect tables and ordered full-write workspace. The engine
-retains the policy deciding when to use those mechanisms.
+## Weight import
 
-Instantiate the existing engine bindings with the provider and register it at
-the application composition boundary. No model, format, sampling, cache or
-speculation implementation needs to be copied into the device crate. Current
-language/image application aliases select Metal; CPU Laya uses `DeviceHandle`.
-The erased handle is not a claim that every language/image capability is
-implemented by every provider.
-
-`lisa-engine` has no concrete device dependency or Metal feature, including with
-all features enabled. CPU is a test dependency only. Linux CI checks dependency
-direction and runs the portable format, model, backend, CPU and engine suites.
-`lisa-runtime` no longer exists. Application CPU composition builds and is tested
-without Metal using `cargo test -p lisa-serve --no-default-features --lib`. The
-Metal HTTP adapters and application construction are enabled by the default
-`metal` feature and tested in the Apple workspace suite.
-
-ROCm remains unimplemented. A new crate must provide the required kernels and
-storage/completion semantics, then be registered in applications and validated
-on AMD hardware. Unsupported operations must fail explicitly. A successful
-portable build alone does not establish backend or model acceptance.
+Format readers expose tensors with their original encoding. The engine's
+`weights::prepared` describes payloads, layouts and encodings independently of
+the container: packed Q8/K/IQ/NVFP4 blocks and affine weight/scale/bias triples
+stay distinct. Import preserves original bytes, scales, biases and groups; it
+never requantizes. Deferred providers (`weights::source`) give bounded row
+access for lazy embeddings, resident experts, staged image weights and the
+disk-resident DeepSeek Engram table.
 
 ## Kernel packaging
 
-Cargo generates an authenticated, compressed `kernels.bin` matching the binary's
-Metal sources. Ship it beside standalone executables or in app Resources.
-Missing, malformed or mismatched packs fail initialization; there is no network
-or source-tree fallback. The runtime validates/decompresses once, while Metal
-compilation remains JIT. Preserve the matching dSYM outside the app bundle.
+```mermaid
+flowchart LR
+  src[shaders/**/*.metal, *.h] -->|build.rs: expand //@include| pack[kernels.bin<br/>zlib + SHA-256]
+  frag[shaders/fragments/*.inc] --> pack
+  pack -->|first use, validated once| lib[Library cache<br/>by source, math, NAX]
+  lib --> pipe[Pipeline cache<br/>by name, math, NAX, constants]
+```
+
+Shaders live in `lisa-metal/src/shaders`, grouped by operation (`moe`,
+`sparse_attention`, `kda`, `hyper`, `ple`, `gguf`, `native_*`, …). Rust launch
+wrappers live in `jit/` and `kernels/`. Runs of source shared by several
+headers live once in `shaders/fragments/` and are spliced in verbatim by
+`build.rs`, so every kernel compiles exactly its original text. Provenance
+pins hash the expanded sources and a test checks them.
+
+Cargo writes `kernels.bin` beside each executable; the app bundles it in
+Resources. A missing or mismatched package fails initialization.
+
+Each runtime keeps two caches. The **pipeline cache** is keyed by kernel name,
+math mode, NAX language target and function constants; a hit hashes those
+fields and allocates nothing, and dispatch paths build kernel source only on a
+miss (`compile_lazy`). The **library cache** is keyed by complete source text,
+math mode and language target, bounded to 128 handles and 32 MiB of source,
+and is consulted only on a pipeline miss. Source hashing and the
+same-name/different-source check run only on misses; a collision is fatal.
+
+## Adding a backend
+
+A device crate implements the backend contracts: capabilities, imports, views,
+storage, kernels and completion. The application registers it in
+`lisa-serve::application`. Plans, readers, sampling and sessions are shared.
+Each new provider needs its own kernel and model validation; compiling is not
+support. CPU application composition builds without the `metal` feature and
+currently serves Laya only.

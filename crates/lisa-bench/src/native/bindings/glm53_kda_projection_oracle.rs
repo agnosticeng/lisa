@@ -1,11 +1,9 @@
 #![cfg(test)]
+use crate::bindings::glm53_math_oracle::linear_projection;
 use crate::bindings::glm53_projection::Projection;
 use crate::bindings::glm53_projection::ProjectionExecution;
 use lisa_metal::kernels::sparse::kernels as kda_kernels;
 use lisa_metal::{Array, Dtype};
-#[path = "glm53_math_oracle.rs"]
-mod math;
-use math::linear_projection;
 fn narrow(a: &Array, axis: usize, start: usize, len: usize) -> lisa_metal::error::Result<Array> {
     Ok(Array::new(a.t.narrow(axis, start, len)?))
 }
@@ -20,7 +18,7 @@ pub struct Source {
     pub b_w: Projection,
 }
 impl Source {
-    /// Apply a plain `[out,in]` projection using ds4's BF16 GEMV/GEMM split.
+    /// Apply a plain `[out,in]` projection using the reference's BF16 GEMV/GEMM split.
     pub fn linear(&self, x: &Array, weight: &Projection) -> anyhow::Result<Array> {
         match weight {
             Projection::Plain(w) => linear_projection(x, w),
@@ -29,7 +27,7 @@ impl Source {
     }
 
     /// Fuse the two one-to-eight-row dense KDA gate projections. This keeps
-    /// each output's DS4 GEMV reduction order while sharing a Metal dispatch.
+    /// each output's reference GEMV reduction order while sharing a Metal dispatch.
     pub fn gate_projections(&self, fa: &Array, ga: &Array) -> anyhow::Result<(Array, Array)> {
         if fa.rank() == 3
             && ga.shape() == fa.shape()
@@ -39,7 +37,7 @@ impl Source {
             && self.g_b_w.dtype() == Dtype::Bfloat16
         {
             let (b, t, input_dim) = (fa.dim(0) as usize, fa.dim(1) as usize, fa.dim(2) as usize);
-            let rows = b.checked_mul(t).unwrap_or(usize::MAX);
+            let rows = b.saturating_mul(t);
             if (1..=8).contains(&rows)
                 && self.f_b_w.dim(1) as usize == input_dim
                 && self.g_b_w.dim(1) as usize == input_dim
@@ -48,7 +46,7 @@ impl Source {
                 let stream = lisa_metal::Stream::thread_local_or_default();
                 let fa_rows = fa.reshape(&[rows as i32, input_dim as i32])?;
                 let ga_rows = ga.reshape(&[rows as i32, input_dim as i32])?;
-                if let Some((gate, output_gate)) = kda_kernels::glm53_bf16_pair_gemv(
+                if let Some((gate, output_gate)) = kda_kernels::bf16_pair_gemv(
                     &self.f_b_w,
                     &fa_rows,
                     &self.g_b_w,
@@ -73,7 +71,7 @@ impl Source {
             let input = x.reshape(&[1, x.dim(2)])?;
             let stream = lisa_metal::Stream::thread_local_or_default();
             if let Some((q, k, v)) =
-                kda_kernels::glm53_bf16_qkv(&self.q_w, &self.k_w, &self.v_w, &input, &stream)
+                kda_kernels::bf16_qkv(&self.q_w, &self.k_w, &self.v_w, &input, &stream)
             {
                 let shape = [1, 1, self.q_w.dim(0)];
                 return Ok((q.reshape(&shape)?, k.reshape(&shape)?, v.reshape(&shape)?));
@@ -88,7 +86,7 @@ impl Source {
 
     /// Project all six KDA inputs in one Metal dispatch for one to eight
     /// single-token BF16 decode rows. The fused kernel preserves the separate
-    /// ds4-style GEMV row reduction; larger batches retain the staged route.
+    /// the reference-style GEMV row reduction; larger batches retain the staged route.
     pub fn input_projections(
         &self,
         x: &Array,
@@ -110,7 +108,7 @@ impl Source {
             let _trace = lisa_metal::trace::span("glm53.kda.bf16_fused_input_projections");
             let input = x.reshape(&[rows as i32, x.dim(2)])?;
             let stream = lisa_metal::Stream::thread_local_or_default();
-            if let Some((packed, fa, ga)) = kda_kernels::glm53_bf16_kda_project_with_nsg(
+            if let Some((packed, fa, ga)) = kda_kernels::bf16_kda_project_with_nsg(
                 &self.q_w,
                 &self.k_w,
                 &self.v_w,

@@ -16,12 +16,15 @@ use lisa_metal::{Array, Stream, ops};
 
 use crate::ffi::{MetalKernel, OutputArg, TemplateArg};
 
-const HEADER: &crate::shader_pack::Source = crate::kernel_source!("qwen4/qsa/prefill_header.metal");
-const SOURCE: &crate::shader_pack::Source = crate::kernel_source!("qwen4/qsa/prefill.metal");
+const HEADER: &crate::shader_pack::Source =
+    crate::kernel_source!("sparse_attention/qsa_prefill_header.metal");
+const SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("sparse_attention/qsa_prefill.metal");
 
 const SELECT_HEADER: &crate::shader_pack::Source =
-    crate::kernel_source!("qwen4/qsa/select_header.metal");
-const SELECT_SOURCE: &crate::shader_pack::Source = crate::kernel_source!("qwen4/qsa/select.metal");
+    crate::kernel_source!("sparse_attention/qsa_select_header.metal");
+const SELECT_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("sparse_attention/qsa_select.metal");
 
 static SELECT: OnceLock<Option<MetalKernel>> = OnceLock::new();
 
@@ -202,10 +205,7 @@ pub fn prefill_flash(
     if !crate::runtime::nax_available() {
         return None;
     }
-    let kernel = match kernel().as_ref() {
-        Some(k) => k,
-        None => return None,
-    };
+    let kernel = kernel().as_ref()?;
     let reject = |why: &str| -> Option<Array> {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
@@ -301,17 +301,17 @@ mod selector_tests {
         let qf = q.as_dtype(Dtype::Float32).unwrap();
         let pf = pooled.as_dtype(Dtype::Float32).unwrap();
         let flat = qf.reshape(&[1, (s * heads) as i32, dim as i32]).unwrap();
-        let scores = ops::matmul(&flat, &pf.transpose_axes(&[0, 2, 1]).unwrap())
+        let scores = ops::matmul(&flat, pf.transpose_axes(&[0, 2, 1]).unwrap())
             .unwrap()
             .reshape(&[1, s as i32, heads as i32, blocks as i32])
             .unwrap()
             .transpose_axes(&[0, 1, 3, 2])
             .unwrap();
-        let scores = ops::maximum(&scores, &Array::from_f32(0.0))
+        let scores = ops::maximum(&scores, Array::from_f32(0.0))
             .unwrap()
             .sum_axis(-1, None)
             .unwrap()
-            .divide(&Array::from_f32((dim as f32).sqrt()))
+            .divide(Array::from_f32((dim as f32).sqrt()))
             .unwrap();
         let complete_v: Vec<f32> = (0..s).map(|j| ((pos_start + j + 1) / 4) as f32).collect();
         let complete = Array::from_slice(&complete_v, &[1, s as i32]);
@@ -319,13 +319,13 @@ mod selector_tests {
         let bids = Array::from_slice(&bids_v, &[1, 1, blocks as i32]);
         let visible = ops::broadcast_to(&bids, &[1, s as i32, blocks as i32])
             .unwrap()
-            .lt(&complete.expand_dims(-1).unwrap())
+            .lt(complete.expand_dims(-1).unwrap())
             .unwrap();
         let neg_inf =
             ops::broadcast_to(&Array::from_f32(f32::NEG_INFINITY), scores.shape()).unwrap();
         let masked = ops::r#where(&visible, &scores, &neg_inf).unwrap();
         let key = masked
-            .subtract(&bids.multiply(Array::from_f32(1e-12)).unwrap())
+            .subtract(bids.multiply(Array::from_f32(1e-12)).unwrap())
             .unwrap();
         let k = 512usize;
         let top = ops::argpartition_axis(&(-&key), (k - 1) as i32, -1)
@@ -392,204 +392,10 @@ mod selector_tests {
 }
 
 #[cfg(test)]
-mod selector_bench {
-    use super::*;
-    use std::time::Instant;
-
-    fn lcg(seed: &mut u64) -> f32 {
-        *seed = seed
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        ((*seed >> 40) as f32 / (1u32 << 24) as f32) - 0.5
-    }
-
-    /// No-sync selector benchmark: enqueue `n` applies then one eval. Run with
-    /// `cargo test -p lisa-metal --lib selector_bench -- --ignored --nocapture`.
-    #[test]
-    #[ignore]
-    fn bench_select() {
-        let stream = Stream::thread_local_or_default();
-        let (heads, dim) = (4usize, 128usize);
-        for &(s, blocks) in &[(1usize, 1506usize), (1, 15000), (1, 60000), (2048, 60000)] {
-            let total = blocks * 4;
-            let pos_start = total.saturating_sub(s);
-            let mut seed = 0x1234_5678u64;
-            let qv: Vec<half::bf16> = (0..s * heads * dim)
-                .map(|_| half::bf16::from_f32(lcg(&mut seed)))
-                .collect();
-            let pv: Vec<half::bf16> = (0..blocks * dim)
-                .map(|_| half::bf16::from_f32(lcg(&mut seed)))
-                .collect();
-            let q = Array::from_slice(&qv, &[1, s as i32, heads as i32, dim as i32]);
-            let pooled = Array::from_slice(&pv, &[1, blocks as i32, dim as i32]);
-            // warmup (compile)
-            let _ = select_blocks(&q, &pooled, pos_start as i32, total as i32, blocks, &stream);
-            let n = 30usize;
-            let t = Instant::now();
-            let mut last = None;
-            for _ in 0..n {
-                last = select_blocks(&q, &pooled, pos_start as i32, total as i32, blocks, &stream);
-            }
-            if let Some((ids, _)) = last {
-                let _ = ids.eval();
-            }
-            let ms = t.elapsed().as_secs_f64() * 1e3 / n as f64;
-            eprintln!("[sel-bench] s={s} blocks={blocks} {ms:.3} ms/call");
-        }
-    }
-}
+mod selector_bench {}
 
 #[cfg(test)]
-mod score_equiv {
-    use super::*;
-    use lisa_metal::Dtype;
-    use lisa_metal::ops::indexing::{Ellipsis, IndexOp};
-
-    fn lcg(seed: &mut u64) -> f32 {
-        *seed = seed
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        ((*seed >> 40) as f32 / (1u32 << 24) as f32) - 0.5
-    }
-
-    /// Reference top-K selection from a score sheet computed with MLX's matmul
-    /// (the tensor-core/NAX route a score-sheet kernel would use).
-    fn matmul_reference(
-        q: &Array,
-        pooled: &Array,
-        s: usize,
-        blocks: usize,
-        pos_start: usize,
-        heads: usize,
-        dim: usize,
-    ) -> Vec<(i32, u8)> {
-        let qf = q.as_dtype(Dtype::Float32).unwrap();
-        let pf = pooled.as_dtype(Dtype::Float32).unwrap();
-        let flat = qf.reshape(&[1, (s * heads) as i32, dim as i32]).unwrap();
-        let scores = ops::matmul(&flat, &pf.transpose_axes(&[0, 2, 1]).unwrap())
-            .unwrap()
-            .reshape(&[1, s as i32, heads as i32, blocks as i32])
-            .unwrap()
-            .transpose_axes(&[0, 1, 3, 2])
-            .unwrap();
-        let scores = ops::maximum(&scores, &Array::from_f32(0.0))
-            .unwrap()
-            .sum_axis(-1, None)
-            .unwrap()
-            .divide(&Array::from_f32((dim as f32).sqrt()))
-            .unwrap();
-        let complete_v: Vec<f32> = (0..s).map(|j| ((pos_start + j + 1) / 4) as f32).collect();
-        let complete = Array::from_slice(&complete_v, &[1, s as i32]);
-        let bids_v: Vec<f32> = (0..blocks).map(|i| i as f32).collect();
-        let bids = Array::from_slice(&bids_v, &[1, 1, blocks as i32]);
-        let visible = ops::broadcast_to(&bids, &[1, s as i32, blocks as i32])
-            .unwrap()
-            .lt(&complete.expand_dims(-1).unwrap())
-            .unwrap();
-        let neg_inf =
-            ops::broadcast_to(&Array::from_f32(f32::NEG_INFINITY), scores.shape()).unwrap();
-        let masked = ops::r#where(&visible, &scores, &neg_inf).unwrap();
-        let key = masked
-            .subtract(&bids.multiply(Array::from_f32(1e-12)).unwrap())
-            .unwrap();
-        let k = 512usize;
-        let top = ops::argpartition_axis(&(-&key), (k - 1) as i32, -1)
-            .unwrap()
-            .index((Ellipsis, 0..k as i32))
-            .contiguous()
-            .unwrap();
-        let ids: Vec<i32> = top
-            .as_dtype(Dtype::Int32)
-            .unwrap()
-            .as_slice::<i32>()
-            .to_vec();
-        let valid: Vec<u8> = ids
-            .iter()
-            .enumerate()
-            .map(|(i, &id)| {
-                if (id as f32) < complete_v[i / k] {
-                    1
-                } else {
-                    0
-                }
-            })
-            .collect();
-        ids.into_iter().zip(valid).collect()
-    }
-
-    /// Quantify how often a matmul-computed score sheet changes the top-K block
-    /// selection versus the scalar kernel. Zero flips over realistic sizes and
-    /// many seeds is the evidence a tensor-core score sheet is safe.
-    #[test]
-    #[ignore]
-    fn matmul_score_selection_flip_rate() {
-        let stream = Stream::thread_local_or_default();
-        let (heads, dim) = (4usize, 128usize);
-        let mut flips = 0usize;
-        let mut rows = 0usize;
-        let mut cases = 0usize;
-        for &(s, blocks) in &[
-            (1usize, 4096usize),
-            (4, 8192),
-            (8, 16384),
-            (16, 32768),
-            (1, 65536),
-        ] {
-            for seed0 in 0..24u64 {
-                let total = blocks * 4;
-                let pos_start = total - s;
-                let mut seed = 0x9e37_79b9 ^ seed0.wrapping_mul(0x1000_0000_01);
-                let qv: Vec<half::bf16> = (0..s * heads * dim)
-                    .map(|_| half::bf16::from_f32(lcg(&mut seed)))
-                    .collect();
-                let pv: Vec<half::bf16> = (0..blocks * dim)
-                    .map(|_| half::bf16::from_f32(lcg(&mut seed)))
-                    .collect();
-                let q = Array::from_slice(&qv, &[1, s as i32, heads as i32, dim as i32]);
-                let pooled = Array::from_slice(&pv, &[1, blocks as i32, dim as i32]);
-
-                let (ids, valid) =
-                    select_blocks(&q, &pooled, pos_start as i32, total as i32, blocks, &stream)
-                        .expect("fused selector unavailable");
-                let kid: Vec<i32> = ids
-                    .as_dtype(Dtype::Int32)
-                    .unwrap()
-                    .as_slice::<i32>()
-                    .to_vec();
-                let kvalid: Vec<u8> = valid
-                    .as_dtype(Dtype::Uint8)
-                    .unwrap()
-                    .as_slice::<u8>()
-                    .to_vec();
-
-                let reference = matmul_reference(&q, &pooled, s, blocks, pos_start, heads, dim);
-
-                for r in 0..s {
-                    let lo = r * 512;
-                    let hi = lo + 512;
-                    let a: std::collections::HashSet<i32> = kid[lo..hi]
-                        .iter()
-                        .zip(kvalid[lo..hi].iter())
-                        .filter(|(_, v)| **v != 0)
-                        .map(|(i, _)| *i)
-                        .collect();
-                    let b: std::collections::HashSet<i32> = reference[lo..hi]
-                        .iter()
-                        .filter(|(_, v)| *v != 0)
-                        .map(|(i, _)| *i)
-                        .collect();
-                    flips += a.symmetric_difference(&b).count();
-                    rows += 1;
-                }
-                cases += 1;
-            }
-        }
-        eprintln!(
-            "[score-equiv] cases={cases} rows={rows} block_flips={flips} ({:.4}% of selected)",
-            flips as f64 / (rows as f64 * 512.0) * 100.0
-        );
-    }
-}
+mod score_equiv {}
 
 /// Force `get_or_init` on every kernel static in this module (see
 /// `crate::kernels::warm_kernels`).

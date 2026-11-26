@@ -5,11 +5,12 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use lisa_bench::bindings::qwen4::config;
 use lisa_bench::bindings::qwen4::tower as model;
-use lisa_bench::cli::{DepthArg, ModelDir, parse_depth, pld_enable};
-use lisa_engine::conversation_cache;
+use lisa_bench::cli::{DepthArg, ModelDir, parse_depth};
+use lisa_engine::conversation::cache as conversation_cache;
 mod layerdiff;
 mod recurrent_reference;
 mod smoke;
+mod spec_check;
 use lisa_bench::loading::{self, Loaded};
 use lisa_bench::{generate, sampler, sched, session, tokenizer};
 use lisa_metal::ops::indexing::IndexOp;
@@ -25,6 +26,35 @@ mod glm53_run;
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// Compute device: `metal`, `cpu` or `auto` (Metal when present).
+    #[arg(long, global = true)]
+    device: Option<String>,
+    /// Cap the RAM budget in GiB; it can only lower the detected budget and
+    /// also arms HTTP request admission.
+    #[arg(long, global = true, value_parser = clap::value_parser!(u64).range(1..))]
+    ram_cap_gb: Option<u64>,
+    /// Key/value cache format: `auto` (8-bit where the model implements it),
+    /// `native` (each model's own) or `int8` (required; others refuse to load).
+    #[arg(long, global = true, default_value = "auto", value_parser = ["auto", "native", "int8"])]
+    kv_format: String,
+    /// Most rows a greedy tree round verifies (1 to 16). Each round chooses
+    /// its rows from measured costs and learned acceptance, up to this cap.
+    #[arg(long, global = true, default_value_t = 16, value_parser = clap::value_parser!(u64).range(1..=16))]
+    tree_nodes: u64,
+    /// Record hierarchical spans and print their report at exit; an optional
+    /// comma-separated list keeps only spans with those name prefixes.
+    #[arg(long, global = true, num_args = 0..=1, default_missing_value = "", value_name = "PREFIXES")]
+    trace: Option<String>,
+    /// Write the recorded spans as a Chrome trace to this path.
+    #[arg(long, global = true, value_name = "PATH")]
+    trace_json: Option<std::path::PathBuf>,
+    /// One dispatch per command buffer so per-buffer GPU time attributes to a
+    /// single kernel (slow; diagnostic only).
+    #[arg(long, global = true)]
+    gpu_probe: bool,
+    /// Append one JSON line per completed command buffer to this path.
+    #[arg(long, global = true, value_name = "PATH")]
+    cb_record: Option<std::path::PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -35,10 +65,13 @@ enum Command {
     Glm53Run(glm53_run::Args),
     /// Verify the compute stack: quantized matmul, fast ops, custom kernels.
     Smoke,
+    /// Check that greedy speculative decoding reproduces serial greedy tokens,
+    /// and report both decode rates.
+    SpecCheck(spec_check::Args),
     /// Run the public golden correctness check.
     Golden {
-        /// A local model directory or a HF repo id (resolved against the hub
-        /// cache only — the golden never triggers a download).
+        /// A HF repo id, resolved against the hub cache only (the golden never
+        /// triggers a download).
         #[arg(long)]
         model: String,
         /// Golden JSON. Defaults to the tracked qwen3_5 golden
@@ -47,17 +80,12 @@ enum Command {
         golden: Option<PathBuf>,
         #[arg(long, default_value_t = 256)]
         max_tokens: usize,
-        /// MTP speculative draft depth (0 = serial, 2..=7 = MTP; 1 is rejected).
+        /// MTP speculative draft depth (0 = serial, 2..=6 = native MTP;
+        /// model-specific limits apply; 1 is rejected).
         /// The golden deliberately stays SERIAL by default: it is a parity tool
         /// (the tracked baseline was captured serially), not a benchmark.
         #[arg(long, default_value_t = 0, value_parser = parse_depth)]
         depth: usize,
-        /// Prompt-lookup (PLD) speculative decode (greedy only).
-        #[arg(long, default_value_t = false)]
-        pld: bool,
-        /// PLD draft depth (used when --pld is set; 0 = default 4).
-        #[arg(long, default_value_t = 0)]
-        pld_depth: usize,
         /// Instead of comparing, generate greedily and write the tokens back
         /// into the golden file as the baseline (qwen3_5 capture mode; needs
         /// an explicit --golden to write into).
@@ -89,6 +117,11 @@ enum Command {
         /// Write prompt IDs and the full first-token logit vector as JSON.
         #[arg(long)]
         dump_logits: Option<PathBuf>,
+        /// Feed the final N prompt tokens one at a time through decode steps
+        /// after prefilling the rest, so the logits exercise decode attention
+        /// over the cached keys and values.
+        #[arg(long, default_value_t = 0)]
+        decode_tail: usize,
     },
     /// KV cache write/read unit test.
     CacheTest,
@@ -119,8 +152,10 @@ enum Command {
     SessionCheck {
         #[arg(long)]
         model: ModelDir,
+        /// A golden whose first case's prompt tokens to feed; without one, a
+        /// text prompt in the checkpoint's own tokens.
         #[arg(long)]
-        golden: PathBuf,
+        golden: Option<PathBuf>,
         #[arg(long, default_value_t = 16)]
         chunk: usize,
     },
@@ -150,7 +185,8 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         seed: u64,
         /// MTP draft depth (`auto` = EV controller, the default; 0 = continuous
-        /// batching; 2..=7 = fixed per-stream MTP; 1 is rejected).
+        /// batching; 2..=6 = fixed per-stream native MTP; model-specific limits apply;
+        /// 1 is rejected).
         #[arg(long, default_value = "auto")]
         depth: DepthArg,
         /// Print raw token ids per stream (for batched-vs-serial parity diffs).
@@ -183,7 +219,7 @@ enum Command {
     },
     /// Verify-round GPU audit: wall ms/verify, dispatches/verify and
     /// per-kernel GPU ms/verify over N S-row verify forwards at `kv`
-    /// (Port 2 decomposition, specs/24). Same counter method as serial-audit.
+    /// (Port 2 decomposition). Same counter method as serial-audit.
     VerifyAudit {
         #[arg(long)]
         model: ModelDir,
@@ -203,13 +239,13 @@ enum Command {
         golden: PathBuf,
         #[arg(long, default_value_t = 9)]
         iters: usize,
-        /// Select the GLM Q8 prefill route or run an interleaved DS4/stock A/B.
+        /// Select the GLM Q8 prefill route or run an interleaved reference/stock A/B.
         #[arg(long, default_value = "ds4-mpp", value_parser = ["ds4-mpp", "stock", "abba"])]
         q8_prefill: String,
         /// Select the default, grouped, or per-slot routed-MoE prefill schedule.
         #[arg(long, default_value = "auto", value_parser = ["auto", "grouped", "stock", "abba"])]
         moe_grouped: String,
-        /// Select the fused or DS4-split grouped gate/up schedule, or interleave both.
+        /// Select the fused or reference-split grouped gate/up schedule, or interleave both.
         #[arg(long, default_value = "auto", value_parser = ["auto", "fused", "split", "abba"])]
         moe_pair: String,
         /// Select scalar or four-byte-vector affine-Q2 unpacking for grouped MoE.
@@ -223,9 +259,8 @@ enum Command {
         dump_schedule_logits_prefix: Option<PathBuf>,
     },
     /// Serial-step GPU audit: wall ms/step, dispatches/step and per-label GPU
-    /// intervals over N serial decode steps (specs/16). Pair with
-    /// LISA_GPU_PROBE=1 for per-command-buffer GPU intervals attributed to
-    /// one kernel per buffer; use a normal run for wall/step because probe
+    /// intervals over N serial decode steps. Pair with `--gpu-probe` for
+    /// per-command-buffer GPU intervals attributed to one kernel per buffer; use a normal run for wall/step because probe
     /// mode changes command-buffer submission cadence.
     SerialAudit {
         #[arg(long)]
@@ -240,7 +275,11 @@ enum Command {
         /// Counted steps after 8 warmup steps.
         #[arg(long, default_value_t = 32)]
         steps: usize,
-        /// Compare the DS4 KDA projection schedule, a 4/16-simdgroup
+        /// Prefill the prompt this many times on fresh sessions and report
+        /// each run; later runs exclude first-use kernel compilation.
+        #[arg(long, default_value_t = 1)]
+        prefill_runs: usize,
+        /// Compare the reference KDA projection schedule, a 4/16-simdgroup
         /// candidate, or interleave them in ABBA order.
         #[arg(
             long,
@@ -248,23 +287,16 @@ enum Command {
             value_parser = ["ds4", "4", "16", "abba", "abba4", "abba16"]
         )]
         kda_nsg: String,
-        /// Compare DS4's one-pool indexer scorer with its four-pool SIMD-group schedule.
+        /// Compare the reference's one-pool indexer scorer with its four-pool SIMD-group schedule.
         #[arg(long, default_value = "rows4", value_parser = ["legacy", "rows4", "abba"])]
         dsa_score: String,
-        /// Select the DS4 threadgroup or SIMD-shuffle top-k network, or interleave both.
+        /// Select the reference threadgroup or SIMD-shuffle top-k network, or interleave both.
         #[arg(long, default_value = "shuffle", value_parser = ["legacy", "shuffle", "abba"])]
         dsa_topk: String,
         /// Compare the reference 4-row output-head QMV tile with the 8-row candidate.
         #[arg(long, default_value = "4", value_parser = ["4", "8", "abba"])]
         lm_head_qmv: String,
     },
-}
-
-/// Short host tag for the table's `measured` provenance field.
-fn whoami() -> String {
-    std::env::var("USER")
-        .or_else(|_| std::env::var("LOGNAME"))
-        .unwrap_or_else(|_| "unknown".to_string())
 }
 
 fn main() -> anyhow::Result<()> {
@@ -275,9 +307,32 @@ fn main() -> anyhow::Result<()> {
 
 fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    // Resolve the device backend: `LISA_DEVICE`, else Metal when present, else
-    // CPU. Announce a non-default (CPU) selection.
-    let backend = lisa_bench::device::Backend::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Select diagnostics, the RAM cap and the device backend before anything
+    // touches Metal or loads a model.
+    let _ = lisa_metal::diagnostics::configure(lisa_metal::diagnostics::Diagnostics {
+        trace: cli.trace.as_deref().map(|prefixes| {
+            prefixes
+                .split(',')
+                .map(str::trim)
+                .filter(|prefix| !prefix.is_empty())
+                .map(str::to_owned)
+                .collect()
+        }),
+        trace_json: cli.trace_json.clone(),
+        gpu_probe: cli.gpu_probe,
+        cb_record: cli.cb_record.clone(),
+    });
+    if let Some(gib) = cli.ram_cap_gb {
+        lisa_engine::memory::set_ram_cap_gib(gib as usize);
+    }
+    lisa_engine::memory::set_kv_format(match cli.kv_format.as_str() {
+        "native" => lisa_engine::memory::KvFormat::Native,
+        "int8" => lisa_engine::memory::KvFormat::Int8,
+        _ => lisa_engine::memory::KvFormat::Auto,
+    });
+    lisa_engine::loading::set_tree_nodes(cli.tree_nodes as usize);
+    let backend = lisa_bench::device::Backend::resolve(cli.device.as_deref())?;
+    backend.select()?;
     if backend != lisa_bench::device::Backend::Metal {
         eprintln!("device: {}", backend.name());
     }
@@ -285,7 +340,7 @@ fn run() -> anyhow::Result<()> {
     // Cap how far the Metal buffer pool may grow past load-steady-state before
     // a sweep is forced. Without a cap a pipelined prefill or MTP round pins
     // every temporary it ever made (buffers are only released at a flush).
-    let _ = lisa_metal::memory::set_cache_limit(8 << 30);
+    lisa_metal::memory::set_cache_limit(8 << 30);
     // The GPU command buffer is committed every 50 dispatches by default,
     // which is late enough that the MTP head's sequential draft steps do not
     // overlap the CPU graph build. Committing at ~16 recovers ~2 ms of the
@@ -305,6 +360,7 @@ fn run() -> anyhow::Result<()> {
             prompt,
             raw,
             dump_logits,
+            decode_tail,
         } => {
             let mut tower = match loading::load_dir(&model)? {
                 Loaded::Language(tower) => tower,
@@ -315,7 +371,7 @@ fn run() -> anyhow::Result<()> {
                     anyhow::bail!("logits are unavailable for decision model {}", model.name())
                 }
             };
-            let tok = tokenizer::Tokenizer::load(&model)?;
+            let tok = lisa_engine::checkpoint::tokenizer::load(&model)?;
             let text = if raw {
                 prompt.clone()
             } else {
@@ -324,12 +380,15 @@ fn run() -> anyhow::Result<()> {
             let ids = tok.encode(&text, false)?;
             println!("{} tokens", ids.len());
             println!("input_ids: {ids:?}");
-            let mut caches = tower.new_caches();
-            let i32s: Vec<i32> = ids.iter().map(|&t| t as i32).collect();
-            let arr = lisa_metal::Array::from_slice(&i32s, &[1i32, i32s.len() as i32]);
-            let (mixed, _) = tower.forward(&arr, Some(&mut caches))?;
-            let last = mixed.index((.., mixed.dim(1) - 1, ..));
-            let logits = tower.head(&last)?;
+            // The production prefill path, as generation runs it.
+            let mut session = lisa_bench::core::session::Session::new(&mut *tower);
+            anyhow::ensure!(decode_tail < ids.len(), "--decode-tail must leave a prefix");
+            let (prefix, tail) = ids.split_at(ids.len() - decode_tail);
+            let mut logits = session.feed_multi(&mut *tower, prefix)?.0;
+            for &token in tail {
+                logits = session.feed(&mut *tower, &[token])?;
+            }
+            let logits = logits.reshape(&[1, -1])?;
             let neg = -&logits;
             let top = lisa_metal::ops::argpartition_axis(&neg, 7, -1)?;
             let top = top.index((.., 0..8));
@@ -393,7 +452,7 @@ fn run() -> anyhow::Result<()> {
             // The tracked golden prompts are tiny; build a natural long prompt
             // (repeated text + a counting question) so the greedy continuation
             // runs the full token budget instead of hitting EOS immediately.
-            let tok = tokenizer::Tokenizer::load(&model)?;
+            let tok = lisa_engine::checkpoint::tokenizer::load(&model)?;
             let story = "The quick brown fox jumps over the lazy dog. ".repeat(276);
             let text = tokenizer::generation_prompt(&[(
                 "user".to_string(),
@@ -414,16 +473,21 @@ fn run() -> anyhow::Result<()> {
             };
             generate::set_eos_ids(vec![248_046, 248_044]);
             tower.warmup(&prompt[..8])?;
-            let split = prompt.len().saturating_sub(suffix.min(prompt.len()));
+            // Entries split only at the model's natural prefill alignment.
+            let grain = tower.prefix_cache_granularity().unwrap_or(1).max(1);
+            let split = prompt.len().saturating_sub(suffix.min(prompt.len())) / grain * grain;
 
             // Pass 1 is discarded (first-call Metal JIT / lazy page faults).
             for pass in 0..2 {
                 // Reference: one full prefill, greedy decode.
                 let mut greedy = sampler::Sampler::default();
-                let (ref_tokens, ref_stats) =
-                    generate::generate(&mut *tower, &prompt, tokens, &mut greedy, 0, &mut |_t| {
-                        Ok(())
-                    })?;
+                let (ref_tokens, ref_stats) = generate::generate(
+                    &mut *tower,
+                    &prompt,
+                    tokens,
+                    &mut greedy,
+                    &mut |_t| Ok(()),
+                )?;
                 // Cached: prefill the prefix once, snapshot it, resume from the
                 // entry on a fresh session, prefill only the suffix, decode.
                 let mut cache = conversation_cache::PrefixCache::new(
@@ -445,7 +509,6 @@ fn run() -> anyhow::Result<()> {
                     &prompt[matched..],
                     tokens,
                     &mut greedy,
-                    0,
                     None,
                     &mut |_t| Ok(()),
                 )?;
@@ -478,14 +541,29 @@ fn run() -> anyhow::Result<()> {
             golden,
             chunk,
         } => {
-            let data = std::fs::read_to_string(&golden)?;
-            let g: serde_json::Value = serde_json::from_str(&data)?;
-            let prompt: Vec<u32> = g["cases"][0]["prompt_tokens"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter_map(|v| v.as_u64().map(|x| x as u32))
-                .collect();
+            let tok = lisa_engine::checkpoint::tokenizer::load(&model)?;
+            let prompt: Vec<u32> = match &golden {
+                Some(golden) => {
+                    let g: serde_json::Value =
+                        serde_json::from_str(&std::fs::read_to_string(golden)?)?;
+                    g["cases"][0]["prompt_tokens"]
+                        .as_array()
+                        .ok_or_else(|| anyhow::anyhow!("golden has no prompt tokens"))?
+                        .iter()
+                        .filter_map(|v| v.as_u64().map(|x| x as u32))
+                        .collect()
+                }
+                None => tok.encode(
+                    &tokenizer::generation_prompt(&[(
+                        "user".to_string(),
+                        format!(
+                            "{}How many sentences mention the fox? Answer briefly.",
+                            "The quick brown fox jumps over the lazy dog. ".repeat(24)
+                        ),
+                    )]),
+                    false,
+                )?,
+            };
             anyhow::ensure!(
                 !prompt.is_empty(),
                 "session-check requires a nonempty prompt"
@@ -494,7 +572,6 @@ fn run() -> anyhow::Result<()> {
                 lisa_bench::Loaded::Language(tower) => tower,
                 _ => anyhow::bail!("session-check requires a language model"),
             };
-            let tok = tokenizer::Tokenizer::load(&model)?;
             generate::set_eos_ids_for_model(tok.im_end_ids.clone(), tower.as_ref());
             tower.warmup(&prompt[..prompt.len().min(8)])?;
             let (eq, dlog, dhid) = session::verify_incremental(tower.as_mut(), &prompt, chunk)?;
@@ -529,7 +606,7 @@ fn run() -> anyhow::Result<()> {
                 }
             };
             let tower = tower.as_mut();
-            let tok = tokenizer::Tokenizer::load(&model)?;
+            let tok = lisa_engine::checkpoint::tokenizer::load(&model)?;
             generate::set_eos_ids_for_model(tok.im_end_ids.clone(), tower);
             let requests: Vec<sched::Request> = prompts
                 .iter()
@@ -582,11 +659,13 @@ fn run() -> anyhow::Result<()> {
             kv,
             prefill_chunk,
             steps,
+            prefill_runs,
             kda_nsg,
             dsa_score,
             dsa_topk,
             lm_head_qmv,
         } => {
+            anyhow::ensure!(prefill_runs > 0, "--prefill-runs must be positive");
             anyhow::ensure!(
                 dsa_score != "abba" || kda_nsg == "ds4",
                 "--dsa-score abba requires the default DS4 KDA schedule"
@@ -625,7 +704,7 @@ fn run() -> anyhow::Result<()> {
                     anyhow::bail!("serial-audit expects a language model")
                 }
             };
-            let tok = tokenizer::Tokenizer::load(&model)?;
+            let tok = lisa_engine::checkpoint::tokenizer::load(&model)?;
             let text = tokenizer::generation_prompt(&[(
                 "user".to_string(),
                 "The quick brown fox jumps over the lazy dog. ".repeat(kv.div_ceil(10) + 1),
@@ -633,19 +712,48 @@ fn run() -> anyhow::Result<()> {
             let mut ids: Vec<u32> = tok.encode(&text, false)?;
             ids.truncate(kv);
             tower.warmup(&ids[..ids.len().min(64)])?;
-            let mut sess = lisa_bench::core::session::Session::new(&mut *tower);
-            let logits = if prefill_chunk == 0 {
-                sess.feed_multi(&mut *tower, &ids)?.0
-            } else {
-                let mut logits = None;
-                for chunk in ids.chunks(prefill_chunk) {
-                    let next = sess.feed(&mut *tower, chunk)?;
-                    next.eval()?;
-                    logits = Some(next);
-                    lisa_metal::memory::trim_cache();
+            let mut prefilled = None;
+            for _ in 0..prefill_runs {
+                let mut sess = lisa_bench::core::session::Session::new(&mut *tower);
+                let prefill_dispatches = runtime_dispatch_count();
+                let prefill_started = std::time::Instant::now();
+                let logits = if prefill_chunk == 0 {
+                    sess.feed_multi(&mut *tower, &ids)?.0
+                } else {
+                    let mut logits = None;
+                    for chunk in ids.chunks(prefill_chunk) {
+                        let next = sess.feed(&mut *tower, chunk)?;
+                        next.eval()?;
+                        logits = Some(next);
+                        lisa_metal::memory::trim_cache();
+                    }
+                    logits.expect("non-empty serial-audit prompt")
+                };
+                logits.eval()?;
+                println!(
+                    "prefill: {} tokens in {:.1} ms ({:.0} tok/s), {} dispatches",
+                    ids.len(),
+                    prefill_started.elapsed().as_secs_f64() * 1e3,
+                    ids.len() as f64 / prefill_started.elapsed().as_secs_f64(),
+                    runtime_dispatch_count() - prefill_dispatches
+                );
+                prefilled = Some((sess, logits));
+            }
+            let (mut sess, logits) = prefilled.expect("at least one prefill run");
+            if lisa_metal::diagnostics::get().gpu_probe {
+                let mut gpu = runtime_label_gpu_ms();
+                gpu.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+                let dispatches: std::collections::HashMap<_, _> =
+                    runtime_label_dispatches().into_iter().collect();
+                println!("--- prefill kernels by GPU interval (warmup included) ---");
+                for (label, ns) in gpu.iter().take(25) {
+                    println!(
+                        "  {:9.1} ms {:7} dispatches  {label}",
+                        *ns as f64 / 1e6,
+                        dispatches.get(label).copied().unwrap_or(0)
+                    );
                 }
-                logits.expect("non-empty serial-audit prompt")
-            };
+            }
             let argmax_id = |a: &lisa_metal::Array| -> anyhow::Result<u32> {
                 let out = lisa_metal::ops::indexing::argmax(a, None)
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -660,6 +768,7 @@ fn run() -> anyhow::Result<()> {
             }
             // Snapshot BEFORE the counted steps (counters are cumulative since
             // process start, prefill included) so deltas cover exactly them.
+            lisa_metal::enable_allocation_labels();
             let pre_d = runtime_dispatch_count();
             let pre_lc = runtime_label_counts();
             let pre_ld = runtime_label_dispatches();
@@ -714,11 +823,7 @@ fn run() -> anyhow::Result<()> {
                     lisa_bench::core::quant::Glm53IndexerTopkShuffleScope::new(use_shuffle)
                 });
                 let _lm_head_qmv_scope = (lm_head_qmv != "4").then(|| {
-                    lisa_metal::ops::Glm53LmHeadQmvTileScope::new(if use_wide_lm_head {
-                        8
-                    } else {
-                        4
-                    })
+                    lisa_metal::ops::LmHeadQmvTileScope::new(if use_wide_lm_head { 8 } else { 4 })
                 });
                 let logits = if use_candidate {
                     let nsg = if kda_nsg == "4" || kda_nsg == "abba4" {
@@ -779,7 +884,7 @@ fn run() -> anyhow::Result<()> {
             println!("greedy tokens: {sampled_tokens:?}");
             println!(
                 "serial-audit: {steps} steps @ kv {kv} (prefill_chunk={prefill_chunk}, kda_nsg={kda_nsg}, dsa_score={dsa_score}, dsa_topk={dsa_topk}, lm_head_qmv={lm_head_qmv}, probe={:?})",
-                std::env::var_os("LISA_GPU_PROBE").is_some(),
+                lisa_metal::diagnostics::get().gpu_probe,
             );
             println!(
                 "wall ms/step: median {:.2}  mean {:.2}",
@@ -847,7 +952,7 @@ fn run() -> anyhow::Result<()> {
                 .iter()
                 .map(|(k, g)| (k, *g as i64 - gpu.get(k).copied().unwrap_or(0) as i64))
                 .collect();
-            dl.sort_by(|a, b| b.1.cmp(&a.1));
+            dl.sort_by_key(|entry| std::cmp::Reverse(entry.1));
             let gpu_sum: f64 = dl.iter().map(|(_, g)| *g).sum::<i64>() as f64 / 1e6;
             println!(
                 "attributed GPU interval ms/step: {:.2}  wall-minus-interval: {:+.2} ms/step",
@@ -869,7 +974,7 @@ fn run() -> anyhow::Result<()> {
                     )
                 })
                 .collect();
-            dlc.sort_by(|a, b| b.1.cmp(&a.1));
+            dlc.sort_by_key(|entry| std::cmp::Reverse(entry.1));
             println!("--- kernels by dispatch count/step ---");
             for (k, c) in dlc.iter().filter(|(_, c)| *c > 0) {
                 println!("{:>7.1}/step  {}", *c as f64 / n, k);
@@ -885,7 +990,7 @@ fn run() -> anyhow::Result<()> {
                     )
                 })
                 .collect();
-            alc.sort_by(|a, b| b.1.cmp(&a.1));
+            alc.sort_by_key(|entry| std::cmp::Reverse(entry.1));
             println!("--- output allocations/step ---");
             for (k, c) in alc.iter().filter(|(_, c)| *c > 0) {
                 println!("{:>7.1}/step  {}", *c as f64 / n, k);
@@ -908,7 +1013,7 @@ fn run() -> anyhow::Result<()> {
                     anyhow::bail!("verify-audit expects a language model")
                 }
             };
-            let tok = tokenizer::Tokenizer::load(&model)?;
+            let tok = lisa_engine::checkpoint::tokenizer::load(&model)?;
             let text = tokenizer::generation_prompt(&[(
                 "user".to_string(),
                 "The quick brown fox jumps over the lazy dog. ".repeat(kv.div_ceil(10) + 1),
@@ -921,9 +1026,9 @@ fn run() -> anyhow::Result<()> {
             let (logits, _) = sess.feed_multi(&mut *tower, &ids)?;
             let _ = logits;
             let s = s.max(2);
-            let verify_ids: Vec<i32> = std::iter::repeat(1i32).take(s as usize).collect();
+            let verify_ids: Vec<i32> = std::iter::repeat_n(1i32, s as usize).collect();
             // One S-row verify forward with snapshot/rollback (round-cost's
-            // verify pass); wall ms includes head+argmax, splitk scope armed.
+            // verify pass); wall ms includes the production verified head+argmax.
             let verify_once = |sess: &mut lisa_bench::core::session::Session,
                                tower: &mut dyn lisa_bench::language::LanguageModel<
                 lisa_bench::metal_language::MetalLanguageRuntime,
@@ -941,15 +1046,13 @@ fn run() -> anyhow::Result<()> {
                         .collect(),
                 ]);
                 let arr = lisa_metal::Array::from_slice(&verify_ids, &[1i32, s as i32]);
-                let _splitk = lisa_metal::ops::enter_verify_splitk_scope();
                 let t0 = std::time::Instant::now();
                 let (mixed, _multi) = tower.forward_capture(&arr, Some(&mut sess.caches), true)?;
-                let logits = tower.head(&mixed)?;
+                let logits = tower.head_verified(&mixed)?;
                 let top = lisa_metal::ops::indexing::argmax_axis(&logits, -1, None)
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
                 top.eval().map_err(|e| anyhow::anyhow!("{e}"))?;
                 let dt = t0.elapsed().as_secs_f64() * 1e3;
-                drop(_splitk);
                 for (c, sn) in sess.caches.iter_mut().zip(snaps.iter()) {
                     c.restore_rollback(sn)?;
                 }
@@ -959,6 +1062,7 @@ fn run() -> anyhow::Result<()> {
             for _ in 0..warm {
                 verify_once(&mut sess, &mut *tower)?;
             }
+            lisa_metal::enable_allocation_labels();
             let pre_d = runtime_dispatch_count();
             let pre_lc = runtime_label_counts();
             std::thread::sleep(std::time::Duration::from_millis(300));
@@ -989,7 +1093,7 @@ fn run() -> anyhow::Result<()> {
                 .iter()
                 .map(|(k, g)| (k, *g as i64 - gpu.get(k).copied().unwrap_or(0) as i64))
                 .collect();
-            dl.sort_by(|a, b| b.1.cmp(&a.1));
+            dl.sort_by_key(|entry| std::cmp::Reverse(entry.1));
             let gpu_sum: f64 = dl.iter().map(|(_, g)| *g).sum::<i64>() as f64 / 1e6;
             println!(
                 "GPU ms/verify (sum over kernels): {:.2}  -> un-attributed {:.2} ms/verify",
@@ -1004,7 +1108,7 @@ fn run() -> anyhow::Result<()> {
                 .iter()
                 .map(|(k, v)| (k, *v as i64 - count.get(k).copied().unwrap_or(0) as i64))
                 .collect();
-            cl.sort_by(|a, b| b.1.cmp(&a.1));
+            cl.sort_by_key(|entry| std::cmp::Reverse(entry.1));
             println!("--- ops by dispatch count/verify ---");
             for (k, c) in cl.iter().filter(|(_, c)| *c > 0) {
                 println!("{:>7.1}/verify  {}", *c as f64 / n, k);
@@ -1041,7 +1145,7 @@ fn run() -> anyhow::Result<()> {
             } else {
                 widths
             };
-            let tok = tokenizer::Tokenizer::load(&model)?;
+            let tok = lisa_engine::checkpoint::tokenizer::load(&model)?;
             let key = tower.mtp_cost_key();
             let out_path = out.unwrap_or_else(default_path);
             let mut table = RoundCostTable::load(&out_path).unwrap_or_default();
@@ -1071,7 +1175,7 @@ fn run() -> anyhow::Result<()> {
                         std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)?
                             .as_secs(),
-                        whoami(),
+                        lisa_engine::core::round_cost::host_chip(),
                     );
                     mc.serial_ms[bucket].observe(serial as f32);
                     mc.draft_ms[bucket].observe(draft as f32);
@@ -1485,7 +1589,7 @@ fn run() -> anyhow::Result<()> {
             }
             let median = |mut values: Vec<f64>| {
                 values.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                if values.len() % 2 == 0 {
+                if values.len().is_multiple_of(2) {
                     (values[values.len() / 2 - 1] + values[values.len() / 2]) * 0.5
                 } else {
                     values[values.len() / 2]
@@ -1523,7 +1627,7 @@ fn run() -> anyhow::Result<()> {
                 }
             }
             if moe_grouped == "abba" {
-                for (cycle, samples) in times.chunks_exact(4).enumerate() {
+                for (cycle, samples) in times.as_chunks::<4>().0.iter().enumerate() {
                     let grouped_ms = median(vec![samples[0].4, samples[3].4]) * 1e3;
                     let stock_ms = median(vec![samples[1].4, samples[2].4]) * 1e3;
                     println!(
@@ -1535,7 +1639,7 @@ fn run() -> anyhow::Result<()> {
                 }
             }
             if moe_down_tile == "abba" {
-                for (cycle, samples) in times.chunks_exact(4).enumerate() {
+                for (cycle, samples) in times.as_chunks::<4>().0.iter().enumerate() {
                     let tile64_ms = median(vec![samples[0].4, samples[3].4]) * 1e3;
                     let tile128_ms = median(vec![samples[1].4, samples[2].4]) * 1e3;
                     println!(
@@ -1554,7 +1658,7 @@ fn run() -> anyhow::Result<()> {
                             (*moe == use_grouped_moe).then_some(*seconds)
                         })
                         .collect();
-                    for (cycle, samples) in q8_times.chunks_exact(4).enumerate() {
+                    for (cycle, samples) in q8_times.as_chunks::<4>().0.iter().enumerate() {
                         let mpp_ms = median(vec![samples[0], samples[3]]) * 1e3;
                         let stock_ms = median(vec![samples[1], samples[2]]) * 1e3;
                         println!(
@@ -1567,7 +1671,7 @@ fn run() -> anyhow::Result<()> {
                 }
             }
             if moe_pair == "abba" {
-                for (cycle, samples) in times.chunks_exact(4).enumerate() {
+                for (cycle, samples) in times.as_chunks::<4>().0.iter().enumerate() {
                     let fused_ms = median(vec![samples[0].4, samples[3].4]) * 1e3;
                     let split_ms = median(vec![samples[1].4, samples[2].4]) * 1e3;
                     println!(
@@ -1579,7 +1683,7 @@ fn run() -> anyhow::Result<()> {
                 }
             }
             if moe_q2_load == "abba" {
-                for (cycle, samples) in times.chunks_exact(4).enumerate() {
+                for (cycle, samples) in times.as_chunks::<4>().0.iter().enumerate() {
                     let vector_ms = median(vec![samples[0].4, samples[3].4]) * 1e3;
                     let scalar_ms = median(vec![samples[1].4, samples[2].4]) * 1e3;
                     println!(
@@ -1592,19 +1696,20 @@ fn run() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Command::SpecCheck(args) => {
+            let model = lisa_bench::checkpoint::resolve_model_dir(&args.model)?;
+            spec_check::run(args, model)
+        }
         Command::Golden {
             model,
             golden,
             max_tokens,
             depth,
-            pld,
-            pld_depth,
             capture,
         } => {
-            let pld = pld_enable(pld, pld_depth);
             // The golden is cache-only: it never triggers a model download.
             let model_dir = resolve_cached_model(&model)?;
-            // qwen3_5 (27B) golden over every case in the file; `--depth 2..=7`
+            // qwen3_5 (27B) golden over every case in the file; `--depth 2..=6`
             // runs the same cases through the native MTP head (lossless greedy
             // verify). `--capture` writes the serial greedy baselines.
             if lisa_bench::checkpoint::model_type_of(&model_dir)?.starts_with("qwen3_5") {
@@ -1626,7 +1731,6 @@ fn run() -> anyhow::Result<()> {
                     max_tokens,
                     capture,
                     depth,
-                    pld,
                 );
             }
             // qwen4 (Flash-Next) golden: one long-prompt greedy case over the
@@ -1661,11 +1765,12 @@ fn run() -> anyhow::Result<()> {
                 .filter_map(|v| v.as_u64().map(|x| x as u32))
                 .collect();
 
+            let n = max_tokens.min(expected.len());
+            anyhow::ensure!(n > 0, "golden check requires at least one expected token");
             let config = config::ModelConfig::from_json(&model_dir.join("config.json"))?;
             let mut tower = model::Tower::load(&model_dir, config)?;
             generate::set_eos_ids(vec![248_046, 248_044]);
 
-            let n = max_tokens.min(expected.len());
             let (generated, prefill_tps, decode_tps, spec_line) = if depth > 0 {
                 let mut sess = session::Session::new(&mut tower);
                 let t0 = std::time::Instant::now();
@@ -1680,38 +1785,30 @@ fn run() -> anyhow::Result<()> {
             } else {
                 let mut greedy = sampler::Sampler::default();
                 let (g, s) =
-                    generate::generate(&mut tower, &prompt, n, &mut greedy, pld, &mut |_t| Ok(()))?;
+                    generate::generate(&mut tower, &prompt, n, &mut greedy, &mut |_t| Ok(()))?;
                 (g, s.prefill_tps(), s.decode_tps(), None)
             };
             let mut matches = 0usize;
             let mut first_bad = None;
-            for (i, (a, b)) in generated.iter().zip(expected.iter()).enumerate() {
+            for (i, (a, b)) in generated.iter().zip(&expected[..n]).enumerate() {
                 if a == b {
                     matches += 1;
                 } else if first_bad.is_none() {
                     first_bad = Some(i);
                 }
             }
+            if generated.len() != n && first_bad.is_none() {
+                first_bad = Some(generated.len().min(n));
+            }
             println!(
                 "tokens: {} generated / {} expected | matches {}/{} ({:.1}%) | first mismatch at {:?}",
                 generated.len(),
-                expected.len(),
+                n,
                 matches,
-                generated.len(),
-                100.0 * matches as f64 / generated.len() as f64,
+                n,
+                100.0 * matches as f64 / n as f64,
                 first_bad,
             );
-            if depth > 0 {
-                // Governed wide-verify semantics (AGENTS.md §9.6): the verify
-                // runs one S=depth+1 forward while the golden was captured
-                // serially (S=1), so near-tie tokens can flip and cascade.
-                // Divergence here is expected and deterministic — do not
-                // "fix" it by narrowing the verify.
-                println!(
-                    "note: --depth {depth} verifies wide (S={}); near-tie flips vs the serial golden are governed semantics (AGENTS.md §9.6)",
-                    depth + 1
-                );
-            }
             println!("expected head:  {:?}", &expected[..expected.len().min(12)]);
             println!(
                 "generated head: {:?}",
@@ -1724,9 +1821,23 @@ fn run() -> anyhow::Result<()> {
                 "prefill: {:.1} tok/s | decode: {:.1} tok/s",
                 prefill_tps, decode_tps
             );
-            Ok(())
+            require_golden_prefix(&generated, &expected, n)
         }
     }
+}
+
+fn require_golden_prefix(generated: &[u32], expected: &[u32], n: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        n > 0 && n <= expected.len(),
+        "invalid golden comparison length"
+    );
+    anyhow::ensure!(
+        generated.len() == n,
+        "golden output length differs: {} generated, {n} expected",
+        generated.len()
+    );
+    anyhow::ensure!(generated == &expected[..n], "Qwen4 golden token mismatch");
+    Ok(())
 }
 
 /// The tracked qwen3_5 golden (the single source of truth on disk is
@@ -1761,18 +1872,15 @@ fn embedded_qwen35_golden(dir: &std::path::Path) -> &'static str {
 /// Resolve a golden `--model` value to a local directory WITHOUT downloading:
 /// an existing path is used as-is; a repo id must already be in the HF hub
 /// cache (the golden is an integrity check, not a fetcher).
+/// The Hub-cache checkpoint of repo id `target`, without downloading.
 fn resolve_cached_model(target: &str) -> anyhow::Result<std::path::PathBuf> {
     use lisa_bench::checkpoint::hf;
-    let direct = std::path::Path::new(target);
-    if direct.is_dir() {
-        return Ok(direct.to_path_buf());
-    }
     anyhow::ensure!(
         hf::is_repo_id(target),
-        "unknown model {target:?}: pass a local path or a Hugging Face repo id"
+        "unknown model {target:?}: pass a Hugging Face repo id"
     );
     if let Some(dir) = hf::cached_snapshot(target) {
-        return Ok(dir);
+        return Ok(hf::checkpoint_path(dir));
     }
     anyhow::bail!(
         "model {target} is not in the HF hub cache and the golden never downloads.\n\
@@ -1803,7 +1911,7 @@ fn golden_qwen4_capture(
             .get("prompt")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("capture needs cases[0].prompt text"))?;
-        let tok = tokenizer::Tokenizer::load(model_dir)?;
+        let tok = lisa_engine::checkpoint::tokenizer::load(model_dir)?;
         let text = tokenizer::generation_prompt(&[("user".to_string(), prompt_text.to_string())]);
         let prompt_ids: Vec<u32> = tok.encode(&text, false)?;
         let config = config::ModelConfig::from_json(&model_dir.join("config.json"))?;
@@ -1816,7 +1924,6 @@ fn golden_qwen4_capture(
             &prompt_ids,
             max_tokens,
             &mut greedy,
-            0,
             &mut |_t| Ok(()),
         )?;
         case.insert(
@@ -1850,7 +1957,6 @@ fn golden_qwen35(
     max_tokens: usize,
     capture: bool,
     depth: usize,
-    pld: usize,
 ) -> anyhow::Result<()> {
     let mut g: serde_json::Value = serde_json::from_str(content)?;
     // A golden declares the model it was captured FROM. Comparing a different
@@ -1860,19 +1966,20 @@ fn golden_qwen35(
     // and scored 37/310. Goldens are model-specific, not model_type-specific:
     // refuse rather than lie. Only the embedded default is guarded — an explicit
     // `--golden <path>` is the caller's call (a local capture has no HF path).
-    if !capture && writeback.is_none() {
-        if let Some(gm) = g["model"].as_str() {
-            let dir = model.to_string_lossy();
-            let slug = gm.replace('/', "--");
-            let short = gm.rsplit('/').next().unwrap_or(gm);
-            if !dir.contains(&slug) && !dir.contains(short) {
-                anyhow::bail!(
-                    "the embedded golden is for `{gm}` but the model under test is \
+    if !capture
+        && writeback.is_none()
+        && let Some(gm) = g["model"].as_str()
+    {
+        let dir = model.to_string_lossy();
+        let slug = gm.replace('/', "--");
+        let short = gm.rsplit('/').next().unwrap_or(gm);
+        if !dir.contains(&slug) && !dir.contains(short) {
+            anyhow::bail!(
+                "the embedded golden is for `{gm}` but the model under test is \
                      `{dir}` — goldens are model-specific, not model_type-specific. \
                      Run `--capture --golden <path>` to record this model's own \
                      baseline, or pass --golden <path> to compare against another."
-                );
-            }
+            );
         }
     }
     let mut tower = match lisa_bench::loading::load_dir(model)? {
@@ -1884,7 +1991,7 @@ fn golden_qwen35(
             anyhow::bail!("golden expects a language model")
         }
     };
-    let tok = tokenizer::Tokenizer::load(model)?;
+    let tok = lisa_engine::checkpoint::tokenizer::load(model)?;
     generate::set_eos_ids_for_model(tok.im_end_ids.clone(), tower.as_ref());
 
     let cases = g["cases"]
@@ -1922,9 +2029,7 @@ fn golden_qwen35(
             (g, None)
         } else {
             let (g, s) =
-                generate::generate(&mut *tower, &prompt_ids, n, &mut greedy, pld, &mut |_t| {
-                    Ok(())
-                })?;
+                generate::generate(&mut *tower, &prompt_ids, n, &mut greedy, &mut |_t| Ok(()))?;
             (g, Some(s))
         };
         let secs = t0.elapsed().as_secs_f64();
@@ -1997,4 +2102,26 @@ fn golden_qwen35(
         anyhow::ensure!(all_ok, "qwen3_5 golden mismatch");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod golden_prefix_tests {
+    use super::require_golden_prefix;
+
+    #[test]
+    fn accepts_only_complete_matching_requested_prefixes() {
+        let expected = [10, 20, 30];
+        assert!(require_golden_prefix(&[10, 20], &expected, 2).is_ok());
+        assert!(require_golden_prefix(&expected, &expected, 3).is_ok());
+        for (generated, n) in [
+            (&[][..], 0),
+            (&[][..], 2),
+            (&[10][..], 2),
+            (&[10, 21][..], 2),
+            (&[10, 20, 30][..], 2),
+            (&[10, 20, 30][..], 4),
+        ] {
+            assert!(require_golden_prefix(generated, &expected, n).is_err());
+        }
+    }
 }

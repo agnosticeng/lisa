@@ -23,7 +23,8 @@ pub fn warm(_stream: &lisa_metal::Stream) {
 }
 
 pub use attention::{
-    attn_gate, attn_prep_split, gated_rms, gated_rms_silu, hc_mix, inject_norm, silu_head, swiglu2,
+    attn_gate, attn_prep_split, gated_rms, gated_rms_silu, gated_rms_silu_with_serial_gate, hc_mix,
+    inject_norm, silu_head, swiglu2,
 };
 pub use common::{EXACT_HEADER, copy_rows_concat_into, copy_rows_into, indirect_bench};
 pub use gated_delta::{
@@ -41,7 +42,6 @@ pub mod ggml;
 pub mod indirect_moe;
 pub mod moe_helpers;
 pub mod nax_helpers;
-pub mod refinement;
 pub mod sparse;
 
 /// Initialize operation handles without selecting a model or traversing layers.

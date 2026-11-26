@@ -4,13 +4,13 @@ use crate::core::quant::QuantizedEmbeddingExecution;
 pub(super) fn rms(x: &Array, w: &Array, eps: f32) -> anyhow::Result<Array> {
     let xf = x.as_dtype(Dtype::Float32)?;
     let ms = xf.multiply(&xf)?.contiguous()?.mean_axis(2, true)?; // [B,T,1]
-    let n = xf.multiply(&ms.add(&Array::from_f32_as(eps, Dtype::Float32))?.rsqrt()?)?;
+    let n = xf.multiply(&ms.add(Array::from_f32_as(eps, Dtype::Float32))?.rsqrt()?)?;
     Ok(n.multiply(&w.as_dtype(Dtype::Float32)?)?)
 }
 
 pub(super) fn final_rms(x: &Array, w: &Array, eps: f32) -> anyhow::Result<Array> {
     let stream = lisa_metal::Stream::thread_local_or_default();
-    lisa_metal::kernels::sparse::kernels::glm53_ds4_rms_norm(x, w, eps, &stream).ok_or_else(|| {
+    lisa_metal::kernels::sparse::kernels::ds4_rms_norm(x, w, eps, &stream).ok_or_else(|| {
         anyhow::anyhow!(
             "GLM final DS4-order RMSNorm declined for shape {:?}",
             x.shape()
@@ -36,7 +36,7 @@ pub(super) fn final_hc_mean(state: &Array) -> anyhow::Result<Array> {
 
 pub(super) fn mtp_rms(x: &Array, w: &Array, eps: f32) -> anyhow::Result<Array> {
     let stream = lisa_metal::Stream::thread_local_or_default();
-    lisa_metal::kernels::sparse::kernels::glm53_mtp_rms_norm(x, w, eps, &stream).ok_or_else(|| {
+    lisa_metal::kernels::sparse::kernels::mtp_rms_norm(x, w, eps, &stream).ok_or_else(|| {
         anyhow::anyhow!(
             "GLM MTP ds4-order RMSNorm declined for shape {:?}",
             x.shape()
@@ -59,7 +59,7 @@ pub(super) fn draft_inputs(
     let embedded = embed.forward(&ids)?.as_dtype(Dtype::Float32)?;
     let embedded = mtp_rms(&embedded, &enorm, epsilon)?;
 
-    // ds4 reduces target mHC streams with uniform 1/C weights via its
+    // The reference reduces target mHC streams with uniform 1/C weights via its
     // fused weighted-sum kernel; preserve that kernel and accumulation order.
     anyhow::ensure!(streams == 4, "glm53 MTP mHC width must be four");
     let multi =
@@ -77,7 +77,7 @@ pub(super) fn draft_inputs(
     let rows = joined.reshape(&[1, joined.dim(2)])?;
     let projected = if eh.dtype() == Dtype::Bfloat16 {
         let stream = lisa_metal::Stream::thread_local_or_default();
-        lisa_metal::kernels::sparse::kernels::glm53_bf16_gemv(&eh, &rows, &stream)
+        lisa_metal::kernels::sparse::kernels::bf16_gemv(&eh, &rows, &stream)
             .ok_or_else(|| anyhow::anyhow!("GLM MTP BF16 eh_proj GEMV declined"))?
     } else {
         let weight = eh.transpose_axes(&[1, 0])?.as_dtype(Dtype::Float32)?;
@@ -141,7 +141,7 @@ impl TowerOracle2 for Tower {
             .max()
             .unwrap_or(0);
         if !ds4_native_session_batch_position_supported(b, max_position, dense_compact_limit) {
-            // Match glm53_graph_native_session_batch_supported: ds4 declines
+            // Match glm53_graph_native_session_batch_supported: the reference declines
             // its native cohort kernel at this row count or sparse-context
             // boundary and evaluates each session through the serial graph.
             let mut mixed_rows = Vec::with_capacity(b);
@@ -166,48 +166,19 @@ impl TowerOracle2 for Tower {
             .expand_dims(2)?
             .broadcast_to(&[b as i32, 1, c as i32, h as i32])?
             .contiguous()?;
-        #[cfg(test)]
-        let capture_mhc_expansions = std::env::var_os("LISA_GLM53_MHC_BATCH_CAPTURE").is_some();
-        #[cfg(not(test))]
-        let capture_mhc_expansions = false;
 
         for (li, layer) in self.layers.iter_mut().enumerate() {
-            let (_xc, x_in, post, comb, attn_mixes, attn_split) = if capture_mhc_expansions {
-                if let Some((xc, normed, post, comb, mixes, split)) = layer
-                    .hc_attn
-                    .split_normed_with_mixes(&state, &layer.in_norm, self.config.rms_norm_eps)?
-                {
-                    (xc, normed, post, comb, Some(mixes), Some(split))
-                } else {
-                    let (xc, post, comb) = layer.hc_attn.split(&state)?;
-                    let normed = rms(&xc, &layer.in_norm, self.config.rms_norm_eps)?;
-                    (xc, normed, post, comb, None, None)
-                }
-            } else if let Some((xc, normed, post, comb)) =
-                layer
-                    .hc_attn
-                    .split_normed(&state, &layer.in_norm, self.config.rms_norm_eps)?
+            let (_xc, x_in, post, comb) = if let Some((xc, normed, post, comb)) = layer
+                .hc_attn
+                .split_normed(&state, &layer.in_norm, self.config.rms_norm_eps)?
             {
-                (xc, normed, post, comb, None, None)
+                (xc, normed, post, comb)
             } else {
                 let (xc, post, comb) = layer.hc_attn.split(&state)?;
                 let normed = rms(&xc, &layer.in_norm, self.config.rms_norm_eps)?;
-                (xc, normed, post, comb, None, None)
+                (xc, normed, post, comb)
             };
             let capture = self.capture.as_ref().filter(|capture| capture.wants(li));
-            if capture_mhc_expansions && let Some(capture) = capture {
-                capture.store(&format!("L{li}.mhc_attn_in"), &state);
-                capture.store(&format!("L{li}.mhc_attn_post"), &post);
-                capture.store(&format!("L{li}.mhc_attn_comb"), &comb);
-                capture.store(&format!("L{li}.mhc_attn_collapsed"), &_xc);
-                capture.store(&format!("L{li}.mhc_attn_normed"), &x_in);
-                if let Some(mixes) = &attn_mixes {
-                    capture.store(&format!("L{li}.mhc_attn_mixes"), mixes);
-                }
-                if let Some(split) = &attn_split {
-                    capture.store(&format!("L{li}.mhc_attn_split"), split);
-                }
-            }
             let step = INC_STEP.load(std::sync::atomic::Ordering::Relaxed);
             if let Some(capture) = capture {
                 capture.store(&format!("L{li}.dec_rms_in_s{step}"), &x_in);
@@ -250,40 +221,17 @@ impl TowerOracle2 for Tower {
                 capture.store(&format!("L{li}.dec_state_after_attn_s{step}"), &state);
             }
 
-            let (_xc2, x_in2, post2, comb2, ffn_mixes, ffn_split) = if capture_mhc_expansions {
-                if let Some((xc, normed, post, comb, mixes, split)) = layer
-                    .hc_ffn
-                    .split_normed_with_mixes(&state, &layer.post_norm, self.config.rms_norm_eps)?
-                {
-                    (xc, normed, post, comb, Some(mixes), Some(split))
-                } else {
-                    let (xc, post, comb) = layer.hc_ffn.split(&state)?;
-                    let normed = rms(&xc, &layer.post_norm, self.config.rms_norm_eps)?;
-                    (xc, normed, post, comb, None, None)
-                }
-            } else if let Some((xc, normed, post, comb)) =
+            let (_xc2, x_in2, post2, comb2) = if let Some((xc, normed, post, comb)) =
                 layer
                     .hc_ffn
                     .split_normed(&state, &layer.post_norm, self.config.rms_norm_eps)?
             {
-                (xc, normed, post, comb, None, None)
+                (xc, normed, post, comb)
             } else {
                 let (xc, post, comb) = layer.hc_ffn.split(&state)?;
                 let normed = rms(&xc, &layer.post_norm, self.config.rms_norm_eps)?;
-                (xc, normed, post, comb, None, None)
+                (xc, normed, post, comb)
             };
-            if capture_mhc_expansions && let Some(capture) = capture {
-                capture.store(&format!("L{li}.mhc_ffn_post"), &post2);
-                capture.store(&format!("L{li}.mhc_ffn_comb"), &comb2);
-                capture.store(&format!("L{li}.mhc_ffn_collapsed"), &_xc2);
-                capture.store(&format!("L{li}.mhc_ffn_normed"), &x_in2);
-                if let Some(mixes) = &ffn_mixes {
-                    capture.store(&format!("L{li}.mhc_ffn_mixes"), mixes);
-                }
-                if let Some(split) = &ffn_split {
-                    capture.store(&format!("L{li}.mhc_ffn_split"), split);
-                }
-            }
             if let Some(capture) = capture {
                 capture.store(&format!("L{li}.mhc_ffn_normed"), &x_in2);
             }
@@ -337,61 +285,6 @@ impl TowerOracle1 for Tower {
             LayerCache::Full(cache) => Some(cache.offset),
             LayerCache::Linear(_) | LayerCache::Native(_) => None,
         });
-        #[cfg(test)]
-        let mtp_layer_capture = if b == 1 && s == 2 {
-            static NEXT_CAPTURE: std::sync::atomic::AtomicUsize =
-                std::sync::atomic::AtomicUsize::new(0);
-            static REQUESTED_CALLS: std::sync::OnceLock<Option<Vec<usize>>> =
-                std::sync::OnceLock::new();
-            std::env::var_os("LISA_GLM53_MTP_LAYER_CAPTURE_PREFIX").and_then(|prefix| {
-                let capture_index = NEXT_CAPTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let requested_calls = REQUESTED_CALLS.get_or_init(|| {
-                    std::env::var("LISA_GLM53_MTP_LAYER_CAPTURE_CALLS")
-                        .ok()
-                        .map(|value| {
-                            value
-                                .split(',')
-                                .filter_map(|item| item.trim().parse::<usize>().ok())
-                                .collect()
-                        })
-                });
-                let selected = requested_calls
-                    .as_ref()
-                    .map_or(capture_index < 2, |calls| calls.contains(&capture_index));
-                selected.then_some((prefix, capture_index))
-            })
-        } else {
-            None
-        };
-        #[cfg(test)]
-        let single_step_layer_capture = if b == 1 && s == 1 {
-            static REQUESTED_POSITIONS: std::sync::OnceLock<Option<Vec<usize>>> =
-                std::sync::OnceLock::new();
-            let position = caches.iter().find_map(|cache| match cache {
-                LayerCache::Full(cache) => Some(cache.offset),
-                LayerCache::Linear(_) | LayerCache::Native(_) => None,
-            });
-            std::env::var_os("LISA_GLM53_MTP_LAYER_CAPTURE_PREFIX").and_then(|prefix| {
-                let requested_positions = REQUESTED_POSITIONS.get_or_init(|| {
-                    std::env::var("LISA_GLM53_MTP_LAYER_CAPTURE_POSITIONS")
-                        .ok()
-                        .map(|value| {
-                            value
-                                .split(',')
-                                .filter_map(|item| item.trim().parse::<usize>().ok())
-                                .collect()
-                        })
-                });
-                let selected = position.is_some_and(|position| {
-                    requested_positions
-                        .as_ref()
-                        .is_some_and(|positions| positions.contains(&position))
-                });
-                selected.then_some((prefix, position.expect("selected cache position")))
-            })
-        } else {
-            None
-        };
         let prefill_mode = self.prefill_mode;
         let h = self.config.hidden_size;
         let c = self.config.hc_mult;
@@ -402,22 +295,6 @@ impl TowerOracle1 for Tower {
                 self.layers.len()
             );
         }
-        // DEBUG-ONLY probes: every readback below forces a full GPU→CPU sync
-        // per layer — 90 syncs per decode token when left on.
-        let probe = std::env::var_os("LISA_GLM53_DEBUG").is_some();
-        let flush_layers = std::env::var_os("LISA_GLM53_FLUSH_LAYERS").is_some();
-        let sync_layers = std::env::var("LISA_GLM53_SYNC_LAYERS").ok().map(|spec| {
-            if spec == "1" || spec.eq_ignore_ascii_case("all") {
-                None
-            } else {
-                Some(
-                    spec.split(',')
-                        .filter_map(|item| item.trim().parse::<usize>().ok())
-                        .collect::<std::collections::HashSet<_>>(),
-                )
-            }
-        });
-
         let x = {
             let _trace_embed = lisa_metal::trace::span("glm53.embed");
             let x = self.embed.forward(ids)?.as_dtype(Dtype::Float32)?;
@@ -446,10 +323,10 @@ impl TowerOracle1 for Tower {
                 );
             }
             // Attention half.
-            if let Some(cp) = &self.capture {
-                if cp.wants(li) {
-                    cp.store(&format!("L{li}.mhc_attn_in"), &state);
-                }
+            if let Some(cp) = &self.capture
+                && cp.wants(li)
+            {
+                cp.store(&format!("L{li}.mhc_attn_in"), &state);
             }
             let capture_attn_mixes = self
                 .capture
@@ -480,30 +357,18 @@ impl TowerOracle1 for Tower {
                     (xc, normed, post, comb, None, None)
                 }
             };
-            #[cfg(test)]
-            if li == 1 {
-                if let Some((prefix, position)) = single_step_layer_capture.as_ref() {
-                    capture_single_step_layer_state(
-                        prefix,
-                        *position,
-                        li,
-                        Some("attn-norm"),
-                        &x_in,
-                    )?;
+            if let Some(cp) = &self.capture
+                && cp.wants(li)
+            {
+                cp.store(&format!("L{li}.mhc_attn_collapsed"), &xc);
+                cp.store(&format!("L{li}.mhc_attn_post"), &post);
+                cp.store(&format!("L{li}.mhc_attn_comb"), &comb);
+                cp.store(&format!("L{li}.mhc_attn_normed"), &x_in);
+                if let Some(mixes) = &attn_mixes {
+                    cp.store(&format!("L{li}.mhc_attn_mixes"), mixes);
                 }
-            }
-            if let Some(cp) = &self.capture {
-                if cp.wants(li) {
-                    cp.store(&format!("L{li}.mhc_attn_collapsed"), &xc);
-                    cp.store(&format!("L{li}.mhc_attn_post"), &post);
-                    cp.store(&format!("L{li}.mhc_attn_comb"), &comb);
-                    cp.store(&format!("L{li}.mhc_attn_normed"), &x_in);
-                    if let Some(mixes) = &attn_mixes {
-                        cp.store(&format!("L{li}.mhc_attn_mixes"), mixes);
-                    }
-                    if let Some(split) = &attn_split {
-                        cp.store(&format!("L{li}.mhc_attn_split"), split);
-                    }
+                if let Some(split) = &attn_split {
+                    cp.store(&format!("L{li}.mhc_attn_split"), split);
                 }
             }
             // incremental-decode probe: norm of every stage, every layer
@@ -513,35 +378,11 @@ impl TowerOracle1 for Tower {
                 INC_STEP.load(std::sync::atomic::Ordering::Relaxed)
             };
             let capture_mode = if x_in.dim(1) == 1 { "dec" } else { "rep" };
-            if probe && x_in.dim(1) == 1 {
-                let n = |a: &Array| -> f32 {
-                    let v = a
-                        .as_dtype(Dtype::Float32)
-                        .unwrap()
-                        .to_vec1::<f32>()
-                        .unwrap_or_default();
-                    v.iter().map(|x| x * x).sum::<f32>().sqrt()
-                };
-                let nan = |a: &Array| -> bool {
-                    a.as_dtype(Dtype::Float32)
-                        .unwrap()
-                        .to_vec1::<f32>()
-                        .unwrap_or_default()
-                        .iter()
-                        .any(|x| x.is_nan())
-                };
-                eprintln!(
-                    "[inc-probe] s{step} T{} L{li:>2} rms_in {:9.4} nan {}",
-                    x_in.dim(1),
-                    n(&x_in),
-                    nan(&x_in)
-                );
-            }
-            if let Some(cp) = &self.capture {
-                if cp.wants(li) {
-                    let t2 = if x_in.dim(1) == 1 { "dec" } else { "rep" };
-                    cp.store(&format!("L{li}.{t2}_rms_in_s{step}"), &x_in);
-                }
+            if let Some(cp) = &self.capture
+                && cp.wants(li)
+            {
+                let t2 = if x_in.dim(1) == 1 { "dec" } else { "rep" };
+                cp.store(&format!("L{li}.{t2}_rms_in_s{step}"), &x_in);
             }
             let attended = {
                 let _trace_attn = lisa_metal::trace::span("glm53.attention");
@@ -574,48 +415,25 @@ impl TowerOracle1 for Tower {
                     _ => anyhow::bail!("glm53: cache kind mismatch at layer {li}"),
                 }
             };
-            if probe && x_in.dim(1) == 1 {
-                let n = |a: &Array| -> f32 {
-                    let v = a
-                        .as_dtype(Dtype::Float32)
-                        .unwrap()
-                        .to_vec1::<f32>()
-                        .unwrap_or_default();
-                    v.iter().map(|x| x * x).sum::<f32>().sqrt()
-                };
-                let nan = |a: &Array| -> bool {
-                    a.as_dtype(Dtype::Float32)
-                        .unwrap()
-                        .to_vec1::<f32>()
-                        .unwrap_or_default()
-                        .iter()
-                        .any(|x| x.is_nan())
-                };
-                eprintln!(
-                    "[inc-probe] s{step} L{li:>2} attn_out {:9.4} nan {}",
-                    n(&attended),
-                    nan(&attended)
-                );
-            }
-            if let Some(cp) = &self.capture {
-                if cp.wants(li) {
-                    let t2 = if x_in.dim(1) == 1 { "dec" } else { "rep" };
-                    cp.store(&format!("L{li}.{t2}_attn_out_s{step}"), &attended);
-                    cp.store(&format!("L{li}.mhc_attn_xc"), &xc);
-                }
+            if let Some(cp) = &self.capture
+                && cp.wants(li)
+            {
+                let t2 = if x_in.dim(1) == 1 { "dec" } else { "rep" };
+                cp.store(&format!("L{li}.{t2}_attn_out_s{step}"), &attended);
+                cp.store(&format!("L{li}.mhc_attn_xc"), &xc);
             }
             state = {
                 let _trace_expand = lisa_metal::trace::span("glm53.mhc.attn_expand");
                 layer.hc_attn.expand(&attended, &state, &post, &comb)?
             };
-            if let Some(cp) = &self.capture {
-                if cp.wants(li) {
-                    cp.store(&format!("L{li}.state_after_attn"), &state);
-                    cp.store(
-                        &format!("L{li}.{capture_mode}_state_after_attn_s{step}"),
-                        &state,
-                    );
-                }
+            if let Some(cp) = &self.capture
+                && cp.wants(li)
+            {
+                cp.store(&format!("L{li}.state_after_attn"), &state);
+                cp.store(
+                    &format!("L{li}.{capture_mode}_state_after_attn_s{step}"),
+                    &state,
+                );
             }
 
             // FFN half.
@@ -651,17 +469,17 @@ impl TowerOracle1 for Tower {
                     (xc, normed, post, comb, None, None)
                 }
             };
-            if let Some(cp) = &self.capture {
-                if cp.wants(li) {
-                    cp.store(&format!("L{li}.mhc_ffn_post"), &post2);
-                    cp.store(&format!("L{li}.mhc_ffn_comb"), &comb2);
-                    cp.store(&format!("L{li}.mhc_ffn_normed"), &x_in2);
-                    if let Some(mixes) = &ffn_mixes {
-                        cp.store(&format!("L{li}.mhc_ffn_mixes"), mixes);
-                    }
-                    if let Some(split) = &ffn_split {
-                        cp.store(&format!("L{li}.mhc_ffn_split"), split);
-                    }
+            if let Some(cp) = &self.capture
+                && cp.wants(li)
+            {
+                cp.store(&format!("L{li}.mhc_ffn_post"), &post2);
+                cp.store(&format!("L{li}.mhc_ffn_comb"), &comb2);
+                cp.store(&format!("L{li}.mhc_ffn_normed"), &x_in2);
+                if let Some(mixes) = &ffn_mixes {
+                    cp.store(&format!("L{li}.mhc_ffn_mixes"), mixes);
+                }
+                if let Some(split) = &ffn_split {
+                    cp.store(&format!("L{li}.mhc_ffn_split"), split);
                 }
             }
             let m = {
@@ -673,47 +491,27 @@ impl TowerOracle1 for Tower {
                     }
                 }
             };
-            if let Some(cp) = &self.capture {
-                if cp.wants(li) {
-                    let t2 = if x_in.dim(1) == 1 { "dec" } else { "rep" };
-                    cp.store(&format!("L{li}.{t2}_moe_out_s{step}"), &m);
-                    cp.store(&format!("L{li}.mhc_ffn_xc2"), &xc2);
-                }
+            if let Some(cp) = &self.capture
+                && cp.wants(li)
+            {
+                let t2 = if x_in.dim(1) == 1 { "dec" } else { "rep" };
+                cp.store(&format!("L{li}.{t2}_moe_out_s{step}"), &m);
+                cp.store(&format!("L{li}.mhc_ffn_xc2"), &xc2);
             }
             state = {
                 let _trace_expand = lisa_metal::trace::span("glm53.mhc.ffn_expand");
                 layer.hc_ffn.expand(&m, &state, &post2, &comb2)?
             };
-            #[cfg(test)]
-            if let Some((prefix, capture_index)) = mtp_layer_capture.as_ref() {
-                capture_mtp_verify_layer_state(prefix, *capture_index, li, &state)?;
-            }
-            #[cfg(test)]
-            if let Some((prefix, position)) = single_step_layer_capture.as_ref() {
-                capture_single_step_layer_state(prefix, *position, li, None, &state)?;
-            }
-            if let Some(cp) = &self.capture {
-                if cp.wants(li) {
-                    cp.store(&format!("L{li}.state_after_ffn"), &state);
-                    cp.store(
-                        &format!("L{li}.{capture_mode}_state_after_ffn_s{step}"),
-                        &state,
-                    );
-                }
-            }
-            if sync_layers
-                .as_ref()
-                .is_some_and(|selected| selected.as_ref().is_none_or(|layers| layers.contains(&li)))
+            if let Some(cp) = &self.capture
+                && cp.wants(li)
             {
-                state.eval()?;
+                cp.store(&format!("L{li}.state_after_ffn"), &state);
+                cp.store(
+                    &format!("L{li}.{capture_mode}_state_after_ffn_s{step}"),
+                    &state,
+                );
             }
-            if flush_layers {
-                lisa_metal::Stream::thread_local_or_default()
-                    .runtime()
-                    .commands
-                    .flush()?;
-            }
-            // DS4 submits indexed GLM decode work every four layers without
+            // The reference submits indexed GLM decode work every four layers without
             // waiting for completion. This lets Metal execute early layers
             // while the host encodes the remainder of the token. A single
             // command buffer for the whole 45-layer forward adds a large
@@ -725,7 +523,6 @@ impl TowerOracle1 for Tower {
                     .capture
                     .as_ref()
                     .is_none_or(|capture| capture.preserves_dispatch())
-                && !probe
                 && (li + 1) % 4 == 0
                 && li + 1 < layer_count
             {
@@ -734,14 +531,13 @@ impl TowerOracle1 for Tower {
                     .commands
                     .flush()?;
             }
-            // DS4's final prefill chunk submits every layer above eight
+            // The reference's final prefill chunk submits every layer above eight
             // rows and drains at each sixteen-layer boundary. Intermediate
             // chunks retain one command stream until the chunk-end drain.
             if prefill_mode
                 && (s > DS4_GLM53_PREFILL_CHUNK_TOKENS || (self.prefill_final_chunk && s > 8))
                 && li + 1 < layer_count
                 && self.capture.as_ref().is_none_or(|c| c.preserves_dispatch())
-                && !probe
             {
                 let stream = lisa_metal::Stream::thread_local_or_default();
                 if (li + 1) % 16 == 0 {
@@ -769,27 +565,12 @@ impl TowerOracle1 for Tower {
                 .flush_and_wait()?;
         }
         // Final: mean over the streams, RMS, head.
-        if let Some(c) = &self.capture {
-            if std::env::var_os("LISA_GLM53_CAPTURE").is_some() {
-                c.store("final_state", &state);
-                let mode = if s == 1 { "dec" } else { "rep" };
-                let step = INC_STEP.load(std::sync::atomic::Ordering::Relaxed);
-                c.store(&format!("final_{mode}_state_s{step}"), &state);
-            }
-        }
         let mixed = final_hc_mean(&state)?;
         let mixed = final_rms(&mixed, &self.final_norm, self.config.rms_norm_eps)?;
         if let Some(c) = &self.capture {
             let mode = if s == 1 { "dec" } else { "rep" };
             let step = INC_STEP.load(std::sync::atomic::Ordering::Relaxed);
             c.store(&format!("final_{mode}_mixed_s{step}"), &mixed);
-            if !c.preserves_dispatch()
-                && let Ok(p) = std::env::var("LISA_GLM53_CAPTURE")
-            {
-                // Re-flush on every forward so step-tagged decode captures
-                // include the final mixed representation used by the head.
-                let _ = c.flush(&p);
-            }
         }
         let multi = state.reshape(&[(b) as i32, (s) as i32, (c * h) as i32])?;
         Ok((mixed, multi))
@@ -841,7 +622,7 @@ impl MtpBlockOracle0 for MtpBlock {
         let embedded = embed.forward(&ids)?.as_dtype(Dtype::Float32)?;
         let embedded = mtp_rms(&embedded, &self.enorm, config.rms_norm_eps)?;
 
-        // ds4 reduces target mHC streams with uniform 1/C weights via its
+        // The reference reduces target mHC streams with uniform 1/C weights via its
         // fused weighted-sum kernel; preserve that kernel and accumulation order.
         anyhow::ensure!(streams == 4, "glm53 MTP mHC width must be four");
         let multi =
@@ -859,7 +640,7 @@ impl MtpBlockOracle0 for MtpBlock {
         let rows = joined.reshape(&[1, joined.dim(2)])?;
         let projected = if self.eh_proj.dtype() == Dtype::Bfloat16 {
             let stream = lisa_metal::Stream::thread_local_or_default();
-            lisa_metal::kernels::sparse::kernels::glm53_bf16_gemv(&self.eh_proj, &rows, &stream)
+            lisa_metal::kernels::sparse::kernels::bf16_gemv(&self.eh_proj, &rows, &stream)
                 .ok_or_else(|| anyhow::anyhow!("GLM MTP BF16 eh_proj GEMV declined"))?
         } else {
             let weight = self
@@ -875,7 +656,7 @@ impl MtpBlockOracle0 for MtpBlock {
             .attn
             .forward_mtp(&attn_in, tape, position, min_position)?;
         let stream = lisa_metal::Stream::thread_local_or_default();
-        let (after_attn, ffn_in) = lisa_metal::kernels::sparse::kernels::glm53_mtp_add_rms_norm(
+        let (after_attn, ffn_in) = lisa_metal::kernels::sparse::kernels::mtp_add_rms_norm(
             &x,
             &attended,
             &self.ffn_norm,
@@ -883,97 +664,17 @@ impl MtpBlockOracle0 for MtpBlock {
             &stream,
         )
         .ok_or_else(|| anyhow::anyhow!("GLM MTP DS4 add+RMSNorm kernel declined"))?;
-        #[cfg(all(test, feature = "glm53-fixtures"))]
-        if position == 15 || std::env::var_os("LISA_GLM53_MTP_RESIDUAL_CAPTURE_DIR").is_some() {
-            capture_or_assert_mtp_residual_ds4(
-                &x,
-                &attended,
-                &self.ffn_norm,
-                &after_attn,
-                &ffn_in,
-                config.rms_norm_eps,
-            )?;
-        }
         let (routed, shared) = self.mlp.forward_parts_with_capture(&ffn_in, None, 0)?;
-        #[cfg(all(test, feature = "glm53-fixtures"))]
-        if position == 15
-            || std::env::var_os("LISA_GLM53_MTP_ROUTER_CAPTURE_DIR").is_some()
-            || std::env::var_os("LISA_GLM53_MTP_ROUTED_CAPTURE_DIR").is_some()
-        {
-            self.mlp.capture_or_assert_mtp_router_ds4(&ffn_in)?;
-            self.mlp
-                .capture_or_assert_mtp_routed_ds4(&ffn_in, &routed)?;
-        }
         let shared =
             shared.ok_or_else(|| anyhow::anyhow!("GLM MTP checkpoint has no shared expert"))?;
-        #[cfg(all(test, feature = "glm53-fixtures"))]
-        if position == 15 || std::env::var_os("LISA_GLM53_MTP_SHARED_CAPTURE_DIR").is_some() {
-            self.mlp
-                .capture_or_assert_mtp_shared_ds4(&ffn_in, &shared)?;
-        }
-        #[cfg(test)]
-        if position == 15 {
-            let combined = self.mlp.forward_with_capture(&ffn_in, None, 0)?;
-            let branch_sum = routed.add(&shared)?;
-            let combined_values = combined.to_vec1::<f32>()?;
-            let branch_values = branch_sum.to_vec1::<f32>()?;
-            let delta2 = combined_values
-                .iter()
-                .zip(&branch_values)
-                .map(|(actual, expected)| f64::from(actual - expected).powi(2))
-                .sum::<f64>();
-            let expected2 = branch_values
-                .iter()
-                .map(|value| f64::from(*value).powi(2))
-                .sum::<f64>();
-            let max_abs = combined_values
-                .iter()
-                .zip(&branch_values)
-                .map(|(actual, expected)| (actual - expected).abs())
-                .fold(0.0f32, f32::max);
-            let rel_l2 = (delta2 / expected2.max(f64::MIN_POSITIVE)).sqrt();
-            anyhow::ensure!(
-                max_abs <= 1e-4 && rel_l2 <= 1e-5,
-                "fused production MoE differs from the DS4-validated branches: max_abs={max_abs:e}, rel_l2={rel_l2:e}"
-            );
-            eprintln!(
-                "[glm53-mtp-moe-fused] output max_abs={max_abs:.3e} rel_l2={rel_l2:.3e} against DS4-validated branch sum"
-            );
-        }
         let stream = lisa_metal::Stream::thread_local_or_default();
-        let next_sum = lisa_metal::kernels::sparse::kernels::glm53_mtp_add3(
-            &after_attn,
-            &routed,
-            &shared,
-            &stream,
-        )
-        .ok_or_else(|| anyhow::anyhow!("GLM MTP DS4 ordered add3 kernel declined"))?;
+        let next_sum =
+            lisa_metal::kernels::sparse::kernels::mtp_add3(&after_attn, &routed, &shared, &stream)
+                .ok_or_else(|| anyhow::anyhow!("GLM MTP DS4 ordered add3 kernel declined"))?;
         let next = mtp_rms(&next_sum, &self.shared_head_norm, config.rms_norm_eps)?;
-        #[cfg(all(test, feature = "glm53-fixtures"))]
-        // The checked-in tail fixture is anchored at position 15. Keep the
-        // capture hook on that same row; allowing the test's later generated
-        // feedback rows to overwrite it silently changes the fixture input.
-        if position == 15 {
-            capture_or_assert_mtp_tail_ds4(
-                &after_attn,
-                &routed,
-                &shared,
-                &self.shared_head_norm,
-                &next_sum,
-                &next,
-                config.rms_norm_eps,
-            )?;
-        }
-        // DS4's shared output head uses the same native Q8 dispatcher in
+        // The reference's shared output head uses the same native Q8 dispatcher in
         // target and MTP execution, including the vocabulary-sized reduction.
         let logits = lm_head.forward_glm53_prefill(&next)?;
-        #[cfg(all(test, feature = "glm53-fixtures"))]
-        if position == 15
-            || (crate::bindings::glm53_attention::mtp_real_target_fixtures_enabled()
-                && (position == 5 || position == 6))
-        {
-            capture_or_assert_mtp_lm_head_ds4(&next, lm_head, &logits, position)?;
-        }
         Ok(logits)
     }
 }

@@ -81,7 +81,11 @@ pub enum DeltaScan {
     Scalar,
     TwoRows,
     FourRows,
-    Verify { epsilon: u32 },
+    Verify {
+        epsilon: u32,
+        /// Match the fused single-query delta decoder's gate transcendental.
+        serial_gate: bool,
+    },
 }
 impl DeltaScan {
     pub fn gated(self) -> bool {

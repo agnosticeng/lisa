@@ -75,8 +75,8 @@ impl MoEOracle1 for MoE {
         let keepalive: &[&Array] = &indirect_expert_buffers;
         let grouped_prefill = n >= 96
             && k == 8
-            && self.pools.inter % 64 == 0
-            && h % 128 == 0
+            && self.pools.inter.is_multiple_of(64)
+            && h.is_multiple_of(128)
             && crate::core::quant::glm53_grouped_moe_prefill_override()
                 .unwrap_or(n >= crate::core::quant::GLM53_GROUPED_MOE_MIN_ROWS);
         let grouped_route_map = if grouped_prefill {
@@ -146,7 +146,7 @@ impl MoEOracle1 for MoE {
                             "glm53.moe.grouped_gate_ds4",
                             layer as u64,
                         );
-                        lisa_metal::jit::glm53_moe_q2_mm_grouped_ds4_prefill_with_output(
+                        lisa_metal::jit::moe_q2_mm_grouped_ds4_prefill_with_output(
                             x_rows.t.device(),
                             &address_table.t,
                             &x_rows.t,
@@ -173,7 +173,7 @@ impl MoEOracle1 for MoE {
                             "glm53.moe.grouped_up_ds4",
                             layer as u64,
                         );
-                        lisa_metal::jit::glm53_moe_q2_mm_grouped_ds4_prefill_with_output(
+                        lisa_metal::jit::moe_q2_mm_grouped_ds4_prefill_with_output(
                             x_rows.t.device(),
                             &address_table.t,
                             &x_rows.t,
@@ -199,7 +199,7 @@ impl MoEOracle1 for MoE {
                         "glm53.moe.grouped_swiglu_ds4",
                         layer as u64,
                     );
-                    lisa_metal::jit::glm53_moe_grouped_swiglu_weight_prefill_with_output(
+                    lisa_metal::jit::moe_grouped_swiglu_weight_prefill_with_output(
                         x_rows.t.device(),
                         &gate,
                         &up,
@@ -214,7 +214,7 @@ impl MoEOracle1 for MoE {
                         "glm53.moe.grouped_pair_fused_ds4",
                         layer as u64,
                     );
-                    lisa_metal::jit::glm53_moe_q2_pair_grouped_ds4_prefill_with_output(
+                    lisa_metal::jit::moe_q2_pair_grouped_ds4_prefill_with_output(
                         x_rows.t.device(),
                         &address_table.t,
                         &x_rows.t,
@@ -267,7 +267,7 @@ impl MoEOracle1 for MoE {
                 dtype => anyhow::bail!("moe grouped down: unsupported metadata dtype {dtype:?}"),
             };
             let _trace = lisa_metal::trace::span_detail("glm53.moe.down_grouped_ds4", layer as u64);
-            let down_slots = lisa_metal::jit::glm53_moe_q2_down_grouped_ds4_prefill_with_output(
+            let down_slots = lisa_metal::jit::moe_q2_down_grouped_ds4_prefill_with_output(
                 act.t.device(),
                 &address_table.t,
                 &act.t,
@@ -296,15 +296,15 @@ impl MoEOracle1 for MoE {
                 lisa_metal::kernels::sparse::kernels::moe_sum8(&down_slots, n, h, &stream)
                     .ok_or_else(|| anyhow::anyhow!("glm53 grouped MoE: ordered sum8 declined"))?
             };
-            let acc = if let Some(shared) = shared_for_sum {
+
+            if let Some(shared) = shared_for_sum {
                 acc.add(shared)?
             } else {
                 acc
-            };
-            acc
+            }
         } else if k == 8 && capture.is_none_or(|capture| capture.preserves_dispatch()) {
             let _trace = lisa_metal::trace::span_detail("glm53.moe.down_sum8", layer as u64);
-            // Keep DS4's per-expert reduction order, add routes in order, and
+            // Keep the reference's per-expert reduction order, add routes in order, and
             // append the shared output in the same dispatch.
             let routed = lisa_metal::kernels::sparse::kernels::moe_gather_qmv_sum8_addr_ds4(
                 &address_table,
@@ -320,7 +320,7 @@ impl MoEOracle1 for MoE {
             .ok_or_else(|| anyhow::anyhow!("moe address: DS4 fused down projection declined"))?;
             if let Some(capture) = capture {
                 // In diagnostic captures, compare the fused result to the
-                // standalone DS4 matvec plus ordered sum and retain each slot.
+                // standalone reference matvec plus ordered sum and retain each slot.
                 let down_slots = lisa_metal::kernels::sparse::kernels::moe_gather_qmv_addr_ds4(
                     &address_table,
                     &act,
@@ -409,7 +409,7 @@ impl MoEOracle0 for MoE {
             .as_dtype(Dtype::Float32)?
             .reshape(&[(n) as i32, (h) as i32])?;
 
-        // Router logits in F32. Keep ds4's token-count-specific matvec lane:
+        // Router logits in F32. Keep the reference's token-count-specific matvec lane:
         // plain one-row, specialized two-to-eight-row, then plain per-token.
         let logits = {
             let _trace =
@@ -465,7 +465,7 @@ impl MoEOracle0 for MoE {
                 && self.top_k == 8;
             let shared = if let Some(sh) = &self.shared {
                 // Only the streaming reference needs a submission boundary
-                // here. Resident execution follows the tower's DS4 cadence.
+                // here. Resident execution follows the tower's reference cadence.
                 if !self.pools.gpu_address_all_experts {
                     stream.runtime().commands.flush()?;
                 }
@@ -491,7 +491,7 @@ impl MoEOracle0 for MoE {
             };
             let prepared_resources =
                 if let Some(stage_result) = stage_result {
-                    // Match DS4's streaming schedule: submit the shared-expert
+                    // Match the reference's streaming schedule: submit the shared-expert
                     // work before joining the selected-expert staging worker,
                     // so the GPU can execute it while the host prepares the
                     // routed experts. Without this flush, the join could wait

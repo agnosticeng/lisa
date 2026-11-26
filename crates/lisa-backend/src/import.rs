@@ -7,6 +7,10 @@ pub enum ImportMode {
     /// Copy exactly the supplied bytes. The source read finishes before return.
     #[default]
     Copy,
+    /// Copy exactly the supplied bytes into compact storage. The source read
+    /// finishes before return. Retained capacity may include allocator bucket
+    /// padding, but must not inherit an unrelated larger reusable allocation.
+    CopyCompact,
     /// Retain shared storage without copying. Unsupported alignment/storage is
     /// an error; the engine decides whether a separate copy is acceptable.
     SharedRequired,
@@ -24,8 +28,11 @@ pub struct HostStorage {
     length: usize,
     owner: Arc<dyn Any + Send + Sync>,
 }
-// SAFETY: construction requires immutable, stable memory and a thread-safe owner.
+// SAFETY: `new` requires immutable, stable memory, and `owner` is Send + Sync;
+// moving the handle to another thread moves only that retained ownership.
 unsafe impl Send for HostStorage {}
+// SAFETY: shared access only reads the immutable bytes or clones the
+// thread-safe `owner` Arc.
 unsafe impl Sync for HostStorage {}
 impl HostStorage {
     /// # Safety
@@ -103,6 +110,20 @@ impl TensorSource<'_> {
     }
 }
 
+/// Byte-preserving views of an imported allocation. This contract has no
+/// checkpoint or tensor-role knowledge. Views retain the source allocation,
+/// cannot exceed its logical byte range, and do not change its mutability.
+pub trait StorageDevice: crate::Device {
+    fn max_allocation_bytes(&self) -> usize;
+    fn byte_view(
+        &self,
+        source: &Self::Tensor,
+        offset: usize,
+        shape: &[i32],
+        dtype: ScalarType,
+    ) -> Result<Self::Tensor, Self::Error>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,6 +132,7 @@ mod tests {
         let bytes = Arc::new(vec![1u8, 2, 3, 4, 5, 6, 7, 8]);
         let weak = Arc::downgrade(&bytes);
         let pointer = NonNull::new(bytes.as_ptr() as *mut u8).unwrap();
+        // SAFETY: the Arc<Vec<u8>> owner holds exactly this immutable buffer.
         let storage = unsafe { HostStorage::new(pointer, bytes.len(), bytes.clone()) };
         drop(bytes);
         let valid = TensorSource::Shared {
@@ -139,18 +161,4 @@ mod tests {
         drop(valid);
         assert!(weak.upgrade().is_none());
     }
-}
-
-/// Byte-preserving views of an imported allocation. This contract has no
-/// checkpoint or tensor-role knowledge. Views retain the source allocation,
-/// cannot exceed its logical byte range, and do not change its mutability.
-pub trait StorageDevice: crate::Device {
-    fn max_allocation_bytes(&self) -> usize;
-    fn byte_view(
-        &self,
-        source: &Self::Tensor,
-        offset: usize,
-        shape: &[i32],
-        dtype: ScalarType,
-    ) -> Result<Self::Tensor, Self::Error>;
 }

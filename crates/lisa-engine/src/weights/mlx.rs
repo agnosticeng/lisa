@@ -6,6 +6,7 @@ use memmap2::Advice;
 use std::{
     collections::HashMap,
     ffi::c_void,
+    ops::Range,
     path::Path,
     ptr::NonNull,
     sync::{Arc, Mutex},
@@ -87,6 +88,7 @@ where
         if names.is_empty() {
             return (0, 0);
         }
+        // SAFETY: getpagesize takes no arguments and has no preconditions.
         let page_size = unsafe { getpagesize() } as usize;
         if page_size == 0 {
             return (0, 0);
@@ -176,12 +178,21 @@ where
         length: usize,
         page_size: usize,
     ) -> Option<bool> {
-        if page_size == 0 || start % page_size != 0 || length == 0 {
+        let mapped = self.source.mapping().len();
+        if page_size == 0
+            || !start.is_multiple_of(page_size)
+            || length == 0
+            || start.checked_add(length).is_none_or(|end| end > mapped)
+        {
             return None;
         }
         let pages = length.div_ceil(page_size);
         let mut residency = vec![0u8; pages];
+        // SAFETY: `start + length <= mapping.len()` was checked above, so the offset
+        // pointer stays inside the live mapping.
         let address = unsafe { self.source.mapping().as_ptr().add(start) }.cast::<c_void>();
+        // SAFETY: `address` is page-aligned and `residency` holds one byte per page
+        // of `length`; mincore only reports residency and fails on unmapped pages.
         let result = unsafe { mincore(address, length, residency.as_mut_ptr().cast()) };
         if result != 0 {
             return None;
@@ -196,16 +207,6 @@ where
         self.tensor_array_with_window(name, MAPPED_EXPERT_WINDOW_BYTES)
     }
 
-    /// Return a typed tensor view backed only by its own page-aligned payload.
-    /// Whole-shard device views can wire unrelated routed experts into memory,
-    /// so model weights that stay resident use these tight windows instead.
-    pub fn tensor_array_individual(&self, name: &str) -> anyhow::Result<Option<D::Tensor>> {
-        let Some(info) = self.source.tensor_info(name) else {
-            return Ok(None);
-        };
-        self.tensor_array_with_window(name, info.end.saturating_sub(info.start))
-    }
-
     /// Return an individually mapped typed view without retaining its device
     /// buffer in the shard. Owners such as the routed-expert LRU then control
     /// the device buffer lifetime directly.
@@ -213,15 +214,44 @@ where
         &self,
         name: &str,
     ) -> anyhow::Result<Option<D::Tensor>> {
+        Ok(self
+            .tensor_array_individual_uncached_with_range(name)?
+            .map(|(tensor, _)| tensor))
+    }
+
+    /// The typed view and the exact retained device-buffer window in the
+    /// source mapping. Loaders can protect this entire window when retiring
+    /// source pages used only by copied tensors.
+    pub(crate) fn tensor_array_individual_uncached_with_range(
+        &self,
+        name: &str,
+    ) -> anyhow::Result<Option<(D::Tensor, Range<usize>)>> {
+        self.tensor_array_individual_window(name, false)
+    }
+
+    fn tensor_array_individual_window(
+        &self,
+        name: &str,
+        independent: bool,
+    ) -> anyhow::Result<Option<(D::Tensor, Range<usize>)>> {
         let Some(info) = self.source.tensor_info(name) else {
             return Ok(None);
         };
-        let Some((buffer, offset_bytes, payload_bytes)) =
-            self.mapped_tensor_buffer_uncached(name, info.end.saturating_sub(info.start))?
+        let element_size = info.dtype.size_of();
+        // Reject impossible typed views before creating a device buffer that
+        // would briefly wire a large, ultimately copied checkpoint payload.
+        if info.start % element_size != 0 {
+            return Ok(None);
+        }
+        let Some((buffer, offset_bytes, payload_bytes, window)) = self.mapped_tensor_buffer_inner(
+            name,
+            info.end.saturating_sub(info.start),
+            false,
+            independent,
+        )?
         else {
             return Ok(None);
         };
-        let element_size = info.dtype.size_of();
         if offset_bytes % element_size != 0 {
             return Ok(None);
         }
@@ -237,7 +267,7 @@ where
             .device
             .byte_view(&buffer, offset_bytes, &info.shape, scalar_type(info.dtype))
         {
-            Ok(array) => Ok(Some(array)),
+            Ok(array) => Ok(Some((array, window))),
             Err(_) => Ok(None),
         }
     }
@@ -251,7 +281,7 @@ where
             return Ok(None);
         };
         let element_size = info.dtype.size_of();
-        let Some((buffer, offset_bytes, payload_bytes)) =
+        let Some((buffer, offset_bytes, payload_bytes, _)) =
             self.mapped_tensor_buffer(name, window_limit)?
         else {
             return Ok(None);
@@ -276,17 +306,11 @@ where
         }
     }
 
-    /// Return an untyped byte view of a tensor in a bounded mapping window.
-    /// Byte loads allow packed U32 quantized weights whose safetensors payload
-    /// begins at a non-U32-aligned offset to remain zero-copy and GPU-readable.
-    pub fn tensor_byte_array(&self, name: &str) -> anyhow::Result<Option<D::Tensor>> {
-        self.tensor_byte_array_with_window(name, MAPPED_EXPERT_WINDOW_BYTES)
-    }
-
     /// Map one packed tensor with only its page-aligned byte range. GLM expert
     /// weights are scattered through the shards; sharing a 4 MiB window for
     /// each tensor retained tens of GiB of unrelated mapped data.
     pub fn tensor_byte_array_individual(&self, name: &str) -> anyhow::Result<Option<D::Tensor>> {
+        // SAFETY: getpagesize takes no arguments and has no preconditions.
         let page_size = unsafe { getpagesize() } as usize;
         self.tensor_byte_array_with_window(name, page_size)
     }
@@ -301,7 +325,7 @@ where
             return Ok(None);
         };
         let payload_bytes = info.end.saturating_sub(info.start);
-        let Some((buffer, offset_bytes, payload_bytes)) =
+        let Some((buffer, offset_bytes, payload_bytes, _)) =
             self.mapped_tensor_buffer_uncached(name, payload_bytes)?
         else {
             return Ok(None);
@@ -320,7 +344,7 @@ where
 
     /// Return a byte view over one tensor through a shared whole-shard device
     /// buffer when the shard fits the device's maximum buffer length. This
-    /// mirrors ds4's model-view layout: expert addresses point into a small
+    /// mirrors the reference's model-view layout: expert addresses point into a small
     /// number of shard allocations instead of creating one device allocation
     /// per expert tensor. The file remains mmap-backed; creating the view does
     /// not fault the shard payload into memory.
@@ -336,6 +360,7 @@ where
             return Ok(None);
         }
 
+        // SAFETY: getpagesize takes no arguments and has no preconditions.
         let page_size = unsafe { getpagesize() } as usize;
         if page_size == 0 {
             return Ok(None);
@@ -377,6 +402,7 @@ where
             return Ok(None);
         }
 
+        // SAFETY: getpagesize takes no arguments and has no preconditions.
         let page_size = unsafe { getpagesize() } as usize;
         if page_size == 0 {
             return Ok(None);
@@ -405,7 +431,7 @@ where
         name: &str,
         window_limit: usize,
     ) -> anyhow::Result<Option<D::Tensor>> {
-        let Some((buffer, offset_bytes, payload_bytes)) =
+        let Some((buffer, offset_bytes, payload_bytes, _)) =
             self.mapped_tensor_buffer(name, window_limit)?
         else {
             return Ok(None);
@@ -426,16 +452,16 @@ where
         &self,
         name: &str,
         window_limit: usize,
-    ) -> anyhow::Result<Option<(D::Tensor, usize, usize)>> {
-        self.mapped_tensor_buffer_inner(name, window_limit, true)
+    ) -> anyhow::Result<Option<(D::Tensor, usize, usize, Range<usize>)>> {
+        self.mapped_tensor_buffer_inner(name, window_limit, true, false)
     }
 
     fn mapped_tensor_buffer_uncached(
         &self,
         name: &str,
         window_limit: usize,
-    ) -> anyhow::Result<Option<(D::Tensor, usize, usize)>> {
-        self.mapped_tensor_buffer_inner(name, window_limit, false)
+    ) -> anyhow::Result<Option<(D::Tensor, usize, usize, Range<usize>)>> {
+        self.mapped_tensor_buffer_inner(name, window_limit, false, false)
     }
 
     fn mapped_tensor_buffer_inner(
@@ -443,7 +469,8 @@ where
         name: &str,
         window_limit: usize,
         retain_buffer: bool,
-    ) -> anyhow::Result<Option<(D::Tensor, usize, usize)>> {
+        independent: bool,
+    ) -> anyhow::Result<Option<(D::Tensor, usize, usize, Range<usize>)>> {
         let Some(info) = self.source.tensor_info(name) else {
             return Ok(None);
         };
@@ -457,6 +484,7 @@ where
             return Ok(None);
         }
 
+        // SAFETY: getpagesize takes no arguments and has no preconditions.
         let page_size = unsafe { getpagesize() } as usize;
         let max_length = self.device.max_allocation_bytes();
         let Some((chunk_start, buffer_length)) = mapped_tensor_window(
@@ -470,7 +498,11 @@ where
             return Ok(None);
         };
         let offset_bytes = info.start - chunk_start;
-        let mapped = if retain_buffer {
+        let mapped = if independent {
+            let end = (chunk_start + buffer_length).min(self.source.mapping().len());
+            let owner = self.source.map_range(chunk_start..end)?;
+            self.import_mapped_window(owner, 0, buffer_length)?
+        } else if retain_buffer {
             self.mapped_buffer(chunk_start, buffer_length)?
         } else {
             self.mapped_buffer_uncached(chunk_start, buffer_length)?
@@ -478,7 +510,12 @@ where
         let Some(buffer) = mapped else {
             return Ok(None);
         };
-        Ok(Some((buffer, offset_bytes, payload_bytes)))
+        Ok(Some((
+            buffer,
+            offset_bytes,
+            payload_bytes,
+            chunk_start..chunk_start + buffer_length,
+        )))
     }
 
     fn mapped_buffer(&self, start: usize, length: usize) -> anyhow::Result<Option<D::Tensor>> {
@@ -506,18 +543,45 @@ where
         let Some(end) = start.checked_add(length) else {
             return Ok(None);
         };
+        // SAFETY: getpagesize takes no arguments and has no preconditions.
         let page_size = unsafe { getpagesize() } as usize;
         if page_size == 0
-            || start % page_size != 0
+            || !start.is_multiple_of(page_size)
             || end > self.source.mapping().len().div_ceil(page_size) * page_size
         {
             return Ok(None);
         }
-        let pointer =
-            unsafe { NonNull::new_unchecked(self.source.mapping().as_ptr().add(start) as *mut u8) };
-        let owner: Arc<dyn std::any::Any + Send + Sync> = self.source.mapping().clone();
-        // mmap covers the final partial page. The retained mapping owns this
-        // exact immutable region; the device never receives its filename.
+        self.import_mapped_window(self.source.mapping().clone(), start, length)
+    }
+
+    fn import_mapped_window(
+        &self,
+        mapping: Arc<memmap2::Mmap>,
+        start: usize,
+        length: usize,
+    ) -> anyhow::Result<Option<D::Tensor>> {
+        // SAFETY: getpagesize takes no arguments and has no preconditions.
+        let page_size = unsafe { getpagesize() } as usize;
+        let padded = mapping
+            .len()
+            .checked_add(page_size.saturating_sub(1))
+            .map(|n| n / page_size.max(1) * page_size);
+        if page_size == 0
+            || !start.is_multiple_of(page_size)
+            || !length.is_multiple_of(page_size)
+            || start
+                .checked_add(length)
+                .is_none_or(|end| padded.is_none_or(|n| end > n))
+        {
+            return Ok(None);
+        }
+        // SAFETY: start is page-aligned and start + length <= the page-rounded
+        // mapping length (checked above), so the offset stays inside the non-null mapping.
+        let pointer = unsafe { NonNull::new_unchecked(mapping.as_ptr().add(start) as *mut u8) };
+        let owner: Arc<dyn std::any::Any + Send + Sync> = mapping;
+        // SAFETY: mmap covers the final partial page, so all `length` bytes are
+        // readable; only that page's padding may exceed the logical mapping length.
+        // The read-only mapping is immutable and `owner` retains it through last use.
         let storage = unsafe { lisa_backend::HostStorage::new(pointer, length, owner) };
         let Ok(pages) = i32::try_from(length / page_size) else {
             return Ok(None);
@@ -579,7 +643,42 @@ pub fn mapped_tensor_window(
     Some((window_start, window_length))
 }
 
+// SAFETY: these match the libc declarations of getpagesize and mincore.
 unsafe extern "C" {
     fn getpagesize() -> i32;
     fn mincore(address: *const c_void, length: usize, residency: *mut c_void) -> i32;
+}
+
+impl<D> super::source::TensorSource<D::Tensor> for Shard<D>
+where
+    D: lisa_backend::StorageDevice + Sync,
+    D::Tensor: Clone + Send,
+{
+    fn get(&mut self, name: &str) -> anyhow::Result<D::Tensor> {
+        get_tensor(self, name)
+    }
+}
+
+pub fn get_tensor<D>(shard: &Shard<D>, name: &str) -> anyhow::Result<D::Tensor>
+where
+    D: lisa_backend::StorageDevice + Sync,
+    D::Tensor: Clone + Send,
+{
+    for candidate in [name, &format!("language_model.{name}")] {
+        if let Some(tensor) = shard.tensor_array(candidate)? {
+            return Ok(tensor);
+        }
+        if let Some((bytes, dtype, shape)) = shard.tensor_bytes(candidate) {
+            return Ok(shard.device().pull(
+                lisa_backend::HostTensor {
+                    bytes,
+                    dtype,
+                    shape,
+                }
+                .into(),
+                Default::default(),
+            )?);
+        }
+    }
+    anyhow::bail!("tensor {name} not found in shard")
 }

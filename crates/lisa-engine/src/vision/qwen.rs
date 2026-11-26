@@ -1,13 +1,12 @@
-//! Checkpoint and request bindings for the model-owned Qwen vision program.
-use super::weights::{get, load_weights};
+//! Prepared tensor and request bindings for the model-owned Qwen vision program.
+use super::weights::get;
 use crate::core::{graph::PreparedGraph, program};
 use crate::{bindings::BindingDevice, execution::DeviceContext};
-use anyhow::Context;
 pub use definition::Config;
 use lisa_backend::{HostTensor, ManagedDevice, ScalarType, TensorAccess};
 use lisa_models::{program::Schema, vision::qwen as definition};
 use serde_json::Value;
-use std::{cell::RefCell, collections::HashMap, path::Path};
+use std::{cell::RefCell, collections::HashMap};
 pub struct Encoder<D: BindingDevice + ManagedDevice> {
     pub context: DeviceContext<D>,
     pub config: Config,
@@ -17,16 +16,11 @@ pub struct Encoder<D: BindingDevice + ManagedDevice> {
     pub prepared: RefCell<Option<(usize, usize, PreparedGraph<D>)>>,
 }
 impl<D: BindingDevice + ManagedDevice> Encoder<D> {
-    pub fn load(context: DeviceContext<D>, dir: &Path) -> anyhow::Result<Self> {
-        let root: Value = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
-        let config: Config = serde_json::from_value(
-            root.get("vision_config")
-                .context("checkpoint has no vision_config")?
-                .clone(),
-        )?;
-        config.validate()?;
-        super::admit_scratch(&context, 2usize << 30)?;
-        let mut weights = load_weights(&context, dir)?;
+    pub fn from_weights(
+        context: DeviceContext<D>,
+        config: Config,
+        mut weights: HashMap<String, D::Tensor>,
+    ) -> anyhow::Result<Self> {
         let schema = weights
             .iter()
             .map(|(k, v)| (k.clone(), v.shape().to_vec()))
@@ -44,15 +38,10 @@ impl<D: BindingDevice + ManagedDevice> Encoder<D> {
             .iter()
             .map(|(k, v)| (k.clone(), v.shape().to_vec()))
             .collect();
-        let processor = match std::fs::read(dir.join("preprocessor_config.json")) {
-            Ok(bytes) => serde_json::from_slice(&bytes)?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Value::Null,
-            Err(e) => return Err(e.into()),
-        };
         Ok(Self {
             context,
             config,
-            processor,
+            processor: Value::Null,
             weights,
             schema,
             prepared: RefCell::new(None),

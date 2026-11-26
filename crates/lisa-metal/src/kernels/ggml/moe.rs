@@ -1,11 +1,11 @@
-//! DS4's standalone routed activation and ordered six-expert reduction.
+//! The reference's standalone routed activation and ordered six-expert reduction.
 
 use super::{f32_input, output};
 use crate::error::{Error, Result};
 use crate::runtime::Math;
 use crate::{Array, Dtype, Stream};
 
-const SOURCE: &crate::shader_pack::Source = crate::kernel_source!("deepseek41/moe.metal");
+const SOURCE: &crate::shader_pack::Source = crate::kernel_source!("gguf_iq/moe.metal");
 
 /// Original shared-expert flat activation. This has its own dispatch and
 /// code generation; the routed kernel with a unit weight is not its oracle.
@@ -62,7 +62,7 @@ pub fn shared_swiglu(gate: &Array, up: &Array, stream: &Stream) -> Result<Array>
     Ok(out)
 }
 
-/// Clamp, SwiGLU and route weighting in DS4's order. No BF16 boundary is
+/// Clamp, SwiGLU and route weighting in the reference's order. No BF16 boundary is
 /// inserted in the routed experts; the shared expert has separate boundaries.
 pub fn swiglu_weight(
     gate: &Array,

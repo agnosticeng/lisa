@@ -2,36 +2,32 @@
 use crate::error::{Error, Result};
 use crate::runtime::{ConstVal, Math};
 use crate::{Array, Dtype, Stream};
+use lisa_backend::OrderedBlockEncoding;
 const SOURCE: &crate::shader_pack::Source = crate::kernel_source!("gguf/matvec.metal");
 mod pointwise;
 pub use pointwise::{
     conv_silu, conv_silu_on, gates, gates_on, mul_silu, silu_mul, silu_product_on,
 };
 
-/// GGML type ID, bytes per block, elements per block, output rows per SIMD,
+/// Block encoding, bytes per block, elements per block, output rows per SIMD,
 /// SIMD groups, and shared scratch. Only explicitly ported formats are accepted.
-fn geometry(kind: u32) -> Result<(&'static str, i32, i32, i32, usize, usize)> {
+fn geometry(kind: OrderedBlockEncoding) -> Result<(&'static str, i32, i32, i32, usize, usize)> {
     Ok(match kind {
-        8 => ("q8_0", 34, 32, 2, 4, 256),
-        10 => ("q2_K", 84, 256, 4, 2, 16),
-        11 => ("q3_K", 110, 256, 2, 2, 16),
-        12 => ("q4_K", 144, 256, 2, 2, 16),
-        13 => ("q5_K", 176, 256, 1, 2, 16),
-        14 => ("q6_K", 210, 256, 2, 2, 16),
-        16 => ("iq2_xxs", 66, 256, 4, 2, 2176),
-        17 => ("iq2_xs", 74, 256, 4, 2, 4224),
-        18 => ("iq3_xxs", 98, 256, 4, 2, 1152),
-        19 => ("iq1_s", 50, 256, 4, 2, 16),
-        21 => ("iq3_s", 110, 256, 4, 2, 2048),
-        22 => ("iq2_s", 82, 256, 4, 2, 16),
-        23 => ("iq4_xs", 136, 256, 2, 2, 128),
-        29 => ("iq1_m", 56, 256, 4, 2, 16),
-        _ => return Err(Error::msg(format!("unsupported packed GGML type {kind}"))),
+        OrderedBlockEncoding::Q8_0 => ("q8_0", 34, 32, 2, 4, 256),
+        OrderedBlockEncoding::Q2K => ("q2_K", 84, 256, 4, 2, 16),
+        OrderedBlockEncoding::Q3K => ("q3_K", 110, 256, 2, 2, 16),
+        OrderedBlockEncoding::Q4K => ("q4_K", 144, 256, 2, 2, 16),
+        OrderedBlockEncoding::Q5K => ("q5_K", 176, 256, 1, 2, 16),
+        OrderedBlockEncoding::Q6K => ("q6_K", 210, 256, 2, 2, 16),
+        OrderedBlockEncoding::Iq2Xxs => ("iq2_xxs", 66, 256, 4, 2, 2176),
+        OrderedBlockEncoding::Iq2Xs => ("iq2_xs", 74, 256, 4, 2, 4224),
+        OrderedBlockEncoding::Iq3Xxs => ("iq3_xxs", 98, 256, 4, 2, 1152),
+        OrderedBlockEncoding::Iq1S => ("iq1_s", 50, 256, 4, 2, 16),
+        OrderedBlockEncoding::Iq3S => ("iq3_s", 110, 256, 4, 2, 2048),
+        OrderedBlockEncoding::Iq2S => ("iq2_s", 82, 256, 4, 2, 16),
+        OrderedBlockEncoding::Iq4Xs => ("iq4_xs", 136, 256, 2, 2, 128),
+        OrderedBlockEncoding::Iq1M => ("iq1_m", 56, 256, 4, 2, 16),
     })
-}
-
-pub fn supports(kind: u32) -> bool {
-    geometry(kind).is_ok()
 }
 
 #[repr(C)]
@@ -59,7 +55,12 @@ struct Args {
 
 /// Original packed `[output, row_bytes]` times contiguous F32 `[tokens, input]`.
 /// Independent rows use the same reduction in decode and prefill.
-pub fn matvec(kind: u32, weights: &Array, input: &Array, stream: &Stream) -> Result<Array> {
+pub fn matvec(
+    kind: OrderedBlockEncoding,
+    weights: &Array,
+    input: &Array,
+    stream: &Stream,
+) -> Result<Array> {
     let (name, bytes, block, rows_per_simd, groups, scratch) = geometry(kind)?;
     let (_, wl) = weights.t.buffer_and_layout();
     let (_, xl) = input.t.buffer_and_layout();
@@ -140,7 +141,13 @@ pub fn matvec(kind: u32, weights: &Array, input: &Array, stream: &Stream) -> Res
     e.set_threadgroup_memory_length(0, scratch);
     e.dispatch_groups(
         (
-            n as usize / (rows_per_simd as usize * if kind == 8 { 1 } else { groups }),
+            n as usize
+                / (rows_per_simd as usize
+                    * if kind == OrderedBlockEncoding::Q8_0 {
+                        1
+                    } else {
+                        groups
+                    }),
             m as usize,
             1,
         ),
@@ -155,7 +162,7 @@ mod tests {
     #[test]
     fn packed_formats_execute_zero_rows() -> Result<()> {
         let stream = Stream::thread_local_or_default();
-        for kind in [8, 10, 11, 12, 13, 14, 16, 17, 18, 19, 21, 22, 23, 29] {
+        for kind in OrderedBlockEncoding::ALL {
             let (_, bytes, block, _, _, _) = geometry(kind)?;
             let w = Array::from_slice(
                 &vec![0u8; (8 * 2048 / block * bytes) as usize],
@@ -164,7 +171,10 @@ mod tests {
             let x = Array::from_slice(&vec![1f32; 2048 * 2], &[2, 2048]);
             let y = matvec(kind, &w, &x, &stream)?;
             y.eval()?;
-            assert!(y.as_slice::<f32>().iter().all(|v| *v == 0.0), "type {kind}");
+            assert!(
+                y.as_slice::<f32>().iter().all(|v| *v == 0.0),
+                "type {kind:?}"
+            );
         }
         Ok(())
     }
@@ -189,14 +199,14 @@ mod numerical_tests {
                     *byte = (rng >> 24) as u8;
                 }
                 let scale = 0x2800u16 + (b % 8) as u16 * 0x200;
-                let at = if kind == 10 {
+                let at = if kind == OrderedBlockEncoding::Q2K {
                     80
-                } else if kind == 11 || kind == 14 {
+                } else if kind == OrderedBlockEncoding::Q3K || kind == OrderedBlockEncoding::Q6K {
                     bytes as usize - 2
                 } else {
                     0
                 };
-                if kind == 29 {
+                if kind == OrderedBlockEncoding::Iq1M {
                     for j in 0..4 {
                         let q = 48 + j * 2;
                         let v = u16::from_le_bytes([p[q], p[q + 1]]);
@@ -207,8 +217,18 @@ mod numerical_tests {
                 } else {
                     p[at..at + 2].copy_from_slice(&scale.to_le_bytes());
                 }
-                if [10, 12, 13].contains(&kind) {
-                    let at = if kind == 10 { 82 } else { 2 };
+                if [
+                    OrderedBlockEncoding::Q2K,
+                    OrderedBlockEncoding::Q4K,
+                    OrderedBlockEncoding::Q5K,
+                ]
+                .contains(&kind)
+                {
+                    let at = if kind == OrderedBlockEncoding::Q2K {
+                        82
+                    } else {
+                        2
+                    };
                     p[at..at + 2].copy_from_slice(&0x2400u16.to_le_bytes());
                 }
             }
@@ -222,7 +242,7 @@ mod numerical_tests {
             for (i, (&actual, &want)) in y.as_slice::<f32>().iter().zip(&expected).enumerate() {
                 assert!(
                     (actual - want).abs() <= 0.002 + want.abs() * 0.00002,
-                    "kind={kind} K={width} row={i}: {actual} vs {want}"
+                    "kind={kind:?} K={width} row={i}: {actual} vs {want}"
                 );
             }
         }
@@ -387,10 +407,10 @@ mod recurrent_tests {
         let gv = vec![-0.15f32; t * h];
         let bv = vec![0.55f32; t * h];
         let q = Array::from_slice(&qv, &[t as i32, kh as i32, d as i32]);
-        let k = Array::from_slice(&kv, &q.shape());
+        let k = Array::from_slice(&kv, q.shape());
         let v = Array::from_slice(&vv, &[t as i32, h as i32, d as i32]);
         let g = Array::from_slice(&gv, &[t as i32, h as i32]);
-        let b = Array::from_slice(&bv, &g.shape());
+        let b = Array::from_slice(&bv, g.shape());
         let s = Array::from_slice(&sv, &[h as i32, d as i32, d as i32]);
         let stream = Stream::thread_local_or_default();
         let (y, next) = gdn(&q, &k, &v, &g, &b, &s, &stream)?;

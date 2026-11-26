@@ -1,9 +1,8 @@
 use crate::{bindings::BindingDevice, execution::DeviceContext};
-// Loaded checkpoint bindings for the model-owned FLUX 3 denoiser graph.
+// Prepared tensor bindings for the model-owned FLUX 3 denoiser graph.
 use crate::bindings::flux2::weights::{Weights, info};
 
 use lisa_models::flux::{dit3 as model, symbolic::Schema};
-use std::path::Path;
 pub struct Dit<D: BindingDevice> {
     pub context: DeviceContext<D>,
     weights: Weights<D>,
@@ -11,10 +10,7 @@ pub struct Dit<D: BindingDevice> {
     geometry: model::Geometry,
 }
 impl<D: BindingDevice> Dit<D> {
-    pub fn load(context: DeviceContext<D>, dir: &Path) -> anyhow::Result<Self> {
-        let weights = Weights::load_file(context.clone(), &dir.join("model.safetensors"), |key| {
-            !key.contains("image_cond")
-        })?;
+    pub fn from_weights(context: DeviceContext<D>, weights: Weights<D>) -> anyhow::Result<Self> {
         let schema = weights.schema()?;
         let geometry = model::Geometry::from_schema(&schema)?;
         Ok(Self {

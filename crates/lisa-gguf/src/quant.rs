@@ -21,7 +21,7 @@ fn f16_at(b: &[u8], at: usize) -> f32 {
 pub fn decode(kind: TensorType, packed: &[u8], output: &mut [f32]) -> Result<()> {
     let (_, width, bytes) = kind.layout()?;
     ensure!(
-        !output.is_empty() && output.len() as u64 % width == 0,
+        !output.is_empty() && (output.len() as u64).is_multiple_of(width),
         "invalid GGUF decode output length"
     );
     ensure!(
@@ -56,10 +56,38 @@ pub fn decode(kind: TensorType, packed: &[u8], output: &mut [f32]) -> Result<()>
             TensorType::Q4_K => q4_k(b, out),
             TensorType::Q5_K => q5_k(b, out),
             TensorType::Q6_K => q6_k(b, out),
+            TensorType::NVFP4 => nvfp4(b, out),
             _ => bail!("CPU row decoder not implemented for {}", kind.layout()?.0),
         }
     }
     Ok(())
+}
+
+// GGML NVFP4 stores four unsigned E4M3 scales followed by four groups of
+// eight packed E2M1 pairs. The low/high nibbles address separate half-groups.
+// The expert's separate global scale is a model parameter, not part of a block.
+fn nvfp4(b: &[u8], out: &mut [f32]) {
+    const VALUES: [f32; 16] = [
+        0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 0.0, -1.0, -2.0, -3.0, -4.0, -6.0, -8.0, -12.0,
+    ];
+    for group in 0..4 {
+        let s = b[group];
+        // Match GGML's handling of the reserved NaN and sign-bit encodings.
+        let exponent = ((s >> 3) & 15) as i32;
+        let mantissa = (s & 7) as f32;
+        let scale = if s == 0 || s == 127 {
+            0.0
+        } else if exponent == 0 {
+            mantissa * 2.0f32.powi(-10)
+        } else {
+            (1.0 + mantissa / 8.0) * 2.0f32.powi(exponent - 8)
+        };
+        for j in 0..8 {
+            let q = b[4 + group * 8 + j];
+            out[group * 16 + j] = VALUES[(q & 15) as usize] * scale;
+            out[group * 16 + j + 8] = VALUES[(q >> 4) as usize] * scale;
+        }
+    }
 }
 
 fn q2_k(b: &[u8], out: &mut [f32]) {

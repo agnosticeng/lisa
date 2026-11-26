@@ -1,37 +1,41 @@
-LISA includes third-party Metal source and adapted host implementations.
-Paths below describe the current source tree. Local changes to storage access,
-dispatch, arithmetic specializations and source assembly do not remove the
-upstream attributions or license requirements.
+LISA
+Copyright (c) 2026 the LISA authors. Licensed under the MIT License (LICENSE).
 
-MLX
----
-The MLX-derived kernels and helpers under crates/lisa-metal/src/shaders/common/,
-the flattened headers under crates/lisa-metal/src/shaders/nax/, and MLX-derived
-portions of shaders/qwen4/ and shaders/packed_pointwise/ originate in Apple's MLX:
-https://github.com/ml-explore/mlx
-Copyright (c) 2023-2025 Apple Inc. (individual sources retain their own years).
-License: MIT, with the embedded math notices below retained separately.
-Upstream license:
-https://github.com/ml-explore/mlx/blob/main/LICENSE
+LISA includes source adapted from the projects below and was checked against
+the reference implementations listed at the end. This file is the single place
+where external projects are named. Paths are relative to the repository root;
+per-file copyright headers, adjacent licence files and provenance JSON files
+(with exact source revisions and hashes) remain beside the code and are not
+replaced by this summary. Model weights are never redistributed and keep their
+own licences.
 
-Some sources are flattened header closures; others have local adaptations.
-Original source identifiers and copyright comments are retained where present.
-LISA's runtime and Rust dispatch are separate implementations.
-The row-reduction pointer loops in common/reduce/reduce.metal use N_WRITES
-(the pointer-array bound) so the one-row specialization retains N_READS=4.
-The four-row arithmetic and embedded upstream attribution are preserved.
 
-Embedded math notices
----------------------
-crates/lisa-metal/src/shaders/common/elementwise/unary_ops.metal includes MLX's
-cexpf.h and expm1f.h closures. Their additional upstream notices remain in the
-source and are not replaced by the MLX MIT notice:
+1. Adapted source
+=================
+
+Apple MLX
+---------
+https://github.com/ml-explore/mlx — Copyright (c) 2023-2026 Apple Inc. — MIT.
+
+- crates/lisa-metal/src/shaders/common/ (kernels and helpers), shaders/nax/
+  (flattened headers), shaders/fragments/ (verbatim runs shared by those
+  headers), and MLX-derived portions of shaders/{moe,hyper,ple,pointwise,
+  packed_pointwise}/.
+- shaders/common/matmul/gemv_wide.metal, shaders/nax/gemm_thin.metal and
+  shaders/common/matmul/affine_projection.metal from release v0.32.4
+  (gemv.h, steel_gemm_thin_nax.h, quantized.h, steel_gemm_splitk.h).
+- shaders/common/attention/layer_norm.metal from revision
+  1f8e74e3f12f31365464a6867c6579f0e9b29d85 (original SHA-256
+  2d243f5abea7353929f9bc838ceb5a98e52a452dfc29609ad4d5974447ea689f).
+- Rust dispatch in crates/lisa-metal/src/jit/ mirrors MLX host schedules.
+
+shaders/common/elementwise/unary_ops.metal embeds MLX's cexpf.h and expm1f.h
+closures, which carry their own notices:
 
 - cexpf.h: Copyright (c) 2008-2013 NVIDIA Corporation and Copyright (c) 2013
-  Filipe RNC Maia, under the Apache License, Version 2.0.
-  https://www.apache.org/licenses/LICENSE-2.0
-  The source identifies NVIDIA/cccl thrust/detail/complex/cexpf.h as its origin.
-
+  Filipe RNC Maia. Apache License, Version 2.0
+  (https://www.apache.org/licenses/LICENSE-2.0). Origin: NVIDIA/cccl
+  thrust/detail/complex/cexpf.h.
 - expm1f.h: Copyright (c) 2015-2023 Norbert Juffa. All rights reserved.
 
   Redistribution and use in source and binary forms, with or without
@@ -55,234 +59,230 @@ source and are not replaced by the MLX MIT notice:
   ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
   POSSIBILITY OF SUCH DAMAGE.
 
-MTPLX
------
-crates/lisa-metal/src/shaders/qwen4/qsa/{prefill,prefill_header,select,select_header}.metal
-and crates/lisa-metal/src/kernels/block_attention.rs are adapted from MTPLX:
-https://github.com/youssofal/MTPLX
-Copyright the MTPLX authors. License: Apache License, Version 2.0.
-https://www.apache.org/licenses/LICENSE-2.0
-The source operations are mtplx/kernels/qsa_prefill_flash.py and
-mtplx/kernels/qsa_indexer_select.py. The sparse-attention design and
-block-selection tie-break (score - block_id * 1e-12) follow that project.
-The local host dispatch, tensor layout and some kernel details are adapted.
-
 Candle
 ------
-The following sources derive from candle-metal-kernels 0.11.0:
-https://github.com/huggingface/candle
+https://github.com/huggingface/candle — Copyright (c) 2023-2025 Hugging Face and
+contributors — MIT or Apache-2.0 (used under MIT). From candle-metal-kernels
+0.11.0, under crates/lisa-metal/src/shaders/:
 
-- shaders/common/elementwise/elementwise_binary.metal: src/metal_src/binary.metal
-- shaders/common/elementwise/cast.metal: src/metal_src/cast.metal
-- shaders/common/elementwise/select.metal: src/metal_src/ternary.metal
-- shaders/common/data/indexing.metal: src/metal_src/indexing.metal
-- shaders/common/matmul/dense_gemm.metal: src/metal_src/mlx_gemm.metal
-- shaders/common/matmul/dense_gemv.metal: src/metal_src/gemv.metal
+- common/elementwise/elementwise_binary.metal  (src/metal_src/binary.metal)
+- common/elementwise/cast.metal                (src/metal_src/cast.metal)
+- common/elementwise/select.metal              (src/metal_src/ternary.metal)
+- common/data/indexing.metal                   (src/metal_src/indexing.metal)
+- common/matmul/dense_gemm.metal               (src/metal_src/mlx_gemm.metal)
+- common/matmul/dense_gemv.metal               (src/metal_src/gemv.metal)
 
-All paths above are relative to crates/lisa-metal/src/. These are vendored
-kernel sources with local integration and adaptations, without a Candle runtime
-dependency. Copyright (c) 2023-2025 Hugging Face and the contributing authors.
-Candle is distributed under MIT or Apache-2.0; LISA's existing attribution uses
-MIT. The GEMM/GEMV sources also retain their original Apple MLX MIT attribution
-(Copyright (c) 2023-2024 Apple Inc.).
+The GEMM/GEMV sources also keep their Apple MLX attribution.
+
+MTPLX
+-----
+https://github.com/youssofal/MTPLX — Copyright the MTPLX authors — Apache-2.0.
+
+- crates/lisa-metal/src/shaders/sparse_attention/qsa_{prefill,prefill_header,
+  select,select_header}.metal and crates/lisa-metal/src/kernels/block_attention.rs,
+  from mtplx/kernels/qsa_prefill_flash.py and qsa_indexer_select.py, including
+  the block-selection tie-break (score - block_id * 1e-12).
+
+Splash
+------
+https://github.com/incoai/splash — Apache-2.0 (revision
+2afc7337aacc044722fa95e4cb3da75c281a19a8).
+
+- The Inkling decode/verify step's kernels in
+  crates/lisa-metal/src/shaders/reference/: relative attention over paged
+  INT8 keys and values, short convolutions, block residual mixes, message
+  gates, MoE routing, grouping, expert passes and combine, dense GGUF tiles
+  (column, register, staged and prefill, fused segments, the int8 prefill
+  tile), float tiles, normalization,
+  row copies, embedding, logit finishing, the plane repack, RoPE tables, the
+  DFlash2 draft kernels (context prefill included) and the sampling kernels (draft tree selection,
+  verify-row layout, acceptance, candidate selector). Headers are inlined and
+  the code is otherwise unchanged; adjacent LICENSE-APACHE-2.0, LICENSE-GGML
+  for its ggml-derived tables, and provenance.json with source hashes.
+- Host code following its runtime: the generic dispatch
+  (crates/lisa-metal/src/kernels/ggml/reference_dispatch.rs), the plane repack
+  (reference_planes.rs, after runtime/model/GgufPreparation.cpp and
+  GgufImage.cpp) and the tree selection (reference_tree.rs); the step's
+  schedule, state layout, tile and split selection and dispatch order in
+  crates/lisa-engine/src/bindings/inkling2/step/ (runtime/model/
+  Inkling2Loop*.cpp, QwenTarget.hpp's layer loop and Runtime.cpp's prefill
+  chunking, runtime/ops/ host code, KernelSelection.cpp and
+  KernelCalibration.hpp), including the prompt prefill and the DFlash2 draft
+  step and its context prefill (DFlashDraft.cpp,
+  DraftAttention.cpp, DraftSelector.cpp, RoPE.cpp); the af4g64 draft image in
+  crates/lisa-engine/src/weights/inkling2/dflash.rs (DraftCheckpoint.cpp and
+  the GgufPreparation.cpp quantizer); and the tree round control in
+  crates/lisa-engine/src/speculation/tree.rs (lookup acceptance prior table
+  and rates, acceptance-model fit, step costs and row choice, after
+  VerifyBudget.cpp, LookupProposals.cpp, StepCosts.cpp and Runtime.cpp).
+
+MLX-Serve
+---------
+https://github.com/ddalcu/mlx-serve — Copyright (c) 2026 David Dalcu — MIT.
+
+- Revision 6c4306145b7331f6b962b97e145fd9ac46e9e14a: vision processors and
+  encoders and the FLUX.2 pipeline (crates/lisa-models/src/{vision,flux}/).
+- Licence copy: crates/lisa-models/src/LICENSE-MLX-SERVE.
 
 DS4
 ---
-DS4-derived GLM kernels live under crates/lisa-metal/src/shaders/glm53/ and in
-common/attention/ds4_flash_attn.metal, common/matmul/glm53_*.metal and
-common/elementwise/glm53_moe_grouped_swiglu_weight.metal. Associated Rust
-bindings and GLM execution code adapt DS4's shape gates and scheduling to
-LISA's runtime, with legacy MLX affine storage and native GGUF block views.
+https://github.com/antirez/ds4 — Copyright (c) 2026 the ds4.c authors,
+Copyright (c) 2023-2026 the ggml authors, Copyright (c) 2023 DeepSeek — MIT.
 
-Upstream: https://github.com/antirez/ds4
-Reference revision: b4e3faf5262b21db94ec309cf321640ff1eed460
-Source families include metal/dense.metal, metal/glm53_bf16.metal, metal/dsv4_misc.metal,
-metal/moe.metal and metal/flash_attn.metal.
-Copyright (c) 2026 The ds4.c authors.
-Copyright (c) 2023-2026 The ggml authors.
-Copyright (c) 2023 DeepSeek.
-License: MIT. The full notice is retained in:
-crates/lisa-metal/src/shaders/common/attention/ds4_flash_attn.LICENSE
-crates/lisa-metal/src/shaders/common/elementwise/ds4_glm53_moe_swiglu.LICENSE
+- GLM-5.3 kernels at revision b4e3faf5262b21db94ec309cf321640ff1eed460 (affine
+  path) and b3f50180ec2c7324892be1f50bc83555ccb8d5e7 (GGUF path), under
+  crates/lisa-metal/src/shaders/{sparse_attention,kda,hyper,moe,mtp,norm}/,
+  shaders/pointwise/{clamped_swiglu,grouped_swiglu_weight}.metal,
+  shaders/common/matmul/{affine_q2_mpp_ds4,affine_q8_*,moe_q2_*}.metal and
+  shaders/common/attention/ds4_flash_attn.metal, with the GLM bindings in
+  crates/lisa-engine/src/bindings/glm53/ adapting its shape gates and schedules.
+- DeepSeek V4.1 at revision b3f50180ec2c7324892be1f50bc83555ccb8d5e7:
+  crates/lisa-models/src/deepseek41/, crates/lisa-engine/src/bindings/deepseek41/,
+  crates/lisa-metal/src/kernels/ggml*, shaders/gguf_iq/, the chat renderer
+  and DSML parser in
+  crates/lisa-serve/src/deepseek41.rs, the MXFP8 row decoder in
+  crates/lisa-gguf/src/quant/ds4.rs and the reference builder in
+  crates/lisa-bench/reference/deepseek41/.
+- The row-reduction fusion in shaders/packed_pointwise/weighted_swiglu.metal.
+- Licence copies: shaders/common/attention/ds4_flash_attn.LICENSE,
+  shaders/common/elementwise/ds4_glm53_moe_swiglu.LICENSE, shaders/gguf_iq/LICENSE,
+  shaders/packed_pointwise/LICENSE-DS4, crates/lisa-models/src/deepseek41/LICENSE,
+  crates/lisa-serve/src/LICENSE-DS4, crates/lisa-gguf/src/LICENSE-DS4.
 
-The DeepSeek V4.1 GGUF port under crates/lisa-models/src/deepseek41/, crates/lisa-engine/src/bindings/deepseek41_*,
-and crates/lisa-metal/src/kernels/ggml* and shaders/deepseek41/ use DS4 revision
-b3f50180ec2c7324892be1f50bc83555ccb8d5e7. It adapts the tokenizer, Engram
-hash/read scheduling, hyper-connections, cache quantization, sparse attention,
-index selection and routed/shared experts to LISA's Rust runtime. Source
-hashes and local adaptations are recorded beside each shader. The full MIT
-notice is in crates/lisa-metal/src/shaders/deepseek41/LICENSE and
-crates/lisa-models/src/deepseek41/LICENSE.
-The native V4.1 renderer and DSML parser in crates/lisa-serve/src/deepseek41.rs
-port ds4_server.c and ds4_tool_text.h from that same revision. Their original-C
-test oracle identity is in deepseek41_provenance.json; the full MIT notice is
-retained in crates/lisa-serve/src/LICENSE-DS4.
-The reference builder under crates/lisa-bench/reference/deepseek41/ extracts
-that pinned DS4 graph and GGML CPU decoders into an external build directory.
-Generated upstream code retains these licenses; adapter identities and compiler
-commands are recorded in its build manifest.
+GGML / llama.cpp
+----------------
+https://github.com/ggml-org/llama.cpp — Copyright (c) 2023-2026 the ggml
+authors — MIT.
 
-The native GLM GGUF path under models/glm53/gguf and shaders/glm53/gguf_*
-uses DS4 revision b3f50180ec2c7324892be1f50bc83555ccb8d5e7. Original Q2_K and
-Q4_K helpers are included in shaders/deepseek41/iq.metal. Shared native GGUF
-BPE and GLM4 split rules live in lisa-engine/src/core/gguf_tokenizer.rs and
-gguf_glm4.rs. Adjacent JSON files record source and adapter identities.
+- GGUF block decoders and codebooks in crates/lisa-gguf/src/ (revision
+  ca3d5a3e10d53f7ea672cb9b6178faca3e2807bc).
+- IQ1_M, IQ2_XS and Q5_K helpers in shaders/gguf_iq/iq.metal (revision
+  7071ba378afa96dcd69c41e1ec2b4912364dbee4).
+- Qwen GGUF packed projections and gated-delta recurrence in shaders/gguf/
+  (revision 18ab62a8ec5144ae5d2f65e78374ba69652d75dd).
+- Inkling 2 vision plans and image preprocessing (crates/lisa-models/src/
+  inkling2/{vision,image}.rs) and the NVFP4 decoder (revision
+  29b52d398b294509746ec0a3f28948a3107c0213).
+- Licence copies: crates/lisa-gguf/src/LICENSE-GGML, shaders/gguf/LICENSE,
+  shaders/gguf_iq/LICENSE-GGML, crates/lisa-models/src/inkling2/LICENSE-GGML.
 
-GGML packed-weight extensions
+OVHai-LLM llama.cpp fork
+------------------------
+https://github.com/OVHai-LLM/llama.cpp — Copyright (c) 2023-2026 the ggml
+authors — MIT. Revision 55c22dca0c987f247c21b427c3b3a09e1a28187f.
+
+- Olala model plans (crates/lisa-models/src/olala/), Mamba3-MIMO and geodesic
+  kernels (shaders/recurrent_mimo/) and the Q6_K helper and decoder.
+- Licence copies: crates/lisa-models/src/olala/LICENSE-GGML,
+  shaders/recurrent_mimo/LICENSE.
+
+Black Forest Labs FLUX
+----------------------
+https://github.com/black-forest-labs/flux-3-image-klein — Copyright 2026 Black
+Forest Labs, Inc. — Apache-2.0. Revision bfc8889a4497f846416f253a3972a1941ac698b9.
+
+- FLUX 3 transformer, text-encoder contract, VAE layout and flow-map schedule in
+  crates/lisa-models/src/flux/ and crates/lisa-engine/src/bindings/flux3/
+  (LICENSE.flux3 and bindings/flux3/LICENSE).
+- FLUX.2 Klein dimensions and encoder taps checked against
+  https://github.com/black-forest-labs/flux2 at 50fe5162777813d869182b139e83b10743caef15.
+
+MLX-VLM
+-------
+https://github.com/Blaizzy/mlx-vlm — Copyright 2026 The HuggingFace Team —
+Apache-2.0. Revision a22a364af9d7ee5e7e063881923cf18a3f42533d.
+
+- LFM3 text architecture and ShortConv in crates/lisa-models/src/lfm3/
+  (crates/lisa-models/src/lfm3/LICENSE).
+
+PrismML
+-------
+- 1-bit decode additions in shaders/common/matmul/quantized.metal from
+  https://github.com/PrismML-Eng/mlx at bbc151c6360ee79a7412fa23cfc5c5fc63ced1ca
+  (Apple MLX MIT attribution).
+- VAE tile geometry and cosine blending in crates/lisa-models/src/flux/tiles.rs
+  from https://github.com/PrismML-Eng/mflux-prism at
+  bcd13e83b7fcfd76186c98ef322dd9cf28e996c1, a fork of mflux under the MIT licence
+  below:
+
+  Copyright (c) 2026 Filip Strand
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in
+  all copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+
+Checkpoint metadata fixtures
 ----------------------------
-The GGUF block decoders and codebooks under crates/lisa-gguf/src/
-derive from ggml-org/llama.cpp revision
-ca3d5a3e10d53f7ea672cb9b6178faca3e2807bc. The IQ1_M, IQ2_XS and Q5_K
-Metal arithmetic helpers in shaders/deepseek41/iq.metal derive from revision
-7071ba378afa96dcd69c41e1ec2b4912364dbee4; the IQ2_XXS path retains DS4's
-helper. These adapters retain the original GGML block bytes and do not
-requantize the checkpoint to MLX affine storage.
-Upstream: https://github.com/ggml-org/llama.cpp
-Copyright (c) 2023-2026 The ggml authors. License: MIT.
-Full notices and provenance are retained in crates/lisa-gguf/src/LICENSE-GGML
-and crates/lisa-metal/src/shaders/deepseek41/LICENSE-GGML, with provenance.json
-alongside the sources.
+- Olala: OVHaiLLM/Olala-v1.0-mini-7A1B-GGUF at
+  b9f5d20adf2ac0aec05e9fa00b057cf26df263fc, Copyright 2026 OVH LLM SAS,
+  Apache-2.0 (LICENSE-OLALA beside each fixture).
+- Inkling 2: unsloth/Inkling-2-Mini-GGUF at
+  29eac40c55957e3b76db6b7028e549cb244745de, based on Thinking Machines Lab's
+  Inkling 2 Mini, Apache-2.0.
+- LFM3: crates/lisa-models/src/lfm3/fixtures/LICENSE.
 
-MLX-Serve media implementations
--------------------------------
-The native vision processors/encoders and FLUX.2 pipeline under
-crates/lisa-models/src/{vision,flux}/ and their runtime bindings adapt operation order and model
-layout from https://github.com/ddalcu/mlx-serve
-Revision: 6c4306145b7331f6b962b97e145fd9ac46e9e14a
-Copyright (c) 2026 David Dalcu. License: MIT (full text below).
-LISA supplies its own Rust execution, bounded attention and convolution storage,
-request isolation, image decoding, HTTP handling and Apple app integration.
 
-The LayerNorm source common/attention/layer_norm.metal comes from MLX revision
-1f8e74e3f12f31365464a6867c6579f0e9b29d85,
-mlx/backend/metal/kernels/layer_norm.metal. The utils include and explicit
-instantiation list are omitted because LISA supplies them at JIT assembly.
-Original SHA-256: 2d243f5abea7353929f9bc838ceb5a98e52a452dfc29609ad4d5974447ea689f
+2. Reference implementations
+============================
 
-Black Forest Labs FLUX image inference
---------------------------------------
-The native FLUX 3 implementation under crates/lisa-models/src/flux/ and crates/lisa-engine/src/bindings/flux3/
-adapts the transformer, text-encoder contract, VAE layout and flow-map schedule
-from https://github.com/black-forest-labs/flux-3-image-klein
-Revision: bfc8889a4497f846416f253a3972a1941ac698b9.
-Copyright 2026 Black Forest Labs, Inc. License: Apache-2.0.
-The full license is retained in crates/lisa-models/src/flux/LICENSE.flux3 and
-crates/lisa-engine/src/bindings/flux3/LICENSE.
-LISA changes execution to Rust/Metal, stages model loading, bounds attention and
-convolution scratch, and uses its bundled text encoder for prompt expansion
-with a compact adaptation of the reference's external-LLM caption guide.
-FLUX.2 Klein 9B dimensions and encoder taps were checked against the official
-https://github.com/black-forest-labs/flux2 reference at
-50fe5162777813d869182b139e83b10743caef15. MLX tensor bytes are retained.
-Model weights carry their own licenses, separate from inference source code.
+Used as numerical oracles, design references or platform contracts; no source
+is copied unless listed above. A reference does not imply that its arithmetic
+or performance applies to LISA.
 
-MIT license text
-----------------
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+- Apple MLX: v0.32.4 and c69303b00f5f61860436e832f23fa8c34b96f93a
+  (https://github.com/ml-explore/mlx).
+- DS4 (https://github.com/antirez/ds4): GLM and DeepSeek execution reference
+  at b3f50180ec2c7324892be1f50bc83555ccb8d5e7; legacy GLM reference at
+  b4e3faf5262b21db94ec309cf321640ff1eed460.
+- llama.cpp (https://github.com/ggml-org/llama.cpp): Qwen 27B GGUF reference
+  and Inkling Metal capability reference at
+  29b52d398b294509746ec0a3f28948a3107c0213.
+- MLX-Serve (https://github.com/ddalcu/mlx-serve): GLM vision reference
+  (6c43061); MLX-Serve GGUF kernels (https://github.com/ddalcu/mlx-serve-gguf,
+  c32bb7b06ec372551219604254193e18f9341bd4).
+- Olala: architecture paper (https://huggingface.co/OVHaiLLM/Olala-v1.0-mini-7A1B),
+  OVHai-LLM llama.cpp at 55c22dca0c987f247c21b427c3b3a09e1a28187f and mlx-engine
+  at 58083ca0ac4ca0654b508f74e1bdf7b6e0e173f4 (https://github.com/OVHai-LLM).
+- MTPLX v2.13.0 (https://github.com/youssofal/MTPLX, bebe21b5ba36af3688335ab66d365509fd042fad):
+  Inkling round program, executor, prompt routing and quantization recipes.
+- Qwen MTP: Layr Labs qwen-3.8-mtp-challenge
+  (https://github.com/Layr-Labs/qwen-3.8-mtp-challenge, 0863b06ac16e26e48fc06e97444095b00feb66d4).
+- Inkling serving references: TokenSpeed recipes (https://lightseek.org/tokenspeed),
+  vLLM (https://github.com/vllm-project/vllm, c6b1b800ec856e2cf504a10df8f8626bb6e24152),
+  SGLang (https://github.com/sgl-project/sglang, a8ac86595c72cdd2f340a986020bdad69a06b65e),
+  Ollama (https://github.com/ollama/ollama, 318ee284aa3b5558de57efefff730ea33c4a9bef)
+  and Strata (https://github.com/Niko1221/Strata, v0.2.19).
+- FLUX checkpoints: mlx-community/flux2-klein-4b-4bit
+  (860e87183ceb29e39627c0612ebd66d8ea66e68c), mlx-community/flux2-klein-9b-4bit
+  (f0c62655b9da432932ba24d4bfce8a96800cf0bd), black-forest-labs/flux-3-image-klein
+  (09561231f44e41381c461caf53d5452005a60ac9), prism-ml/bonsai-image-binary-4B-mlx-1bit
+  (d1b3ac11a7f1ba61d84b277339daeeed4a98e0e2).
+- Optimization references: Sushi (https://github.com/beamivalice/sushi) and the
+  inference-optimisation skill (https://github.com/sybil-solutions/inference-optimisation-skill).
+- Inkling DFlash2 drafter: the checkpoint incoai/Inkling-2-Mini-DFlash2
+  (4f9088ea66c21f2b99ed657d1941c306b03e84d2, Apache-2.0) and its SGLang
+  integration patch; the method's reference z-lab/dflash
+  (https://github.com/z-lab/dflash). No source is adapted from them.
+- Apple platform contracts: concurrent compute dispatch, buffer barriers and
+  os_proc_available_memory (https://developer.apple.com/documentation/).
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-GGML Qwen GGUF kernels
------------------------
-Packed projections and the F32 gated-delta recurrence under
-crates/lisa-metal/src/shaders/gguf/ originate in llama.cpp/GGML:
-https://github.com/ggml-org/llama.cpp
-License: MIT; the upstream LICENSE and source revision/hashes are retained
-in that directory. Rust dispatch and the Qwen GGUF storage adapter are local
-implementations. The Qwen graph and tokenizer follow the same pinned reference.
-
-Tencent DSpine inference algorithm
-----------------------------------
-The Metal selection, chain and feature bridge kernels under
-crates/lisa-metal/src/shaders/dspine/ adapt the algorithms in
-sglang_dspine/kernels/dspine.py at the revision below. Selection preserves
-Lisa's stable total order and the bridge retains MLX's composed arithmetic.
-normalize.metal and normalize_codes.metal preserve Apple's MLX 0.32.4
-row_reduce_simple reduction design (Copyright 2023-2024 Apple Inc., MIT;
-full license above), including read order and simd_sum stages.
-
-The optional Qwen 3.8 27B DSpine drafter in
-crates/lisa-models/src/qwen3_5/dspine/ and its weight bindings in
-crates/lisa-engine/src/bindings/dspine.rs follow the inference design
-in https://github.com/Tencent/DSpine at revision
-321b0fc1388c4cdf03483ab73856975f7c0c0be7. The upstream project is licensed
-under Apache-2.0; this implementation is an independent Rust/Metal port.
-Checkpoint weights are distributed under their own model license.
-Vocabulary projection tables follow dspine_mlx/dspine_mlx/bridge.py at that
-revision with shape-matched native matmuls. dspine_retrieval.rs implements a
-native affine 2-bit counterpart to the upstream coarse-head/top-128-rescore
-design; it does not import CUDA FP8 arithmetic or weights.
-The measured SPS policy in dspine_policy.rs and compact-history Metal GDN
-verification/commit design also follow that revision's
-sglang_dspine/verification/policy.py and runtime/replayssm/. The Metal kernels
-retain Lisa's sequential GDN arithmetic; they do not copy CUDA matrix math.
-
-DSpine small-row Metal projections
----------------------------------
-crates/lisa-metal/src/shaders/common/matmul/dspine_wide.metal and
-crates/lisa-metal/src/shaders/nax/dspine_thin.metal retain the arithmetic and
-reduction order of MLX v0.32.4's gemv.h and steel_gemm_thin_nax.h.
-Copyright © 2023-2024, 2026 Apple Inc. License: MIT (full text above).
-The Rust dispatch mirrors that release's matmul.cpp for the qualified
-DSpine shapes; the target model's projection dispatch is unchanged.
-
-DSpine affine 4-bit Metal projections
-------------------------------------
-crates/lisa-metal/src/shaders/common/matmul/dspine_quantized.metal contains
-MLX v0.32.4 quantized.h and its gemm_splitk_accum template from
-steel/gemm/kernels/steel_gemm_splitk.h. Copyright © 2023-2024 Apple Inc.
-License: MIT (full text above). The DSpine-only wrapper retains that
-release's promoted input sums and F32 split-K partials. Target kernels
-retain their existing arithmetic. Source hashes are recorded in the
-DSpine fixture provenance.
-
-The explicit DS4 MXFP8 row decoder in crates/lisa-gguf/src/quant/ds4.rs
-is ported from ds4_engram.c at b3f50180ec2c7324892be1f50bc83555ccb8d5e7.
-Its MIT license is preserved at crates/lisa-gguf/src/LICENSE-DS4.
-
-LFM3 model plans
-----------------
-crates/lisa-models/src/lfm3/ adapts the text architecture from MLX-VLM's
-LFM3 and LFM2 ShortConv implementations at revision
- a22a364af9d7ee5e7e063881923cf18a3f42533d:
-https://github.com/Blaizzy/mlx-vlm/tree/a22a364af9d7ee5e7e063881923cf18a3f42533d/mlx_vlm/models/lfm3
-Copyright 2026 The HuggingFace Team. All rights reserved.
-License: Apache-2.0; retained at crates/lisa-models/src/lfm3/LICENSE.
-Local modifications express the model as portable Rust graphs with explicit
-immutable state, bounded sliding attention and original packed MLX weights.
-The LiquidAI checkpoint weights are downloaded separately under their own
-LFM Open License v1.0; their license is retained with the downloaded package.
-
-PrismML Bonsai image support
----------------------------
-The 1-bit decode additions in common/matmul/quantized.metal follow
-PrismML-Eng/mlx revision bbc151c6360ee79a7412fa23cfc5c5fc63ced1ca,
-mlx/backend/metal/kernels/quantized.h (Apple MLX MIT attribution above).
-https://github.com/PrismML-Eng/mlx
-The overlapping VAE tile geometry and cosine blending in
-crates/lisa-models/src/flux/tiles.rs adapt VAETiler from
-https://github.com/PrismML-Eng/mflux-prism
-Revision bcd13e83b7fcfd76186c98ef322dd9cf28e996c1.
-The checkpoint adapter retains original binary packs and BF16 parameters.
-Model weights are downloaded separately under the publisher's license.
-
-MIT License
-
-Copyright (c) 2026 Filip Strand
+3. MIT License text
+===================
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -301,14 +301,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
-Olala GGUF support
-------------------
-The Olala model plans and Mamba3-MIMO/geodesic Metal kernels are adapted from
-OVHai-LLM/llama.cpp, revision 55c22dca0c987f247c21b427c3b3a09e1a28187f.
-Copyright (c) 2023-2026 The ggml authors. MIT License, retained beside the
-model plans and kernels. The Q6_K Metal helper and CPU decoder come from the
-same revision. See recurrent_mimo/provenance.json and q6k_provenance.json.
-The checkpoint metadata fixture comes from OVHaiLLM/Olala-v1.0-mini-7A1B-GGUF,
-revision b9f5d20adf2ac0aec05e9fa00b057cf26df263fc (Apache-2.0).
-Copyright 2026 OVH LLM SAS. No model weights are redistributed.

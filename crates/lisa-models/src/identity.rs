@@ -5,6 +5,7 @@
 pub enum ModelKind {
     Lfm3,
     Olala,
+    Inkling2,
     Qwen4,
     Qwen35,
     Qwen35Gguf,
@@ -20,6 +21,7 @@ impl ModelKind {
     pub fn from_model_type(name: &str) -> anyhow::Result<Self> {
         match name {
             "olala" => Ok(Self::Olala),
+            "inkling2" => Ok(Self::Inkling2),
             "lfm3" => Ok(Self::Lfm3),
             "qwen4_exp" | "qwen4_exp_text" => Ok(Self::Qwen4),
             "qwen3_5" | "qwen3_5_text" => Ok(Self::Qwen35),

@@ -452,7 +452,7 @@ fn latent_and_pixel_plans_preserve_family_arithmetic() -> anyhow::Result<()> {
         let mut expected = expected;
         let velocity = input(&[1, 6, 128], Dtype::Bfloat16)?;
         for dt in [-0.17, -0.33333334] {
-            let mut delta = velocity.multiply(&Array::from_f32(dt))?;
+            let mut delta = velocity.multiply(Array::from_f32(dt))?;
             if family == Family::Klein3 {
                 delta = delta.as_dtype(Dtype::Bfloat16)?.as_dtype(Dtype::Float32)?;
             }

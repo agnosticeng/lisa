@@ -9,26 +9,38 @@ pub mod weights;
 use anyhow::ensure;
 
 use lisa_models::flux::pipeline::{self as model, Family};
-use std::path::{Path, PathBuf};
 use weights::run;
 
 pub const DEFAULT_MODEL: &str = "mlx-community/flux2-klein-4b-4bit";
 pub const DEFAULT_STEPS: u32 = 4;
 pub use lisa_models::flux::pipeline::Options;
+/// Stage acquisition returns imported tensors without exposing their container.
+pub trait StageSource<D: BindingDevice + ManagedDevice> {
+    fn tokenizer(&self) -> anyhow::Result<crate::core::tokenizer::Tokenizer>;
+    fn text_weights(&self) -> anyhow::Result<weights::Weights<D>>;
+    fn denoiser_weights(&self) -> anyhow::Result<weights::Weights<D>>;
+    fn decoder_weights(&self) -> anyhow::Result<weights::Weights<D>>;
+}
+pub struct Policy {
+    pub bounded: bool,
+    pub required_ram: usize,
+}
 pub struct Pipeline<D: BindingDevice + ManagedDevice> {
     pub context: DeviceContext<D>,
-    dir: PathBuf,
+    source: Box<dyn StageSource<D>>,
+    policy: Policy,
 }
 impl<D: BindingDevice + ManagedDevice> Pipeline<D> {
-    pub fn load(context: DeviceContext<D>, dir: &Path) -> anyhow::Result<Self> {
-        ensure!(
-            is_checkpoint(dir),
-            "expected an MLX FLUX.2 Klein checkpoint with text_encoder, transformer, tokenizer and vae"
-        );
-        Ok(Self {
+    pub fn from_prepared(
+        context: DeviceContext<D>,
+        source: Box<dyn StageSource<D>>,
+        policy: Policy,
+    ) -> Self {
+        Self {
             context,
-            dir: dir.into(),
-        })
+            source,
+            policy,
+        }
     }
     /// Each stage releases its weights before the next stage loads. The caller
     /// must release any language model before entering this separate pipeline.
@@ -46,19 +58,15 @@ impl<D: BindingDevice + ManagedDevice> Pipeline<D> {
         );
         // Leave room for convolution intermediates, attention, and allocator
         // overlap. Check both the configured cap and current system headroom.
-        let binary = crate::checkpoint::catalog::bonsai::is_checkpoint(&self.dir);
-        if binary {
+        let bounded = self.policy.bounded;
+        if bounded {
             self.context.device().clear_unused();
             ensure!(
                 options.width <= 512 && options.height <= 512,
                 "Bonsai currently supports up to 512 × 512 pixels"
             );
         }
-        let needed = if binary {
-            crate::checkpoint::catalog::bonsai::REQUIRED_RAM
-        } else {
-            8usize << 30
-        };
+        let needed = self.policy.required_ram;
         ensure!(
             self.context
                 .device()
@@ -77,9 +85,13 @@ impl<D: BindingDevice + ManagedDevice> Pipeline<D> {
         progress("Encoding prompt", 0, steps)?;
         let enc = {
             let _trace = self.context.trace("image.text_encoder");
-            text::encode(&self.context, &self.dir, prompt)?
+            let tokenizer = self.source.tokenizer()?;
+            let mut ids = tokenizer.encode(&lisa_models::flux::text2::prompt(prompt), false)?;
+            let real = lisa_models::flux::text2::pad(&mut ids);
+            let weights = self.source.text_weights()?;
+            text::encode(&self.context, &weights, &ids, real, bounded)?
         };
-        if binary {
+        if bounded {
             self.context.device().clear_unused();
         }
         let (h, w) = ((options.height / 16) as i32, (options.width / 16) as i32);
@@ -101,7 +113,11 @@ impl<D: BindingDevice + ManagedDevice> Pipeline<D> {
         {
             let model = {
                 let _trace = self.context.trace("image.denoiser.load");
-                dit::Dit::load(self.context.clone(), &self.dir)?
+                dit::Dit::from_weights(
+                    self.context.clone(),
+                    self.source.denoiser_weights()?,
+                    bounded,
+                )?
             };
             let sigma = model::schedule2((h * w) as usize, steps as usize);
             for i in 0..steps as usize {
@@ -117,25 +133,22 @@ impl<D: BindingDevice + ManagedDevice> Pipeline<D> {
             }
         }
         drop(enc);
-        if binary {
+        if bounded {
             self.context.device().clear_unused();
         }
         progress("Decoding image", steps, steps)?;
-        let values = if binary {
+        let values = if bounded {
             let _trace = self.context.trace("image.vae.tiled");
-            vae::decode_binary(
-                &self.context,
-                &self.dir,
-                &run(&self.context, model::decoder_input(h, w), &[&latents])?,
-                progress,
-            )?
+            let packed = run(&self.context, model::decoder_input(h, w), &[&latents])?;
+            let weights = self.source.decoder_weights()?;
+            vae::decode_tiled(&self.context, &weights, &packed, progress)?
         } else {
             let _trace = self.context.trace("image.vae");
-            let pixels = vae::decode(
-                &self.context,
-                &self.dir,
-                &run(&self.context, model::decoder_input(h, w), &[&latents])?,
-            )?;
+            let pixels = {
+                let packed = run(&self.context, model::decoder_input(h, w), &[&latents])?;
+                let weights = self.source.decoder_weights()?;
+                vae::decode_weights(&weights, &packed, ScalarType::BF16)?
+            };
             let pixels = run(&self.context, model::pixel_readback(), &[&pixels])?;
             pixels.eval()?;
             pixels.read_f32()?
@@ -148,4 +161,3 @@ impl<D: BindingDevice + ManagedDevice> Pipeline<D> {
         Ok(bytes.into_inner())
     }
 }
-pub use crate::checkpoint::catalog::is_flux2 as is_checkpoint;

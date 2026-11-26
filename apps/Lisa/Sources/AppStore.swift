@@ -25,6 +25,11 @@ struct Conversation: Codable, Identifiable {
 struct ModelChoice: Decodable, Identifiable {
     let id: String
     let name: String
+    let quantization: String
+    let family: String
+    let features: [String]
+    let generates: String
+    let released: String
     let detail: String
     let size: UInt64
     let local: Bool
@@ -160,9 +165,9 @@ struct ModelChoice: Decodable, Identifiable {
     func refreshModels() async throws {
         let result = try await bridge.call(["op":"models"]) as? [String:Any] ?? [:]
         let choices = try bridge.decoded([ModelChoice].self, result["models"] ?? [])
+        // Catalog order, so families stay together; models that fit first.
         models = choices.enumerated().sorted {
             if $0.element.fits != $1.element.fits { return $0.element.fits }
-            if $0.element.local != $1.element.local { return $0.element.local }
             return $0.offset < $1.offset
         }.map(\.element)
     }

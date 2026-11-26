@@ -70,15 +70,16 @@
                 }
             }
         }
-        // Rollback conv input ([B, KM1+T, CONV_DIM]): the state rows come from
-        // the KM1 threads with t < KM1, every thread emits its own proj row.
+        // Rollback conv input ([B, KM1+T, CONV_DIM]): distribute all history
+        // rows across the T token threads, including captures shorter than KM1.
+        // Every thread also emits its own projected row below.
         // Pure copies of what `win` reads (state then the first CONV_DIM proj
         // columns), so the capture matches the composed concatenate bit-exactly.
-        if (t < (uint)KM1) {
+        for (uint r = t; r < (uint)KM1; r += (uint)T) {
             device InT* o_in = conv_in + (uint)(b * (KM1 + T) * CONV_DIM);
             for (int i = 0; i < N_READS; ++i) {
                 const uint ch = vec * 128 + lane * N_READS + i;
-                o_in[(uint)(t * CONV_DIM) + ch] = static_cast<InT>(win((int)t, ch));
+                o_in[(uint)(r * CONV_DIM) + ch] = static_cast<InT>(win((int)r, ch));
             }
         }
         {

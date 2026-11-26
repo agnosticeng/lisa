@@ -73,3 +73,15 @@ pub mod olala {
     pub const REPO: &str = "OVHaiLLM/Olala-v1.0-mini-7A1B-GGUF";
     pub const ENTRY: &str = "Olala-v1.0-mini-7A1B-q5_k_m.gguf";
 }
+
+/// Original packed text checkpoint, matching still-image projector and the
+/// block-diffusion drafter of its tree rounds.
+pub mod inkling2 {
+    pub const DFLASH_REPO: &str = "incoai/Inkling-2-Mini-DFlash2";
+    pub const DFLASH_REVISION: &str = "4f9088ea66c21f2b99ed657d1941c306b03e84d2";
+    /// Draft packages downloaded with the GGUF target.
+    pub const COMPANIONS: [(&str, &str); 1] = [(DFLASH_REPO, DFLASH_REVISION)];
+    pub const REPO: &str = "unsloth/Inkling-2-Mini-GGUF";
+    pub const ENTRY: &str = "Inkling-2-Mini-UD-Q4_K_M.gguf";
+    pub const PROJECTOR: &str = "mmproj-F16.gguf";
+}

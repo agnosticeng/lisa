@@ -1,8 +1,8 @@
 //! Image generation requests run on the same owning engine thread as UI work.
+use crate::application::ImagePipeline as Pipeline;
 use anyhow::{Context, ensure};
 use base64::Engine;
 use lisa_engine::image_generation::Options;
-use crate::application::ImagePipeline as Pipeline;
 use serde_json::{Value, json};
 use std::{
     net::{TcpListener, TcpStream},

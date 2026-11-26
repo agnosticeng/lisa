@@ -1,17 +1,11 @@
 //! Native conformance adapters for portable image bindings.
+#[cfg(test)]
 use super::weights::Weights;
-use lisa_metal::{Array, Dtype, device::MetalDevice};
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-};
-pub fn decode(dir: &Path, packed: &Array) -> anyhow::Result<Array> {
-    lisa_engine::bindings::flux2::vae::decode(
-        &crate::metal_context::execution_context(),
-        dir,
-        packed,
-    )
-}
+#[cfg(test)]
+use lisa_metal::Array;
+#[cfg(test)]
+use lisa_metal::Dtype;
+#[cfg(test)]
 pub(crate) fn decode_weights(
     weights: &Weights,
     packed: &Array,

@@ -1,14 +1,12 @@
-//! Laya configuration I/O and request override diagnostics.
-use anyhow::Context;
+//! Laya request override validation and diagnostics.
 pub use lisa_models::laya::config::{LayaConfig, clamp_temperature};
-use std::path::Path;
 /// Like [`clamp_temperature`], but warn when a value is changed. Used for
 /// user-supplied overrides so a clamped calibration is never silent.
 pub(crate) fn clamp_temperature_warn(name: &str, orig: f32) -> f32 {
     let mut applied = orig;
     clamp_temperature(name, &mut applied);
     if applied != orig {
-        if !(orig > 0.0) || !orig.is_finite() {
+        if orig <= 0.0 || !orig.is_finite() {
             eprintln!("warning: temperature {name}={orig} is not positive/finite; using {applied}");
         } else if applied > orig {
             eprintln!(
@@ -23,10 +21,7 @@ pub(crate) fn clamp_temperature_warn(name: &str, orig: f32) -> f32 {
     applied
 }
 
-pub trait LayaConfigIo {
-    fn from_dir(dir: &Path) -> anyhow::Result<Self>
-    where
-        Self: Sized;
+pub trait LayaOverrides {
     fn apply_overrides(
         &mut self,
         head_max_len: Option<usize>,
@@ -35,13 +30,7 @@ pub trait LayaConfigIo {
         by_options: &[(String, f32)],
     ) -> anyhow::Result<()>;
 }
-impl LayaConfigIo for LayaConfig {
-    fn from_dir(dir: &Path) -> anyhow::Result<Self> {
-        let enc = read_json(&dir.join("encoder/config.json"))?;
-        let agent = read_json(&dir.join("rl_agent_config.json"))?;
-        let tokenizer = read_json(&dir.join("tokenizer/tokenizer_config.json")).ok();
-        Self::from_values(&enc, &agent, tokenizer.as_ref())
-    }
+impl LayaOverrides for LayaConfig {
     /// Apply runtime overrides, re-checking the budget invariant. Precedence is
     /// `by_options` > `temperature` > shipped config: passing `temperature`
     /// clears the shipped buckets (so it can beat them), and `by_options` is
@@ -90,16 +79,11 @@ impl LayaConfigIo for LayaConfig {
     }
 }
 
-fn read_json(path: &Path) -> anyhow::Result<serde_json::Value> {
-    let data =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    Ok(serde_json::from_str(&data)?)
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::prompt::{QType, effective_scale};
     use super::*;
+    use crate::checkpoint::laya::LayaConfigIo;
 
     const ENCODER: &str = include_str!("../../tests/fixtures/laya_encoder_config.json");
     const AGENT: &str = include_str!("../../tests/fixtures/laya_rl_agent_config.json");

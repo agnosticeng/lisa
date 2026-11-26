@@ -1,16 +1,15 @@
 //! Diagnostics for the native GGUF graph and bounded prefill. Timings do
-//! not certify parity with DS4's wide prefill or optimized decode schedule.
+//! not certify parity with the reference's wide prefill or optimized decode schedule.
 
 use anyhow::{Context, Result, ensure};
-use lisa_bench::bindings::deepseek41::{self, graph::Graph, state::State, tokenizer::Tokenizer};
-use lisa_gguf::Package;
+use lisa_bench::bindings::deepseek41::{self, graph::Graph, state::State};
 use std::{io::Write, path::PathBuf, time::Instant};
 
 #[derive(clap::Args)]
 pub struct Args {
-    /// First GGUF shard (split.no=0). All parts must be fully downloaded.
+    /// The DeepSeek package's Hugging Face repo id, from the Hub cache.
     #[arg(long)]
-    model: PathBuf,
+    model: lisa_bench::cli::ModelDir,
     #[arg(long)]
     prompt: String,
     #[arg(long)]
@@ -33,7 +32,7 @@ pub struct Args {
     #[arg(long, value_delimiter = ',', requires = "capture")]
     capture_layers: Vec<usize>,
     /// Replay one decode token from an independent cache snapshot, comparing
-    /// every logit bit. This validates LISA state reuse, not DS4 model parity.
+    /// every logit bit. This validates LISA state reuse, not reference-model parity.
     #[arg(long)]
     snapshot_check: bool,
     /// New JSON evidence file; existing evidence is never overwritten.
@@ -73,8 +72,8 @@ pub fn run(args: Args) -> Result<()> {
     for path in [&args.output, &args.capture].into_iter().flatten() {
         ensure!(!path.exists(), "refusing to overwrite {}", path.display());
     }
-    let package = Package::open(&args.model)?;
-    let tokenizer = Tokenizer::from_header(&package.header)?;
+    let package = lisa_engine::checkpoint::deepseek41::open_package(&args.model)?;
+    let tokenizer = lisa_engine::checkpoint::tokenizer::native_from_header(&package.header)?;
     let prompt = if args.raw {
         tokenizer.encode(&args.prompt)?
     } else {
@@ -102,7 +101,10 @@ pub fn run(args: Args) -> Result<()> {
         deepseek41::DS4_REVISION
     );
     let start = Instant::now();
-    let mut graph = Graph::load(lisa_bench::metal_context::execution_context(), &package)?;
+    let mut graph = lisa_engine::weights::deepseek41::load_graph(
+        lisa_bench::metal_context::execution_context(),
+        &package,
+    )?;
     let load_seconds = start.elapsed().as_secs_f64();
     eprintln!(
         "DeepSeek: mapped {:.2} GiB resident weights; Engram stays on disk",
@@ -180,7 +182,7 @@ pub fn run(args: Args) -> Result<()> {
         capture.flush(path.to_str().context("capture path is not UTF-8")?)?;
     }
     let report = serde_json::json!({
-        "model": args.model, "ds4_revision": deepseek41::DS4_REVISION,
+        "model": args.model.as_ref() as &std::path::Path, "ds4_revision": deepseek41::DS4_REVISION,
         "schedule": "bounded layer-major prefill / scalar decode", "prefill_chunk": args.prefill_chunk, "parity_certified": false,
         "captured": args.capture.is_some(), "snapshot_checked": args.snapshot_check,
         "prompt_ids": prompt, "generated_ids": generated,

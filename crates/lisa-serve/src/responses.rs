@@ -3,14 +3,14 @@
 use std::io::Write;
 use std::net::TcpStream;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver};
 
 use serde_json::{Value, json};
 
 use super::http::{write_chunk, write_response, write_sse};
 use super::{
-    ApiState, Job, REFUSED_MARKER, Reply, SEQ, Surface, completion_id, error_message_for,
-    http_status_for, now, response_id,
+    ApiState, Job, REFUSED_MARKER, Reply, SEQ, Surface, WakeSender, completion_id,
+    error_message_for, http_status_for, now, response_id,
 };
 
 /// A fully-collected engine reply.
@@ -80,7 +80,7 @@ pub(super) fn usage_json(
     json!({
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
-        // Match DS4's cache accounting and expose prefix-cache hits to clients.
+        // Match the reference's cache accounting and expose prefix-cache hits to clients.
         "prompt_tokens_details": prompt_tokens_details_json(prompt_tokens, cached_tokens),
         "total_tokens": prompt_tokens + completion_tokens,
     })
@@ -183,10 +183,10 @@ pub(super) fn collect_surface(
 /// Anthropic Messages response body.
 pub(super) fn messages_payload(api: &ApiState, d: &ReplyData) -> Value {
     let mut content: Vec<Value> = Vec::new();
-    if let Some(r) = &d.reasoning {
-        if !r.is_empty() {
-            content.push(json!({ "type": "thinking", "thinking": r, "signature": "" }));
-        }
+    if let Some(r) = &d.reasoning
+        && !r.is_empty()
+    {
+        content.push(json!({ "type": "thinking", "thinking": r, "signature": "" }));
     }
     if !d.content.is_empty() {
         content.push(json!({ "type": "text", "text": d.content }));
@@ -278,14 +278,14 @@ pub(super) fn empty_response_resource(api: &ApiState, id: &str, status: &str) ->
 
 pub(super) fn responses_payload_with_id(api: &ApiState, d: &ReplyData, id: &str) -> Value {
     let mut output: Vec<Value> = Vec::new();
-    if let Some(r) = &d.reasoning {
-        if !r.is_empty() {
-            output.push(json!({
-                "type": "reasoning",
-                "id": format!("rs_{:x}", now()),
-                "summary": [{ "type": "summary_text", "text": r }],
-            }));
-        }
+    if let Some(r) = &d.reasoning
+        && !r.is_empty()
+    {
+        output.push(json!({
+            "type": "reasoning",
+            "id": format!("rs_{:x}", now()),
+            "summary": [{ "type": "summary_text", "text": r }],
+        }));
     }
     if !d.content.is_empty() {
         output.push(json!({
@@ -342,7 +342,7 @@ pub(super) fn collect_choices(
     api: &ApiState,
     stream: &mut TcpStream,
     body: &Value,
-    tx: Sender<Job>,
+    tx: WakeSender<Job>,
     n: usize,
     surface: Surface,
 ) -> anyhow::Result<()> {
@@ -456,7 +456,7 @@ pub(super) fn stream_chat(
         stream,
         &chunk(json!({"role": "assistant"}), Value::Null, None),
     )?;
-
+    let mut first = true;
     for reply in rx {
         match reply {
             Reply::Start { .. } => {}
@@ -472,8 +472,12 @@ pub(super) fn stream_chat(
                 if let Some(reasoning) = reasoning {
                     delta["reasoning_content"] = json!(reasoning);
                 }
-                if !delta.as_object().map_or(true, |object| object.is_empty()) {
+                if !delta.as_object().is_none_or(|object| object.is_empty()) {
                     write_sse(stream, &chunk(delta, Value::Null, logprobs))?;
+                    if first {
+                        super::application::trace_http("serve.http.first_write");
+                        first = false;
+                    }
                 }
             }
             Reply::Done {
@@ -547,6 +551,7 @@ pub(super) fn stream_completions(
     include_usage: bool,
 ) -> anyhow::Result<()> {
     let id = completion_id();
+    let mut first = true;
     for reply in rx {
         match reply {
             Reply::Start { .. } => {}
@@ -560,6 +565,10 @@ pub(super) fn stream_completions(
                         json!({ "index": 0, "text": text, "finish_reason": Value::Null }),
                     ),
                 )?;
+                if first && !text.is_empty() {
+                    super::application::trace_http("serve.http.first_write");
+                    first = false;
+                }
             }
             Reply::Done {
                 finish,

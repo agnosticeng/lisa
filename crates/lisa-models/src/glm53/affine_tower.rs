@@ -299,18 +299,17 @@ pub fn submission(
     prefill: bool,
     final_chunk: bool,
     preserves_dispatch: bool,
-    probe: bool,
     layer: usize,
     layers: usize,
 ) -> Submission {
-    if !preserves_dispatch || probe || layer + 1 >= layers {
+    if !preserves_dispatch || layer + 1 >= layers {
         return Submission::None;
     }
-    if batch == 1 && rows == 1 && !prefill && (layer + 1) % 4 == 0 {
+    if batch == 1 && rows == 1 && !prefill && (layer + 1).is_multiple_of(4) {
         return Submission::Flush;
     }
     if prefill && (rows > PREFILL_CHUNK || (final_chunk && rows > 8)) {
-        if (layer + 1) % 16 == 0 {
+        if (layer + 1).is_multiple_of(16) {
             Submission::Drain
         } else {
             Submission::Flush
@@ -340,45 +339,32 @@ mod tests {
                 for prefill in [false, true] {
                     for final_chunk in [false, true] {
                         for preserve in [false, true] {
-                            for probe in [false, true] {
-                                for layer in 0..45 {
-                                    let serial = b == 1
-                                        && rows == 1
-                                        && !prefill
-                                        && preserve
-                                        && !probe
-                                        && (layer + 1) % 4 == 0
-                                        && layer + 1 < 45;
-                                    let chunk = prefill
-                                        && (rows > 2048 || (final_chunk && rows > 8))
-                                        && layer + 1 < 45
-                                        && preserve
-                                        && !probe;
-                                    let expected = if serial {
-                                        Submission::Flush
-                                    } else if chunk {
-                                        if (layer + 1) % 16 == 0 {
-                                            Submission::Drain
-                                        } else {
-                                            Submission::Flush
-                                        }
+                            for layer in 0..45 {
+                                let serial = b == 1
+                                    && rows == 1
+                                    && !prefill
+                                    && preserve
+                                    && (layer + 1) % 4 == 0
+                                    && layer + 1 < 45;
+                                let chunk = prefill
+                                    && (rows > 2048 || (final_chunk && rows > 8))
+                                    && layer + 1 < 45
+                                    && preserve;
+                                let expected = if serial {
+                                    Submission::Flush
+                                } else if chunk {
+                                    if (layer + 1) % 16 == 0 {
+                                        Submission::Drain
                                     } else {
-                                        Submission::None
-                                    };
-                                    assert_eq!(
-                                        submission(
-                                            b,
-                                            rows,
-                                            prefill,
-                                            final_chunk,
-                                            preserve,
-                                            probe,
-                                            layer,
-                                            45
-                                        ),
-                                        expected
-                                    );
-                                }
+                                        Submission::Flush
+                                    }
+                                } else {
+                                    Submission::None
+                                };
+                                assert_eq!(
+                                    submission(b, rows, prefill, final_chunk, preserve, layer, 45),
+                                    expected
+                                );
                             }
                         }
                     }
@@ -424,7 +410,7 @@ pub fn kv_bytes_per_token(config: &super::config::ModelConfig, layers: usize) ->
 }
 
 pub fn stream_state_bytes(config: &super::config::ModelConfig, layers: usize) -> usize {
-    // KDA: ds4-compatible F32 conv window + F32 recurrence state.
+    // KDA: the reference-compatible F32 conv window + F32 recurrence state.
     let qkv = config.linear_num_heads * config.linear_head_dim;
     let per_kda = (config.linear_conv_kernel_dim - 1) * qkv * 3 * 4
         + config.linear_num_heads * config.linear_head_dim.pow(2) * 4;

@@ -1,6 +1,5 @@
 #![cfg(test)]
 use super::*;
-use crate::bindings::deepseek41_moe::tests::{counts, difference};
 #[path = "glm53_indexer_oracle.rs"]
 mod oracle;
 fn values(shape: &[i32], seed: usize) -> Array {
@@ -56,16 +55,10 @@ fn check<const N: usize>(
     old: impl FnOnce() -> anyhow::Result<[Array; N]>,
     new: impl FnOnce() -> anyhow::Result<[Array; N]>,
 ) -> anyhow::Result<()> {
-    let before = counts();
     let a = old()?;
-    let between = counts();
     let b = new()?;
-    let after = counts();
     for (a, b) in a.iter().zip(&b) {
         equal(a, b)?;
-    }
-    if std::env::var_os("LISA_TRACE").is_some() {
-        assert_eq!(difference(&before, &between), difference(&between, &after));
     }
     Ok(())
 }
@@ -113,18 +106,8 @@ fn indexer_pool_score_selection_preserve_bits_and_kernel_counts() -> anyhow::Res
                 let raw = values(&[batch, rows as i32, 256], end + 71);
                 ta.append(&raw, 4)?;
                 tb.append(&raw, 4)?;
-                let before = counts();
                 a.update_pooled_cache(&mut ta, None, 0)?;
-                let between = counts();
                 b.update_pooled_cache(&mut tb, None, 0)?;
-                let after = counts();
-                if std::env::var_os("LISA_TRACE").is_some() {
-                    assert_eq!(
-                        difference(&before, &between),
-                        difference(&between, &after),
-                        "pool {ape_dtype:?} B{batch} end{end}"
-                    );
-                }
                 assert_eq!(ta.pooled_upto, tb.pooled_upto);
                 assert_eq!(ta.raw_start(), tb.raw_start());
                 if let (Some(a), Some(b)) = (ta.pooled_view(), tb.pooled_view()) {

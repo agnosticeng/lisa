@@ -21,12 +21,12 @@ pub fn gated_delta_ops(
 
     let repeat = hv / hk;
     let q = if repeat > 1 {
-        ops::repeat_axis::<half::bf16>(q.clone(), repeat as i32, -2)?
+        ops::repeat_axis::<half::bf16>(q.clone(), repeat, -2)?
     } else {
         q.clone()
     };
     let k = if repeat > 1 {
-        ops::repeat_axis::<half::bf16>(k.clone(), repeat as i32, -2)?
+        ops::repeat_axis::<half::bf16>(k.clone(), repeat, -2)?
     } else {
         k.clone()
     };

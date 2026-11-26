@@ -28,19 +28,26 @@ impl SearchNavigation {
             BrowserRequest::Search(query) => {
                 let content = navigate(BrowserRequest::Search(query));
                 if content.starts_with("Search page: ") {
-                    self.results = content.lines().filter_map(|line| {
-                        line.strip_prefix("URL: ").map(str::to_string)
-                    }).collect();
+                    self.results = content
+                        .lines()
+                        .filter_map(|line| line.strip_prefix("URL: ").map(str::to_string))
+                        .collect();
                     // Keep full redirects in the navigator, not the prompt.
                     // Their opaque tokens waste context and are easy to miscopy.
-                    return content.lines().filter(|line| !line.starts_with("URL: "))
-                        .collect::<Vec<_>>().join("\n");
+                    return content
+                        .lines()
+                        .filter(|line| !line.starts_with("URL: "))
+                        .collect::<Vec<_>>()
+                        .join("\n");
                 }
                 content
             }
             BrowserRequest::Open(reference) => {
                 let url = if let Some(index) = reference.strip_prefix("google-result:") {
-                    index.parse::<usize>().ok().and_then(|n| n.checked_sub(1))
+                    index
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|n| n.checked_sub(1))
                         .and_then(|index| self.results.get(index))
                 } else {
                     self.results.iter().find(|url| **url == reference)
@@ -63,72 +70,155 @@ pub(crate) struct ReadPages {
 
 impl ReadPages {
     pub(crate) fn remember(&mut self, content: &str) {
-        let Some((header, body)) = content.split_once("\n\n") else { return };
+        let Some((header, body)) = content.split_once("\n\n") else {
+            return;
+        };
         let mut lines = header.lines();
-        let Some(title) = lines.next().and_then(|line| line.strip_prefix("Page: ")) else { return };
-        let Some(url) = lines.next().and_then(|line| line.strip_prefix("URL: ")) else { return };
-        if self.pages.iter().any(|(_, seen, _)| seen == url) { return }
-        let body = body.split("\n\nLinks on this page:").next().unwrap_or(body).trim();
-        if body.is_empty() || !(url.starts_with("https://") || url.starts_with("http://")) { return }
+        let Some(title) = lines.next().and_then(|line| line.strip_prefix("Page: ")) else {
+            return;
+        };
+        let Some(url) = lines.next().and_then(|line| line.strip_prefix("URL: ")) else {
+            return;
+        };
+        if self.pages.iter().any(|(_, seen, _)| seen == url) {
+            return;
+        }
+        let body = body
+            .split("\n\nLinks on this page:")
+            .next()
+            .unwrap_or(body)
+            .trim();
+        if body.is_empty() || !(url.starts_with("https://") || url.starts_with("http://")) {
+            return;
+        }
         self.pages.push((title.into(), url.into(), body.into()));
     }
 
     pub(crate) fn answer(&self) -> Option<String> {
-        if self.pages.is_empty() { return None }
-        Some(self.pages.iter().take(3).map(|(title, url, body)| {
-            let title = title.replace('[', "\\[").replace(']', "\\]");
-            // Release listings expose a title followed by a dated metadata row.
-            // Render those exact fields, excluding ratings and site controls.
-            let lines = body.lines().map(str::trim).filter(|line| !line.is_empty()).collect::<Vec<_>>();
-            let mut entries = lines.windows(2).filter_map(|pair| {
-                if let Some(date) = pair[1].strip_prefix("Sortie le ") {
-                    if pair[0].chars().count() <= 180 && date.len() <= 80 {
-                        return Some(format!("- **{}**  \n  {}", escape_markdown(pair[0]), escape_markdown(date)));
+        if self.pages.is_empty() {
+            return None;
+        }
+        Some(
+            self.pages
+                .iter()
+                .take(3)
+                .map(|(title, url, body)| {
+                    let title = title.replace('[', "\\[").replace(']', "\\]");
+                    // Release listings expose a title followed by a dated metadata row.
+                    // Render those exact fields, excluding ratings and site controls.
+                    let lines = body
+                        .lines()
+                        .map(str::trim)
+                        .filter(|line| !line.is_empty())
+                        .collect::<Vec<_>>();
+                    let mut entries = lines
+                        .windows(2)
+                        .filter_map(|pair| {
+                            if let Some(date) = pair[1].strip_prefix("Sortie le ")
+                                && pair[0].chars().count() <= 180
+                                && date.len() <= 80
+                            {
+                                return Some(format!(
+                                    "- **{}**  \n  {}",
+                                    escape_markdown(pair[0]),
+                                    escape_markdown(date)
+                                ));
+                            }
+                            let fields = pair[1].split('|').map(str::trim).collect::<Vec<_>>();
+                            if fields.len() < 2 || pair[0].chars().count() > 180 {
+                                return None;
+                            }
+                            let date = fields[0];
+                            let has_year =
+                                date.split(|ch: char| !ch.is_ascii_digit()).any(|part| {
+                                    part.len() == 4
+                                        && part
+                                            .parse::<u32>()
+                                            .is_ok_and(|year| (1900..=2199).contains(&year))
+                                });
+                            if !has_year || date.len() > 64 {
+                                return None;
+                            }
+                            let detail = if fields.len() >= 3 && !fields.last().unwrap().is_empty()
+                            {
+                                format!("{} · {}", date, fields.last().unwrap())
+                            } else {
+                                date.into()
+                            };
+                            Some(format!(
+                                "- **{}**  \n  {}",
+                                escape_markdown(pair[0]),
+                                escape_markdown(&detail)
+                            ))
+                        })
+                        .take(8)
+                        .collect::<Vec<_>>();
+                    if entries.is_empty() {
+                        // Some listings place title and release date on the same row.
+                        entries = lines
+                            .iter()
+                            .filter_map(|line| {
+                                let (name, date) = line.split_once("Sortie le ")?;
+                                let name = name.trim();
+                                if name.is_empty() || name.chars().count() > 180 || date.len() > 80
+                                {
+                                    return None;
+                                }
+                                Some(format!(
+                                    "- **{}**  \n  {}",
+                                    escape_markdown(name),
+                                    escape_markdown(date.trim())
+                                ))
+                            })
+                            .take(8)
+                            .collect();
                     }
-                }
-                let fields = pair[1].split('|').map(str::trim).collect::<Vec<_>>();
-                if fields.len() < 2 || pair[0].chars().count() > 180 { return None }
-                let date = fields[0];
-                let has_year = date.split(|ch: char| !ch.is_ascii_digit())
-                    .any(|part| part.len() == 4 && part.parse::<u32>().is_ok_and(|year| (1900..=2199).contains(&year)));
-                if !has_year || date.len() > 64 { return None }
-                let detail = if fields.len() >= 3 && !fields.last().unwrap().is_empty() { format!("{} · {}", date, fields.last().unwrap()) } else { date.into() };
-                Some(format!("- **{}**  \n  {}", escape_markdown(pair[0]), escape_markdown(&detail)))
-            }).take(8).collect::<Vec<_>>();
-            if entries.is_empty() {
-                // Some listings place title and release date on the same row.
-                entries = lines.iter().filter_map(|line| {
-                    let (name, date) = line.split_once("Sortie le ")?;
-                    let name = name.trim();
-                    if name.is_empty() || name.chars().count() > 180 || date.len() > 80 { return None }
-                    Some(format!("- **{}**  \n  {}", escape_markdown(name), escape_markdown(date.trim())))
-                }).take(8).collect();
-            }
-            if !entries.is_empty() {
-                return format!("{}\n\n[{title}](<{url}>)", entries.join("\n\n"));
-            }
-            let excerpt = body.chars().take(500).collect::<String>();
-            let truncated = excerpt.len() < body.len();
-            let excerpt = if truncated {
-                // Do not finish a truncated excerpt halfway through a word.
-                excerpt.rsplit_once(char::is_whitespace).map(|(text, _)| text).unwrap_or(&excerpt).to_string()
-            } else { excerpt };
-            // Escape markup from pages so quoted text cannot create invented
-            // links or alter the source card's Markdown structure.
-            let mut quote = excerpt.lines().map(|line| {
-                let escaped = escape_markdown(line);
-                format!("> {escaped}")
-            }).collect::<Vec<_>>().join("\n");
-            if truncated { quote.push_str("\n> […]"); }
-            format!("[{title}](<{url}>)\n\n{quote}")
-        }).collect::<Vec<_>>().join("\n\n"))
+                    if !entries.is_empty() {
+                        return format!("{}\n\n[{title}](<{url}>)", entries.join("\n\n"));
+                    }
+                    let excerpt = body.chars().take(500).collect::<String>();
+                    let truncated = excerpt.len() < body.len();
+                    let excerpt = if truncated {
+                        // Do not finish a truncated excerpt halfway through a word.
+                        excerpt
+                            .rsplit_once(char::is_whitespace)
+                            .map(|(text, _)| text)
+                            .unwrap_or(&excerpt)
+                            .to_string()
+                    } else {
+                        excerpt
+                    };
+                    // Escape markup from pages so quoted text cannot create invented
+                    // links or alter the source card's Markdown structure.
+                    let mut quote = excerpt
+                        .lines()
+                        .map(|line| {
+                            let escaped = escape_markdown(line);
+                            format!("> {escaped}")
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if truncated {
+                        quote.push_str("\n> […]");
+                    }
+                    format!("[{title}](<{url}>)\n\n{quote}")
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        )
     }
 }
 
 fn escape_markdown(text: &str) -> String {
-    text.chars().flat_map(|ch| {
-        if "\\`*_{}[]<>()#+-.!|".contains(ch) { vec!['\\', ch] } else { vec![ch] }
-    }).collect()
+    text.chars()
+        .flat_map(|ch| {
+            if "\\`*_{}[]<>()#+-.!|".contains(ch) {
+                vec!['\\', ch]
+            } else {
+                vec![ch]
+            }
+        })
+        .collect()
 }
 
 use serde::Deserialize;
@@ -320,24 +410,44 @@ mod tests {
     #[test]
     fn navigation_only_opens_results_from_the_latest_google_search() {
         let mut navigation = SearchNavigation::default();
-        let blocked = navigation.navigate(BrowserRequest::Open("https://www.cherche.com/invented".into()), |_| panic!("invented URL opened"));
+        let blocked = navigation.navigate(
+            BrowserRequest::Open("https://www.cherche.com/invented".into()),
+            |_| panic!("invented URL opened"),
+        );
         assert!(blocked.starts_with("Browser error:"));
         let page = json!({"title":"Google", "url":"https://www.google.com/search?q=films", "body":"", "results":[
             {"title":"Movies", "url":"https://www.google.com/goto?url=opaque", "snippet":"Current movies"}
         ]});
-        navigation.navigate(BrowserRequest::Search("films".into()), |_| parse_search_page(&page.to_string()).unwrap());
+        navigation.navigate(BrowserRequest::Search("films".into()), |_| {
+            parse_search_page(&page.to_string()).unwrap()
+        });
         for reference in ["google-result:1", "https://www.google.com/goto?url=opaque"] {
-            assert_eq!(navigation.navigate(BrowserRequest::Open(reference.into()), |request| {
-                let BrowserRequest::Open(url) = request else { panic!("expected navigation") };
-                assert_eq!(url, "https://www.google.com/goto?url=opaque");
-                "Read page".into()
-            }), "Read page");
+            assert_eq!(
+                navigation.navigate(BrowserRequest::Open(reference.into()), |request| {
+                    let BrowserRequest::Open(url) = request else {
+                        panic!("expected navigation")
+                    };
+                    assert_eq!(url, "https://www.google.com/goto?url=opaque");
+                    "Read page".into()
+                }),
+                "Read page"
+            );
         }
-        for reference in ["google-result:0", "google-result:2", "https://example.com/guessed", "https://www.google.com/goto?url=altered"] {
-            navigation.navigate(BrowserRequest::Open(reference.into()), |_| panic!("unknown result opened"));
+        for reference in [
+            "google-result:0",
+            "google-result:2",
+            "https://example.com/guessed",
+            "https://www.google.com/goto?url=altered",
+        ] {
+            navigation.navigate(BrowserRequest::Open(reference.into()), |_| {
+                panic!("unknown result opened")
+            });
         }
         navigation.navigate(BrowserRequest::Search("another query".into()), |_| "Search page: https://www.google.com/search?q=other\n1. Other\nURL: https://other.test/\nSnippet: Other".into());
-        navigation.navigate(BrowserRequest::Open("https://www.google.com/goto?url=opaque".into()), |_| panic!("stale result opened"));
+        navigation.navigate(
+            BrowserRequest::Open("https://www.google.com/goto?url=opaque".into()),
+            |_| panic!("stale result opened"),
+        );
     }
 
     #[test]
@@ -363,7 +473,13 @@ mod tests {
         assert!(answer.contains("- **First Film**  \n  18 novembre 2026 · Action, Adventure"));
         assert!(answer.contains("- **Second Film**  \n  18 novembre 2026 · Comedy"));
         assert!(answer.ends_with("[This week's releases](<https://example.com/releases>)"));
-        for noise in ["Ratings", "BOOK TICKETS", "Long description", "Home", "2h 38min"] {
+        for noise in [
+            "Ratings",
+            "BOOK TICKETS",
+            "Long description",
+            "Home",
+            "2h 38min",
+        ] {
             assert!(!answer.contains(noise));
         }
         let mut inline = ReadPages::default();

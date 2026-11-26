@@ -1,16 +1,12 @@
 //! Native validation adapters for portable bindings.
-use crate::core::{
-    cache::{FullAttentionCache, IndexerTape, LayerCache},
-    graph::PreparedGraph,
-    loader::TensorSource,
-    norm::{RmsNorm, Rotary},
-    quant::{QuantizedEmbedding, QuantizedLinear},
-};
+#[cfg(test)]
+use crate::core::{graph::PreparedGraph, norm::RmsNorm, quant::QuantizedLinear};
 use lisa_metal::{Array, device::MetalDevice};
-pub type GatedResidual = lisa_engine::bindings::qwen4_hyper::GatedResidual<MetalDevice>;
+pub type GatedResidual = lisa_engine::bindings::qwen4::hyper::GatedResidual<MetalDevice>;
+#[cfg(test)]
 use lisa_models::qwen4::hyper as model;
 pub fn inject(residual: &Array, output: &Array, inject: &Array) -> anyhow::Result<Array> {
-    lisa_engine::bindings::qwen4_hyper::inject(
+    lisa_engine::bindings::qwen4::hyper::inject(
         &crate::metal_context::execution_context(),
         residual,
         output,
@@ -26,7 +22,7 @@ pub fn inject_norm(
     streams: i32,
     epsilon: f32,
 ) -> anyhow::Result<(Array, Array)> {
-    lisa_engine::bindings::qwen4_hyper::inject_norm(
+    lisa_engine::bindings::qwen4::hyper::inject_norm(
         &crate::metal_context::execution_context(),
         residual,
         out,

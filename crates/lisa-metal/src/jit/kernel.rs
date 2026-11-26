@@ -62,20 +62,23 @@ pub struct OutputArg {
     pub dtype: DType,
 }
 
-/// A kernel input that can be bound directly as a Metal inline scalar instead
-/// of allocating a one-element tensor buffer.
+/// A kernel input that can bind small immutable metadata directly through
+/// Metal's inline bytes API instead of allocating host-upload storage.
 #[derive(Clone, Copy)]
 pub enum KernelInput<'a> {
     Tensor(&'a Tensor),
     I32(i32),
     F32(f32),
+    /// Rank-one i32 metadata with the same ABI as a small tensor. Its length
+    /// must be in 1..MAX_CONSTANT_ARRAY_SIZE, preserving the constant pointer.
+    I32Slice(&'a [i32]),
 }
 
 impl KernelInput<'_> {
     fn dtype(self) -> DType {
         match self {
             Self::Tensor(t) => t.dtype(),
-            Self::I32(_) => DType::Int32,
+            Self::I32(_) | Self::I32Slice(_) => DType::Int32,
             Self::F32(_) => DType::Float32,
         }
     }
@@ -84,6 +87,7 @@ impl KernelInput<'_> {
         match self {
             Self::Tensor(t) => t.rank(),
             Self::I32(_) | Self::F32(_) => 0,
+            Self::I32Slice(_) => 1,
         }
     }
 
@@ -91,6 +95,7 @@ impl KernelInput<'_> {
         match self {
             Self::Tensor(t) => t.elem_count(),
             Self::I32(_) | Self::F32(_) => 1,
+            Self::I32Slice(values) => values.len(),
         }
     }
 }
@@ -291,6 +296,7 @@ pub struct MetalKernel {
     math: Math,
     atomic_outputs: bool,
     full_write_outputs: bool,
+    audited_full_write_outputs: Vec<bool>,
     threadgroup_memory_bytes: usize,
     shape_infos: Vec<(bool, bool, bool)>,
     attributes: Vec<String>,
@@ -300,6 +306,8 @@ pub struct MetalKernel {
     apply_keys: Mutex<HashMap<u64, (String, ComputePipeline)>>,
 }
 
+// SAFETY: the pipeline caches are behind `Mutex`es and the remaining fields are
+// immutable owned data; `ComputePipeline` is itself Send + Sync.
 unsafe impl Send for MetalKernel {}
 unsafe impl Sync for MetalKernel {}
 
@@ -392,6 +400,7 @@ impl MetalKernel {
             math,
             atomic_outputs,
             full_write_outputs: false,
+            audited_full_write_outputs: Vec::new(),
             threadgroup_memory_bytes,
             shape_infos,
             attributes,
@@ -410,6 +419,37 @@ impl MetalKernel {
             "atomic outputs require explicit initialization"
         );
         self.full_write_outputs = true;
+        self
+    }
+
+    /// Opt into completion-gated, uncleared storage for every fully overwritten
+    /// output. This does not enable ordered reuse. Bucket padding is unspecified
+    /// and must not be read; partial or atomic writers must retain clearing.
+    pub fn with_audited_full_write_outputs(mut self) -> Self {
+        assert!(
+            !self.atomic_outputs,
+            "atomic outputs require initialization"
+        );
+        self.audited_full_write_outputs = vec![true; self.output_names.len()];
+        self
+    }
+
+    /// The same audited contract for selected output slots only. Unlisted
+    /// outputs keep their existing allocation policy, including zeroed unused
+    /// placeholders. Indices are checked when constructing the kernel handle.
+    pub fn with_audited_full_write_output_indices(mut self, indices: &[usize]) -> Self {
+        assert!(
+            !self.atomic_outputs,
+            "atomic outputs require initialization"
+        );
+        self.audited_full_write_outputs = vec![false; self.output_names.len()];
+        for &index in indices {
+            assert!(
+                index < self.output_names.len(),
+                "invalid full-write output index"
+            );
+            self.audited_full_write_outputs[index] = true;
+        }
         self
     }
 
@@ -661,6 +701,15 @@ impl MetalKernel {
             if let KernelInput::Tensor(t) = input {
                 let _ = t.device();
             }
+            if let KernelInput::I32Slice(values) = input
+                && (values.is_empty() || values.len() >= MAX_CONSTANT_ARRAY_SIZE)
+            {
+                crate::bail!(
+                    "kernel {}: inline i32 metadata needs 1..{} elements",
+                    self.name,
+                    MAX_CONSTANT_ARRAY_SIZE
+                );
+            }
             input_dtypes.push(input.dtype());
             input_ndims.push(input.rank());
             input_sizes.push(input.elem_count());
@@ -824,7 +873,14 @@ impl MetalKernel {
                 continue;
             }
             let bytes = count * out.dtype.size_of();
-            let buffer = if self.full_write_outputs {
+            let buffer = if self
+                .audited_full_write_outputs
+                .get(oi)
+                .copied()
+                .unwrap_or(false)
+            {
+                mdev.buffer_for_audited_full_gpu_write(bytes, "lisa_kernel_out")?
+            } else if self.full_write_outputs {
                 mdev.buffer_for_full_gpu_write(bytes, "lisa_kernel_out")?
             } else {
                 mdev.buffer_for_gpu_write(bytes, "lisa_kernel_out")?
@@ -917,6 +973,27 @@ impl MetalKernel {
                         enc.set_bytes(index, &value);
                         index += 1;
                     }
+                    KernelInput::I32Slice(values) => {
+                        enc.set_bytes_directly(
+                            index,
+                            std::mem::size_of_val(values),
+                            values.as_ptr().cast(),
+                        );
+                        index += 1;
+                        let (want_shape, want_strides, want_ndim) = self.shape_infos[i];
+                        if want_shape {
+                            enc.set_bytes(index, &(values.len() as i32));
+                            index += 1;
+                        }
+                        if want_strides {
+                            enc.set_bytes(index, &1i64);
+                            index += 1;
+                        }
+                        if want_ndim {
+                            enc.set_bytes(index, &1i32);
+                            index += 1;
+                        }
+                    }
                 }
             }
             for t in &out_tensors {
@@ -959,3 +1036,7 @@ impl MetalKernel {
         Ok(out_tensors)
     }
 }
+
+#[cfg(test)]
+#[path = "kernel_output_tests.rs"]
+mod output_tests;

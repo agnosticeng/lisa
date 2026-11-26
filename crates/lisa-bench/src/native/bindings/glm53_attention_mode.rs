@@ -1,1 +1,1 @@
-pub use lisa_engine::bindings::glm53_attention_mode::*;
+pub use lisa_engine::bindings::glm53::attention::mode::*;

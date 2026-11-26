@@ -32,6 +32,7 @@ impl TensorType {
     pub const IQ4_NL: Self = Self(20);
     pub const IQ1_M: Self = Self(29);
     pub const BF16: Self = Self(30);
+    pub const NVFP4: Self = Self(40);
 
     pub fn layout(self) -> anyhow::Result<(&'static str, u64, u64)> {
         Ok(match self.0 {
@@ -54,7 +55,7 @@ impl TensorType {
             18 => ("IQ3_XXS", 256, 98),
             19 => ("IQ1_S", 256, 50),
             // IQ4_NL is 18 bytes per 32 values, including the FP16 scale.
-            // DS4's unused type-table entry has different geometry; use GGML's ABI.
+            // The reference's unused type-table entry has different geometry; use GGML's ABI.
             20 => ("IQ4_NL", 32, 18),
             21 => ("IQ3_S", 256, 110),
             22 => ("IQ2_S", 256, 82),
@@ -67,6 +68,7 @@ impl TensorType {
             29 => ("IQ1_M", 256, 56),
             30 => ("BF16", 1, 2),
             39 => ("MXFP4", 32, 17),
+            40 => ("NVFP4", 64, 36),
             _ => anyhow::bail!("unsupported GGUF tensor type {}", self.0),
         })
     }
@@ -74,7 +76,7 @@ impl TensorType {
     pub fn row_bytes(self, columns: u64) -> anyhow::Result<u64> {
         let (name, block, bytes) = self.layout()?;
         anyhow::ensure!(
-            columns > 0 && columns % block == 0,
+            columns > 0 && columns.is_multiple_of(block),
             "{name} row width {columns} is not a positive multiple of {block}"
         );
         (columns / block)

@@ -3,7 +3,6 @@ use crate::error::Result;
 use super::Array;
 
 /// One element of an `Array::i(...)` index (`IndexOp` for a 2-tuple).
-
 pub trait IdxElem {
     fn apply_idx(&self, a: &Array, dim: usize) -> Result<(Array, bool)>;
 }

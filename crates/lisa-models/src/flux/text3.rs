@@ -179,17 +179,17 @@ impl Encoder<'_> {
         let x = x.as_dtype(Dtype::F32)?;
         let a = x.slice(-1, 0, 64)?;
         let b = x.slice(-1, 64, 128)?;
-        Ok(ops::concatenate(
+        ops::concatenate(
             &[
                 &a.multiply(&c)?.subtract(&b.multiply(&s)?)?,
                 &b.multiply(&c)?.add(&a.multiply(&s)?)?,
             ],
             -1,
         )?
-        .as_dtype(Dtype::BF16)?)
+        .as_dtype(Dtype::BF16)
     }
     fn norm(&self, x: &Array, key: &str) -> anyhow::Result<Array> {
-        Ok(x.rms(&self.weights.get(&format!("{key}.weight"))?, 1e-6)?)
+        x.rms(&self.weights.get(&format!("{key}.weight"))?, 1e-6)
     }
     fn forward(
         &self,

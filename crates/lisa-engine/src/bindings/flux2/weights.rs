@@ -1,10 +1,9 @@
 use crate::{bindings::BindingDevice, execution::DeviceContext};
 use lisa_backend::{HostTensor, ScalarType, TensorAccess};
-// Image weights: original MLX affine 4-bit/group-64 packs and native BF16/F32 tensors.
-use crate::weights::mlx::{Checkpoint, Shard};
+// Prepared affine packs and native BF16/F32 tensors.
 use anyhow::Context;
 
-use std::{cell::RefCell, collections::HashMap, path::Path};
+use std::{cell::RefCell, collections::HashMap};
 
 use lisa_models::flux::symbolic::WeightLayout;
 pub struct Weights<D: BindingDevice>(
@@ -15,52 +14,6 @@ pub struct Weights<D: BindingDevice>(
 impl<D: BindingDevice> Weights<D> {
     pub fn from_map(context: DeviceContext<D>, tensors: HashMap<String, D::Tensor>) -> Self {
         Self(tensors, RefCell::new(HashMap::new()), context)
-    }
-    pub fn load(context: DeviceContext<D>, dir: &Path) -> anyhow::Result<Self> {
-        Self::load_filtered(context.clone(), dir, |_| true)
-    }
-    pub fn load_file(
-        context: DeviceContext<D>,
-        path: &Path,
-        keep: impl Fn(&str) -> bool,
-    ) -> anyhow::Result<Self> {
-        let shard = Shard::open(context.device().clone(), path)?;
-        let mut out = HashMap::new();
-        for key in shard.tensor_names().filter(|key| keep(key)) {
-            out.insert(
-                key.clone(),
-                crate::weights::source::get_tensor(&shard, key)?,
-            );
-        }
-        Ok(Self::from_map(context.clone(), out))
-    }
-    pub fn load_filtered(
-        context: DeviceContext<D>,
-        dir: &Path,
-        keep: impl Fn(&str) -> bool,
-    ) -> anyhow::Result<Self> {
-        if !dir.join("model.safetensors.index.json").is_file() {
-            return Self::load_file(context.clone(), &dir.join("model.safetensors"), keep);
-        }
-        let cp = Checkpoint::open(dir)?;
-        let mut shards = HashMap::new();
-        let mut out = HashMap::new();
-        for (key, file) in cp.weight_map {
-            if !keep(&key) {
-                continue;
-            }
-            if !shards.contains_key(&file) {
-                shards.insert(
-                    file.clone(),
-                    Shard::open(context.device().clone(), &dir.join(&file))?,
-                );
-            }
-            out.insert(
-                key.clone(),
-                crate::weights::source::get_tensor(&shards[&file], &key)?,
-            );
-        }
-        Ok(Self::from_map(context.clone(), out))
     }
     pub fn get(&self, key: &str) -> anyhow::Result<D::Tensor> {
         self.0
@@ -104,7 +57,6 @@ impl<D: BindingDevice> Weights<D> {
         }
         PreparedGraph::new(device, program.graph, weights)
     }
-    #[cfg(any(test, feature = "diagnostics"))]
     pub fn lin(&self, key: &str, x: &D::Tensor) -> anyhow::Result<D::Tensor> {
         use lisa_models::flux::symbolic::{Trace, Weights};
         let trace = Trace::new();

@@ -15,7 +15,7 @@ use super::{Header, TensorInfo};
 const MAX_READ_BYTES: usize = 64 * 1024 * 1024;
 
 /// A validated file range. Keeping the open file avoids reopening a replaced
-/// path when reading disk-only Engram rows later in a session.
+/// path when reading disk-resident rows later in a session.
 #[derive(Clone, Debug)]
 pub struct Tensor {
     pub info: TensorInfo,
@@ -28,6 +28,7 @@ impl Tensor {
     /// first page and padding in its last page. Use this for memory admission
     /// before calling [`Self::mapped_region`].
     pub fn mapped_region_bytes(&self) -> Result<usize> {
+        // SAFETY: sysconf takes no pointers and only reads a system constant.
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
         ensure!(page.is_power_of_two(), "invalid host page size");
         let inner = self.info.offset % page;
@@ -48,6 +49,7 @@ impl Tensor {
     /// padding after the file's end must never be read. Keep checkpoint files
     /// immutable while any mapping exists, and retain the mapping for all users.
     pub fn mapped_region(&self) -> Result<(Arc<Mmap>, usize)> {
+        // SAFETY: sysconf takes no pointers and only reads a system constant.
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
         let length = self.mapped_region_bytes()?;
         let inner = self.info.offset % page;
@@ -56,8 +58,9 @@ impl Tensor {
             "GGUF shard was truncated: {}",
             self.path.display()
         );
-        // mmap extends only to the end of the file's last page; tensor views
-        // are bounded to real payload bytes and never read that padding.
+        // SAFETY: the open descriptor covers offset + bytes (checked above), so each
+        // mapped page is at least partly file-backed; views never read padding past
+        // EOF, and checkpoint files stay immutable while any mapping exists.
         let map = unsafe {
             MmapOptions::new()
                 .offset(self.info.offset - inner)
@@ -81,6 +84,8 @@ impl Tensor {
         );
         #[cfg(target_os = "macos")]
         for (command, value) in [(libc::F_NOCACHE, 1), (libc::F_RDAHEAD, 0)] {
+            // SAFETY: `file` is an open descriptor owned for the call, and F_NOCACHE and
+            // F_RDAHEAD take a plain int argument.
             if unsafe { libc::fcntl(file.as_raw_fd(), command, value) } == -1 {
                 return Err(std::io::Error::last_os_error().into());
             }
@@ -101,6 +106,8 @@ impl Tensor {
             "GGUF shard was truncated: {}",
             self.path.display()
         );
+        // SAFETY: the open descriptor covers offset + bytes (checked above), the map
+        // is read-only, and checkpoint files stay immutable while any mapping exists.
         let map = unsafe {
             MmapOptions::new()
                 .offset(self.info.offset)
@@ -128,8 +135,8 @@ impl Tensor {
             .with_context(|| format!("reading {} in {}", self.info.name, self.path.display()))
     }
 
-    /// Read the requested rows in caller order. This never reads the full
-    /// Engram table or admits it into the resident Metal weight allocation.
+    /// Read the requested rows in caller order without reading the whole
+    /// tensor, so large row tables can stay on disk.
     pub fn read_rows(&self, rows: &[u64], output: &mut [u8]) -> Result<()> {
         let bytes = usize::try_from(self.info.row_bytes()?)?;
         let total = rows
@@ -159,7 +166,19 @@ pub struct Package {
 }
 
 impl Package {
+    /// Open a single file or a split package whose shards follow the standard
+    /// `-NNNNN-of-NNNNN.gguf` naming next to the first shard.
     pub fn open(first: &Path) -> Result<Self> {
+        Self::open_with(first, |_, _| Ok(None))
+    }
+
+    /// Like [`Package::open`], but a shard missing under the standard name is
+    /// requested from `locate(header, part)`. Checkpoint adapters use this for
+    /// published layouts that store a shard elsewhere; the reader never guesses.
+    pub fn open_with(
+        first: &Path,
+        locate: impl Fn(&Header, u64) -> Result<Option<PathBuf>>,
+    ) -> Result<Self> {
         let header = Header::open(first)?;
         let count = match header.metadata.get("split.count") {
             Some(v) => v.as_u64().context("invalid split.count")?,
@@ -188,26 +207,11 @@ impl Package {
                 let expected = parent.join(format!("{stem}-{part:05}-of-{count:05}.gguf"));
                 if expected.is_file() {
                     paths.push(expected);
-                    continue;
+                } else if let Some(path) = locate(&header, part)? {
+                    paths.push(path);
+                } else {
+                    anyhow::bail!("missing GGUF shard {}", expected.display());
                 }
-                // ISTA publishes the shared Engram file under its original
-                // name, outside IQ2_XXS/. Accept that exact package layout;
-                // never guess among unrelated GGUF weights in the directory.
-                if part == count && header.architecture()? == "deepseek41" {
-                    let engram_name = "DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf";
-                    let mut candidates = BTreeSet::new();
-                    for directory in [Some(parent), parent.parent()].into_iter().flatten() {
-                        let path = directory.join(engram_name);
-                        if path.is_file() {
-                            candidates.insert(path.canonicalize()?);
-                        }
-                    }
-                    if candidates.len() == 1 {
-                        paths.push(candidates.into_iter().next().unwrap());
-                        continue;
-                    }
-                }
-                anyhow::bail!("missing GGUF shard {}", expected.display());
             }
         }
         Self::open_paths(paths)

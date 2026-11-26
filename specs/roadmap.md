@@ -1,54 +1,45 @@
 # Open work
 
-Architecture and behavior already implemented belong in the owning specs.
-This file lists unresolved work; it makes no throughput or completion estimate.
-
-## Backend extension
-
-ROCm needs device kernels, import/completion and device-memory mechanisms,
-plus application registration. Model bindings, caches, batch packing,
-sampling/RNG and speculative rollback are generic engine implementations.
-Reuse the [existing plans and interfaces](architecture.md#adding-a-backend).
-Admission requires numerical/state checks for each supported encoding/model on
-actual AMD hardware; an enum case or portable build is insufficient.
+The single list of unresolved gaps. Implemented behaviour belongs in the owning
+spec; this file makes no completion or throughput estimate.
 
 ## Model acceptance
 
 | Path | Remaining work |
 | --- | --- |
-| GLM GGUF | Attribute the first layer-3 DS4 arithmetic mismatch; port packed wide projections, grouped expert prefill and wide target verification; prove accepted/rejected/resumed MTP state before performance claims |
-| Legacy MLX GLM | Complete state/serving coverage, independent same-weight reference identity and full-checkpoint acceptance; resolve vision attention/embedding drift |
-| DeepSeek | Broader real-context/ring/DSML coverage, grouped expert prefill and long-context performance; native state spill if needed |
-| Qwen 27B GGUF | Real small-memory hardware coverage, long contexts and independent MTP-head comparison |
-| Qwen 0.8B | Attribute the serial/PLD discrepancy without replacing the serial golden |
-| Qwen Flash-Next | Attribute chunked/full-prefill state drift before claiming strict equivalence; broader batching shapes/contexts and full-checkpoint vision qualification |
-| DSpine | Full sampled conditional-q/rejection and residual sampling, exact sparse target support, graph replay and multi-request ragged SPS; independent oracle/state checks for each |
-| Olala | Full per-layer pinned-reference parity, long-context/cache qualification, device UI qualification and efficient packed expert dispatch; see [status](models/olala.md) |
-| FLUX | Broader full-checkpoint stage/image/size coverage and isolated performance acceptance |
+| GLM GGUF | Attribute the layer-3 reference mismatch; packed wide projections, grouped expert prefill and wide verification; prove accepted, rejected and resumed MTP state |
+| GLM MLX | State and serving coverage, independent same-weight reference identity, full-checkpoint acceptance, vision attention/embedding drift |
+| DeepSeek | Broader real contexts, ring and DSML coverage, grouped expert prefill, long-context performance, native state spill |
+| Qwen 27B GGUF | Small-memory hardware, long contexts, independent MTP-head comparison |
+| Qwen 0.8B | Output, state and continuation on physical mobile devices |
+| Qwen Flash-Next | Chunked versus full-prefill state drift; broader batching shapes; full-checkpoint vision |
+| Inkling 2 | Per-layer reference parity; calibration rows measured on Apple7–9 and Apple11 hardware; task and image quality; contexts past 43,008 tokens |
+| Olala | Per-layer reference parity, long contexts, wider grouped prefill |
+| FLUX | Broader stage, image and size coverage; isolated performance acceptance |
 
-## Shared engine and serving
+## Engine and serving
 
-- Complete prompt/session compatibility and exact suffix-resume checks. Preserve
-  target and draft state together and avoid redundant target replay only after
-  proving equivalent committed state.
-- Add byte-budgeted prefix/session retention and validated persistence identity.
-  Finer reusable prefix boundaries need recurrent-state proof. Native cache
-  spill needs a versioned codec with corrupt/partial-file handling.
-- Propagate disconnect cancellation into active work at safe boundaries.
-- Shared speculative forwards require independent masks, sampler/RNG ownership
-  and rollback for every client; separate batch/MTP support is insufficient.
-- Run live API conformance after HTTP/state changes. Structured output remains
-  repair/validation with a retry; token grammar support is separate feature work.
+- Byte-budgeted prefix and session retention with validated persistence
+  identity; a versioned spill codec for native caches.
+- Prompt/session compatibility and exact suffix-resume checks that preserve
+  target and draft state together.
+- Cancel active work at safe boundaries when a client disconnects.
+- Shared speculative forwards across clients (independent masks, samplers and
+  rollback per client).
 
-## Product and validation
+## Backends
 
-- Extend the [iPhone 15 Pro Max Qwen 0.8B checks](desktop.md#apple-validation--2026-11-19)
-  to other devices, real OS suspension/memory warnings and media/serving paths.
-  Resolve Simulator BF16 compilation independently of model arithmetic.
-  Bring SwiftUI feature coverage and distribution size to its shipping target.
-- Maintain a durable external legacy GLM capture inventory: filenames, sizes,
-  hashes and exact reference/generator identity. Do not restore large tracked
-  capture payloads; enabled tests must fail when required data is absent.
-- Optimization candidates require a concrete workload and the
-  [validation protocol](performance.md#validation-protocol). Upstream source
-  ideas or a proposed speed budget are not implementation or performance proof.
+A ROCm provider needs kernels, import/completion and memory mechanisms plus
+application registration, then per-model numerical and state checks on AMD
+hardware. Plans, caches, sampling and speculation are already generic.
+
+## Product
+
+- Physical-device qualification of app lifecycle, memory warnings, background
+  GPU builds, browser, voice, image generation and serving.
+- Resolve the Simulator BF16 compiler-service failure without changing weights
+  or arithmetic.
+- Checkpoint-level parity commands for GLM, Inkling and FLUX that compare
+  against reference outputs through `lisa-bench --model`.
+- Move GLM and LFM3 prompt builders out of `core/tokenizer.rs` into their model
+  bindings.

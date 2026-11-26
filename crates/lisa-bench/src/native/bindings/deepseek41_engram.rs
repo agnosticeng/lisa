@@ -1,1 +1,1 @@
-pub use lisa_engine::bindings::deepseek41_engram::*;
+pub use lisa_engine::bindings::deepseek41::engram::*;

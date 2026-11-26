@@ -1,21 +1,20 @@
-//! Original packed GGUF binding; no model payload is requantized or expanded.
+//! Prepared packed tensor binding and immutable Olala session state.
 use super::BindingDevice;
 use crate::{
+    bindings::shared::capture::Capture,
     cache::{LayerCache, NativeCache, NativeState},
-    core::{capture::Capture, graph::PreparedGraph},
-    language::LanguageModel,
-    language_runtime::Runtime,
-    sampler::Sampler,
-    weights::gguf::{ResidentWeights, load_resident},
+    core::graph::PreparedGraph,
+    language::{LanguageModel, runtime::Runtime},
+    sampling::sampler::Sampler,
+    weights::{prepared::PreparedWeights, source::EmbeddingRows},
 };
 use anyhow::{Context, Result, ensure};
 use lisa_backend::{ManagedDevice, ReadbackDevice, ScalarType as Dtype, TensorAccess};
-use lisa_gguf::{Package, TensorType as Type};
 use lisa_models::olala::{
-    config::{Config, Role},
+    config::Config,
     graph::{self, Definition, Format},
 };
-use std::{collections::BTreeMap, path::Path, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc};
 #[derive(Clone)]
 struct State<T> {
     position: usize,
@@ -39,61 +38,23 @@ struct Layer<D: BindingDevice> {
     weights: Vec<D::Tensor>,
     plan: PreparedGraph<D>,
     has_history: bool,
+    sequence: Option<(usize, PreparedGraph<D>)>,
 }
 pub struct Tower<D: BindingDevice + ManagedDevice + ReadbackDevice> {
     runtime: Runtime<D, Sampler<D>>,
     config: Config,
     capacity: usize,
-    _resident: ResidentWeights<D, D::Reservation>,
-    embedding: lisa_gguf::Tensor,
+    _resident: PreparedWeights<D::Tensor, D::Reservation>,
+    embedding: Box<dyn EmbeddingRows<D::Tensor>>,
     formats: BTreeMap<String, Format>,
     layers: Vec<Layer<D>>,
     head: PreparedGraph<D>,
     capture: Option<Capture<D::Tensor>>,
     warmed: bool,
 }
-fn formats(package: &Package, c: &Config) -> Result<BTreeMap<String, Format>> {
-    let mut result = BTreeMap::new();
-    for (name, shape, role) in lisa_models::olala::config::tensors(c) {
-        let t = &package.tensor(&name)?.info;
-        ensure!(
-            t.dimensions == shape,
-            "Olala tensor {name} shape mismatch: {:?}, expected {shape:?}",
-            t.dimensions
-        );
-        let valid = match role {
-            Role::Parameter => t.kind == Type::F32,
-            Role::ExpertUp => t.kind == Type::Q8_0,
-            Role::ExpertDown => matches!(t.kind, Type::Q5_K | Type::Q6_K),
-            Role::Projection => matches!(
-                t.kind,
-                Type::F32 | Type::BF16 | Type::Q5_K | Type::Q6_K | Type::Q8_0
-            ),
-        };
-        ensure!(
-            valid,
-            "unsupported Olala tensor encoding for {name}: {:?}",
-            t.kind
-        );
-        let dtype = match t.kind {
-            Type::F32 => Dtype::F32,
-            Type::BF16 => Dtype::BF16,
-            _ => Dtype::U8,
-        };
-        result.insert(
-            name,
-            Format {
-                projection: super::packed::projection(t.kind)?,
-                dtype,
-                row_bytes: i32::try_from(t.row_bytes()?)?,
-            },
-        );
-    }
-    Ok(result)
-}
 fn bind<D: BindingDevice + ManagedDevice>(
     device: &D,
-    resident: &ResidentWeights<D, D::Reservation>,
+    resident: &PreparedWeights<D::Tensor, D::Reservation>,
     def: &Definition,
 ) -> Result<Vec<D::Tensor>> {
     def.weights
@@ -141,22 +102,14 @@ impl<D: BindingDevice + ManagedDevice + ReadbackDevice> Tower<D>
 where
     D::Error: From<anyhow::Error>,
 {
-    pub fn load(runtime: Runtime<D, Sampler<D>>, path: &Path) -> Result<Self> {
-        ensure!(
-            path.is_file(),
-            "Olala currently requires an original GGUF file"
-        );
-        let package = Package::open(path)?;
-        let config = crate::checkpoint::olala::config(&package.header)?;
-        let formats = formats(&package, &config)?;
+    pub fn from_prepared(
+        runtime: Runtime<D, Sampler<D>>,
+        config: Config,
+        formats: BTreeMap<String, Format>,
+        resident: PreparedWeights<D::Tensor, D::Reservation>,
+        embedding: Box<dyn EmbeddingRows<D::Tensor>>,
+    ) -> Result<Self> {
         let device = runtime.context.device();
-        let embedding = package.tensor("token_embd.weight")?.disk_reader()?;
-        let names = formats
-            .keys()
-            .filter(|k| k.as_str() != "token_embd.weight")
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        let resident = load_resident(device.clone(), &package, &names)?;
         let mut layers = vec![];
         for i in 0..config.layers.len() {
             let def = graph::layer(&config, i, false, &formats);
@@ -166,6 +119,7 @@ where
                 weights,
                 plan,
                 has_history: false,
+                sequence: None,
             });
         }
         let def = graph::head(&formats);
@@ -184,22 +138,9 @@ where
             warmed: false,
         })
     }
-    fn step(&mut self, token: u32, caches: &mut Vec<LayerCache<D>>) -> Result<D::Tensor> {
-        ensure!(token < 151936, "Olala token outside vocabulary");
-        ensure!(caches.len() == 1, "invalid Olala cache count");
-        let LayerCache::Native(cache) = &mut caches[0] else {
-            anyhow::bail!("Olala requires its native cache")
-        };
-        let old = cache.get::<State<D::Tensor>>()?;
-        let position = old.position;
-        ensure!(position < self.capacity, "Olala context capacity exceeded");
-        let mut next = old.clone();
+    fn embedding_row(&self, token: u32) -> Result<D::Tensor> {
         let device = self.runtime.context.device();
-        let mut bytes = vec![0; self.embedding.info.row_bytes()? as usize];
-        self.embedding.read_rows(&[token as u64], &mut bytes)?;
-        let mut emb = vec![0.; 1536];
-        lisa_gguf::quant::decode(self.embedding.info.kind, &bytes, &mut emb)?;
-        let input = super::tensor_io::pull_f32(&self.runtime.context, &emb, &[1, 1536])?;
+        let input = self.embedding.row(token)?;
         let ops = crate::tensor_ops::TensorOps::new(device, crate::tensor_ops::TensorLaw::Native);
         use lisa_backend::{Binary as B, TensorOperation as T, Unary as U};
         let sq = ops.op(T::Binary(B::Multiply), &[&input, &input])?;
@@ -212,7 +153,22 @@ where
         )?;
         let norm = ops.op(T::Unary(U::Sqrt), &[&sum])?;
         let norm = ops.op(T::Binary(B::Maximum), &[&norm, &ops.scalar(1e-12)?])?;
-        let mut x = ops.op(T::Binary(B::Divide), &[&input, &norm])?;
+        ops.op(T::Binary(B::Divide), &[&input, &norm])
+    }
+    fn step(&mut self, token: u32, caches: &mut [LayerCache<D>]) -> Result<D::Tensor> {
+        ensure!(token < 151936, "Olala token outside vocabulary");
+        ensure!(caches.len() == 1, "invalid Olala cache count");
+        let LayerCache::Native(cache) = &mut caches[0] else {
+            anyhow::bail!("Olala requires its native cache")
+        };
+        let old = cache.get::<State<D::Tensor>>()?;
+        let position = old.position;
+        ensure!(position < self.capacity, "Olala context capacity exceeded");
+        let mut next = old.clone();
+        let device = self.runtime.context.device();
+        let mut x = self.embedding_row(token)?;
+        let ops = crate::tensor_ops::TensorOps::new(device, crate::tensor_ops::TensorLaw::Native);
+        use lisa_backend::{TensorOperation as T, Unary as U};
         let unused = ops.scalar(0.)?;
         // Only the empty-history branch changes the graph. Keep position as
         // runtime data so attention plans and their constants survive decode.
@@ -258,12 +214,12 @@ where
             let mut out = layer.plan.run(&args, &mut [])?.into_iter();
             x = out.next().context("missing Olala output")?;
             next.layers[i] = out.collect();
-            if let Some(c) = &self.capture {
-                if c.wants(i) {
-                    c.store(&format!("p{position}.layer{i}"), &x);
-                    for (j, s) in next.layers[i].iter().enumerate() {
-                        c.store(&format!("p{position}.layer{i}.state{j}"), s);
-                    }
+            if let Some(c) = &self.capture
+                && c.wants(i)
+            {
+                c.store(&format!("p{position}.layer{i}"), &x);
+                for (j, s) in next.layers[i].iter().enumerate() {
+                    c.store(&format!("p{position}.layer{i}.state{j}"), s);
                 }
             }
             if i % 4 == 3 {
@@ -277,6 +233,107 @@ where
         *cache.get_mut::<State<D::Tensor>>()? = next;
         Ok(x)
     }
+    fn prompt_rows(
+        &mut self,
+        tokens: &[u32],
+        caches: &mut Vec<LayerCache<D>>,
+    ) -> Result<Vec<D::Tensor>> {
+        ensure!(
+            !tokens.is_empty() && tokens.len() <= 8,
+            "invalid Olala prompt block"
+        );
+        ensure!(
+            tokens.iter().all(|&t| t < 151936),
+            "Olala token outside vocabulary"
+        );
+        ensure!(caches.len() == 1, "invalid Olala cache count");
+        let LayerCache::Native(cache) = &caches[0] else {
+            anyhow::bail!("Olala requires its native cache")
+        };
+        let position = cache.get::<State<D::Tensor>>()?.position;
+        ensure!(
+            position
+                .checked_add(tokens.len())
+                .is_some_and(|n| n <= self.capacity),
+            "Olala context capacity exceeded"
+        );
+        if tokens.len() == 1 || self.capture.is_some() {
+            return tokens.iter().map(|&t| self.step(t, caches)).collect();
+        }
+        // Establish all recurrent/history slots with the existing empty-prefix law.
+        if position == 0 {
+            let mut out = vec![self.step(tokens[0], caches)?];
+            out.extend(self.prompt_rows(&tokens[1..], caches)?);
+            return Ok(out);
+        }
+        let LayerCache::Native(cache) = &mut caches[0] else {
+            unreachable!()
+        };
+        let mut next = cache.get::<State<D::Tensor>>()?.clone();
+        let mut rows = tokens
+            .iter()
+            .map(|&t| self.embedding_row(t))
+            .collect::<Result<Vec<_>>>()?;
+        let device = self.runtime.context.device();
+        let ops = crate::tensor_ops::TensorOps::new(device, crate::tensor_ops::TensorLaw::Native);
+        let dummy = ops.scalar(0.)?;
+        let positions = (0..tokens.len())
+            .map(|row| {
+                ops.op(
+                    lisa_backend::TensorOperation::Unary(lisa_backend::Unary::Log),
+                    &[&ops.scalar((position + row + 1).min(self.config.window) as f32)?],
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            if layer
+                .sequence
+                .as_ref()
+                .is_none_or(|(n, _)| *n != tokens.len())
+            {
+                let def = graph::layer_sequence(&self.config, i, tokens.len(), &self.formats)
+                    .map_err(anyhow::Error::msg)?;
+                layer.sequence = Some((
+                    tokens.len(),
+                    // Expansion retains the serial plan's weight indices and
+                    // its already-padded device views.
+                    PreparedGraph::new(device.clone(), def.graph, layer.weights.clone())?,
+                ));
+            }
+            let state = &next.layers[i];
+            ensure!(!state.is_empty(), "missing Olala prompt state");
+            let mut args = Vec::with_capacity(tokens.len() * 6);
+            for row in 0..tokens.len() {
+                args.extend([
+                    &rows[row],
+                    state.first().unwrap_or(&dummy),
+                    state.get(1).unwrap_or(&dummy),
+                    state.get(2).unwrap_or(&dummy),
+                    state.get(3).unwrap_or(&dummy),
+                    &positions[row],
+                ]);
+            }
+            let outputs = layer
+                .sequence
+                .as_ref()
+                .unwrap()
+                .1
+                .run(&args, &mut [])?
+                .into_iter()
+                .collect::<Vec<_>>();
+            let count = if self.config.layers[i] { 2 } else { 5 };
+            ensure!(
+                outputs.len() == tokens.len() * count,
+                "invalid Olala prompt outputs"
+            );
+            rows = outputs.chunks_exact(count).map(|o| o[0].clone()).collect();
+            next.layers[i] = outputs[outputs.len() - count + 1..].to_vec();
+            device.submit(false)?;
+        }
+        next.position += tokens.len();
+        *cache.get_mut::<State<D::Tensor>>()? = next;
+        Ok(rows)
+    }
 }
 impl<D: BindingDevice + ManagedDevice + ReadbackDevice> LanguageModel<Runtime<D, Sampler<D>>>
     for Tower<D>
@@ -285,6 +342,9 @@ where
 {
     fn runtime(&self) -> &Runtime<D, Sampler<D>> {
         &self.runtime
+    }
+    fn prefix_cache_granularity(&self) -> Option<usize> {
+        Some(1)
     }
     fn max_position_embeddings(&self) -> usize {
         self.capacity
@@ -382,8 +442,8 @@ where
     fn prefill(&mut self, tokens: &[u32], caches: &mut Vec<LayerCache<D>>) -> Result<D::Tensor> {
         ensure!(!tokens.is_empty(), "empty Olala prompt");
         let mut last = None;
-        for &token in tokens {
-            last = Some(self.step(token, caches)?);
+        for chunk in tokens.chunks(8) {
+            last = self.prompt_rows(chunk, caches)?.pop();
             self.runtime.context.device().submit(true)?;
             self.runtime.context.device().trim_unused();
         }

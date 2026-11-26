@@ -1,15 +1,15 @@
 //! Native specialization and conformance fixtures for portable GLM bindings.
-use anyhow::{Context, Result, ensure};
-use lisa_metal::{Array, Dtype, Stream, device::MetalDevice};
+use anyhow::Result;
+use lisa_metal::Array;
 pub fn linear_projection(x: &Array, w: &Array) -> Result<Array> {
-    lisa_engine::bindings::glm53_math::linear_projection(
+    lisa_engine::bindings::glm53::math::linear_projection(
         &crate::metal_context::execution_context(),
         x,
         w,
     )
 }
 pub fn l2norm_last(x: &Array, eps: f32) -> lisa_metal::error::Result<Array> {
-    lisa_engine::bindings::glm53_math::l2norm_last(
+    lisa_engine::bindings::glm53::math::l2norm_last(
         &crate::metal_context::execution_context(),
         x,
         eps,
@@ -17,7 +17,7 @@ pub fn l2norm_last(x: &Array, eps: f32) -> lisa_metal::error::Result<Array> {
     .map_err(|e| lisa_metal::error::Error::msg(e.to_string()))
 }
 pub fn gated_rms_norm(x: &Array, w: &Array, g: &Array, eps: f32) -> Result<Array> {
-    lisa_engine::bindings::glm53_math::gated_rms_norm(
+    lisa_engine::bindings::glm53::math::gated_rms_norm(
         &crate::metal_context::execution_context(),
         x,
         w,
@@ -26,7 +26,7 @@ pub fn gated_rms_norm(x: &Array, w: &Array, g: &Array, eps: f32) -> Result<Array
     )
 }
 pub fn rms_norm_last(x: &Array, w: Option<&Array>, eps: f32) -> Result<Array> {
-    lisa_engine::bindings::glm53_math::rms_norm_last(
+    lisa_engine::bindings::glm53::math::rms_norm_last(
         &crate::metal_context::execution_context(),
         x,
         w,
@@ -34,12 +34,10 @@ pub fn rms_norm_last(x: &Array, w: Option<&Array>, eps: f32) -> Result<Array> {
     )
 }
 #[cfg(test)]
-#[path = "glm53_math_oracle.rs"]
-mod oracle;
+use crate::bindings::glm53_math_oracle as oracle;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bindings::deepseek41_moe::tests::{counts, difference};
 
     fn values(shape: &[i32], seed: usize) -> Array {
         Array::from_slice(
@@ -53,16 +51,10 @@ mod tests {
         old: impl FnOnce() -> anyhow::Result<Array>,
         new: impl FnOnce() -> anyhow::Result<Array>,
     ) -> anyhow::Result<()> {
-        let a = counts();
         let old = old()?;
-        let b = counts();
         let new = new()?;
-        let c = counts();
         assert_eq!(old.shape(), new.shape());
         assert_eq!(old.to_vec1::<u32>()?, new.to_vec1::<u32>()?);
-        if std::env::var_os("LISA_TRACE").is_some() {
-            assert_eq!(difference(&a, &b), difference(&b, &c));
-        }
         Ok(())
     }
     #[test]

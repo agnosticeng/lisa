@@ -1,4 +1,6 @@
 //! UI-independent engine commands, streaming events and conversation execution.
+mod generation;
+
 use crate::browser::{BrowserEvent, BrowserRequest};
 use crate::models::config_model_type;
 use crate::{catalog, chats};
@@ -36,6 +38,9 @@ pub(crate) enum Command {
         addr: String,
         stop: Arc<AtomicBool>,
     },
+    /// Wake the shared worker after an HTTP request is queued. This command
+    /// does not execute a request or change the active model context.
+    ServeWake,
 }
 
 /// Events pushed from the engine thread and drained on the main thread.
@@ -117,10 +122,17 @@ struct GenerationTiming {
 }
 impl GenerationTiming {
     fn new() -> Self {
-        Self { started: std::time::Instant::now(), first: None, last: None, tokens: 0 }
+        Self {
+            started: std::time::Instant::now(),
+            first: None,
+            last: None,
+            tokens: 0,
+        }
     }
     fn token(&mut self, id: u32) {
-        if lisa_engine::eos::is_eos(id) { return; }
+        if lisa_engine::eos::is_eos(id) {
+            return;
+        }
         let now = std::time::Instant::now();
         self.first.get_or_insert(now);
         self.last = Some(now);
@@ -131,18 +143,24 @@ impl GenerationTiming {
         let seconds = self.last?.duration_since(first).as_secs_f64();
         let speed = if self.tokens > 1 && seconds > 0.0 {
             format!("{:.1} tok/s", (self.tokens - 1) as f64 / seconds)
-        } else { "rate unavailable".into() };
-        Some(format!("Generation: {speed} · {} output tokens · first token {:.2}s", self.tokens, first.duration_since(self.started).as_secs_f64()))
+        } else {
+            "rate unavailable".into()
+        };
+        Some(format!(
+            "Generation: {speed} · {} output tokens · first token {:.2}s",
+            self.tokens,
+            first.duration_since(self.started).as_secs_f64()
+        ))
     }
 }
 
 const CHAT_MAX_TOKENS: usize = 2048;
-/// Shorten a path under the user's home directory to `~/…`.
+/// Replace the user's home-directory prefix with a tilde for display.
 pub(crate) fn tilde(path: &str) -> String {
-    if let Ok(home) = std::env::var("HOME") {
-        if let Some(rest) = path.strip_prefix(&home) {
-            return format!("~{rest}");
-        }
+    if let Ok(home) = std::env::var("HOME")
+        && let Some(rest) = path.strip_prefix(&home)
+    {
+        return format!("~{rest}");
     }
     path.to_string()
 }
@@ -154,7 +172,10 @@ fn dated_system_prompt(system: &str) -> String {
 }
 
 fn system_prompt_on_date(system: &str, date: &str) -> String {
-    format!("{}\n\nCurrent UTC date: {date}. Use this date to interpret today, recent, and latest. Do not treat older facts as current without verification.", system.trim())
+    format!(
+        "{}\n\nCurrent UTC date: {date}. Use this date to interpret today, recent, and latest. Do not treat older facts as current without verification.",
+        system.trim()
+    )
 }
 
 pub(crate) fn chat_input_ids(
@@ -164,13 +185,13 @@ pub(crate) fn chat_input_ids(
     first: bool,
     is_glm: bool,
 ) -> anyhow::Result<Vec<u32>> {
-    use lisa_engine::core::tokenizer::{self, GlmReasoning};
+    use lisa_engine::core::tokenizer::{self, ReasoningEffort};
     if let Some(ids) = tokenizer.native_chat_turn(system, text, first)? {
         return Ok(ids);
     }
     let prompt = if is_glm {
         if first {
-            tokenizer::glm_generation_prompt(text, system, GlmReasoning::Disabled)
+            tokenizer::glm_generation_prompt(text, system, ReasoningEffort::Disabled)
         } else {
             format!("<|user|>{text}<|assistant|><think></think>")
         }
@@ -192,12 +213,10 @@ pub(crate) fn chat_input_ids(
 }
 
 pub(crate) fn new_chat_session(
-    model: &mut dyn lisa_engine::language::LanguageModel<
-        lisa_serve::application::LanguageRuntime,
-    >,
+    model: &mut dyn lisa_engine::language::LanguageModel<lisa_serve::application::LanguageRuntime>,
 ) -> lisa_serve::application::Session {
-    use lisa_serve::application::Session;
     use lisa_engine::speculation::TargetMtpEosPolicy;
+    use lisa_serve::application::Session;
     model.drafter_reset();
     let mut session = Session::new(model);
     // Chat turn suffixes start after assistant text, without a committed EOS.
@@ -206,9 +225,7 @@ pub(crate) fn new_chat_session(
 }
 
 pub(crate) fn replay_chat_history(
-    model: &mut dyn lisa_engine::language::LanguageModel<
-        lisa_serve::application::LanguageRuntime,
-    >,
+    model: &mut dyn lisa_engine::language::LanguageModel<lisa_serve::application::LanguageRuntime>,
     tokenizer: &lisa_engine::core::tokenizer::Tokenizer,
     history: &[(String, String)],
     system: &str,
@@ -220,12 +237,8 @@ pub(crate) fn replay_chat_history(
             return Ok(());
         }
         if model.has_block_drafter() {
-            model.set_block_drafter_capture(true);
-            model.set_block_drafter_prefill_append(true);
-            let result = session.feed(model, ids);
-            model.set_block_drafter_prefill_append(false);
-            model.set_block_drafter_capture(false);
-            result?;
+            // The drafter's context commits with the target's state.
+            session.feed(model, ids)?;
         } else if model.has_drafter() {
             let (_, multi) = session.feed_multi(model, ids)?;
             session.mtp_tokens.extend_from_slice(ids);
@@ -276,9 +289,7 @@ impl EngineContexts {
     fn activate(
         &mut self,
         owner: EngineOwner,
-        model: &mut dyn lisa_engine::language::LanguageModel<
-            lisa_serve::application::LanguageRuntime,
-        >,
+        model: &mut dyn lisa_engine::language::LanguageModel<lisa_serve::application::LanguageRuntime>,
     ) {
         if self.owner == owner {
             return;
@@ -311,8 +322,60 @@ fn check_cancel() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn server_waker(commands: std::sync::Weak<mpsc::Sender<Command>>) -> Arc<dyn Fn() + Send + Sync> {
+    // A notifier must not keep the UI command channel alive after its owner
+    // drops. The worker still exits when its real command senders disappear.
+    Arc::new(move || {
+        if let Some(commands) = commands.upgrade() {
+            let _ = commands.send(Command::ServeWake);
+        }
+    })
+}
+
+#[cfg(test)]
+mod server_wake_tests {
+    use super::*;
+
+    #[test]
+    fn http_wake_preserves_command_order_and_does_not_keep_worker_alive() {
+        let (commands, receiver) = mpsc::channel();
+        let commands = Arc::new(commands);
+        let wake = server_waker(Arc::downgrade(&commands));
+        commands.send(Command::Unload).unwrap();
+        wake();
+        assert!(matches!(receiver.recv().unwrap(), Command::Unload));
+        assert!(matches!(receiver.recv().unwrap(), Command::ServeWake));
+        drop(commands);
+        wake();
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn http_wake_interrupts_an_idle_command_receive() {
+        let (commands, receiver) = mpsc::channel();
+        let commands = Arc::new(commands);
+        let wake = server_waker(Arc::downgrade(&commands));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let worker_barrier = barrier.clone();
+        let (done, observed) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            worker_barrier.wait();
+            let command = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+            done.send(matches!(command, Command::ServeWake)).unwrap();
+        });
+        barrier.wait();
+        wake();
+        assert!(observed.recv_timeout(Duration::from_secs(1)).unwrap());
+        worker.join().unwrap();
+    }
+}
+
 pub(crate) fn spawn_controlled(
     rx: mpsc::Receiver<Command>,
+    commands: std::sync::Weak<mpsc::Sender<Command>>,
     events: Arc<Mutex<Vec<UiEvent>>>,
     cancel: Arc<AtomicBool>,
     image_root: PathBuf,
@@ -344,7 +407,7 @@ pub(crate) fn spawn_controlled(
             let mut history_system = String::new();
             let mut history_error: Option<String> = None;
             let mut is_glm = false;
-            let mut is_olala = false;
+            let mut has_control_frames = false;
             let mut contexts = EngineContexts::new();
 
             // One engine thread serves both UI chat and (optionally) the
@@ -359,27 +422,23 @@ pub(crate) fn spawn_controlled(
                     Ok(c) => c,
                     Err(mpsc::TryRecvError::Disconnected) => break,
                     Err(mpsc::TryRecvError::Empty) => {
-                        if let Some(stop) = serve_stop.as_ref() {
-                            if stop.load(Ordering::Relaxed) {
+                        if let Some(stop) = serve_stop.as_ref()
+                            && stop.load(Ordering::Relaxed) {
                                 if let Some(mut srv) = server.take() {srv.shutdown();}
                                 if let Some(mut srv) = image_server.take() {srv.shutdown();}
                                 serve_stop = None;
                                 push(UiEvent::ServeStopped);
                                 continue;
                             }
-                        }
                         if let (Some(srv), Some(m), Some(t)) =
                             (server.as_mut(), model.as_mut(), tokenizer.as_ref())
-                        {
-                            if srv.step_with_context(&mut **m, t, |model| {
+                            && srv.step_with_context(&mut **m, t, |model| {
                                 contexts.activate(EngineOwner::Server, model);
                             }) {
                                 continue;
                             }
-                        }
-                        if let (Some(server),Some(model))=(&image_server,&image_model) {
-                            if server.step(model) {continue;}
-                        }
+                        if let (Some(server),Some(model))=(&image_server,&image_model)
+                            && server.step(model) {continue;}
                         match rx.recv_timeout(std::time::Duration::from_millis(50)) {
                             Ok(c) => c,
                             Err(mpsc::RecvTimeoutError::Timeout) => continue,
@@ -388,6 +447,7 @@ pub(crate) fn spawn_controlled(
                     }
                 };
                 match cmd {
+                    Command::ServeWake => {}
                     Command::Unload => {
                         prompt_cache.clear();
                         let had_model = model.is_some() || image_model.is_some();
@@ -430,7 +490,7 @@ pub(crate) fn spawn_controlled(
                             && !path.join(".lisa-resident/index.json").is_file()
                         {
                             push(UiEvent::Log("Preparing GLM weights for the first load. This uses extra disk space and may take several minutes.".into()));
-                            if let Err(e) = lisa_engine::core::prepare::prepare_model(&path, false) {
+                            if let Err(e) = lisa_engine::weights::prepare::prepare_model(&path, false) {
                                 push(UiEvent::Log(format!("preparation error: {e}")));
                                 push(UiEvent::Loaded(false));
                                 continue;
@@ -448,7 +508,7 @@ pub(crate) fn spawn_controlled(
                             }
                         }) {
                             Ok(lisa_serve::application::loading::Loaded::Language(m)) => {
-                                match lisa_engine::core::tokenizer::Tokenizer::load(&path) {
+                                match lisa_engine::checkpoint::tokenizer::load(&path) {
                                     Ok(t) => {
                                         lisa_engine::generation::set_eos_ids_for_model(
                                             t.im_end_ids.clone(),
@@ -459,10 +519,10 @@ pub(crate) fn spawn_controlled(
                                             config_model_type(&path).as_deref(),
                                             Some("glm5_next" | "glm5_next_text" | "glm5-next")
                                         );
-                                        is_olala = config_model_type(&path).as_deref() == Some("olala");
+                                        has_control_frames = matches!(config_model_type(&path).as_deref(), Some("olala" | "inkling2"));
                                         model = Some(m);
                                         model_dir = Some(path.clone());
-                                        if let Some(m) = model.as_mut().filter(|_| !is_olala && history_images.iter().all(Vec::is_empty)) {
+                                        if let Some(m) = model.as_mut().filter(|_| !has_control_frames && history_images.iter().all(Vec::is_empty)) {
                                             // Prefill recorded turns without sampling. Qwen
                                             // also retains the hidden rows needed to prime MTP.
                                             match replay_chat_history(
@@ -713,7 +773,7 @@ pub(crate) fn spawn_controlled(
                             continue;
                         };
                         contexts.activate(EngineOwner::Chat, &mut **model);
-                        if is_olala || !images.is_empty() || history_images.iter().any(|i|!i.is_empty()) {
+                        if has_control_frames || !images.is_empty() || history_images.iter().any(|i|!i.is_empty()) {
                             let result=(||->anyhow::Result<(String,Vec<String>)> {
                                 let urls=images.iter().map(|p|lisa_engine::vision::file_data_url(p)).collect::<anyhow::Result<Vec<_>>>()?;
                                 push(UiEvent::UserImages(images.clone()));
@@ -734,7 +794,7 @@ pub(crate) fn spawn_controlled(
                                 let body=serde_json::json!({"messages":messages});
                                 let decoded=lisa_engine::vision::decode_message_images(&body)?;
                                 let dir=model_dir.as_ref().ok_or_else(||anyhow::anyhow!("no model directory"))?;
-                                let template=lisa_serve::ChatTemplate::new(&lisa_engine::core::tokenizer::load_chat_template(dir)?.ok_or_else(|| anyhow::anyhow!("missing chat template"))?)?;
+                                let template=lisa_serve::ChatTemplate::new(&lisa_engine::checkpoint::tokenizer::load_chat_template(dir)?.ok_or_else(|| anyhow::anyhow!("missing chat template"))?)?;
                                 let chat:Vec<lisa_serve::ChatMessage>=body["messages"].as_array().unwrap().iter().map(|m|lisa_serve::ChatMessage {
                                     role:m["role"].as_str().unwrap().into(),content:m["content"].as_str().unwrap_or("").into(),
                                     reasoning_content:None,tool_calls:Vec::new(),tool_call_id:None,parts:m["content"].as_array().cloned()
@@ -745,21 +805,22 @@ pub(crate) fn spawn_controlled(
                                 if !decoded.is_empty() { model.prepare_images(&mut ids,&decoded)?; }
                                 drop(decoded);
                                 let mut timing = GenerationTiming::new();
-                                let (mut sess, offset)=prompt_cache.prepare(&mut **model,&ids,is_olala && urls.is_empty() && history_images.iter().all(Vec::is_empty),|reused,fed| {
+                                let (mut sess, offset)=prompt_cache.prepare(&mut **model,&ids,urls.is_empty() && history_images.iter().all(Vec::is_empty),|reused,fed| {
                                     check_cancel()?;
                                     if fed == reused { push(UiEvent::Log(format!("Prompt: {} tokens · {reused} reused · {} to process",ids.len(),ids.len()-reused))); }
                                     Ok(())
                                 })?;
-                                let mut decoder=lisa_engine::core::tokenizer::IncrementalDecoder::new(tokenizer,!is_olala);
-                                let output=sess.generate(&mut **model,&ids[offset..],CHAT_MAX_TOKENS,&mut sampler,0,None,&mut |id| {
+                                let mut decoder=lisa_engine::core::tokenizer::IncrementalDecoder::new(tokenizer,!has_control_frames);
+                                let policy=generation::chat_policy(!urls.is_empty(),history_images.iter().any(|images| !images.is_empty()));
+                                let output=sess.generate_with_policy(&mut **model,&ids[offset..],CHAT_MAX_TOKENS,&mut sampler,policy,None,&mut |id| {
                 check_cancel()?;
                                     timing.token(id);
                                     decoder.push(id)?;
-                                    push(UiEvent::AssistantReset(if is_olala { template.streaming_sections(decoder.stable_text(), false).1.to_owned() } else { clean_reply(decoder.stable_text()) }));
+                                    push(UiEvent::AssistantReset(if has_control_frames { template.streaming_sections(decoder.stable_text(), false).1.to_owned() } else { clean_reply(decoder.stable_text()) }));
                                     Ok(())
                                 })?;
                                 if let Some(message) = timing.message() { push(UiEvent::Log(message)); }
-                                let reply=if is_olala { template.parse_reply(&tokenizer.decode(&output)?, &[], false).0 } else { clean_reply(&tokenizer.decode_clean(&output)?) };
+                                let reply=if has_control_frames { template.parse_reply(&tokenizer.decode(&output)?, &[], false).0 } else { clean_reply(&tokenizer.decode_clean(&output)?) };
                                 push(UiEvent::AssistantReset(reply.clone()));
                                 Ok((reply,urls))
                             })();
@@ -853,17 +914,10 @@ pub(crate) fn spawn_controlled(
                         let block_drafter = model.has_block_drafter();
                         let use_mtp = target_mtp || block_drafter || (model.has_drafter() && sampler.greedy());
                         let result = if use_mtp {
-                            // Greedy DSpine uses the measured BS1 SPS width.
-                            // Initial Auto probes shifted block alignment and
-                            // regressed the chat workload in the admission run.
-                            let depth = if block_drafter && sampler.greedy() {
-                                lisa_engine::speculation::MtpDepth::Fixed(
-                                    model.block_drafter_verify_depth(),
-                                )
-                            } else {
-                                lisa_engine::speculation::MtpDepth::Auto
-                            };
-                            let mtp_sampler = if target_mtp || block_drafter { Some(&mut sampler) } else { None };
+                            // Greedy block drafters run tree rounds; sampled
+                            // targets decode serially.
+                            let depth = lisa_engine::speculation::MtpDepth::Auto;
+                            let mtp_sampler = if target_mtp || block_drafter || !sampler.can_use_raw_argmax() { Some(&mut sampler) } else { None };
                             sess.generate_mtp_depth(
                                 &mut **model,
                                 &ids,
@@ -879,7 +933,6 @@ pub(crate) fn spawn_controlled(
                                 &ids,
                                 CHAT_MAX_TOKENS,
                                 &mut sampler,
-                                0,
                                 None,
                                 &mut emit,
                             )
@@ -941,7 +994,7 @@ pub(crate) fn spawn_controlled(
                             continue;
                         }
                         let chat_template = model_dir.as_ref().and_then(|d| {
-                            lisa_engine::core::tokenizer::load_chat_template(d).ok().flatten()
+                            lisa_engine::checkpoint::tokenizer::load_chat_template(d).ok().flatten()
                         });
                         let cfg = lisa_serve::ServerConfig {
                             supports_images: model.as_ref().is_some_and(|m|m.supports_images()),
@@ -965,7 +1018,6 @@ pub(crate) fn spawn_controlled(
                             } else {
                                 0
                             },
-                            pld: 0,
                             prefix_cache: 2,
                             max_batch: 4,
                             chat_template,
@@ -974,7 +1026,7 @@ pub(crate) fn spawn_controlled(
                                 .map(lisa_serve::model_id_of)
                                 .unwrap_or_else(|| "unknown".to_string()),
                         };
-                        match lisa_serve::Server::start(cfg, stop.clone(), model.as_ref().expect("loaded model").runtime().context.device().clone()) {
+                        match lisa_serve::Server::start_with_waker(cfg, stop.clone(), model.as_ref().expect("loaded model").runtime().context.device().clone(), server_waker(commands.clone())) {
                             Ok(srv) => {
                                 let local = srv.local_addr();
                                 server = Some(srv);
@@ -993,9 +1045,7 @@ pub(crate) fn spawn_controlled(
 }
 
 pub(crate) fn run_web_agent<F>(
-    model: &mut dyn lisa_engine::language::LanguageModel<
-        lisa_serve::application::LanguageRuntime,
-    >,
+    model: &mut dyn lisa_engine::language::LanguageModel<lisa_serve::application::LanguageRuntime>,
     tokenizer: &lisa_engine::core::tokenizer::Tokenizer,
     model_dir: &std::path::Path,
     history: &[(String, String)],
@@ -1013,8 +1063,8 @@ where
 {
     use serde_json::{Value, json};
 
-    let template_src =
-        lisa_engine::core::tokenizer::load_chat_template(model_dir)?.ok_or_else(|| {
+    let template_src = lisa_engine::checkpoint::tokenizer::load_chat_template(model_dir)?
+        .ok_or_else(|| {
             anyhow::anyhow!("the loaded model does not provide a chat template for tool use")
         })?;
     let template = lisa_serve::ChatTemplate::new(&template_src)?;
@@ -1148,7 +1198,10 @@ where
                 BrowserEvent::NeedsInput(message) => push(UiEvent::AssistantReset(message)),
                 BrowserEvent::Finished(result) => {
                     let result = result.unwrap_or_else(|error| format!("Browser error: {error}"));
-                    push(UiEvent::Log(format!("Browser evidence: {}", result.lines().next().unwrap_or("empty"))));
+                    push(UiEvent::Log(format!(
+                        "Browser evidence: {}",
+                        result.lines().next().unwrap_or("empty")
+                    )));
                     return Ok(result);
                 }
             }
@@ -1165,32 +1218,44 @@ where
     const MAX_BROWSER_ACTIONS: usize = 6;
     let mut remaining_actions = MAX_BROWSER_ACTIONS;
     if explicit_web_search(query) {
-        let calls = vec![json!({"id":"lisa_initial_search", "type":"function", "function":{
-            "name":"web_search", "arguments":json!({"query":query}).to_string()
-        }})];
+        let calls = vec![
+            json!({"id":"lisa_initial_search", "type":"function", "function":{
+                "name":"web_search", "arguments":json!({"query":query}).to_string()
+            }}),
+        ];
         let results = execute_browser_calls(&calls, &mut remaining_actions, |request| {
             navigation.navigate(request, |request| {
                 browser_request(request).unwrap_or_else(|error| format!("Browser error: {error}"))
             })
         });
-        let found_results = results.iter().any(|result| result.starts_with("Search page: "));
-        anyhow::ensure!(found_results, "Google did not return readable sources; no answer was generated from memory");
+        let found_results = results
+            .iter()
+            .any(|result| result.starts_with("Search page: "));
+        anyhow::ensure!(
+            found_results,
+            "Google did not return readable sources; no answer was generated from memory"
+        );
         append_browser_exchange(&mut messages, String::new(), calls, results);
         if found_results {
             // Read a real result before asking a small checkpoint to answer.
-            let calls = vec![json!({"id":"lisa_initial_page", "type":"function", "function":{
-                "name":"web_open", "arguments":json!({"result":1}).to_string()
-            }})];
+            let calls = vec![
+                json!({"id":"lisa_initial_page", "type":"function", "function":{
+                    "name":"web_open", "arguments":json!({"result":1}).to_string()
+                }}),
+            ];
             let results = execute_browser_calls(&calls, &mut remaining_actions, |request| {
                 navigation.navigate(request, |request| {
-                    browser_request(request).unwrap_or_else(|error| format!("Browser error: {error}"))
+                    browser_request(request)
+                        .unwrap_or_else(|error| format!("Browser error: {error}"))
                 })
             });
             for result in &results {
                 remember_browser_sources(result, &mut sources);
                 read_pages.remember(result);
             }
-            if let Some(answer) = read_pages.answer() { return Ok(answer); }
+            if let Some(answer) = read_pages.answer() {
+                return Ok(answer);
+            }
             append_browser_exchange(&mut messages, String::new(), calls, results);
         }
     }
@@ -1251,11 +1316,18 @@ where
                 model.prepare_images(&mut ids, decoded)?;
             }
             let mut timing = GenerationTiming::new();
-            let (mut session, offset) = prompt_cache.prepare(model, &ids, template.uses_olala_channels() && decoded_images.is_none(), |reused, fed| {
-                check_cancel()?;
-                if fed == reused { push(UiEvent::Log(format!("Prompt: {} tokens · {reused} reused · {} to process", ids.len(), ids.len()-reused))); }
-                Ok(())
-            })?;
+            let (mut session, offset) =
+                prompt_cache.prepare(model, &ids, decoded_images.is_none(), |reused, fed| {
+                    check_cancel()?;
+                    if fed == reused {
+                        push(UiEvent::Log(format!(
+                            "Prompt: {} tokens · {reused} reused · {} to process",
+                            ids.len(),
+                            ids.len() - reused
+                        )));
+                    }
+                    Ok(())
+                })?;
             let mut output = Vec::new();
             // Keep control tokens in the decode so the display filter can
             // withhold reasoning and tool arguments at every token boundary.
@@ -1276,14 +1348,20 @@ where
                 &ids[offset..],
                 answer_limit.min(available),
                 sampler,
-                0,
                 None,
                 &mut |id| {
                     check_cancel()?;
                     timing.token(id);
                     output.push(id);
                     decoder.push(id)?;
-                    let display = if template.uses_olala_channels() { template.streaming_sections(decoder.stable_text(), false).1.to_owned() } else { browser_stream_text(decoder.stable_text(), thinking_prefilled) };
+                    let display = if template.uses_control_channels() {
+                        template
+                            .streaming_sections(decoder.stable_text(), false)
+                            .1
+                            .to_owned()
+                    } else {
+                        browser_stream_text(decoder.stable_text(), thinking_prefilled)
+                    };
                     if remaining_actions == MAX_BROWSER_ACTIONS && display != emitted {
                         if emitted.is_empty() || !display.starts_with(&emitted) {
                             // Replace the per-pass status before streaming the answer.
@@ -1298,17 +1376,26 @@ where
                     Ok(())
                 },
             )?;
-            if let Some(message) = timing.message() { push(UiEvent::Log(message)); }
+            if let Some(message) = timing.message() {
+                push(UiEvent::Log(message));
+            }
             Ok(output)
         })();
         model.clear_images();
         let output = generated?;
         // Parse control markers before stripping special tokens for display.
         let raw = tokenizer.decode(&output)?;
-        let (content, calls) = if template.uses_olala_channels() { let (content, _, calls) = template.parse_reply(&raw, &tools, false); (content, calls) } else { lisa_serve::extract_tool_calls(&raw, &tools) };
+        let (content, calls) = if template.uses_control_channels() {
+            let (content, _, calls) = template.parse_reply(&raw, &tools, false);
+            (content, calls)
+        } else {
+            lisa_serve::extract_tool_calls(&raw, &tools)
+        };
         if calls.is_empty() || requested_final_answer {
-            anyhow::ensure!(remaining_actions == MAX_BROWSER_ACTIONS || !sources.is_empty(),
-                "No source page could be read; no unverified web answer was returned");
+            anyhow::ensure!(
+                remaining_actions == MAX_BROWSER_ACTIONS || !sources.is_empty(),
+                "No source page could be read; no unverified web answer was returned"
+            );
             let answer = clean_reply(&content).trim().to_string();
             // A truncated bare call is not a user-facing answer.
             let answer = if answer.starts_with("<function=") {
@@ -1344,7 +1431,9 @@ where
             remember_browser_sources(result, &mut sources);
             read_pages.remember(result);
         }
-        if let Some(answer) = read_pages.answer() { return Ok(answer); }
+        if let Some(answer) = read_pages.answer() {
+            return Ok(answer);
+        }
         append_browser_exchange(&mut messages, content, calls, results);
     }
     unreachable!("web-agent pass loop returns or errors")
@@ -1354,9 +1443,20 @@ where
 /// checkpoint to choose its first tool. Ordinary chat still chooses tools.
 fn explicit_web_search(query: &str) -> bool {
     let query = query.trim().to_lowercase();
-    ["cherche ", "recherche ", "search for ", "search the internet", "search the web", "search online", "cherche sur internet",
-     "recherche sur internet", "cherche sur le web", "recherche sur le web"]
-        .iter().any(|prefix| query.starts_with(prefix))
+    [
+        "cherche ",
+        "recherche ",
+        "search for ",
+        "search the internet",
+        "search the web",
+        "search online",
+        "cherche sur internet",
+        "recherche sur internet",
+        "cherche sur le web",
+        "recherche sur le web",
+    ]
+    .iter()
+    .any(|prefix| query.starts_with(prefix))
 }
 
 /// Display ordinary text as it arrives, holding incomplete control markers
@@ -1452,12 +1552,14 @@ pub(crate) fn browser_tool_request(call: &serde_json::Value) -> Result<BrowserRe
         Some(value) if value.is_object() => value.clone(),
         _ => return Err("tool arguments must be an object".into()),
     };
-    if name == "web_open" {
-        if let Some(index) = args.get("result") {
-            let index = index.as_u64().filter(|n| *n > 0)
-                .ok_or("web_open requires a positive result number")?;
-            return Ok(BrowserRequest::Open(format!("google-result:{index}")));
-        }
+    if name == "web_open"
+        && let Some(index) = args.get("result")
+    {
+        let index = index
+            .as_u64()
+            .filter(|n| *n > 0)
+            .ok_or("web_open requires a positive result number")?;
+        return Ok(BrowserRequest::Open(format!("google-result:{index}")));
     }
     let key = match name {
         "web_search" => "query",
@@ -1571,7 +1673,12 @@ mod browser_agent_tests {
     fn generation_rate_excludes_prefill_and_the_first_token() {
         use std::time::{Duration, Instant};
         let start = Instant::now();
-        let mut timing = super::GenerationTiming { started: start, first: None, last: None, tokens: 0 };
+        let mut timing = super::GenerationTiming {
+            started: start,
+            first: None,
+            last: None,
+            tokens: 0,
+        };
         assert!(timing.message().is_none());
         timing.first = Some(start + Duration::from_secs(10));
         timing.last = timing.first;
@@ -1579,7 +1686,10 @@ mod browser_agent_tests {
         assert!(timing.message().unwrap().contains("rate unavailable"));
         timing.tokens = 4;
         timing.last = Some(start + Duration::from_secs(13));
-        assert_eq!(timing.message().unwrap(), "Generation: 1.0 tok/s · 4 output tokens · first token 10.00s");
+        assert_eq!(
+            timing.message().unwrap(),
+            "Generation: 1.0 tok/s · 4 output tokens · first token 10.00s"
+        );
     }
 
     #[test]
@@ -1590,25 +1700,43 @@ mod browser_agent_tests {
         assert!(today.starts_with(instructions));
         assert!(today.contains("Current UTC date: 2026-11-19"));
         assert!(!today.contains("2026-11-18"));
-        assert_ne!(yesterday, today, "a date change invalidates cached chat context");
+        assert_ne!(
+            yesterday, today,
+            "a date change invalidates cached chat context"
+        );
     }
 
     #[test]
     fn browser_open_uses_positive_result_numbers() {
         let call = |result| serde_json::json!({"function":{"name":"web_open", "arguments":{"result":result}}});
-        assert!(matches!(super::browser_tool_request(&call(serde_json::json!(2))), Ok(crate::browser::BrowserRequest::Open(reference)) if reference == "google-result:2"));
-        for invalid in [serde_json::json!(0), serde_json::json!(-1), serde_json::json!(1.5), serde_json::json!("1")] {
+        assert!(
+            matches!(super::browser_tool_request(&call(serde_json::json!(2))), Ok(crate::browser::BrowserRequest::Open(reference)) if reference == "google-result:2")
+        );
+        for invalid in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("1"),
+        ] {
             assert!(super::browser_tool_request(&call(invalid)).is_err());
         }
     }
 
     #[test]
     fn explicit_search_starts_only_for_direct_web_requests() {
-        assert!(super::explicit_web_search("Cherche sur internet la liste des derniers films sorties"));
-        assert!(super::explicit_web_search("cherche la liste des derniers films"));
-        assert!(super::explicit_web_search("Search the internet for the latest movie releases"));
+        assert!(super::explicit_web_search(
+            "Cherche sur internet la liste des derniers films sorties"
+        ));
+        assert!(super::explicit_web_search(
+            "cherche la liste des derniers films"
+        ));
+        assert!(super::explicit_web_search(
+            "Search the internet for the latest movie releases"
+        ));
         assert!(!super::explicit_web_search("Don't search the internet"));
-        assert!(!super::explicit_web_search("Explain the phrase 'search the web'"));
+        assert!(!super::explicit_web_search(
+            "Explain the phrase 'search the web'"
+        ));
         assert!(!super::explicit_web_search("Explain special relativity"));
     }
 

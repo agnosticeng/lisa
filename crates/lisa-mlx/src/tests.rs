@@ -134,3 +134,75 @@ fn oversized_index_is_rejected_without_reading_the_payload() {
             .contains("256 MiB")
     );
 }
+
+#[test]
+fn independent_range_mapping_keeps_original_file_and_releases_parser() {
+    let payload: Vec<_> = (0..65539).map(|i| (i as u8).wrapping_mul(73)).collect();
+    let file = shard_file(
+        serde_json::json!({
+            "bytes":{"dtype":"U8","shape":[payload.len()],"data_offsets":[0,payload.len()]}
+        }),
+        &payload,
+    );
+    let shard = Shard::open(file.path()).unwrap();
+    let parser = Arc::downgrade(shard.mapping());
+    let original = shard.tensor_info("bytes").unwrap();
+    let start = original.start + 321;
+    let end = original.end;
+    let expected = shard.mapping()[start..end].to_vec();
+    // A path replacement must not substitute a different checkpoint after its
+    // metadata has been validated. map_range uses the original open handle.
+    let moved = file.path().with_extension("original");
+    std::fs::rename(file.path(), &moved).unwrap();
+    std::fs::write(file.path(), vec![0xa5; shard.mapping().len()]).unwrap();
+    let retained = shard.map_range(start..end).unwrap();
+    assert_eq!(&retained[..], expected);
+    // SAFETY: start < end <= mapping.len(), so the offset stays in bounds.
+    assert_ne!(retained.as_ptr(), unsafe {
+        shard.mapping().as_ptr().add(start)
+    });
+    let window = Arc::downgrade(&retained);
+    assert!(shard.map_range(0..0).is_err());
+    #[allow(
+        clippy::reversed_empty_ranges,
+        reason = "a reversed range must be rejected"
+    )]
+    let reversed = 7..3;
+    assert!(shard.map_range(reversed).is_err());
+    assert!(shard.map_range(0..end + 1).is_err());
+    assert!(shard.map_range(usize::MAX..usize::MAX).is_err());
+    drop(shard);
+    assert!(
+        parser.upgrade().is_none(),
+        "the window cannot retain the full parser mapping"
+    );
+    std::fs::remove_file(moved).unwrap();
+    assert_eq!(
+        &retained[..],
+        expected,
+        "partial final page remains owned after unlink"
+    );
+    drop(retained);
+    assert!(window.upgrade().is_none());
+}
+
+#[test]
+fn independent_range_mapping_rejects_changed_file_length() {
+    let file = shard_file(
+        serde_json::json!({
+            "bytes":{"dtype":"U8","shape":[64],"data_offsets":[0,64]}
+        }),
+        &[19; 64],
+    );
+    let shard = Shard::open(file.path()).unwrap();
+    file.as_file()
+        .set_len(shard.mapping().len() as u64 + 1)
+        .unwrap();
+    assert!(
+        shard
+            .map_range(0..8)
+            .unwrap_err()
+            .to_string()
+            .contains("length changed")
+    );
+}

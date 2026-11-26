@@ -12,6 +12,7 @@
 //!   3. an **explicit-instantiation line** per variant
 //!      (`[[host_name("name")]] … decltype(fn<args>) fn<args>;`), built by
 //!      `builtin_template_def`.
+//!
 //! The assembled source is JIT-compiled with the Safe/precise compile options
 //! and cached per generated kernel name. This mirrors how the GPU code is meant
 //! to be specialized; the bodies stay static and the host only picks a variant.
@@ -76,13 +77,9 @@ const MLX_SORT_PREAMBLE: &crate::shader_pack::Source =
 /// `has_w` function constant (index 20).
 const MLX_RMS_NORM_SOURCE: &crate::shader_pack::Source =
     crate::kernel_source!("common/attention/rms_norm.metal");
-/// Fused residual-add + RMSNorm (specs/08 §1).
+/// Fused residual-add + RMSNorm.
 const MLX_FUSED_ADD_RMS_SOURCE: &crate::shader_pack::Source =
     crate::kernel_source!("common/attention/fused_add_rms.metal");
-/// Norm-in-qmv mega-kernel (specs/16 phase 1): fused add+rms prologue inside
-/// `affine_qmv_fast`. Must come AFTER `MLX_QUANTIZED_PREAMBLE` (uses qdot).
-pub(crate) const MLX_NORM_QMV_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("common/matmul/norm_qmv.metal");
 /// MLX `kernels/rope.metal` (AOT source; project include stripped). Function
 /// constants: 1 = forward, 2 = traditional, 3 = head_seq_transpose.
 const MLX_ROPE_SOURCE: &crate::shader_pack::Source =
@@ -102,35 +99,34 @@ pub(crate) const MLX_ARG_REDUCE_SOURCE: &crate::shader_pack::Source =
 use crate::array::{Array, Dtype};
 use crate::runtime::MetalRuntime;
 
+mod affine_q8_pair;
+mod affine_q8_tiny;
 mod attention;
 mod buf;
 mod compile;
-mod dspine;
 mod elementwise;
-mod glm53_q8_pair;
-mod glm53_q8_tiny;
 mod kernel;
 mod matmul;
-#[cfg(test)]
-mod mpp_probe;
+pub(crate) mod native_geometry;
 mod nax;
 mod norm;
+mod projection;
 mod reduce;
 mod rope;
 mod sort;
 
+pub use affine_q8_pair::*;
+pub use affine_q8_tiny::*;
 pub use attention::*;
 pub use buf::*;
 pub(crate) use compile::builtin_template_def;
 pub use compile::*;
-pub use dspine::*;
 pub use elementwise::*;
-pub use glm53_q8_pair::*;
-pub use glm53_q8_tiny::*;
 pub use kernel::*;
 pub use matmul::*;
 pub use nax::*;
 pub use norm::*;
+pub use projection::*;
 pub use reduce::*;
 pub use rope::*;
 pub use sort::*;

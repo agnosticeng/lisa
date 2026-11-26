@@ -114,7 +114,7 @@ mod tests {
             let q = q
                 .index((.., .., start..end, ..))
                 .as_dtype(Dtype::Float32)?
-                .multiply(&Array::from_f32(scale))?;
+                .multiply(Array::from_f32(scale))?;
             let q = q.reshape(&[q.dim(1), end - start, q.dim(3)])?;
             let mut scores = q.matmul(&k)?;
             if let Some(mask) = mask {

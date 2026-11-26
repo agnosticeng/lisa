@@ -54,7 +54,7 @@ pub(super) fn capabilities() -> Vec<KernelCapability> {
     .into_iter()
     .map(|(k, a)| capability(k, a))
     .collect::<Vec<_>>();
-    for encoding in [8, 10, 11, 12, 13, 14, 16, 17, 18, 19, 21, 22, 23, 29] {
+    for encoding in OrderedBlockEncoding::ALL {
         caps.push(capability(K::BlockLinear(encoding), &[BYTES, F32]));
     }
     caps
@@ -128,16 +128,16 @@ pub(super) fn invoke(
 mod tests {
     use super::*;
     #[test]
-    fn prepared_f32_contracts_reject_unsupported_encoding_and_geometry() -> Result<()> {
+    fn prepared_f32_contracts_cover_block_encodings_and_reject_invalid_geometry() -> Result<()> {
         let device = MetalDevice::system_default();
         let stream = device.stream();
-        assert!(
-            device
-                .prepare(Kernel::OrderedF32(OrderedF32::BlockLinear {
-                    encoding: 999
-                }))?
-                .is_none()
-        );
+        for encoding in OrderedBlockEncoding::ALL {
+            assert!(
+                device
+                    .prepare(Kernel::OrderedF32(OrderedF32::BlockLinear { encoding }))?
+                    .is_some()
+            );
+        }
         assert!(
             device
                 .prepare(Kernel::OrderedF32(OrderedF32::UnitRms {

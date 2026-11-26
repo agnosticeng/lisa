@@ -111,9 +111,6 @@ impl ByteBlob {
     pub fn i64s(&mut self, vs: &[i64]) {
         self.push(&vs.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
     }
-    pub fn len_fields(&self) -> usize {
-        self.fields.len()
-    }
     /// Bind each field to `base`, `base+1`, … via `set_bytes_directly`.
     pub fn bind(&self, enc: &crate::runtime::ComputeEncoder, base: usize) {
         for (i, (off, len)) in self.fields.iter().enumerate() {
@@ -199,8 +196,16 @@ pub fn put_along_axis(
     // update buffer when constructing a dense Boolean attention mask.
     let kernel_name = format!(
         "{lib_name}{}{}",
-        if updates.buffer_and_layout().1.is_contiguous() { "c" } else { "nc" },
-        if indices.buffer_and_layout().1.is_contiguous() { "c" } else { "nc" },
+        if updates.buffer_and_layout().1.is_contiguous() {
+            "c"
+        } else {
+            "nc"
+        },
+        if indices.buffer_and_layout().1.is_contiguous() {
+            "c"
+        } else {
+            "nc"
+        },
     );
     let a = |s: &str| s.to_string();
     let mut defs = String::new();

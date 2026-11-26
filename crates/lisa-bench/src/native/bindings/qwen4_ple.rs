@@ -1,17 +1,18 @@
 //! Native validation adapters for portable bindings.
-use crate::core::{
-    cache::{FullAttentionCache, IndexerTape, LayerCache},
-    graph::PreparedGraph,
-    loader::TensorSource,
-    norm::{RmsNorm, Rotary},
-    quant::{QuantizedEmbedding, QuantizedLinear},
-};
-use lisa_metal::{Array, device::MetalDevice};
-pub type PleLayer = lisa_engine::bindings::qwen4_ple::PleLayer<MetalDevice>;
-pub type NgramEmbedding = lisa_engine::bindings::qwen4_ple::NgramEmbedding<MetalDevice>;
+#[cfg(test)]
+use crate::core::{norm::RmsNorm, quant::QuantizedLinear};
+#[cfg(test)]
+use lisa_metal::Array;
+use lisa_metal::device::MetalDevice;
+pub type PleLayer = lisa_engine::bindings::qwen4::ple::PleLayer<MetalDevice>;
+pub type NgramEmbedding = lisa_engine::bindings::qwen4::ple::NgramEmbedding<MetalDevice>;
+#[cfg(test)]
 use half::bf16;
-pub use lisa_engine::bindings::qwen4_ple::{NgramConstants, NgramTable, ShardMap};
+pub use lisa_engine::bindings::qwen4::ple::NgramConstants;
+pub use lisa_engine::weights::qwen4::ple::{NgramTable, ShardMap};
+#[cfg(test)]
 use memmap2::Mmap;
+#[cfg(test)]
 use std::sync::Arc;
 #[cfg(test)]
 #[path = "qwen4_ple_tests.rs"]

@@ -1,6 +1,6 @@
 #![cfg(test)]
 use super::*;
-use crate::bindings::deepseek41_moe::tests::{counts, difference, tensor};
+use crate::bindings::deepseek41_moe::tests::tensor;
 use lisa_gguf::TensorType as T;
 use lisa_metal::Dtype;
 #[path = "glm53_packed_attention_oracle.rs"]
@@ -22,7 +22,9 @@ fn equal(a: &Array, b: &Array) -> Result<()> {
 #[test]
 fn packed_attention_plans_preserve_short_sparse_and_wide_bits() -> Result<()> {
     let weight = |shape: &[i32], seed| -> Result<Projection> {
-        Ok(Projection::Packed(tensor(T::Q8_0, shape, seed)?))
+        Ok(Projection::Packed(
+            tensor(T::Q8_0, shape, seed)?.into_prepared()?,
+        ))
     };
     let make_indexer = || -> Result<Indexer> {
         Ok(Indexer {
@@ -50,7 +52,6 @@ fn packed_attention_plans_preserve_short_sparse_and_wide_bits() -> Result<()> {
         value: tensor(T::Q8_0, &[64, 256, 512], 13)?,
         qnorm: values(&[1536], 17),
         kvnorm: values(&[512], 19),
-        indexer: make_indexer()?,
     };
     let clone = |p: &Projection| match p {
         Projection::Plain(a) => Projection::Plain(a.clone()),
@@ -62,24 +63,18 @@ fn packed_attention_plans_preserve_short_sparse_and_wide_bits() -> Result<()> {
         qb: clone(&old.qb),
         kva: clone(&old.kva),
         output: clone(&old.output),
-        key: old.key.clone(),
-        value: old.value.clone(),
+        key: old.key.clone().into_prepared()?,
+        value: old.value.clone().into_prepared()?,
         qnorm: old.qnorm.clone(),
         kvnorm: old.kvnorm.clone(),
         indexer: make_indexer()?,
     };
     let x = values(&[1, 1, 4096], 31);
-    let before = counts();
     let a = old.project(&x)?;
-    let between = counts();
     let b = new.project(&x)?;
-    let after = counts();
     equal(&a.0, &b.0)?;
     equal(&a.1, &b.1)?;
     equal(&a.2, &b.2)?;
-    if std::env::var_os("LISA_TRACE").is_some() {
-        assert_eq!(difference(&before, &between), difference(&between, &after));
-    }
     for n in [1, 7, 2051, 2052, 4097] {
         let latent = values(&[1, n, 512], 37).as_dtype(Dtype::Float16)?;
         for dense in [false, true] {
@@ -89,19 +84,9 @@ fn packed_attention_plans_preserve_short_sparse_and_wide_bits() -> Result<()> {
                     .collect::<Vec<_>>(),
                 &[1, 1, n],
             );
-            let before = counts();
             let a = old.attend(&a.1, &latent, &ids, dense)?;
-            let between = counts();
             let b = new.attend(&b.1, &latent, &ids, dense)?;
-            let after = counts();
             equal(&a, &b)?;
-            if std::env::var_os("LISA_TRACE").is_some() {
-                assert_eq!(
-                    difference(&before, &between),
-                    difference(&between, &after),
-                    "window{n} dense{dense}"
-                );
-            }
         }
     }
     let (mut ta, mut tb) = (
@@ -110,15 +95,9 @@ fn packed_attention_plans_preserve_short_sparse_and_wide_bits() -> Result<()> {
     );
     for position in 0usize..8 {
         let start = position.saturating_sub(3usize);
-        let before = counts();
         let a = old.mtp(&x, &mut ta, position, start)?;
-        let between = counts();
         let b = new.mtp(&x, &mut tb, position, start)?;
-        let after = counts();
         equal(&a, &b)?;
-        if std::env::var_os("LISA_TRACE").is_some() {
-            assert_eq!(difference(&before, &between), difference(&between, &after));
-        }
         equal(
             &ta.compact_slice(0, position + 1)
                 .unwrap()

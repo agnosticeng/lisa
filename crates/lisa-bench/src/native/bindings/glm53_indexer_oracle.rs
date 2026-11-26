@@ -1,5 +1,4 @@
 #![cfg(test)]
-#![allow(dead_code)]
 //! Frozen pre-migration indexer oracle; never used in production.
 use crate::bindings::glm53_oracle_helpers::{mm, narrow};
 use crate::core::cache::IndexerTape;
@@ -30,7 +29,7 @@ pub struct Indexer {
 }
 
 impl Indexer {
-    /// Run a plain `[out,in]` indexer projection with ds4's BF16 dispatch:
+    /// Run a plain `[out,in]` indexer projection with the reference's BF16 dispatch:
     /// row GEMV for up to eight rows, tiled GEMM for larger prefill chunks.
     pub(super) fn project(&self, x: &Array, weight: &Array) -> anyhow::Result<Array> {
         anyhow::ensure!(
@@ -54,9 +53,9 @@ impl Indexer {
             let input = x.reshape(&[rows as i32, input_dim as i32])?;
             let stream = lisa_metal::Stream::thread_local_or_default();
             let projected = if rows <= 8 {
-                lisa_metal::kernels::sparse::kernels::glm53_bf16_gemv(weight, &input, &stream)
+                lisa_metal::kernels::sparse::kernels::bf16_gemv(weight, &input, &stream)
             } else {
-                lisa_metal::kernels::sparse::kernels::glm53_bf16_gemm(weight, &input, &stream)
+                lisa_metal::kernels::sparse::kernels::bf16_gemm(weight, &input, &stream)
             }
             .ok_or_else(|| {
                 anyhow::anyhow!(
@@ -71,7 +70,7 @@ impl Indexer {
     }
 
     /// Pair short-batch indexer BF16 projections in one dispatch. Every output
-    /// row keeps the DS4 GEMV reduction order even when the two projections
+    /// row keeps the reference GEMV reduction order even when the two projections
     /// use different input and output widths.
     pub(super) fn project_pair(
         &self,
@@ -104,7 +103,7 @@ impl Indexer {
             let input_a = x_a.reshape(&[rows_a as i32, input_dim_a as i32])?;
             let input_b = x_b.reshape(&[rows_b as i32, input_dim_b as i32])?;
             let stream = lisa_metal::Stream::thread_local_or_default();
-            let (a, b) = lisa_metal::kernels::sparse::kernels::glm53_bf16_pair_gemv(
+            let (a, b) = lisa_metal::kernels::sparse::kernels::bf16_pair_gemv(
                 weight_a, &input_a, weight_b, &input_b, &stream,
             )
             .ok_or_else(|| {
@@ -173,9 +172,6 @@ impl Indexer {
         let n_new = p_n - start;
         let grouped = raw.reshape(&[b as i32, n_new as i32, kpool as i32, (2 * hd) as i32])?;
         let mut fused_done = false;
-        if !std::env::var("LISA_GLM53_POOL_OPS")
-            .map(|v| v == "1")
-            .unwrap_or(false)
         {
             let raw_k = narrow(&grouped, 3, 0, hd)?.contiguous()?;
             let gate = narrow(&grouped, 3, hd, hd)?.contiguous()?;
@@ -291,15 +287,15 @@ impl Indexer {
         let scores = {
             let _trace = lisa_metal::trace::span_detail("glm53.dsa.indexer_scores", layer as u64);
             let scorer = if prefill_mode && t == 1 {
-                lisa_metal::kernels::sparse::kernels::glm53_indexer_scores_batch
+                lisa_metal::kernels::sparse::kernels::indexer_scores_batch
             } else if crate::core::quant::glm53_indexer_decode_rows4_override().unwrap_or(true) {
-                lisa_metal::kernels::sparse::kernels::glm53_indexer_scores_rows4
+                lisa_metal::kernels::sparse::kernels::indexer_scores_rows4
             } else {
-                lisa_metal::kernels::sparse::kernels::glm53_indexer_scores
+                lisa_metal::kernels::sparse::kernels::indexer_scores
             };
             scorer(
-                &iq,
-                &weights,
+                iq,
+                weights,
                 &pooled,
                 offset.saturating_sub(t),
                 kpool,
@@ -310,10 +306,10 @@ impl Indexer {
         };
         if let Some(c) = capture.filter(|capture| capture.wants(layer)) {
             let pos0 = offset.saturating_sub(t);
-            c.store(&format!("L{layer}.dsa_indexer_q_p{pos0}_t{t}"), &iq);
+            c.store(&format!("L{layer}.dsa_indexer_q_p{pos0}_t{t}"), iq);
             c.store(
                 &format!("L{layer}.dsa_indexer_weights_p{pos0}_t{t}"),
-                &weights,
+                weights,
             );
             c.store(&format!("L{layer}.dsa_pooled_keys"), &pooled);
             c.store(&format!("L{layer}.dsa_index_scores_p{pos0}_t{t}"), &scores);
@@ -322,7 +318,7 @@ impl Indexer {
     }
 
     /// Decode GPU-mask path: indexer scores stay on the GPU, the top-`select_k` pools
-    /// come from ds4's blockwise GPU top-k, and the additive keep mask is built with
+    /// come from the reference's blockwise GPU top-k, and the additive keep mask is built with
     /// elementwise ops — membership (pool_of(t) among the selected pools) or
     /// the always-selected tail. Returns the additive mask [B, 1, T, tc]
     /// f32 (0.0 keep, -1e30 masked — the host path's exact values).
@@ -367,7 +363,7 @@ impl Indexer {
             ar_v.push(i as i32);
         }
         let ar = Array::from_slice(&ar_v, &[tc as i32]); // [tc] i32
-        let pool_of = lisa_metal::ops::floor_divide(&ar, &Array::from_int(kpool as i32))?; // [tc]
+        let pool_of = lisa_metal::ops::floor_divide(&ar, Array::from_int(kpool as i32))?; // [tc]
         let top_b = top
             .expand_dims(1)?
             .broadcast_to(&[b as i32, tc as i32, select_k as i32])?;
@@ -381,10 +377,10 @@ impl Indexer {
         let member_any = member
             .as_dtype(Dtype::Float32)?
             .sum_axis(2, false)?
-            .gt(&Array::from_f32_as(0.0f32, Dtype::Float32))?
+            .gt(Array::from_f32_as(0.0f32, Dtype::Float32))?
             .as_dtype(Dtype::Float32)?; // [B,tc] f32 0/1
         let tail = ar
-            .ge(&Array::from_int(tail_start as i32))?
+            .ge(Array::from_int(tail_start as i32))?
             .as_dtype(Dtype::Float32)?
             .expand_dims(0)?
             .broadcast_to(&[b as i32, tc as i32])?;
@@ -431,7 +427,7 @@ impl Indexer {
         let score_cap = (SCORE_SCRATCH_BYTES / score_row_bytes.max(1)).clamp(1, MAX_SCORE_TOKENS);
         let rows_per_chunk = score_cap.min(t.max(1));
         let query_start = offset.saturating_sub(t);
-        // Match ds4's prefill order: project the complete query batch once,
+        // Match the reference's prefill order: project the complete query batch once,
         // then chunk only the score tensor's working set. Splitting the tail
         // before projection changes a large BF16 GEMM into a small-row GEMV.
         let (iq_all, weights_all) = self.project_score_inputs(x, qr)?;
@@ -521,7 +517,7 @@ impl Indexer {
         let expanded = {
             let _trace =
                 lisa_metal::trace::span_detail("glm53.dsa.selection_expansion", layer as u64);
-            lisa_metal::kernels::sparse::kernels::glm53_expand_pool_selection_for_attention(
+            lisa_metal::kernels::sparse::kernels::expand_pool_selection_for_attention(
                 &top,
                 t,
                 abs_start,
@@ -541,7 +537,7 @@ impl Indexer {
     }
 
     /// Host top-k per query with causal visibility (absolute positions) —
-    /// prefill path and the decode fallback (LISA_GLM53_POOL_OPS=1).
+    /// prefill path and the decode fallback.
     pub(super) fn select(
         &self,
         x: &Array,
@@ -611,7 +607,7 @@ pub fn layer_norm(x: &Array, w: &Array, b: &Array, eps: f32) -> anyhow::Result<A
     let mean = xf.mean_axis(2, true)?; // [B,T,1]
     let cent = xf.subtract(&mean)?;
     let var = cent.multiply(&cent)?.mean_axis(2, true)?;
-    let inv = var.add(&Array::from_f32_as(eps, Dtype::Float32))?.rsqrt()?;
+    let inv = var.add(Array::from_f32_as(eps, Dtype::Float32))?.rsqrt()?;
     let n = cent.multiply(&inv)?;
     let out = n
         .multiply(&w.as_dtype(Dtype::Float32)?)?

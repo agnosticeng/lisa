@@ -144,6 +144,10 @@ pub enum SparseF32 {
     ClampedSwiGlu {
         limit: u32,
     },
+    /// Preserve standalone clamped activation rounding before route weighting.
+    WeightedClampedSwiGlu {
+        limit: u32,
+    },
     SumEight {
         rows: usize,
         width: usize,
@@ -193,6 +197,7 @@ pub enum SparseF32Kind {
     RouterLinear,
     RouteSigmoid,
     ClampedSwiGlu,
+    WeightedClampedSwiGlu,
     SumEight,
 }
 impl SparseF32 {
@@ -241,6 +246,7 @@ impl SparseF32 {
             Self::RouterLinear => K::RouterLinear,
             Self::RouteSigmoid { .. } => K::RouteSigmoid,
             Self::ClampedSwiGlu { .. } => K::ClampedSwiGlu,
+            Self::WeightedClampedSwiGlu { .. } => K::WeightedClampedSwiGlu,
             Self::SumEight { .. } => K::SumEight,
         }
     }
@@ -250,7 +256,7 @@ impl SparseF32 {
             | Self::QueryLatentRmsCompact { .. }
             | Self::AttentionOutput { .. } => 4,
             Self::QueryLatentRmsInto { .. } => 5,
-            Self::AttentionScores { .. } => 3,
+            Self::AttentionScores { .. } | Self::WeightedClampedSwiGlu { .. } => 3,
             Self::AffineHeadQuery { .. } | Self::AffineHeadValue { .. } => 4,
             Self::AffineIndexedDecode { .. } => 6,
             Self::IndexedLatentShort { .. } => 3,
@@ -430,7 +436,9 @@ impl SparseF32 {
                     && f32::from_bits(*scale).is_finite()
                     && f32::from_bits(*scale) > 0.
             }
-            Self::AffineGateUp { limit, .. } | Self::ClampedSwiGlu { limit } => {
+            Self::AffineGateUp { limit, .. }
+            | Self::ClampedSwiGlu { limit }
+            | Self::WeightedClampedSwiGlu { limit } => {
                 f32::from_bits(*limit).is_finite() && f32::from_bits(*limit) >= 0.
             }
             Self::SumEight { rows, width } => {

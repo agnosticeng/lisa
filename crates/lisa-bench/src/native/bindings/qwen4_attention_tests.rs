@@ -164,3 +164,122 @@ fn attention_plans_preserve_causal_sparse_ragged_and_cache_bits() -> anyhow::Res
     }
     Ok(())
 }
+
+#[test]
+fn captured_attention_matches_serial_queries_across_sparse_boundary() -> anyhow::Result<()> {
+    use lisa_metal::ops::indexing::IndexOp;
+    let mut src = source(256);
+    let mut attention = Attention::load_on(
+        crate::metal_context::execution_context(),
+        &mut src,
+        "a",
+        1e-6,
+        24,
+        2,
+        256,
+    )?;
+    let rope = Rotary::new(64, 10000000.);
+    for native in [true, false] {
+        attention.block_kernel = native;
+        attention.indexer.select_available = native;
+        for (offset, rows) in [(41, 2), (1023, 7), (2047, 2), (2048, 7)] {
+            let make = |start, rows| {
+                Array::from_slice(
+                    &(0..rows * 256)
+                        .map(|i| {
+                            half::bf16::from_f32(
+                                (((i + start * 256) * 13 % 251) as f32 - 125.) / 311.,
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                    &[1, rows, 256],
+                )
+            };
+            let positions = |start, rows| {
+                Array::from_slice(
+                    &(start..start + rows).map(|x| x as f32).collect::<Vec<_>>(),
+                    &[1, rows],
+                )
+            };
+            let mut base =
+                FullAttentionCache::new(crate::metal_context::execution_context(), 2, 256);
+            attention.forward(
+                &make(0, offset),
+                &rope,
+                Some(&mut base),
+                0,
+                &positions(0, offset),
+            )?;
+            let clone = || {
+                let mut cache =
+                    FullAttentionCache::new(crate::metal_context::execution_context(), 2, 256);
+                cache.keys = base.keys.clone();
+                cache.values = base.values.clone();
+                cache.offset = base.offset;
+                cache.capacity = base.capacity;
+                cache.indexer_tape.restore(&base.indexer_tape.snapshot());
+                cache
+            };
+            let x = make(offset, rows);
+            let mut serial = clone();
+            let mut expected = Vec::new();
+            for row in 0..rows {
+                let out = attention.forward(
+                    &x.index((.., row..row + 1, ..)).contiguous()?,
+                    &rope,
+                    Some(&mut serial),
+                    (offset + row) as usize,
+                    &positions(offset + row, 1),
+                )?;
+                expected.extend(out.to_vec1::<u16>()?);
+            }
+            let key_bits = serial
+                .keys
+                .as_ref()
+                .unwrap()
+                .index((.., .., 0..serial.offset as i32, ..))
+                .to_vec1::<u16>()?;
+            let value_bits = serial
+                .values
+                .as_ref()
+                .unwrap()
+                .index((.., .., 0..serial.offset as i32, ..))
+                .to_vec1::<u16>()?;
+            let mut captured = clone();
+            let out = attention.forward_with_capture(
+                &x,
+                &rope,
+                Some(&mut captured),
+                offset as usize,
+                &positions(offset, rows),
+                true,
+            )?;
+            assert_eq!(
+                out.to_vec1::<u16>()?,
+                expected,
+                "attention native={native} offset={offset} S={rows}"
+            );
+            assert_eq!(
+                captured
+                    .keys
+                    .as_ref()
+                    .unwrap()
+                    .index((.., .., 0..captured.offset as i32, ..))
+                    .to_vec1::<u16>()?,
+                key_bits,
+                "keys native={native} offset={offset}"
+            );
+            assert_eq!(
+                captured
+                    .values
+                    .as_ref()
+                    .unwrap()
+                    .index((.., .., 0..captured.offset as i32, ..))
+                    .to_vec1::<u16>()?,
+                value_bits,
+                "values native={native} offset={offset}"
+            );
+        }
+    }
+    Ok(())
+}

@@ -1,9 +1,9 @@
 //! Application-facing device selection policy, independent of weight format.
-//! Concrete runtimes report availability; they do not read `LISA_DEVICE` or
-//! decide which other backend a request should use. Only implemented model
+//! Concrete runtimes report availability; the application selects a backend
+//! once and runtimes never decide which other backend a request should use. Only implemented model
 //! paths are admitted by the loader.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 
 #[cfg(feature = "metal")]
 fn metal_available() -> bool {
@@ -22,6 +22,8 @@ pub enum Backend {
     /// Host CPU (only models with a host forward path, e.g. Laya).
     Cpu,
 }
+
+static SELECTED: std::sync::OnceLock<Backend> = std::sync::OnceLock::new();
 
 impl Backend {
     /// Construct a model-unaware device handle at the application boundary.
@@ -76,6 +78,18 @@ impl Backend {
         Ok(backend)
     }
 
+    /// Select the process backend once at application start; loaders use it.
+    pub fn select(self) -> Result<()> {
+        SELECTED
+            .set(self)
+            .map_err(|_| anyhow::anyhow!("the device backend is already selected"))
+    }
+
+    /// The selected backend, otherwise the runtime-discovered default.
+    pub fn selected() -> Self {
+        *SELECTED.get_or_init(|| Self::resolve(None).unwrap_or(Self::Cpu))
+    }
+
     /// Resolve a supplied device, otherwise auto-select from runtime discovery.
     /// Model support is validated separately before importing weights.
     pub fn resolve(explicit: Option<&str>) -> Result<Self> {
@@ -87,24 +101,6 @@ impl Backend {
                 Self::Cpu
             }),
         }
-    }
-
-    /// Explicit API/CLI choices take precedence over the environment. Only the
-    /// application boundary should call this; resolved loaders never reread it.
-    pub fn from_options(explicit: Option<&str>) -> Result<Self> {
-        if explicit.is_some() {
-            return Self::resolve(explicit);
-        }
-        Self::from_env()
-    }
-
-    pub fn from_env() -> Result<Self> {
-        let name = match std::env::var("LISA_DEVICE") {
-            Ok(name) => Some(name),
-            Err(std::env::VarError::NotPresent) => None,
-            Err(error) => return Err(error).context("LISA_DEVICE must be UTF-8"),
-        };
-        Self::resolve(name.as_deref())
     }
 
     /// The backend's canonical name.

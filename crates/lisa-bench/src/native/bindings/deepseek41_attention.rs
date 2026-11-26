@@ -3,13 +3,15 @@ use crate::{
     bindings::deepseek41_state::State,
     core::{capture::Capture, gguf_resident::ResidentWeights},
 };
-use anyhow::{Context, Result};
+use anyhow::Result;
 use lisa_metal::{Array, Stream, device::MetalDevice};
-use lisa_models::deepseek41::{attention as model, config::Config};
-pub type Projections = lisa_engine::bindings::deepseek41_attention::Projections<MetalDevice>;
-pub struct Scratch(lisa_engine::bindings::deepseek41_attention::Scratch<MetalDevice>);
+#[cfg(test)]
+use lisa_models::deepseek41::attention as model;
+use lisa_models::deepseek41::config::Config;
+pub type Projections = lisa_engine::bindings::deepseek41::attention::Projections<MetalDevice>;
+pub struct Scratch(lisa_engine::bindings::deepseek41::attention::Scratch<MetalDevice>);
 impl std::ops::Deref for Scratch {
-    type Target = lisa_engine::bindings::deepseek41_attention::Scratch<MetalDevice>;
+    type Target = lisa_engine::bindings::deepseek41::attention::Scratch<MetalDevice>;
     fn deref(&self) -> &Self::Target {
         &self.0
     }
@@ -22,13 +24,13 @@ impl std::ops::DerefMut for Scratch {
 impl Scratch {
     pub fn new(stream: &Stream) -> Result<Self> {
         Ok(Self(
-            lisa_engine::bindings::deepseek41_attention::Scratch::new(&MetalDevice::on_stream(
+            lisa_engine::bindings::deepseek41::attention::Scratch::new(&MetalDevice::on_stream(
                 stream,
             ))?,
         ))
     }
 }
-pub struct Attention(lisa_engine::bindings::deepseek41_attention::Attention<MetalDevice>);
+pub struct Attention(lisa_engine::bindings::deepseek41::attention::Attention<MetalDevice>);
 impl Attention {
     pub fn load(
         weights: &ResidentWeights,
@@ -37,7 +39,7 @@ impl Attention {
         stream: &Stream,
     ) -> Result<Self> {
         Ok(Self(
-            lisa_engine::bindings::deepseek41_attention::Attention::load(
+            lisa_engine::bindings::deepseek41::attention::Attention::load(
                 &**weights,
                 layer,
                 config,
@@ -48,7 +50,7 @@ impl Attention {
     #[cfg(test)]
     pub fn bound(spec: model::Spec, weights: Vec<Array>, stream: &Stream) -> Result<Self> {
         Ok(Self(
-            lisa_engine::bindings::deepseek41_attention::Attention::bound(
+            lisa_engine::bindings::deepseek41::attention::Attention::bound(
                 spec,
                 weights,
                 &MetalDevice::on_stream(stream),
@@ -84,7 +86,7 @@ impl Attention {
     }
 }
 pub fn rope_table(position: u32, stream: &Stream) -> Result<Array> {
-    lisa_engine::bindings::deepseek41_attention::rope_table(
+    lisa_engine::bindings::deepseek41::attention::rope_table(
         position,
         &MetalDevice::on_stream(stream),
     )

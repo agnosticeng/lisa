@@ -4,13 +4,17 @@ use crate::array::{Array, Dtype};
 use crate::runtime::{ConstVal, Math};
 
 use super::compile::{
-    builtin_template_def, compile_builtin, compile_builtin_bool_consts,
-    compile_builtin_typed_consts, type_string, type_to_name,
+    builtin_template_def, compile_builtin_bool_consts_lazy, compile_builtin_lazy,
+    compile_builtin_typed_consts_lazy, type_string, type_to_name,
 };
 use super::nax::{compile_nax_jit, matmul_nax};
 use super::{DType, Device, Tensor};
 use super::{MLX_SDPA_VECTOR_PREAMBLE, MLX_SOFTMAX_PREAMBLE, MLX_UTILS_PREAMBLE, NAX_ATTN_HEADER};
 use crate::error::Result;
+
+#[cfg(test)]
+#[path = "attention_capture_tests.rs"]
+mod capture_tests;
 
 const DS4_FLASH_ATTN_SOURCE: &crate::shader_pack::Source =
     crate::kernel_source!("common/attention/ds4_flash_attn.metal");
@@ -63,22 +67,17 @@ struct Ds4FlashAttnArgs {
     logit_softcap: f32,
 }
 
-/// DS4's dense-causal raw FlashAttention path for GLM's 512-wide compact KV.
+/// The reference's dense-causal raw FlashAttention path for GLM's 512-wide compact KV.
 /// The query remains F32 at the binding and is staged to F16 by the reference
-/// kernel. The result is F32, matching DS4's attention-lora buffer.
+/// kernel. The result is F32, matching the reference's attention-lora buffer.
 pub fn ds4_flash_attention_prefill_raw_heads(
     q: &Tensor,
     kv: &Tensor,
     q_row0: usize,
     scale: f32,
 ) -> Result<Tensor> {
-    let (b, n_q, n_head, head_dim) = (
-        q.dim(0) as usize,
-        q.dim(1) as usize,
-        q.dim(2) as usize,
-        q.dim(3) as usize,
-    );
-    let n_kv = kv.dim(1) as usize;
+    let (b, n_q, n_head, head_dim) = (q.dim(0), q.dim(1), q.dim(2), q.dim(3));
+    let n_kv = kv.dim(1);
     if q.rank() != 4
         || kv.rank() != 3
         || b != 1
@@ -109,7 +108,7 @@ pub fn ds4_flash_attention_prefill_raw_heads(
         Array::cat(&[kv.clone(), padding], 1)?.contiguous()?
     };
 
-    // DS4's causal mask stores half(0) for visible keys and half(-infinity)
+    // The reference's causal mask stores half(0) for visible keys and half(-infinity)
     // for future and padded keys. Its block map uses 0=masked, 1=partial,
     // 2=fully unmasked.
     let mask_bytes = n_q
@@ -117,6 +116,8 @@ pub fn ds4_flash_attention_prefill_raw_heads(
         .and_then(|elements| elements.checked_mul(std::mem::size_of::<u16>()))
         .ok_or_else(|| crate::array::err("DS4 flash mask size overflow"))?;
     let mask_buffer = device.buffer_for_full_write(mask_bytes, "glm53_ds4_flash_mask")?;
+    // SAFETY: `mask_buffer` is fresh storage of `n_q * n_kv_padded` u16 values (overflow
+    // checked above) with no GPU user; every written index is below that count.
     unsafe {
         let dst = mask_buffer.contents() as *mut u16;
         for qi in 0..n_q {
@@ -332,13 +333,12 @@ pub fn sdpa_vector(
         "sdpa_vector",
         &[qt.to_string(), d.to_string(), vd.to_string()],
     );
-    let source = format!("{MLX_UTILS_PREAMBLE}{MLX_SDPA_VECTOR_PREAMBLE}{def}");
+    let source = || format!("{MLX_UTILS_PREAMBLE}{MLX_SDPA_VECTOR_PREAMBLE}{def}");
     let has_mask = mask.is_some();
     let bool_mask = has_mask && matches!(mask.unwrap().dtype(), Dtype::Bool | Dtype::Uint8);
     let float_mask = has_mask && !bool_mask;
-    let pipeline = compile_builtin_bool_consts(
+    let pipeline = compile_builtin_bool_consts_lazy(
         device,
-        &source,
         &kernel_name,
         &[
             (20, has_mask),
@@ -348,6 +348,7 @@ pub fn sdpa_vector(
             (24, float_mask),
             (25, false), // has_sinks
         ],
+        source,
     )?;
 
     let qd = q.dims().to_vec();
@@ -425,76 +426,11 @@ pub fn sdpa_vector_2pass(
     do_causal: bool,
     mask: Option<&Tensor>,
 ) -> Result<Tensor> {
-    // The exact paired kernel is optional: the real 24/4-head 8k campaign
-    // measured a small end-to-end regression versus valid head splitting.
-    static SHARED_KV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let paired = mask.is_none()
-        && q.dims()[0] == 1
-        && q.dtype() == Dtype::Bfloat16
-        && q.dims()[1] == 24
-        && k.dims()[1] == 4
-        && q.dims()[3] == 256
-        && v.dims()[3] == 256
-        && (2..=8).contains(&q.dims()[2])
-        && k.dims()[2] >= 8192
-        && *SHARED_KV
-            .get_or_init(|| std::env::var("LISA_QWEN_SHARED_KV_VERIFY").as_deref() == Ok("1"));
-    sdpa_vector_2pass_impl(device, q, k, v, scale, do_causal, mask, paired)
+    sdpa_vector_2pass_with_blocks(device, q, k, v, scale, do_causal, mask, None)
 }
 
-fn sdpa_vector_2pass_impl(
-    device: &Device,
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    scale: f32,
-    do_causal: bool,
-    mask: Option<&Tensor>,
-    paired: bool,
-) -> Result<Tensor> {
-    let mask_storage = vector_mask(mask, q)?;
-    let mask = mask_storage.as_ref();
-    let mdev = device;
-    let qt = type_string(q.dtype())?;
-    let d = q.dims()[3];
-    let vd = v.dims()[3];
-    let ql = q.dims()[2];
-    let family = if paired {
-        "sdpa_vector_2pass_1_rows2"
-    } else {
-        "sdpa_vector_2pass_1"
-    };
-    let kname1 = format!("{family}_{qt}_{d}_{vd}_{ql}");
-    let kname2 = format!("sdpa_vector_2pass_2_{qt}_{vd}");
-    let mut template = vec![qt.to_string(), d.to_string(), vd.to_string()];
-    if paired {
-        template.push(ql.to_string());
-    }
-    let mut defs = builtin_template_def(&kname1, family, &template);
-    defs.push_str(&builtin_template_def(
-        &kname2,
-        "sdpa_vector_2pass_2",
-        &[qt.to_string(), vd.to_string()],
-    ));
-    let source = format!("{MLX_UTILS_PREAMBLE}{MLX_SDPA_VECTOR_PREAMBLE}{defs}");
-
-    let gqa_factor = q.dims()[1] / k.dims()[1];
-    let n_simds = gqa_factor * q.dims()[2];
-    // Split independent query heads across groups when the original geometry
-    // would exceed 1024 threads. Keep the full query width and original block
-    // count, so every row retains its key traversal and reduction order.
-    let query_groups = if paired { ql.div_ceil(2) } else { ql };
-    let group_heads = (1..=gqa_factor)
-        .rev()
-        .find(|&heads| gqa_factor % heads == 0 && heads * query_groups <= 32)
-        .ok_or_else(|| crate::array::err("unsupported SDPA threadgroup geometry"))?;
-    let head_splits = gqa_factor / group_heads;
-    if paired && head_splits != 1 {
-        return Err(crate::array::err("unsupported paired SDPA head split"));
-    }
-    let n = k.dims()[2];
-    let devc = mdev.architecture_name().chars().last().unwrap_or('s');
-    let blocks: usize = if devc == 's' {
+fn vector_blocks(device_class: char, n: usize, n_simds: usize) -> usize {
+    if device_class == 's' {
         let mut bl = 64;
         if n > 1024 && n_simds > 4 {
             if n <= 8192 {
@@ -508,7 +444,7 @@ fn sdpa_vector_2pass_impl(
             }
         }
         bl
-    } else if devc == 'd' {
+    } else if device_class == 'd' {
         let mut bl = 128;
         if n_simds <= 2 && n > 8192 {
             bl = 256;
@@ -524,11 +460,54 @@ fn sdpa_vector_2pass_impl(
         64
     } else {
         32
-    };
+    }
+}
 
-    let pipeline1 = compile_builtin_typed_consts(
+fn sdpa_vector_2pass_with_blocks(
+    device: &Device,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    do_causal: bool,
+    mask: Option<&Tensor>,
+    serial_blocks: Option<usize>,
+) -> Result<Tensor> {
+    let mask_storage = vector_mask(mask, q)?;
+    let mask = mask_storage.as_ref();
+    let mdev = device;
+    let qt = type_string(q.dtype())?;
+    let d = q.dims()[3];
+    let vd = v.dims()[3];
+    let ql = q.dims()[2];
+    let family = "sdpa_vector_2pass_1";
+    let kname1 = format!("{family}_{qt}_{d}_{vd}_{ql}");
+    let kname2 = format!("sdpa_vector_2pass_2_{qt}_{vd}");
+    let template = [qt.to_string(), d.to_string(), vd.to_string()];
+    let mut defs = builtin_template_def(&kname1, family, &template);
+    defs.push_str(&builtin_template_def(
+        &kname2,
+        "sdpa_vector_2pass_2",
+        &[qt.to_string(), vd.to_string()],
+    ));
+    let source = || format!("{MLX_UTILS_PREAMBLE}{MLX_SDPA_VECTOR_PREAMBLE}{defs}");
+
+    let gqa_factor = q.dims()[1] / k.dims()[1];
+    let n_simds = gqa_factor * q.dims()[2];
+    // Split independent query heads across groups when the original geometry
+    // would exceed 1024 threads. Keep the full query width and original block
+    // count, so every row retains its key traversal and reduction order.
+    let group_heads = (1..=gqa_factor)
+        .rev()
+        .find(|&heads| gqa_factor.is_multiple_of(heads) && heads * ql <= 32)
+        .ok_or_else(|| crate::array::err("unsupported SDPA threadgroup geometry"))?;
+    let head_splits = gqa_factor / group_heads;
+    let n = k.dims()[2];
+    let devc = mdev.architecture_name().chars().last().unwrap_or('s');
+    let blocks = serial_blocks.unwrap_or_else(|| vector_blocks(devc, n, n_simds));
+
+    let pipeline1 = compile_builtin_typed_consts_lazy(
         device,
-        &source,
         &kname1,
         &[
             (20, ConstVal::Bool(mask.is_some())),
@@ -550,8 +529,9 @@ fn sdpa_vector_2pass_impl(
             (26, ConstVal::Int(blocks as i32)),
             (27, ConstVal::Int(head_splits as i32)),
         ],
+        source,
     )?;
-    let pipeline2 = compile_builtin(device, &source, &kname2)?;
+    let pipeline2 = compile_builtin_lazy(device, &kname2, source)?;
 
     let qd = q.dims().to_vec();
     let (b, h, ql) = (qd[0], qd[1], qd[2]);
@@ -568,12 +548,10 @@ fn sdpa_vector_2pass_impl(
         (interm_count) as usize * (q.dtype()).size_of(),
         "sdpa_interm",
     )?;
-    let red_dims = vec![b, h, ql, blocks];
+    let red_dims = [b, h, ql, blocks];
     let red_count: usize = red_dims.iter().product();
-    let sbuf =
-        mdev.buffer_for_gpu_write((red_count) as usize * (DType::F32).size_of(), "sdpa_sums")?;
-    let mbuf =
-        mdev.buffer_for_gpu_write((red_count) as usize * (DType::F32).size_of(), "sdpa_maxs")?;
+    let sbuf = mdev.buffer_for_gpu_write((red_count) * (DType::F32).size_of(), "sdpa_sums")?;
+    let mbuf = mdev.buffer_for_gpu_write((red_count) * (DType::F32).size_of(), "sdpa_maxs")?;
 
     let k_head_stride: usize = if k.dims()[1] == 1 {
         k.stride()[0]
@@ -630,7 +608,7 @@ fn sdpa_vector_2pass_impl(
         MTLSize {
             width: 32,
             height: group_heads,
-            depth: if paired { ql.div_ceil(2) } else { ql },
+            depth: ql,
         },
     );
 
@@ -656,6 +634,127 @@ fn sdpa_vector_2pass_impl(
     );
     let _ = interm_dims;
     Ok(out)
+}
+
+/// A causal row's ordinary single-query reduction schedule. Zero denotes the
+/// one-pass kernel; otherwise this is the two-pass key partition count.
+fn serial_vector_blocks(device_class: char, gqa: usize, length: usize) -> usize {
+    if (matches!(device_class, 's' | 'd') && length >= 1024) || (gqa > 1 && length >= 4096) {
+        vector_blocks(device_class, length, gqa)
+    } else {
+        0
+    }
+}
+
+fn serial_vector_widths_supported(query_key: usize, value: usize) -> bool {
+    // Both vector shaders assign D/32 and V/32 elements to each SIMD lane.
+    // A partial lane would otherwise silently omit its trailing channels.
+    query_key > 0 && value > 0 && query_key.is_multiple_of(32) && value.is_multiple_of(32)
+}
+
+#[cfg(test)]
+mod serial_geometry_tests {
+    #[test]
+    fn vector_widths_reject_empty_or_partial_lanes() {
+        for (d, v) in [(0, 256), (256, 0), (80, 256), (256, 80), (1, 1)] {
+            assert!(!super::serial_vector_widths_supported(d, v));
+        }
+        for (d, v) in [(32, 32), (96, 128), (192, 256), (256, 256), (512, 512)] {
+            assert!(super::serial_vector_widths_supported(d, v));
+        }
+    }
+}
+
+/// Preserve ordinary decode arithmetic across a causal query block. Adjacent
+/// rows with identical single-query partitions share vector launches. A block
+/// crossing a family/partition threshold is split only at that threshold.
+/// Ordinary prefill and the explicitly selected wide arithmetic are unchanged.
+pub fn sdpa_serial_causal(
+    device: &Device,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+) -> Result<Tensor> {
+    if q.rank() != 4
+        || k.rank() != 4
+        || v.rank() != 4
+        || q.dims()[0] == 0
+        || q.dims()[1] == 0
+        || q.dims()[2] == 0
+        || k.dims()[1] == 0
+        || !q.dims()[1].is_multiple_of(k.dims()[1])
+        || q.dims()[0] != k.dims()[0]
+        || k.dims()[0] != v.dims()[0]
+        || k.dims()[1] != v.dims()[1]
+        || k.dims()[2] != v.dims()[2]
+        || k.dims()[2] < q.dims()[2]
+        || q.dims()[3] != k.dims()[3]
+        || !serial_vector_widths_supported(q.dims()[3], v.dims()[3])
+        || q.dtype() != k.dtype()
+        || k.dtype() != v.dtype()
+        || !scale.is_finite()
+    {
+        crate::bail!("serial causal attention: invalid query/key/value geometry");
+    }
+    let ql = q.dims()[2];
+    let length = k.dims()[2];
+    let gqa = q.dims()[1] / k.dims()[1];
+    let devc = device.architecture_name().chars().last().unwrap_or('s');
+    let kv_contiguous = |t: &Tensor| {
+        let (sh, st) = (t.dims(), t.stride());
+        st[3] == 1 && (sh[0] == 1 || sh[1] == 1 || st[0] == st[1] * sh[1])
+    };
+    let k = if kv_contiguous(k) {
+        k.clone()
+    } else {
+        k.contiguous()?
+    };
+    let v = if kv_contiguous(v) {
+        v.clone()
+    } else {
+        v.contiguous()?
+    };
+    let mut outputs = Vec::new();
+    let mut start = 0;
+    while start < ql {
+        let first_length = length - ql + start + 1;
+        let blocks = serial_vector_blocks(devc, gqa, first_length);
+        let mut end = start + 1;
+        while end < ql
+            && end - start < 8
+            && serial_vector_blocks(devc, gqa, length - ql + end + 1) == blocks
+        {
+            end += 1;
+        }
+        // The vector shader addresses queries as [B,H,rows,D], so a subset of
+        // query rows must be materialized even for a singleton batch.
+        let query = q.narrow(2, start, end - start)?.contiguous()?;
+        let visible = length - ql + end;
+        let key = k.narrow(2, 0, visible)?;
+        let value = v.narrow(2, 0, visible)?;
+        let causal = end - start > 1;
+        outputs.push(if blocks == 0 {
+            sdpa_vector(device, &query, &key, &value, scale, causal, None)?
+        } else {
+            sdpa_vector_2pass_with_blocks(
+                device,
+                &query,
+                &key,
+                &value,
+                scale,
+                causal,
+                None,
+                Some(blocks),
+            )?
+        });
+        start = end;
+    }
+    if outputs.len() == 1 {
+        Ok(outputs.pop().unwrap())
+    } else {
+        Array::cat(&outputs, 2)
+    }
 }
 
 /// MLX `ops::softmax_axis` over the last axis, `Softmax::eval_gpu` block path
@@ -700,11 +799,11 @@ pub fn softmax_last_axis(device: &Device, x: &Tensor, precise: bool) -> Result<T
         "softmax_looped",
         &[in_t.to_string(), acc_t.to_string()],
     ));
-    let source = format!("{MLX_UTILS_PREAMBLE}{MLX_SOFTMAX_PREAMBLE}{defs}");
-    let pipeline = compile_builtin(device, &source, &kernel_name)?;
+    let source = || format!("{MLX_UTILS_PREAMBLE}{MLX_SOFTMAX_PREAMBLE}{defs}");
+    let pipeline = compile_builtin_lazy(device, &kernel_name, source)?;
 
     let count = x.elem_count();
-    let obuf = mdev.buffer_for_gpu_write((count) as usize * (dt).size_of(), "softmax_out")?;
+    let obuf = mdev.buffer_for_gpu_write((count) * (dt).size_of(), "softmax_out")?;
     let out = Array::from_parts(mdev, obuf.clone(), &dims.clone(), dt);
 
     let guard = mdev.commands.encoder()?;
@@ -794,7 +893,7 @@ pub fn sdpa_full_nax(
     };
     let base_name = format!("{prefix}{qt}_bq{bq}_bk{bk}_bd{bd}_wm{wm}_wn{wn}_mask{qt}");
     let align_q = ql % bq == 0;
-    let align_k = k_l % bk == 0;
+    let align_k = k_l.is_multiple_of(bk);
     let pipeline = compile_nax_jit(
         device,
         &sdpa_full_nax_source(&base_name, split_d, bq, bk, bd, wm, wn, "bfloat", "bfloat"),
@@ -891,11 +990,9 @@ pub fn sdpa_full_nax(
     store.contiguous()
 }
 
-/// MLX `fast::scaled_dot_product_attention` fused dispatch for the causal /
-/// array-mask case: ALL `qL <= 8` query runs route to the vector kernels
-/// (masked 2-pass at long KV), the NAX full kernel or dense op chain for
-/// wider ones — the old `qL * gqa > 32` dense diversion is gone (it matched
-/// no MLX path and degraded super-linearly with kL).
+/// Existing wide/prefill arithmetic: vector kernels for short queries, with
+/// the established short-KV dense/NAX arm when `qL * gqa > 32`. Captured rows
+/// requiring ordinary serial-prefix arithmetic use `sdpa_serial_causal`.
 pub fn sdpa(
     device: &Device,
     q: &Tensor,
@@ -939,16 +1036,11 @@ pub fn sdpa(
         let kc = if kv_ok(k) { k.clone() } else { k.contiguous()? };
         let vc = if kv_ok(v) { v.clone() } else { v.contiguous()? };
         let (q, k, v) = (&qc, &kc, &vc);
-        // MLX eval_gpu: 2-pass on 's'/'d' with kL >= 1024 (or short KV heads
-        // with kL >= 4096); causal is dropped for a single query. ALL qL <= 8
-        // route here — including the MTP verify rows: the extra dense
-        // diversion our port once had paid a per-(kv-head, repeat) GEMM +
-        // looped-softmax chain whose cost grows with kL. MEASURED DEVIATION
-        // (specs/23): below kL ~2048 the dense chain is still cheaper at wide
-        // verify (S7/kv1024: 66 ms dense vs 114 fused) — the fused route
-        // engages from 2048 up, where the dense chain's kL-linear term
-        // dominates (S7/16k: 148 → 140 ms, and the chain's premium over the
-        // same-path S5 arm −32 → −15 ms).
+        // Two-pass on 's'/'d' with kL >= 1024 (or grouped KV heads with
+        // kL >= 4096); causal is dropped for a single query. The historical
+        // wide path keeps its dense/NAX arm below 2048 keys when qL*gqa>32.
+        // It is a distinct reduction law, so strict captured verification
+        // cannot select it merely because several rows arrived together.
         let kl = k.dims()[2];
         let devc = device.architecture_name().chars().last().unwrap_or('s');
         let two_pass = ((devc == 'd' || devc == 's') && kl >= 1024)
@@ -1063,7 +1155,7 @@ pub fn sdpa_dense(
                         mv[i * kl + j] = ((offset + i as i64) >= j as i64) as u8;
                     }
                 }
-                Array::from_slice_dt(device, &mv, &[ql as usize, kl as usize], Dtype::Uint8)?
+                Array::from_slice_dt(device, &mv, &[ql, kl], Dtype::Uint8)?
             }
         };
         // bool mask -> `where(mask, scores, finfo(dtype).min)`
@@ -1090,7 +1182,7 @@ pub fn sdpa_dense(
 }
 
 #[cfg(test)]
-mod paired_verify_tests {
+mod verify_tests {
     use super::*;
     use crate::ops::indexing::IndexOp;
 
@@ -1130,7 +1222,7 @@ mod paired_verify_tests {
             ];
             for causal in [false, true] {
                 for mask in [None, Some(&masks[0].t), Some(&masks[1].t)] {
-                    let actual = sdpa_vector_2pass_impl(
+                    let actual = sdpa_vector_2pass_with_blocks(
                         q.t.device(),
                         &q.t,
                         &k.t,
@@ -1138,9 +1230,9 @@ mod paired_verify_tests {
                         0.0625,
                         causal,
                         mask,
-                        false,
+                        None,
                     )?;
-                    let oracle = sdpa_vector_2pass_impl(
+                    let oracle = sdpa_vector_2pass_with_blocks(
                         q.t.device(),
                         &q.t,
                         &oracle_k.t,
@@ -1148,7 +1240,7 @@ mod paired_verify_tests {
                         0.0625,
                         causal,
                         mask,
-                        false,
+                        None,
                     )?;
                     assert_eq!(
                         crate::Array::new(actual).to_vec1::<u16>()?,
@@ -1163,7 +1255,7 @@ mod paired_verify_tests {
     }
 
     #[test]
-    fn paired_verify_attention_preserves_block_order_bits() -> Result<()> {
+    fn long_verify_attention_matches_duplicated_kv_oracle() -> Result<()> {
         let mut seed = 971u32;
         let mut values = |shape: &[i32]| {
             let data: Vec<half::bf16> = (0..shape.iter().product::<i32>())
@@ -1185,7 +1277,7 @@ mod paired_verify_tests {
             for ql in [2, 3, 6, 7, 8] {
                 let q = values(&[2, 24, ql, 256]).index((1..2, .., .., ..));
                 for causal in [false, true] {
-                    let expected = sdpa_vector_2pass_impl(
+                    let expected = sdpa_vector_2pass_with_blocks(
                         q.t.device(),
                         &q.t,
                         &k.t,
@@ -1193,26 +1285,9 @@ mod paired_verify_tests {
                         0.0625,
                         causal,
                         None,
-                        false,
-                    )?;
-                    let actual = sdpa_vector_2pass_impl(
-                        q.t.device(),
-                        &q.t,
-                        &k.t,
-                        &v.t,
-                        0.0625,
-                        causal,
                         None,
-                        true,
                     )?;
-                    let a = crate::Array::new(actual).to_vec1::<u16>()?;
-                    let e = crate::Array::new(expected).to_vec1::<u16>()?;
-                    assert!(
-                        a == e,
-                        "KV={n} Q={ql} causal={causal}; first difference {:?}",
-                        a.iter().zip(&e).position(|(a, e)| a != e)
-                    );
-                    let oracle = sdpa_vector_2pass_impl(
+                    let oracle = sdpa_vector_2pass_with_blocks(
                         q.t.device(),
                         &q.t,
                         &oracle_k.t,
@@ -1220,8 +1295,9 @@ mod paired_verify_tests {
                         0.0625,
                         causal,
                         None,
-                        false,
+                        None,
                     )?;
+                    let e = crate::Array::new(expected).to_vec1::<u16>()?;
                     let oracle = crate::Array::new(oracle).to_vec1::<u16>()?;
                     assert!(
                         e == oracle,
@@ -1291,13 +1367,13 @@ mod mask_batch_tests {
                     let expected = (0..2)
                         .map(|b| {
                             let row = if mb == 1 { 0 } else { b };
-                            Ok(crate::Array::new(run(
+                            crate::Array::new(run(
                                 &q.index((b..b + 1, .., .., ..)),
                                 &k.index((b..b + 1, .., .., ..)),
                                 &v.index((b..b + 1, .., .., ..)),
                                 &mask.index((row..row + 1, .., .., ..)),
                             )?)
-                            .to_vec1::<u16>()?)
+                            .to_vec1::<u16>()
                         })
                         .collect::<Result<Vec<_>>>()?
                         .concat();

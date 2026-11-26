@@ -90,10 +90,6 @@ pub(super) fn capabilities() -> Vec<KernelCapability> {
             ][..],
         ),
         (
-            KernelKind::DeltaReplayCapture,
-            &[BF4, BF4, BF4, FP3, FP3, FP4][..],
-        ),
-        (
             KernelKind::DeltaDecode,
             &[
                 BF16,
@@ -108,7 +104,6 @@ pub(super) fn capabilities() -> Vec<KernelCapability> {
                 BF16,
             ][..],
         ),
-        (KernelKind::DeltaReplayRestore, &[FP4, BF4, FP3, FP4][..]),
     ]
     .into_iter()
     .map(|(kind, inputs)| KernelCapability {
@@ -150,6 +145,7 @@ pub(super) fn invoke(
             width,
             epsilon,
             swish,
+            serial_gate,
         } => {
             let [y, z, w] = inputs else { unreachable!() };
             if y.dim(2) != *heads
@@ -161,15 +157,21 @@ pub(super) fn invoke(
             {
                 return Err(Error::msg("invalid gated RMS bindings"));
             }
-            let call = if *swish {
-                crate::kernels::gated_rms_silu
+            let gated = if *swish {
+                crate::kernels::gated_rms_silu_with_serial_gate(
+                    y,
+                    z,
+                    w,
+                    *heads,
+                    *width,
+                    f32::from_bits(*epsilon),
+                    *serial_gate,
+                    stream,
+                )
             } else {
-                crate::kernels::gated_rms
+                crate::kernels::gated_rms(y, z, w, *heads, *width, f32::from_bits(*epsilon), stream)
             };
-            Outputs::One(
-                call(y, z, w, *heads, *width, f32::from_bits(*epsilon), stream)
-                    .ok_or_else(|| Error::msg("gated RMS dispatch failed"))?,
-            )
+            Outputs::One(gated.ok_or_else(|| Error::msg("gated RMS dispatch failed"))?)
         }
         Kernel::DeltaScan {
             mode,
@@ -225,7 +227,10 @@ pub(super) fn invoke(
                     None => native::gdn_two_row(q, k, v, g, beta, state, *capture, stream),
                 },
                 DeltaScan::FourRows => native::gdn_rows(q, k, v, g, beta, state, *capture, stream),
-                DeltaScan::Verify { epsilon } => {
+                DeltaScan::Verify {
+                    epsilon,
+                    serial_gate,
+                } => {
                     let z = inputs[6];
                     let norm = inputs[7];
                     if !*capture
@@ -237,7 +242,7 @@ pub(super) fn invoke(
                     {
                         return Err(Error::msg("invalid fused delta scan bindings"));
                     }
-                    native::gdn_verify_fused(
+                    native::gdn_verify_fused_with_serial_gate(
                         q,
                         k,
                         v,
@@ -248,6 +253,7 @@ pub(super) fn invoke(
                         norm,
                         f32::from_bits(*epsilon),
                         prealloc,
+                        *serial_gate,
                         stream,
                     )
                 }
@@ -363,55 +369,6 @@ pub(super) fn invoke(
                 stream,
             )?;
             Outputs::Many(vec![y, state, conv])
-        }
-        Kernel::DeltaReplayCapture => {
-            let [q, k, v, g, beta, state] = inputs else {
-                unreachable!()
-            };
-            let (b, t, hk, dk) = (k.dim(0), k.dim(1), k.dim(2), k.dim(3));
-            let (hv, dv) = (v.dim(2), v.dim(3));
-            if b != 1
-                || t <= 1
-                || hk <= 0
-                || hv <= 0
-                || hv % hk != 0
-                || dk != 128
-                || dv != 128
-                || q.shape() != k.shape()
-                || v.shape() != [b, t, hv, dv]
-                || g.shape() != [b, t, hv]
-                || beta.shape() != g.shape()
-                || state.shape() != [b, hv, dv, dk]
-            {
-                return Err(Error::msg("invalid delta capture shapes"));
-            }
-            let (y, state, delta) =
-                crate::kernels::gated_delta::gdn_replay_capture(q, k, v, g, beta, state, stream)?;
-            Outputs::Many(vec![y, state, delta])
-        }
-        Kernel::DeltaReplayRestore { prefix } => {
-            let [base, k, g, delta] = inputs else {
-                unreachable!()
-            };
-            let (b, t, hk, dk) = (k.dim(0), k.dim(1), k.dim(2), k.dim(3));
-            let (hv, dv) = (base.dim(1), base.dim(2));
-            if b != 1
-                || t <= 1
-                || hk <= 0
-                || hv <= 0
-                || hv % hk != 0
-                || dk != 128
-                || dv != 128
-                || base.shape() != [b, hv, dv, dk]
-                || g.shape() != [b, t, hv]
-                || delta.shape() != [b, t, hv, dv]
-                || *prefix > t as usize
-            {
-                return Err(Error::msg("invalid delta history shapes or prefix"));
-            }
-            Outputs::One(crate::kernels::gated_delta::gdn_replay_restore(
-                base, k, g, delta, *prefix, stream,
-            )?)
         }
         _ => unreachable!(),
     };

@@ -84,6 +84,44 @@ fn gguf_header_truncation_is_an_error() {
 }
 
 struct TempFile(std::path::PathBuf);
+
+#[test]
+fn nvfp4_matches_ggml_for_every_scale_and_nibble() {
+    let oracle = include_bytes!("fixtures/nvfp4-f32.bin");
+    for scale in 0..=255u8 {
+        let mut block = [scale; 36];
+        for j in 0..32 {
+            block[4 + j] = (j % 8) as u8 | ((8 + j % 8) as u8) << 4;
+        }
+        let mut decoded = [0.0; 64];
+        super::quant::decode(TensorType::NVFP4, &block, &mut decoded).unwrap();
+        for (i, value) in decoded.iter().enumerate() {
+            let offset = (scale as usize * 16 + i % 16) * 4;
+            let expected = u32::from_le_bytes(oracle[offset..offset + 4].try_into().unwrap());
+            assert_eq!(value.to_bits(), expected, "scale={scale} index={i}");
+        }
+    }
+}
+
+#[test]
+fn nvfp4_packed_geometry_and_multiple_blocks() {
+    assert_eq!(TensorType::NVFP4.layout().unwrap(), ("NVFP4", 64, 36));
+    assert_eq!(TensorType::NVFP4.row_bytes(2304).unwrap(), 1296);
+    assert!(TensorType::NVFP4.row_bytes(63).is_err());
+    let mut packed = [0u8; 72];
+    packed[..4].copy_from_slice(&[56, 64, 72, 80]);
+    packed[4..36].fill(0x21);
+    packed[36..40].fill(48);
+    packed[40..].fill(0x43);
+    let mut output = [0.0; 128];
+    super::quant::decode(TensorType::NVFP4, &packed, &mut output).unwrap();
+    assert_eq!(
+        [output[0], output[8], output[16], output[32], output[48]],
+        [0.5, 1.0, 1.0, 2.0, 4.0]
+    );
+    assert_eq!([output[64], output[72]], [0.75, 1.0]);
+    assert!(super::quant::decode(TensorType::NVFP4, &packed[..71], &mut output).is_err());
+}
 impl TempFile {
     pub fn new(bytes: &[u8]) -> Self {
         use std::io::Write;
@@ -126,6 +164,7 @@ fn gguf_mapping_preserves_payload_offset_and_lifetime() {
     let file = TempFile::new(&file_bytes(&[("a", &[4, 4], TensorType::F32, 0)], &values));
     let package = Package::open(&file.0).unwrap();
     let tensor = package.tensor("a").unwrap();
+    // SAFETY: sysconf takes no pointers and only reads a system constant.
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
     let (mapping, offset) = tensor.mapped_region().unwrap();
     assert_eq!(mapping.len(), tensor.mapped_region_bytes().unwrap());

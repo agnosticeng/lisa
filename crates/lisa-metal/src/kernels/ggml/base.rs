@@ -1,4 +1,4 @@
-//! DS4 dense, normalization and activation-cache dispatches.
+//! The reference dense, normalization and activation-cache dispatches.
 
 use super::{MatvecArgs, f32_input, output};
 use crate::error::{Error, Result};
@@ -6,7 +6,7 @@ use crate::runtime::{ConstVal, Math};
 use crate::{Array, Dtype, Stream};
 use objc2_metal::MTLDevice;
 
-const SOURCE: &crate::shader_pack::Source = crate::kernel_source!("deepseek41/base.metal");
+const SOURCE: &crate::shader_pack::Source = crate::kernel_source!("gguf_iq/base.metal");
 
 /// Native vectorized dense matvec for original F32/F16/BF16 weight views.
 /// Multiple activation rows retain the scalar reduction tree per row.
@@ -28,7 +28,7 @@ fn plain_matvec_impl(
         || input.dim(0) < 1
         || input.dim(0) > 65535
         || !weights.t.buffer_and_layout().1.is_contiguous()
-        || weights.t.buffer_and_layout().1.offset * weights.dtype().size_of() % 16 != 0
+        || !(weights.t.buffer_and_layout().1.offset * weights.dtype().size_of()).is_multiple_of(16)
     {
         return Err(Error::msg("unsupported DS4 plain matvec geometry"));
     }
@@ -43,7 +43,7 @@ fn plain_matvec_impl(
     let (rows, columns, tokens) = (weights.dim(0), weights.dim(1), input.dim(0));
     f32_input(input, &[tokens, columns])?;
     weights.eval_enqueue()?;
-    // DS4 uses one row on Apple10+ for the small output matrices. The scalar
+    // The reference uses one row on Apple10+ for the small output matrices. The scalar
     // reduction is identical; only independent output rows share a group.
     let tile = if blend || (rows <= 1024 && stream.runtime().nax()) {
         1
@@ -119,7 +119,7 @@ struct NormArgs {
     nbf3: [u64; 3],
 }
 
-/// DS4's float4 RMSNorm tree, including its width-dependent thread count.
+/// The reference's float4 RMSNorm tree, including its width-dependent thread count.
 pub fn rms_norm(
     input: &Array,
     weight: Option<&Array>,
@@ -190,7 +190,7 @@ pub fn rms_norm(
     Ok(out)
 }
 
-/// Two DS4 weighted norms in one launch, retaining each row's independent
+/// Two the reference weighted norms in one launch, retaining each row's independent
 /// thread count and reduction tree. Inputs and outputs use f32 storage.
 pub fn rms_norm_pair(
     x0: &Array,
@@ -313,7 +313,7 @@ pub fn rope_coefficient_table(
     Ok(table)
 }
 
-/// Original DS4 decode index-query fusion, using this position's table.
+/// Original reference decode index-query fusion, using this position's table.
 pub fn index_query_rope_quantize(input: &mut Array, table: &Array, stream: &Stream) -> Result<()> {
     f32_input(input, &[32, 128])?;
     f32_input(table, &[64, 2])?;
@@ -351,7 +351,7 @@ pub fn index_query_rope_quantize(input: &mut Array, table: &Array, stream: &Stre
     Ok(())
 }
 
-/// DS4's fused rotation, activation quantization and cache write. Its fast
+/// The reference's fused rotation, activation quantization and cache write. Its fast
 /// divisions are part of the reference arithmetic; the standalone quantizer
 /// uses precise divisions and can differ at FP4 rounding boundaries.
 pub fn rope_quantize_store(
@@ -405,7 +405,7 @@ pub fn rope_quantize_store(
     Ok(())
 }
 
-/// DS4 activation quantization in f32 storage, including the BF16 boundaries.
+/// The reference activation quantization in f32 storage, including the BF16 boundaries.
 /// This never changes or repacks a model weight tensor.
 pub fn quantize_in_place(
     input: &mut Array,
@@ -441,7 +441,7 @@ fn quantize_impl(
     let linear = linear
         && matches!(format, ActivationFormat::Bf16)
         && count <= u32::MAX as u64
-        && input.t.buffer_and_layout().1.offset * 4 % 16 == 0;
+        && (input.t.buffer_and_layout().1.offset * 4).is_multiple_of(16);
     let function = if linear {
         "kernel_dsv41_bf16_linear"
     } else {
@@ -500,7 +500,7 @@ pub struct HcInput {
     pub norm: Array,
 }
 
-/// Final head collapse. Keep DS4's separate BF16 dispatch after the ordered
+/// Final head collapse. Keep the reference's separate BF16 dispatch after the ordered
 /// four-stream sum, rather than using a different fused reduction.
 pub fn hc_collapse(residual: &Array, pre: &Array, stream: &Stream) -> Result<Array> {
     if residual.rank() != 3 || residual.dim(0) != 1 || residual.dim(1) != 4 || residual.dim(2) < 1 {
@@ -684,7 +684,7 @@ struct HcExpandArgs {
     round_block_in: i32,
 }
 
-/// DS4's four-stream residual expansion, with the ordered expert add and its
+/// The reference's four-stream residual expansion, with the ordered expert add and its
 /// separate input/output rounding boundaries preserved.
 pub fn hc_expand(
     block: &Array,
@@ -771,7 +771,7 @@ mod tests {
     #[test]
     fn deepseek41_fused_cache_preserves_reference_fp4_midpoint() {
         let stream = Stream::gpu();
-        // Original DS4 capture: token 128803 at position 1, layer 14,
+        // Original reference capture: token 128803 at position 1, layer 14,
         // compressor columns 176..192. Fast division rounds 0.146484375
         // above the E2M1 tie; the standalone precise division rounds below.
         let block = [
@@ -825,6 +825,41 @@ mod tests {
     }
 
     #[test]
+    fn prompt_rows_plain_matvec_matches_serial_bits() {
+        let stream = Stream::gpu();
+        let mut seed = 0x91c534a7u32;
+        let mut value = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed as i32 as f32) / 765432109.
+        };
+        for (rows, width) in [(64, 64), (64, 4608), (256, 1536), (2304, 2304)] {
+            let weights = (0..rows * width).map(|_| value()).collect::<Vec<_>>();
+            for dtype in [Dtype::Float32, Dtype::Float16, Dtype::Bfloat16] {
+                let weights = Array::from_slice(&weights, &[rows, width])
+                    .as_dtype(dtype)
+                    .unwrap();
+                for tokens in [2, 4, 8] {
+                    let values = (0..tokens * width).map(|_| value()).collect::<Vec<_>>();
+                    let input = Array::from_slice(&values, &[tokens, width]);
+                    let actual = bits(&plain_matvec(&weights, &input, &stream).unwrap());
+                    for row in 0..tokens as usize {
+                        let start = row * width as usize;
+                        let x =
+                            Array::from_slice(&values[start..start + width as usize], &[1, width]);
+                        let expected = bits(&plain_matvec(&weights, &x, &stream).unwrap());
+                        assert_eq!(
+                            &actual[row * rows as usize..(row + 1) * rows as usize],
+                            &expected,
+                            "{dtype:?}: rows={rows}, width={width}, tokens={tokens}, row={row}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    #[test]
     fn deepseek41_bf16_blend_matches_narrow_bits() {
         let stream = Stream::gpu();
         for (rows, width) in [
@@ -854,7 +889,7 @@ mod tests {
     fn deepseek41_linear_bf16_matches_scalar_bits() {
         let stream = Stream::gpu();
         // Exhaust all high words at both rounding ties and just below/above.
-        // Include nonfinite patterns; DS4 truncates their low payload bits.
+        // Include nonfinite patterns; the reference truncates their low payload bits.
         let values: Vec<f32> = (0u32..65536)
             .flat_map(|hi| {
                 [0, 0x7fff, 0x8000, 0x8001, 0xffff].map(|lo| f32::from_bits(hi << 16 | lo))

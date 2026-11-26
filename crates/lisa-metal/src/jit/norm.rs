@@ -1,5 +1,6 @@
 use objc2_metal::MTLSize;
 
+use super::compile::compile_builtin_bool_consts_lazy;
 use std::sync::OnceLock;
 
 use crate::array::Array;
@@ -7,23 +8,17 @@ use crate::array::Array;
 /// The threadgroup size the looped rms family actually launched with (the
 /// pipeline's `max_total_threads_per_threadgroup` at launch time). The
 /// norm-in-qmv prologue must emulate the SAME emulated-lane count to stay
-/// bit-exact with the reduction association (specs/16 phase 1). Set on the
+/// bit-exact with the reduction association. Set on the
 /// first looped rms / fused_add_rms launch; falls back to 1024 (the
 /// Apple-silicon device maximum) when no looped launch has happened yet.
 static LOOPED_RMS_TGS: OnceLock<u32> = OnceLock::new();
-
-pub fn looped_rms_tgs() -> u32 {
-    *LOOPED_RMS_TGS.get_or_init(|| 1024)
-}
 
 fn record_looped_tgs(pipeline: &crate::runtime::ComputePipeline) {
     let tgs = pipeline.max_total_threads_per_threadgroup() as u32;
     let _ = LOOPED_RMS_TGS.set(tgs);
 }
 
-use super::compile::{
-    builtin_template_def, compile_builtin_bool_consts, type_string, type_to_name,
-};
+use super::compile::{builtin_template_def, type_string, type_to_name};
 use super::{Device, Tensor};
 use super::{MLX_FUSED_ADD_RMS_SOURCE, MLX_RMS_NORM_SOURCE, MLX_UTILS_PREAMBLE};
 use crate::error::Result;
@@ -60,11 +55,13 @@ pub fn layer_norm(
     };
     let name = format!("lisa_{fun}_{}", type_to_name(x.dtype())?);
     let defs = builtin_template_def(&name, fun, &[type_string(x.dtype())?.to_string()]);
-    let source = format!(
-        "{MLX_UTILS_PREAMBLE}{}{defs}",
-        crate::kernel_source!("common/attention/layer_norm.metal")
-    );
-    let pipeline = super::compile::compile_builtin(device, &source, &name)?;
+    let source = || {
+        format!(
+            "{MLX_UTILS_PREAMBLE}{}{defs}",
+            crate::kernel_source!("common/attention/layer_norm.metal")
+        )
+    };
+    let pipeline = super::compile::compile_builtin_lazy(device, &name, source)?;
     let dims = x.dims().to_vec();
     let output =
         device.buffer_for_full_gpu_write(x.elem_count() * x.dtype().size_of(), "layer_norm_out")?;
@@ -108,7 +105,7 @@ pub fn layer_norm(
     Ok(out)
 }
 
-/// The weightless-rms ones scalar, cached per dtype (specs/08 item 3). The
+/// The weightless-rms ones scalar, cached per dtype. The
 /// runtime is single-GPU (the device argument is identical across calls in a
 /// process), matching the `BF16_SIGMOID` static precedent in moe_decode.
 fn ones_scalar(device: &Device, dt: crate::array::Dtype) -> Result<Array> {
@@ -132,7 +129,7 @@ fn ones_scalar(device: &Device, dt: crate::array::Dtype) -> Result<Array> {
         .expect("ones scalar alloc"))
 }
 
-/// Fused residual-add + RMSNorm (specs/08 §1): one dispatch returns
+/// Fused residual-add + RMSNorm: one dispatch returns
 /// `(bf16(x + r), rms_norm(bf16(x + r)))`, bit-identical to the composed
 /// `add` → `rms_norm` pair by construction (the kernel rounds the sum to `T`
 /// before the reduction, exactly what the composed chain reads back).
@@ -171,9 +168,9 @@ pub fn fused_add_rms_norm(
         "fused_add_rms_looped",
         &[in_t.to_string()],
     ));
-    let source = format!("{MLX_UTILS_PREAMBLE}{MLX_FUSED_ADD_RMS_SOURCE}{defs}");
+    let source = || format!("{MLX_UTILS_PREAMBLE}{MLX_FUSED_ADD_RMS_SOURCE}{defs}");
 
-    let pipeline = compile_builtin_bool_consts(device, &source, &kernel_name, &[])?;
+    let pipeline = compile_builtin_bool_consts_lazy(device, &kernel_name, &[], source)?;
 
     if looped {
         record_looped_tgs(&pipeline);
@@ -275,11 +272,11 @@ pub fn rms_norm(device: &Device, x: &Tensor, weight: Option<&Tensor>, eps: f32) 
         "rms_looped",
         &[in_t.to_string()],
     ));
-    let source = format!("{MLX_UTILS_PREAMBLE}{MLX_RMS_NORM_SOURCE}{defs}");
+    let source = || format!("{MLX_UTILS_PREAMBLE}{MLX_RMS_NORM_SOURCE}{defs}");
     // function constant 20 is `has_w`. MLX passes a scalar `1` weight when no
     // weight is given (`fast.cpp:112`), so the kernel always runs the weighted
-    // path with that scalar. The ones scalar is a per-step constant (specs/08
-    // item 3): cached per dtype instead of rebuilt per call.
+    // path with that scalar. The ones scalar is a per-step constant, cached per
+    // dtype instead of rebuilt per call.
     let ones;
     let weight = match weight {
         Some(w) => w,
@@ -288,13 +285,13 @@ pub fn rms_norm(device: &Device, x: &Tensor, weight: Option<&Tensor>, eps: f32) 
             &ones
         }
     };
-    let pipeline = compile_builtin_bool_consts(device, &source, &kernel_name, &[(20, true)])?;
+    let pipeline = compile_builtin_bool_consts_lazy(device, &kernel_name, &[(20, true)], source)?;
     if looped {
         record_looped_tgs(&pipeline);
     }
 
     let count = x.elem_count();
-    let obuf = mdev.buffer_for_full_gpu_write((count) as usize * (dt).size_of(), "rms_out")?;
+    let obuf = mdev.buffer_for_full_gpu_write((count) * (dt).size_of(), "rms_out")?;
     let out = Array::from_parts(mdev, obuf.clone(), &dims.clone(), dt);
 
     let guard = mdev.commands.encoder()?;

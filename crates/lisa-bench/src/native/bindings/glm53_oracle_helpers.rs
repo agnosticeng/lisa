@@ -37,5 +37,5 @@ pub fn mm(a: &Array, w: &Array) -> lisa_metal::error::Result<Array> {
     let k = sh[rank - 1];
     let flat = a.reshape(&[rows, k])?;
     let out = flat.matmul(w)?;
-    Ok(out.reshape(&[&sh[..rank - 1], &[w.shape()[1]]].concat())?)
+    out.reshape(&[&sh[..rank - 1], &[w.shape()[1]]].concat())
 }

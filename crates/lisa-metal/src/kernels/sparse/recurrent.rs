@@ -1,15 +1,14 @@
-//! Recurrent operations with the pinned DS4 arithmetic.
+//! Recurrent operations with the pinned reference arithmetic.
 use super::*;
 
-
 pub(super) const KDA_RECURRENCE_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/kda_recurrence.metal");
+    crate::kernel_source!("kda/kda_recurrence.metal");
 pub(super) const KDA_PREPARE_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/kda_prepare.metal");
+    crate::kernel_source!("kda/kda_prepare.metal");
 pub(super) const KDA_OUTPUT_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/kda_output.metal");
+    crate::kernel_source!("kda/kda_output.metal");
 pub(super) const KDA_DECODE_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/kda_decode.metal");
+    crate::kernel_source!("kda/kda_decode.metal");
 
 pub(super) fn kda_prepare_kernel() -> &'static Option<MetalKernel> {
     static K: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
@@ -82,7 +81,7 @@ pub(super) fn kda_decode_kernel() -> &'static Option<MetalKernel> {
     })
 }
 
-/// Fused one-token KDA decode, following ds4's single-dispatch kernel.
+/// Fused one-token KDA decode, following the reference's single-dispatch kernel.
 /// All arrays are contiguous F32; state/cache layouts match ds4.
 #[allow(clippy::too_many_arguments)]
 pub fn kda_decode(
@@ -241,7 +240,7 @@ pub fn kda_prepare(
     }
     let t = q.dim(1);
     let d = (q.dim(2) / n_heads as i32) as usize;
-    let rows_a = crate::kernels::gated_delta::t_scalar_pub(t as i32);
+    let rows_a = crate::kernels::gated_delta::t_scalar_pub(t);
     let n_heads_a = Array::from_int(n_heads as i32);
     let lb = Array::from_f32_as(lower_bound, Dtype::Float32);
     let eps = Array::from_f32_as(norm_eps, Dtype::Float32);
@@ -252,19 +251,19 @@ pub fn kda_prepare(
     let proj = n_heads * d;
     let outputs = [
         OutputArg {
-            shape: vec![t as i32, proj as i32],
+            shape: vec![t, proj as i32],
             dtype: crate::Dtype::Float32,
         },
         OutputArg {
-            shape: vec![t as i32, proj as i32],
+            shape: vec![t, proj as i32],
             dtype: crate::Dtype::Float32,
         },
         OutputArg {
-            shape: vec![t as i32, proj as i32],
+            shape: vec![t, proj as i32],
             dtype: crate::Dtype::Float32,
         },
         OutputArg {
-            shape: vec![t as i32, proj as i32],
+            shape: vec![t, proj as i32],
             dtype: crate::Dtype::Float32,
         },
         OutputArg {
@@ -335,7 +334,7 @@ pub fn kda_output_norm(
             return None;
         }
     };
-    Some(out.into_iter().next()?)
+    out.into_iter().next()
 }
 
 pub(super) fn kda_kernel() -> &'static Option<MetalKernel> {

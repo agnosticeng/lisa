@@ -122,7 +122,11 @@ if (step < uint(T_)) {
             const uint zoff = row * (int)zproj_strides[0]
                             + (hv * Dv + d) * (int)zproj_strides[1];
             const float z = static_cast<float>(zproj[zoff]);
-            if (SIGLU) {
+            if (SIGLU && SERIAL_GATE) {
+                // Match the ordinary fused decoder's helper, including the
+                // default JIT transcendental law and every BF16 boundary.
+                y[ybase + d] = mlx_silu(zproj[zoff]) * n;
+            } else if (SIGLU) {
                 // The composed `nn::silu(z)` = bf16 Sigmoid (per-op bf16
                 // rounding, the exact chain pinned by
                 // sigmoid_mul_matches_composed) then bf16 z*sig; the final

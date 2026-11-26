@@ -51,8 +51,8 @@ In **Models**, download a checkpoint, then select it to load. Choose a language 
 model to generate. Only curated models appear in this list. Allowed checkpoints
 already in your Hugging Face cache are discovered automatically and appear first.
 
-Chats and attachments stay in `~/Library/Application Support/Lisa/chats`.
-Generated images appear as preview cards and are saved to `~/Pictures/Lisa`.
+Chats, attachments and generated images stay in app-managed storage.
+Generated images appear as preview cards with save and share actions.
 Use **⌘N** for a new chat, **Return** to send and **Shift-Return** for a new line.
 The model can use the browser in any language-model chat when it needs current
 information. It searches Google and opens result links; the
@@ -93,24 +93,29 @@ standard Hub cache; cached models can run offline.
 When copying the CLI elsewhere, keep the generated `kernels.bin` beside it.
 The package must come from the same build as the executable.
 
-Text generation defaults to `--depth auto`, enabling MTP when the model and
-request support it. Use `--depth 0` for serial generation. The app uses the
-same automatic policy. For options, run `./target/release/lisa --help` or a
+Text generation defaults to `--depth auto`, which uses the model's own MTP head
+when it ships one and the request supports it. Use `--depth 0` for serial
+generation. The app selects the
+loaded model's generation policy. For options, run `./target/release/lisa --help` or a
 subcommand's `--help`. Use `run` and `serve` across language-model families;
 the interactive CLI `chat` and cohort `batch` commands currently target Qwen4.
 
-Lisa UI uses Tencent's DSpine drafter by default for compatible Qwen 3.8 27B
-MLX targets. Qwen 27B downloads include the shared drafter and omit
-optional MLX MTP sidecars. Existing targets acquire the drafter on first load.
-For CLI use, select it by setting
-`LISA_QWEN_DSPINE_MODEL=tencent/Qwen3.8-27B-DSpine-b16` (or a local model
-directory) for the [DSpine checkpoint](https://huggingface.co/tencent/Qwen3.8-27B-DSpine-b16).
-This applies to MLX targets only. DSpine's checkpoint defines a
-16-token training block. `--depth auto` uses a measured device/checkpoint
-profile when available, otherwise the established seven-row snapshot schedule.
-Draft block size and target
-verification width are tuned separately; PLD retains its depth-six clamp.
-See [the Qwen model notes](specs/models/qwen.md#dspine-block-drafter).
+### Inkling 2 Mini preview
+
+Run the original [Unsloth Inkling 2 Mini GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) with text or an image:
+
+```sh
+./target/release/lisa run --model unsloth/Inkling-2-Mini-GGUF \
+  --image picture.png --prompt "Describe this image." --max-tokens 256
+```
+
+The curated download selects UD-Q4_K_M, `mmproj-F16.gguf` and the DFlash2
+drafter. Packed NVFP4 and Q5_K expert weights remain unchanged. Greedy text
+generation runs tree speculative rounds by default (`--tree-nodes` caps their
+rows); sampled and image requests decode serially. Inkling needs macOS 26 or
+later on any M1 or newer.
+Support is experimental; see
+[Inkling status and limits](specs/models/inkling2.md).
 
 ### Olala 5-bit preview
 
@@ -135,20 +140,20 @@ Hugging Face checkpoints; exact selections live in
 
 | Model | Weights | Implementation |
 | --- | --- | --- |
+| [Inkling 2 Mini](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) | Original mixed UD-Q4_K_M + F16 projector, DFlash2 drafter · about 18 GB | Text chat, reasoning and image input with tree speculative decoding |
 | [Olala mini 7A1B](https://huggingface.co/OVHaiLLM/Olala-v1.0-mini-7A1B-GGUF) | Original GGUF Q5_K_M · 5.99 GB | Experimental text chat and tools |
 | [LFM3 1.7B](https://huggingface.co/LiquidAI/LFM3-1.7B-MLX-4bit) | MLX 4-bit · 991 MB | Text and tools on iPhone and Mac |
 | [Qwen 3.5 0.8B](https://huggingface.co/mlx-community/Qwen3.5-0.8B-MLX-4bit) | MLX 4-bit | Text and compatible image input |
 | [Qwen 3.5 4B](https://huggingface.co/mlx-community/Qwen3.5-4B-MLX-4bit) | MLX 4-bit | Text and compatible image input |
 | [Qwen 3.8 27B](https://huggingface.co/agnosticeng/Qwen3.8-27B-4bit) | MLX 4-bit | Text, compatible image input and MTP |
-| [Qwen 3.8 27B](https://huggingface.co/agnosticeng/Qwen3.8-27B-2bit) | MLX 2-bit · 8.70 GB | Text-only and MTP |
 | [Qwen 3.8 Flash-Next](https://huggingface.co/agnosticeng/Qwen3.8-Flash-Next-4bit) | MLX 4-bit | Hybrid MoE and MTP |
-| [GLM-5.3 Flash](https://huggingface.co/antirez/glm-5.3-flash-gguf) | DS4 Q2 GGUF | **Experimental** · text and MTP |
+| [GLM-5.3 Flash](https://huggingface.co/antirez/glm-5.3-flash-gguf) | Original Q2 GGUF | **Experimental** · text and MTP |
 | [DeepSeek V4.1 Flash Coder](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-GGUF) | Mixed IQ GGUF | **Experimental** · text and tools |
 
-**GLM** uses DS4's original `GLM-5.3-Flash-Q2.gguf`, about 90 GiB of weights
-for a 128 GB Mac. It needs no conversion or prepared duplicate. Prefill and
-target verification still process serial rows; full numerical and performance
-parity with DS4 remains open. [GLM status →](specs/models/glm53.md)
+**GLM** uses the original `GLM-5.3-Flash-Q2.gguf`, about 90 GiB of weights for
+a 128 GB Mac, with no conversion or prepared copy. Prefill groups up to eight
+rows; attention and target verification keep serial order. Full numerical
+parity with its reference remains open. [GLM status →](specs/models/glm53.md)
 
 **DeepSeek** keeps about 67 GiB of weights resident and reads its roughly
 103 GiB Engram table from disk. It needs a high-memory Mac and fast storage.
@@ -170,7 +175,7 @@ Hub token or `HF_TOKEN`. Model weights have their own licenses and usage terms.
 Existing compatible MLX GLM checkpoints remain supported with a prepared
 resident index; they are separate from the curated GGUF model. Laya is also
 available as a typed-decision model through `decide` and `/v1/decisions`, on
-CPU or Metal. See [checkpoint compatibility](specs/architecture.md#checkpoint-dispatch).
+CPU or Metal. See the [capability matrix](specs/README.md#capability-matrix).
 
 ## Images
 
@@ -252,13 +257,11 @@ output, session/history limits and current compatibility boundaries.
 ## Under the hood
 
 LISA owns its tensor runtime, allocation, model execution and generation loop.
-The workspace separates model plans (`lisa-models`), engine execution
-(`lisa-engine`), portable device contracts (`lisa-backend`), Metal kernels
-(`lisa-metal`), portable MLX checkpoint
-reading (`lisa-mlx`), packed-weight storage
-(`lisa-gguf`), application provider composition (`lisa-serve::application`) and the CLI, server and desktop front ends.
-MLX and DS4 provide reference implementations and kernel sources; their
-attribution is preserved in [NOTICE](NOTICE).
+Format readers (`lisa-mlx`, `lisa-gguf`) expose original weights, model plans
+(`lisa-models`) describe computation, the engine (`lisa-engine`) binds and runs
+them through portable device contracts (`lisa-backend`), and the Metal runtime
+(`lisa-metal`) executes kernels. [Architecture](specs/architecture.md) has the
+crate graph and boundaries.
 
 ```sh
 cargo check --workspace --all-targets --all-features
@@ -267,15 +270,16 @@ cargo check --workspace --all-targets --all-features
 This checks compilation without loading a model. Follow [AGENTS.md](AGENTS.md)
 for numerical validation and sequential GPU runs before committing engine changes.
 
-- [Architecture](specs/architecture.md) — components, checkpoint dispatch and ownership.
-- [Model status](specs/README.md#model-status) — supported paths and current limits.
-- [Performance](specs/performance.md) — optimization decisions and validation protocol.
-- [Roadmap](specs/roadmap.md) — remaining work and acceptance criteria.
+- [Specifications](specs/README.md) — capability matrix and document index.
+- [Runtime](specs/runtime.md) — loading, memory, sessions and speculation.
+- [Numerics](specs/numerics.md) — numerical laws and validation protocol.
+- [Roadmap](specs/roadmap.md) — remaining work.
 
 LISA is under active development. Model support does not imply every mode or
 context length has been validated; the linked specs record those boundaries.
 
 ## License
 
-LISA is [MIT licensed](LICENSE). Adapted sources retain their original notices;
-model weights retain their own licenses.
+LISA is [MIT licensed](LICENSE). Adapted sources retain their original notices,
+collected with every reference implementation in [NOTICE](NOTICE); model weights
+retain their own licenses.

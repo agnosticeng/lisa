@@ -1,12 +1,11 @@
 //! Application construction of portable GatedDeltaNet bindings.
 use crate::core::loader::TensorSource;
-use lisa_metal::Array;
 pub struct GatedDeltaNet(
-    pub lisa_engine::bindings::gated_delta::GatedDeltaNet<lisa_metal::device::MetalDevice>,
+    pub lisa_engine::bindings::shared::gated_delta::GatedDeltaNet<lisa_metal::device::MetalDevice>,
 );
 impl std::ops::Deref for GatedDeltaNet {
     type Target =
-        lisa_engine::bindings::gated_delta::GatedDeltaNet<lisa_metal::device::MetalDevice>;
+        lisa_engine::bindings::shared::gated_delta::GatedDeltaNet<lisa_metal::device::MetalDevice>;
     fn deref(&self) -> &Self::Target {
         &self.0
     }
@@ -30,7 +29,7 @@ impl GatedDeltaNet {
         bits: i32,
     ) -> anyhow::Result<Self> {
         Ok(Self(
-            lisa_engine::bindings::gated_delta::GatedDeltaNet::load(
+            lisa_engine::bindings::shared::gated_delta::GatedDeltaNet::load(
                 crate::metal_context::execution_context(),
                 src,
                 prefix,

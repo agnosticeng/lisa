@@ -10,7 +10,7 @@ fn projection(w: &PackedTensor) -> Result<Projection> {
     Ok(if matches!(w.info.kind, T::F32 | T::F16 | T::BF16) {
         Projection::Plain(w.plain_view()?)
     } else {
-        Projection::Packed(w.clone())
+        Projection::Packed(w.clone().into_prepared()?)
     })
 }
 #[test]

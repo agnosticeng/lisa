@@ -18,13 +18,13 @@ pub fn max_tiles(rows: i32, experts: i32) -> i32 {
 }
 
 const TILE_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("qwen4/prefill_tile_table.metal");
+    crate::kernel_source!("moe/prefill_tile_table.metal");
 
-const SOURCE_GU: &crate::shader_pack::Source = crate::kernel_source!("qwen4/prefill_gate_up.metal");
+const SOURCE_GU: &crate::shader_pack::Source = crate::kernel_source!("moe/prefill_gate_up.metal");
 
 const DOWN_BLOCK_N: i32 = 128;
 
-const SOURCE_DOWN: &crate::shader_pack::Source = crate::kernel_source!("qwen4/prefill_down.metal");
+const SOURCE_DOWN: &crate::shader_pack::Source = crate::kernel_source!("moe/prefill_down.metal");
 
 static TILE_TABLE: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 static GATE_UP: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
@@ -212,13 +212,13 @@ pub fn down(
 // --- NAX prefill router: track_router_bf16_storage + track_router_split_sum ---
 
 const ROUTER_PARTIAL_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("qwen4/router_partial.metal");
+    crate::kernel_source!("moe/router_partial.metal");
 
 const ROUTER_SUM_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("qwen4/router_sum.metal");
+    crate::kernel_source!("moe/router_sum.metal");
 
 const ROUTER_LOOP_HEADER: &crate::shader_pack::Source =
-    crate::kernel_source!("qwen4/router_loop_header.metal");
+    crate::kernel_source!("moe/router_loop_header.metal");
 
 static ROUTER_PARTIAL: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 static ROUTER_SUM: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();

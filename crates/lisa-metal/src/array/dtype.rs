@@ -17,29 +17,17 @@ pub enum Dtype {
 }
 
 impl Dtype {
-    // short aliases, so `mlx_rt`'s `DType::F32` etc. keep
-    // reading the same.
-    #[allow(non_upper_case_globals)]
+    // Short aliases (`DType::F32`, …) used throughout the runtime.
     pub const U8: Dtype = Dtype::Uint8;
-    #[allow(non_upper_case_globals)]
     pub const U16: Dtype = Dtype::Uint16;
-    #[allow(non_upper_case_globals)]
     pub const I8: Dtype = Dtype::Int8;
-    #[allow(non_upper_case_globals)]
     pub const U32: Dtype = Dtype::Uint32;
-    #[allow(non_upper_case_globals)]
     pub const I16: Dtype = Dtype::Int16;
-    #[allow(non_upper_case_globals)]
     pub const I32: Dtype = Dtype::Int32;
-    #[allow(non_upper_case_globals)]
     pub const I64: Dtype = Dtype::Int64;
-    #[allow(non_upper_case_globals)]
     pub const F16: Dtype = Dtype::Float16;
-    #[allow(non_upper_case_globals)]
     pub const F32: Dtype = Dtype::Float32;
-    #[allow(non_upper_case_globals)]
     pub const F64: Dtype = Dtype::Float64;
-    #[allow(non_upper_case_globals)]
     pub const BF16: Dtype = Dtype::Bfloat16;
 
     /// Bytes per element.

@@ -1,1 +1,1 @@
-pub use lisa_engine::bindings::deepseek41_weights::*;
+pub use lisa_engine::weights::deepseek41::plan::*;

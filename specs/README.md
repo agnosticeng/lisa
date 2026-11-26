@@ -1,33 +1,51 @@
 # Specifications
 
-These documents describe current architecture decisions, behavior and constraints.
-Implementation details belong beside source; this folder contains no migration
-history, benchmark reports or audit diaries.
+These documents describe LISA as it is: responsibilities, interfaces,
+execution, invariants, supported modes and known limits. They contain no
+history, benchmark results or investigation notes. When a decision changes,
+update the owning document.
 
-| Topic | Owns |
+| Document | Owns |
 | --- | --- |
-| [Architecture](architecture.md) | Crate boundaries, device API, plans, loading and backend extension |
-| [Contracts](contracts.md) | Numerical, memory, state and response obligations |
-| [Serving](serving.md) | HTTP surface, scheduling, sessions and admission |
-| [Desktop](desktop.md) | SwiftUI/Rust ownership, local chats, downloads and packaging |
-| [Media](media.md) | Vision, voice and image-generation paths |
-| [Qwen](models/qwen.md) | Dense/MoE families, DSpine, MTP and GGUF policies |
-| [Olala](models/olala.md) | Original Q5_K_M GGUF, serial MIMO/attention/MoE and validation scope |
-| [LFM3](models/lfm3.md) | Compact hybrid text models, sliding state and reference scope |
-| [GLM](models/glm53.md) | Native GGUF and legacy MLX execution contracts |
-| [DeepSeek](models/deepseek41.md) | Mixed GGUF, Engram and native state |
-| [Performance](performance.md) | Optimization decisions and validation protocol |
-| [Open work](roadmap.md) | Unresolved architectural and acceptance gaps |
+| [Architecture](architecture.md) | Crates and their boundaries, device API, plans, replay, kernel packaging |
+| [Runtime](runtime.md) | Request flow, loading, memory admission, sessions, caches, speculation, scheduling |
+| [Numerics](numerics.md) | Numerical laws, strict paths, the verify exception, state identity, validation |
+| [Serving](serving.md) | HTTP surface, response semantics, history and request admission |
+| [Apple app](apple-app.md) | SwiftUI/Rust split, chats, downloads, lifecycle and packaging |
+| [Media](media.md) | Image input, voice and image generation |
+| [Open work](roadmap.md) | Unresolved gaps and acceptance conditions |
 
-## Model status
+Model pages: [Qwen](models/qwen.md) · [GLM-5.3](models/glm53.md) ·
+[DeepSeek V4.1](models/deepseek41.md) · [Inkling 2](models/inkling2.md) ·
+[Olala](models/olala.md) · [LFM3](models/lfm3.md)
 
-Text and image generation use Metal. Laya also supports CPU. ROCm has no provider.
-Qwen supports checkpoint-dependent batching, vision and drafting; capabilities
-are not interchangeable between MLX and GGUF. GLM and DeepSeek remain
-experimental against their DS4 reference. See each model's document for limits.
-The [catalog](../crates/lisa-app/src/catalog.rs) owns curated repository selection.
+## Capability matrix
 
-Update the owning topic when a decision changes. Keep source licenses, reference
-pins and required fixture identities beside the implementation. New test counts,
-run logs and performance campaigns do not belong in these specs. An implemented
-path is not a claim of numerical parity or performance on every device.
+All language and image models run on Metal. Laya also runs on the CPU.
+
+| Model | Formats | Drafting | Batching | Images | Status |
+| --- | --- | --- | --- | --- | --- |
+| Qwen 3.8 27B | MLX, GGUF | MTP head (MLX `mtp/` sidecar, GGUF embedded) | MLX | MLX | Supported |
+| Qwen 3.8 Flash-Next | MLX | MTP head | Yes | Yes | Supported |
+| Qwen 3.5 (0.8B, 4B) | MLX | — | Yes | Yes | Supported |
+| GLM-5.3 Flash | GGUF, MLX | Target MTP (embedded) | MLX | MLX | Experimental |
+| DeepSeek V4.1 Flash Coder | GGUF | — | — | — | Experimental |
+| Inkling 2 Mini | GGUF | DFlash2 drafter (tree rounds) | — | Yes | Experimental |
+| Olala v1.0 mini | GGUF | — | — | — | Experimental |
+| LFM3 1.7B | MLX | — | — | — | Supported |
+| FLUX.2 / FLUX 3 Klein | MLX, BF16 | — | — | Generation | Supported |
+| Laya | JSON + weights | — | — | — | Supported (CPU, Metal) |
+
+Only draft heads whose weights ship with the model are supported. "Supported"
+means wired end to end and covered by goldens or reference fixtures; it is not
+a claim of parity at every context length or on every device. The app catalog
+([`catalog.rs`](../crates/lisa-app/src/catalog.rs)) owns curated repositories.
+
+## Rules for these documents
+
+- State the current behaviour and its limits; put open work in the roadmap.
+- Name external projects only in [NOTICE](../NOTICE). Reference revisions live
+  in the provenance files beside the code that ports them.
+- Keep fixture identities and licences beside their implementation and large
+  captures outside the repository.
+- An implemented path is not a parity or performance claim on every device.

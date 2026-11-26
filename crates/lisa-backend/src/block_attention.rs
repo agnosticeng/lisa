@@ -82,8 +82,7 @@ impl BlockAttention {
                     && key_heads > 0
                     && heads % key_heads == 0
                     && heads.checked_mul(width).is_some()
-                    && width >= 128
-                    && width <= 4096
+                    && (128..=4096).contains(&width)
                     && width % 128 == 0
                     && rotary > 0
                     && rotary <= width

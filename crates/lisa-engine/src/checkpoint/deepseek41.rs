@@ -1,7 +1,35 @@
 //! GGUF metadata adaptation; geometry and Engram hashing live in lisa-models.
 use anyhow::{Context, Result, ensure};
-use lisa_gguf::{Header, Value};
+use lisa_gguf::{Header, Package, Value};
 pub use lisa_models::deepseek41::{config::Config, engram::Layout};
+use std::path::Path;
+
+/// The published package keeps its shared Engram shard under this original
+/// name, beside or one level above the quantized shard directory.
+const ENGRAM_SHARD: &str = "DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf";
+
+/// Open a DeepSeek GGUF package, accepting the published Engram layout for its
+/// final shard. Any other package opens exactly as [`Package::open`] would.
+pub fn open_package(first: &Path) -> Result<Package> {
+    Package::open_with(first, |header, part| {
+        if header.architecture()? != "deepseek41" || part != header.integer("split.count")? {
+            return Ok(None);
+        }
+        let parent = first.parent().unwrap_or(Path::new("."));
+        let mut found = std::collections::BTreeSet::new();
+        for directory in [Some(parent), parent.parent()].into_iter().flatten() {
+            let path = directory.join(ENGRAM_SHARD);
+            if path.is_file() {
+                found.insert(path.canonicalize()?);
+            }
+        }
+        Ok(if found.len() == 1 {
+            found.pop_first()
+        } else {
+            None
+        })
+    })
+}
 
 pub fn config(header: &Header) -> Result<Config> {
     Config::from_metadata(&Metadata(header))
@@ -10,7 +38,7 @@ pub fn engram_layout(header: &Header) -> Result<Layout> {
     Layout::from_metadata(&Metadata(header))
 }
 
-/// Both DS4's original export and the standard GGUF converter are accepted.
+/// Both the reference's original export and the standard GGUF converter are accepted.
 /// Conflicting aliases are rejected rather than choosing one silently.
 pub struct Metadata<'a>(pub &'a Header);
 

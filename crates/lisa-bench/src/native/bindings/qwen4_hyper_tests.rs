@@ -1,5 +1,6 @@
 #![cfg(test)]
 use super::*;
+use lisa_metal::ops::indexing::IndexOp;
 use lisa_metal::{Dtype, Stream};
 #[path = "qwen4_hyper_oracle.rs"]
 mod original;
@@ -83,7 +84,7 @@ fn gated_residual_plans_preserve_packed_decode_and_batched_bits() -> anyhow::Res
     let out = prepared.run(&[&up.weight, &up.scales, &up.biases], &mut [])?;
     for (a, b) in [&packed.weight, &packed.scales, &packed.biases]
         .into_iter()
-        .zip(out.into_iter())
+        .zip(out)
     {
         assert_eq!(a.shape(), b.shape());
         if a.dtype() == Dtype::Uint32 {
@@ -107,6 +108,7 @@ fn gated_residual_plans_preserve_packed_decode_and_batched_bits() -> anyhow::Res
             block_inject: has_head.then(|| linear(hc, hidden * hc, 37)).transpose()?,
             hc_count: hc as usize,
             hidden: (hidden * hc) as usize,
+            force_norm_operations: false,
         };
         let old = original::GatedResidual {
             hc_norm: new.hc_norm.clone(),
@@ -164,6 +166,94 @@ fn gated_residual_plans_preserve_packed_decode_and_batched_bits() -> anyhow::Res
                     || Ok(vec![inject(&x, &y, &i)?]),
                 )?;
             }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn captured_hyper_mixer_matches_independent_serial_rows() -> anyhow::Result<()> {
+    let (hidden, rank, hc) = (2560, 320, 4);
+    let up = linear(hidden * hc, rank, 13)?;
+    let order = model::decode_order(hidden as usize, hc as usize, (hidden * hc) as usize).unwrap();
+    let idx = Array::from_slice(&order, &[hidden * hc]);
+    let mixer = GatedResidual {
+        context: crate::metal_context::execution_context(),
+        hc_norm: RmsNorm {
+            weight: Array::from_slice(
+                &vec![half::bf16::ONE; (hidden * hc) as usize],
+                &[hidden * hc],
+            ),
+            eps: 1e-6,
+            group_size: Some(hidden as usize),
+        },
+        mix_down: linear(rank, hidden * hc, 29)?,
+        decode_up: Some(QuantizedLinear {
+            weight: up.weight.take_axis(&idx, 0)?,
+            scales: up.scales.take_axis(&idx, 0)?,
+            biases: up.biases.take_axis(&idx, 0)?,
+            group_size: 32,
+            bits: 4,
+        }),
+        mix_up: up,
+        block_inject: Some(linear(hc, hidden * hc, 37)?),
+        hc_count: hc as usize,
+        hidden: (hidden * hc) as usize,
+        force_norm_operations: false,
+    };
+    for (batch, rows) in [(1, 1), (1, 2), (1, 7), (2, 2)] {
+        let make = |width| {
+            Array::from_slice(
+                &(0..batch * rows * width)
+                    .map(|i| half::bf16::from_f32(((i * 13 % 251) as f32 - 125.) / 311.))
+                    .collect::<Vec<_>>(),
+                &[batch, rows, width],
+            )
+        };
+        let x = make(hidden * hc);
+        let out = make(hidden);
+        let inj = make(hc);
+        for finish in [false, true] {
+            let mut left = vec![];
+            let mut right = vec![];
+            for b in 0..batch {
+                for s in 0..rows {
+                    let row = |a: &Array| a.index((b..b + 1, s..s + 1, ..)).contiguous();
+                    let (a, c) = if finish {
+                        mixer.finish(&row(&x)?, Some(&row(&out)?), Some(&row(&inj)?), 1e-6)?
+                    } else {
+                        mixer.mix_from_normed(&row(&x)?, true)?
+                    };
+                    left.extend(a.to_vec1::<u16>()?);
+                    right.extend(c.to_vec1::<u16>()?);
+                }
+            }
+            let ordinary = if finish {
+                mixer.finish(&x, Some(&out), Some(&inj), 1e-6)?
+            } else {
+                mixer.mix_from_normed(&x, true)?
+            };
+            let prior = ordinary.0.to_vec1::<u16>()?;
+            let differing = prior.iter().zip(&left).filter(|(a, b)| a != b).count();
+            eprintln!(
+                "hyper B={batch} S={rows} finish={finish}: ordinary wide/serial differences {differing}/{}",
+                left.len()
+            );
+            let captured = if finish {
+                mixer.finish_captured(&x, Some(&out), Some(&inj), 1e-6)?
+            } else {
+                mixer.mix_from_normed_captured(&x, true)?
+            };
+            assert_eq!(
+                captured.0.to_vec1::<u16>()?,
+                left,
+                "mixed B={batch} S={rows} finish={finish}"
+            );
+            assert_eq!(
+                captured.1.to_vec1::<u16>()?,
+                right,
+                "state/inject B={batch} S={rows} finish={finish}"
+            );
         }
     }
     Ok(())

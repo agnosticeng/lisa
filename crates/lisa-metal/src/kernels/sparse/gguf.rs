@@ -1,9 +1,9 @@
-//! Native GGUF GLM projections; packed DS4 weights are read in place.
+//! Native GGUF GLM projections; packed reference weights are read in place.
 use crate::error::{Error, Result};
 use crate::ffi::{KernelInput, MetalKernel, OutputArg};
 use crate::{Array, Dtype, Stream};
 use std::sync::OnceLock;
-const HEADER: &crate::shader_pack::Source = crate::kernel_source!("glm53/gguf_q8.h");
+const HEADER: &crate::shader_pack::Source = crate::kernel_source!("sparse_attention/gguf_q8.h");
 fn kernel(decode: bool) -> Result<&'static MetalKernel> {
     static QK: OnceLock<std::result::Result<MetalKernel, String>> = OnceLock::new();
     static DECODE: OnceLock<std::result::Result<MetalKernel, String>> = OnceLock::new();
@@ -31,9 +31,9 @@ fn kernel(decode: bool) -> Result<&'static MetalKernel> {
             },
             &["output"],
             if decode {
-                crate::kernel_source!("glm53/gguf_decode.metal")
+                crate::kernel_source!("sparse_attention/gguf_decode.metal")
             } else {
-                crate::kernel_source!("glm53/gguf_qk.metal")
+                crate::kernel_source!("sparse_attention/gguf_qk.metal")
             },
             HEADER,
             true,
@@ -134,7 +134,7 @@ pub fn value(lora: &Array, weight: &Array, s: &Stream) -> Result<Array> {
                 "glm53_gguf_value_v1",
                 &["lora", "weight"],
                 &["output"],
-                crate::kernel_source!("glm53/gguf_value.metal"),
+                crate::kernel_source!("sparse_attention/gguf_value.metal"),
                 HEADER,
                 true,
                 false,

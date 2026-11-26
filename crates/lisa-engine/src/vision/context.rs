@@ -5,7 +5,6 @@ use anyhow::ensure;
 use lisa_backend::ScalarType;
 use lisa_backend::{HostTensor, ManagedDevice, TensorAccess};
 use lisa_models::vision::prompt::{Config, Expansion, Positions, Splice};
-use std::path::{Path, PathBuf};
 pub struct ImageSpan<T> {
     pub start: usize,
     pub features: T,
@@ -14,26 +13,48 @@ pub struct Prompt<T> {
     pub positions: Positions,
     pub spans: Vec<ImageSpan<T>>,
 }
+/// An image encoder contains prepared tensors and no checkpoint reader.
+pub enum Encoder<D: BindingDevice + ManagedDevice> {
+    Qwen(super::qwen::Encoder<D>),
+    Glm(super::glm::Encoder<D>),
+}
+impl<D: BindingDevice + ManagedDevice> Encoder<D> {
+    fn spatial_merge_size(&self) -> usize {
+        match self {
+            Self::Qwen(e) => e.config.spatial_merge_size,
+            Self::Glm(e) => e.config.spatial_merge_size,
+        }
+    }
+    fn encode(&self, image: &image::RgbImage) -> anyhow::Result<(D::Tensor, usize, usize)> {
+        match self {
+            Self::Qwen(e) => e.encode(image),
+            Self::Glm(e) => e.encode(image),
+        }
+    }
+}
+/// Request-scoped acquisition keeps image weights out of the text KV peak.
+pub trait EncoderSource<D: BindingDevice + ManagedDevice> {
+    fn load(&self) -> anyhow::Result<Encoder<D>>;
+}
 pub struct Vision<D: BindingDevice + ManagedDevice> {
     pub context: DeviceContext<D>,
-    pub dir: PathBuf,
+    source: Box<dyn EncoderSource<D>>,
     pub config: Config,
     pub prompt: Option<Prompt<D::Tensor>>,
 }
 
 impl<D: BindingDevice + ManagedDevice> Vision<D> {
-    pub fn from_dir(
+    pub fn from_prepared(
         context: DeviceContext<D>,
-        dir: &Path,
-        rotary_dimensions: usize,
-    ) -> anyhow::Result<Option<Self>> {
-        let root = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
-        Ok(Config::parse(&root, rotary_dimensions)?.map(|config| Self {
+        config: Config,
+        source: Box<dyn EncoderSource<D>>,
+    ) -> Self {
+        Self {
             context,
-            dir: dir.into(),
+            source,
             config,
             prompt: None,
-        }))
+        }
     }
     pub fn active(&self) -> bool {
         self.prompt.is_some()
@@ -54,21 +75,8 @@ impl<D: BindingDevice + ManagedDevice> Vision<D> {
             super::MAX_IMAGES
         );
         self.config.validate_markers(tokens, images.len())?;
-        let qwen = if self.config.glm {
-            None
-        } else {
-            Some(super::qwen::Encoder::load(self.context.clone(), &self.dir)?)
-        };
-        let glm = if self.config.glm {
-            Some(super::glm::Encoder::load(self.context.clone(), &self.dir)?)
-        } else {
-            None
-        };
-        let merge = if let Some(e) = &qwen {
-            e.config.spatial_merge_size
-        } else {
-            glm.as_ref().unwrap().config.spatial_merge_size
-        };
+        let encoder = self.source.load()?;
+        let merge = encoder.spatial_merge_size();
         let mut expansion = Expansion::default();
         let mut spans = Vec::new();
         let mut image_index = 0;
@@ -78,11 +86,7 @@ impl<D: BindingDevice + ManagedDevice> Vision<D> {
                 expansion.text(token)?;
                 continue;
             }
-            let (features, h, w) = if let Some(e) = &qwen {
-                e.encode(&images[image_index])?
-            } else {
-                glm.as_ref().unwrap().encode(&images[image_index])?
-            };
+            let (features, h, w) = encoder.encode(&images[image_index])?;
             let (h, w) = (h / merge, w / merge);
             total_len = total_len
                 .checked_add(h * w - 1)

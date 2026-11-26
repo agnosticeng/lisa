@@ -1,6 +1,5 @@
 #![cfg(test)]
 use super::*;
-use crate::bindings::deepseek41_moe::tests::{counts, difference};
 use crate::bindings::glm53_attention::Dsa;
 use crate::core::{cache::FullAttentionCache, loader::Weights};
 use lisa_metal::Dtype;
@@ -88,7 +87,7 @@ fn weights() -> anyhow::Result<Weights> {
 #[test]
 fn dsa_input_cache_and_target_plans_preserve_bits() -> anyhow::Result<()> {
     let w = weights()?;
-    let old = oracle::Dsa::load::<Weights>(
+    let old = oracle::Dsa::load(
         &mut w.clone(),
         "attn",
         64,
@@ -123,24 +122,14 @@ fn dsa_input_cache_and_target_plans_preserve_bits() -> anyhow::Result<()> {
             let mut bc = FullAttentionCache::new(crate::metal_context::execution_context(), 1, 512);
             for (n, prefill) in [(t, true), (1, false)] {
                 let x = values(&[b, n, 4096], 31);
-                let before = counts();
                 let a = old.forward(&x, &mut ac, None, 3, prefill)?;
-                let between = counts();
                 let z = new.forward(&x, &mut bc, None, 3, prefill)?;
-                let after = counts();
                 equal(&a, &z)?;
                 assert_eq!(ac.offset, bc.offset);
                 equal(
                     &ac.indexer_tape.compact_slice(0, ac.offset).unwrap(),
                     &bc.indexer_tape.compact_slice(0, bc.offset).unwrap(),
                 )?;
-                if std::env::var_os("LISA_TRACE").is_some() {
-                    assert_eq!(
-                        difference(&before, &between),
-                        difference(&between, &after),
-                        "native{native} B{b} T{n} prefill{prefill}"
-                    );
-                }
             }
         }
         for length in [2051usize, 2052] {
@@ -155,15 +144,9 @@ fn dsa_input_cache_and_target_plans_preserve_bits() -> anyhow::Result<()> {
                 cache.offset = length;
             }
             let x = values(&[1, 1, 4096], 61);
-            let before = counts();
             let a = old.forward(&x, &mut ac, None, 3, false)?;
-            let between = counts();
             let b = new.forward(&x, &mut bc, None, 3, false)?;
-            let after = counts();
             equal(&a, &b)?;
-            if std::env::var_os("LISA_TRACE").is_some() {
-                assert_eq!(difference(&before, &between), difference(&between, &after));
-            }
         }
         for preserve in [false, true] {
             let acap = crate::core::capture::Capture {
@@ -179,15 +162,9 @@ fn dsa_input_cache_and_target_plans_preserve_bits() -> anyhow::Result<()> {
             let mut ac = FullAttentionCache::new(crate::metal_context::execution_context(), 1, 512);
             let mut bc = FullAttentionCache::new(crate::metal_context::execution_context(), 1, 512);
             let x = values(&[1, 1, 4096], 71);
-            let before = counts();
             let a = old.forward(&x, &mut ac, Some(&acap), 3, false)?;
-            let between = counts();
             let b = new.forward(&x, &mut bc, Some(&bcap), 3, false)?;
-            let after = counts();
             equal(&a, &b)?;
-            if std::env::var_os("LISA_TRACE").is_some() {
-                assert_eq!(difference(&before, &between), difference(&between, &after));
-            }
             if preserve {
                 let a = acap.pending.lock().unwrap();
                 let b = bcap.pending.lock().unwrap();
@@ -229,19 +206,13 @@ fn dsa_input_cache_and_target_plans_preserve_bits() -> anyhow::Result<()> {
                 bc.write_compact_f16_at(&v, row as usize)?;
             }
             let x = values(&[1, 1, 4096], 43);
-            let before = counts();
             let a = old.forward_mtp(&x, &mut ac, n as usize - 1, 0)?;
-            let between = counts();
             let b = new.forward_mtp(&x, &mut bc, n as usize - 1, 0)?;
-            let after = counts();
             equal(&a, &b)?;
             equal(
                 &ac.compact_slice(0, n as usize).unwrap(),
                 &bc.compact_slice(0, n as usize).unwrap(),
             )?;
-            if std::env::var_os("LISA_TRACE").is_some() {
-                assert_eq!(difference(&before, &between), difference(&between, &after));
-            }
         }
     }
     Ok(())
@@ -267,7 +238,6 @@ fn dense_fallback_graphs_keep_original_order() -> anyhow::Result<()> {
             let v = values(&[batch as i32, 2, 7, 12], 7);
             let keep = values(&[batch as i32, 1, tokens as i32, 7], 11);
             let scale = 0.125f32;
-            let before = counts();
             let kt = k.transpose_axes(&[0, 1, 3, 2])?.contiguous()?;
             let scale_a = ops::full::<i32>(&[1], &Array::from_f32_as(scale, Dtype::Float32))?;
             let mut old = None;
@@ -294,7 +264,6 @@ fn dense_fallback_graphs_keep_original_order() -> anyhow::Result<()> {
                 .reshape(&[batch as i32, 2, tokens as i32, 12])?
                 .transpose_axes(&[0, 2, 1, 3])?
                 .reshape(&[batch as i32, tokens as i32, 24])?;
-            let middle = counts();
             let kt = one(R::DenseTranspose, &[&k])?;
             let mut new = None;
             let mut actual = vec![];
@@ -323,13 +292,9 @@ fn dense_fallback_graphs_keep_original_order() -> anyhow::Result<()> {
                 actual.push([qb, kb, vb, scores, probs]);
             }
             let new = one(R::FinalFallback(s), &[&new.unwrap()])?;
-            let after = counts();
             equal(&old, &new)?;
             for (a, b) in expected.iter().flatten().zip(actual.iter().flatten()) {
                 equal(a, b)?;
-            }
-            if std::env::var_os("LISA_TRACE").is_some() {
-                assert_eq!(difference(&before, &middle), difference(&middle, &after));
             }
         }
     }

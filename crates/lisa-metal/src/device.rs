@@ -13,8 +13,8 @@ mod indexed_attention;
 mod indirect;
 mod ordered_f32;
 mod packed;
+mod program;
 mod projection;
-mod refinement;
 mod residual_bf16;
 mod sparse_f32;
 pub use indirect::IndirectResources;
@@ -91,7 +91,20 @@ const META: TensorConstraint = TensorConstraint {
     max_rank: Some(2),
     ..FLOAT
 };
-static CAPABILITIES: [KernelCapability; 3] = [
+static CAPABILITIES: [KernelCapability; 4] = [
+    KernelCapability {
+        kind: KernelKind::AffineSerialLinear,
+        law: NumericalLaw::AffineSerialV1,
+        inputs: &[FLOAT, PACKED, META, META],
+        variadic: false,
+        shape: ShapeRelation::Affine,
+        encoding: Some(AffineEncoding {
+            word: ScalarType::U32,
+            bits: &[1, 2, 4, 8],
+            group_sizes: &[32, 64, 128],
+        }),
+        workspace: Workspace::ProviderManaged,
+    },
     KernelCapability {
         kind: KernelKind::AffineLinear,
         law: NumericalLaw::AffineV1,
@@ -141,6 +154,32 @@ fn dtype(value: ScalarType) -> Dtype {
     }
 }
 impl Device for MetalDevice {
+    fn gpu_cores(&self) -> Option<u32> {
+        Some(crate::jit::native_geometry::gpu_core_count() as u32)
+    }
+    fn apple_gpu_family(&self) -> Option<u32> {
+        Some(crate::runtime::apple_gpu_family()).filter(|&family| family > 0)
+    }
+    fn metal4(&self) -> bool {
+        crate::runtime::metal4_supported()
+    }
+    fn hold_resident(&self, tensors: &[&Array]) -> Option<Box<dyn std::any::Any + Send + Sync>> {
+        let set = Arc::new(crate::runtime::ResidencySet::new(
+            self.runtime.device(),
+            tensors.len(),
+        )?);
+        for tensor in tensors {
+            if Arc::ptr_eq(tensor.t.runtime(), &self.runtime) {
+                set.add(tensor.t.buffer());
+            }
+        }
+        // Scratch, sequence state and step outputs come from the pool: they
+        // stay wired too.
+        self.runtime.pool.keep_resident(&set);
+        set.commit();
+        set.hold();
+        Some(Box::new(set))
+    }
     type Tensor = Array;
     type KernelHandle = KernelHandle;
     type Stream = Stream;
@@ -148,7 +187,7 @@ impl Device for MetalDevice {
     type Error = Error;
     fn capabilities(&self) -> &[KernelCapability] {
         static ALL: std::sync::OnceLock<Vec<KernelCapability>> = std::sync::OnceLock::new();
-        let all = ALL.get_or_init(|| {
+        ALL.get_or_init(|| {
             let mut all = CAPABILITIES.to_vec();
             all.push(KernelCapability {
                 kind: KernelKind::AffineDequantize,
@@ -193,7 +232,6 @@ impl Device for MetalDevice {
             all.extend(delta::capabilities());
             all.extend(attention::capabilities());
             all.extend(projection::capabilities());
-            all.extend(refinement::capabilities());
             all.extend(ordered_f32::capabilities());
             all.extend(packed::capabilities());
             all.extend(sparse_f32::capabilities(
@@ -204,26 +242,18 @@ impl Device for MetalDevice {
             all.extend(indirect::capabilities());
             all.extend(block_attention::capabilities());
             all.extend(indexed_attention::capabilities());
-            all.push(KernelCapability {
-                kind: KernelKind::Zeros,
-                law: NumericalLaw::TensorV1,
-                inputs: &[],
-                variadic: false,
-                shape: ShapeRelation::TensorOperation,
-                encoding: None,
-                workspace: Workspace::ProviderManaged,
-            });
+            for kind in [KernelKind::Zeros, KernelKind::DeviceZeros] {
+                all.push(KernelCapability {
+                    kind,
+                    law: NumericalLaw::TensorV1,
+                    inputs: &[],
+                    variadic: false,
+                    shape: ShapeRelation::TensorOperation,
+                    encoding: None,
+                    workspace: Workspace::ProviderManaged,
+                });
+            }
             all
-        });
-        if self.runtime.nax() {
-            return all;
-        }
-        static LEGACY: std::sync::OnceLock<Vec<KernelCapability>> = std::sync::OnceLock::new();
-        LEGACY.get_or_init(|| {
-            all.iter()
-                .copied()
-                .filter(|c| c.kind != KernelKind::Bf16SmallRowLinear)
-                .collect()
         })
     }
     fn dtype(&self, tensor: &Array) -> Option<ScalarType> {
@@ -256,11 +286,16 @@ impl Device for MetalDevice {
         let dims: Vec<usize> = host.shape.iter().map(|&d| d as usize).collect();
         let dt = dtype(host.dtype);
         let (buffer, offset) = match options.mode {
-            ImportMode::Copy => {
-                let buffer = self
-                    .runtime
-                    .buffer_for_full_write(host.bytes.len(), "array")?;
-                // Source reads complete before returning. Packed payloads are unchanged.
+            ImportMode::Copy | ImportMode::CopyCompact => {
+                let buffer = if options.mode == ImportMode::CopyCompact {
+                    self.runtime
+                        .buffer_for_compact_full_write(host.bytes.len(), "array")?
+                } else {
+                    self.runtime
+                        .buffer_for_full_write(host.bytes.len(), "array")?
+                };
+                // SAFETY: `buffer` is fresh shared storage of at least `host.bytes.len()` bytes with
+                // no GPU user; the validated source slice is live for this call and cannot overlap it.
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         host.bytes.as_ptr(),
@@ -308,7 +343,6 @@ impl Device for MetalDevice {
         };
         let invoke = match &kernel {
             Kernel::Tensor(_) => tensor::invoke as _,
-            Kernel::Refinement(_) => refinement::invoke as _,
             Kernel::OrderedF32(_) => ordered_f32::invoke as _,
             Kernel::PackedCompute(_) => packed::invoke as _,
             Kernel::SparseF32(_) => sparse_f32::invoke as _,
@@ -317,14 +351,12 @@ impl Device for MetalDevice {
             Kernel::IndirectAffine(_) => indirect::without_resources as _,
             Kernel::IndexedAttention(_) => indexed_attention::invoke as _,
             Kernel::BlockAttention(_) => block_attention::invoke as _,
-            Kernel::Bf16SmallRowLinear | Kernel::Affine4WideLinear => projection::invoke as _,
-            Kernel::DeltaReplayCapture
-            | Kernel::DeltaReplayRestore { .. }
-            | Kernel::DeltaDecode(_)
+            Kernel::Affine4WideLinear => projection::invoke as _,
+            Kernel::DeltaDecode(_)
             | Kernel::DeltaPrep(_)
             | Kernel::DeltaScan { .. }
             | Kernel::GatedRms { .. } => delta::invoke as _,
-            Kernel::Zeros { .. } => zeros as _,
+            Kernel::Zeros { .. } | Kernel::DeviceZeros { .. } => zeros as _,
             Kernel::KeyedGumbel { .. }
             | Kernel::CopyRowsInto { .. }
             | Kernel::CopyRowsConcatInto { .. }
@@ -333,7 +365,7 @@ impl Device for MetalDevice {
             Kernel::HostTensor(_) => return Ok(None),
             Kernel::AffineDequantize { .. } => affine_dequantize as _,
             Kernel::AffineQuantize { .. } => affine_quantize as _,
-            Kernel::AffineLinear { .. } => affine as _,
+            Kernel::AffineLinear { .. } | Kernel::AffineSerialLinear { .. } => affine as _,
             Kernel::SwiGlu => {
                 crate::kernels::attention::swiglu2_kernel()?;
                 swiglu as _
@@ -367,12 +399,25 @@ impl Device for MetalDevice {
         }
         self.runtime.commands.flush_wait_through(completion.id)
     }
+    fn capture_program(
+        &self,
+        inputs: &[&Array],
+        stream: &Stream,
+        encode: &mut dyn FnMut() -> anyhow::Result<Vec<Array>>,
+    ) -> anyhow::Result<ProgramCapture<Array>> {
+        program::capture(self, inputs, stream, encode)
+    }
 }
 fn affine(kernel: &Kernel, inputs: &[&Array], _stream: &Stream) -> Result<Option<Outputs<Array>>> {
-    let Kernel::AffineLinear { group_size, bits } = kernel else {
-        unreachable!()
+    let (group_size, bits, serial) = match kernel {
+        Kernel::AffineLinear { group_size, bits } => (*group_size, *bits, None),
+        Kernel::AffineSerialLinear {
+            group_size,
+            bits,
+            allow_verify_splitk,
+        } => (*group_size, *bits, Some(*allow_verify_splitk)),
+        _ => unreachable!(),
     };
-    let (group_size, bits) = (*group_size, *bits);
     let output = {
         let [x, w, scales, biases] = inputs else {
             unreachable!()
@@ -406,8 +451,20 @@ fn affine(kernel: &Kernel, inputs: &[&Array], _stream: &Stream) -> Result<Option
         let shape = x.shape();
         let rows = shape[..shape.len() - 1].iter().product::<i32>().max(1);
         let flat = x.reshape(&[rows, x.dim(-1)])?;
-        let out =
-            crate::ops::quantized_matmul(&flat, w, scales, Some(biases), true, group_size, bits)?;
+        let out = if let Some(allow_verify_splitk) = serial {
+            crate::ops::quantized_matmul_serial_capture(
+                &flat,
+                w,
+                scales,
+                Some(biases),
+                true,
+                group_size,
+                bits,
+                allow_verify_splitk && (x.rank() <= 2 || x.dim(0) == 1),
+            )?
+        } else {
+            crate::ops::quantized_matmul(&flat, w, scales, Some(biases), true, group_size, bits)?
+        };
         out.reshape(&[&shape[..shape.len() - 1], &[w.dim(0)]].concat())?
     };
     Ok(Some(Outputs::One(output)))
@@ -454,11 +511,13 @@ mod tests {
         pointer: NonNull<u8>,
         layout: Layout,
     }
-    // Only immutable reads after initialization; the owner spans GPU completion.
+    // SAFETY: `Pages` uniquely owns its allocation, which is only read after initialisation
+    // and freed once in `Drop`; shared access is read-only, so Send and Sync hold.
     unsafe impl Send for Pages {}
     unsafe impl Sync for Pages {}
     impl Drop for Pages {
         fn drop(&mut self) {
+            // SAFETY: `pointer` came from `alloc_zeroed(layout)` with this same `layout` and is freed only here.
             unsafe {
                 dealloc(self.pointer.as_ptr(), self.layout);
             }
@@ -466,20 +525,61 @@ mod tests {
     }
 
     #[test]
+    fn compact_pull_preserves_bytes_without_retaining_large_scratch() -> Result<()> {
+        let device = MetalDevice::system_default();
+        device.runtime.synchronize()?;
+        let large = device
+            .runtime
+            .buffer_for_audited_compact_gpu_write(23 * 1024 * 1024, "import_test_scratch")?;
+        let large_id = large.id();
+        assert!(large.reusable_after(device.runtime.commands.completed_watermark()));
+        drop(large);
+        let bits = [0x80000000u32, 0x3f800001, 0x7fc01234];
+        let bytes: Vec<_> = bits.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let tensor = device.pull(
+            HostTensor {
+                bytes: &bytes,
+                shape: &[3],
+                dtype: ScalarType::F32,
+            }
+            .into(),
+            ImportOptions {
+                mode: ImportMode::CopyCompact,
+            },
+        )?;
+        assert_eq!(tensor.t.buffer().length(), 1024);
+        assert_ne!(tensor.t.buffer().id(), large_id);
+        // Inspect the copied payload directly: no conversion may canonicalize
+        // signed zero, low mantissa bits or the NaN payload.
+        assert_eq!(
+            // SAFETY: the copy import finished synchronously into this idle shared buffer, which
+            // holds at least `bytes.len()` bytes.
+            unsafe { std::slice::from_raw_parts(tensor.t.buffer().contents(), bytes.len()) },
+            bytes
+        );
+        Ok(())
+    }
+
+    #[test]
     fn shared_pull_keeps_owner_through_queued_kernel_and_completion() -> Result<()> {
         unsafe extern "C" {
             fn getpagesize() -> i32;
         }
+        // SAFETY: `getpagesize` takes no arguments and only reports the VM page size.
         let page = unsafe { getpagesize() } as usize;
         let layout = Layout::from_size_align(page, page).unwrap();
+        // SAFETY: `layout` is one non-zero, page-aligned page; null is rejected by `NonNull::new`.
         let pointer = NonNull::new(unsafe { alloc_zeroed(layout) }).unwrap();
         let owner = Arc::new(Pages { pointer, layout });
         for i in 0..128 {
+            // SAFETY: 128 u16 writes stay inside the zeroed page, which nothing else accesses yet.
             unsafe {
                 pointer.as_ptr().cast::<u16>().add(i).write(0x3f80);
             }
         }
         let weak = Arc::downgrade(&owner);
+        // SAFETY: the page is owned by `owner`, is not written after this point and stays
+        // mapped until the last clone of `owner` is dropped.
         let storage = unsafe { HostStorage::new(pointer, page, owner.clone()) };
         let device = MetalDevice::system_default();
         let input = device.pull(
@@ -510,6 +610,82 @@ mod tests {
             .map_err(Error::msg)?
             .as_dtype(Dtype::Float32)?;
         assert!(values.as_slice::<f32>().iter().all(|&v| v == 0.73046875));
+        Ok(())
+    }
+
+    #[test]
+    fn residency_shrink_drains_pending_shared_reads_and_preserves_private_cap() -> anyhow::Result<()>
+    {
+        unsafe extern "C" {
+            fn getpagesize() -> i32;
+        }
+        // SAFETY: `getpagesize` takes no arguments and only reports the VM page size.
+        let page = unsafe { getpagesize() } as usize;
+        let layout = Layout::from_size_align(page, page)?;
+        // SAFETY: `layout` is one non-zero, page-aligned page; null is rejected by `NonNull::new`.
+        let pointer = NonNull::new(unsafe { alloc_zeroed(layout) }).unwrap();
+        let owner = Arc::new(Pages { pointer, layout });
+        for i in 0..128 {
+            // SAFETY: 128 u16 writes stay inside the zeroed page, which nothing else accesses yet.
+            unsafe {
+                pointer.as_ptr().cast::<u16>().add(i).write(0x3f80);
+            }
+        }
+        let weak = Arc::downgrade(&owner);
+        let device = MetalDevice::system_default();
+        device.submit(true)?;
+        let baseline = device.memory_usage()?.active;
+        // Keep both source+copy charge during import. Shrinking cannot admit
+        // the pending source's bytes before all queued users have completed.
+        let cap = baseline + 4 * page;
+        let mut reservation = device.reserve_residency(3 * page, cap)?;
+        // SAFETY: the page is owned by `owner`, is not written after this point and stays
+        // mapped until the last clone of `owner` is dropped.
+        let storage = unsafe { HostStorage::new(pointer, page, owner.clone()) };
+        let input = device.pull(
+            TensorSource::Shared {
+                storage,
+                offset: 0,
+                shape: &[1, 128],
+                dtype: ScalarType::BF16,
+            },
+            ImportOptions {
+                mode: ImportMode::SharedRequired,
+            },
+        )?;
+        let handle = device.prepare(Kernel::SwiGlu)?.unwrap();
+        let result = device
+            .dispatch(&handle, &[&input, &input], &device.stream())?
+            .unwrap();
+        drop(input);
+        drop(owner);
+        assert!(
+            weak.upgrade().is_some(),
+            "pending Metal reads retain the independent owner"
+        );
+        assert!(device.shrink_residency(&mut reservation, page)?);
+        device.wait(&result.completion)?;
+        let output = result.output.into_one().map_err(anyhow::Error::msg)?;
+        assert!(
+            output
+                .as_dtype(Dtype::Float32)?
+                .as_slice::<f32>()
+                .iter()
+                .all(|&x| x == 0.73046875)
+        );
+        assert!(
+            device.shrink_residency(&mut reservation, 2 * page).is_err(),
+            "reservation growth is never admitted"
+        );
+        assert!(device.shrink_residency(&mut reservation, 0)?);
+        assert!(device.runtime.pool.has_resident_admission());
+        assert!(
+            device
+                .runtime
+                .buffer_for_compact_full_write(cap + page, "shrink_must_keep_cap")
+                .is_err()
+        );
+        drop(reservation);
         Ok(())
     }
 
@@ -580,18 +756,20 @@ mod tests {
 }
 
 fn zeros(kernel: &Kernel, _inputs: &[&Array], stream: &Stream) -> Result<Option<Outputs<Array>>> {
-    let Kernel::Zeros { shape, dtype: dt } = kernel else {
+    let (Kernel::Zeros { shape, dtype: dt } | Kernel::DeviceZeros { shape, dtype: dt }) = kernel
+    else {
         unreachable!()
     };
     let shape = shape
         .iter()
         .map(|&d| usize::try_from(d).map_err(|_| Error::msg("negative zero tensor dimension")))
         .collect::<Result<Vec<_>>>()?;
-    Ok(Some(Outputs::One(Array::new(crate::array::Array::zeros(
-        stream.runtime(),
-        &shape,
-        dtype(*dt),
-    )?))))
+    let array = if matches!(kernel, Kernel::DeviceZeros { .. }) {
+        crate::array::Array::zeros_on_device(stream.runtime(), &shape, dtype(*dt))?
+    } else {
+        crate::array::Array::zeros(stream.runtime(), &shape, dtype(*dt))?
+    };
+    Ok(Some(Outputs::One(Array::new(array))))
 }
 
 fn affine_dequantize(
@@ -647,6 +825,9 @@ impl MetalDevice {
         stream: &Stream,
         resources: Option<&IndirectResources>,
     ) -> Result<Option<Dispatch<Outputs<Array>, Completion>>> {
+        if self.runtime.commands.is_capturing_program() && !program::supported(&handle.kernel) {
+            self.runtime.commands.decline_program_capture();
+        }
         if inputs.len() != handle.kernel.arity() {
             return Err(Error::msg("dispatch: wrong input count"));
         }
@@ -717,7 +898,7 @@ impl lisa_backend::StorageDevice for MetalDevice {
             .ok_or_else(|| crate::error::Exception::custom("invalid byte-view shape".into()))?;
         let (buffer, layout) = source.t.buffer_and_layout();
         if !layout.is_contiguous()
-            || offset % scalar.size_of() != 0
+            || !offset.is_multiple_of(scalar.size_of())
             || offset
                 .checked_add(bytes)
                 .is_none_or(|end| end > source.size() * source.dtype().size_of())
@@ -756,7 +937,8 @@ impl lisa_backend::HostAccessDevice for MetalDevice {
         let (buffer, layout) = tensor.t.buffer_and_layout();
         let offset = layout.offset * tensor.dtype().size_of();
         let bytes = tensor.size() * tensor.dtype().size_of();
-        // The retained tensor owns this completed readable buffer range.
+        // SAFETY: `tensor` is contiguous and evaluated, so its retained shared buffer holds
+        // `bytes` initialised bytes at `offset` and no GPU work is pending on it.
         Ok(unsafe { std::slice::from_raw_parts(buffer.contents().add(offset), bytes) }.to_vec())
     }
     fn read_i32_through(&self, tensor: &Array) -> anyhow::Result<Vec<i32>> {
@@ -849,6 +1031,14 @@ impl ManagedDevice for MetalDevice {
     fn reserve_residency(&self, bytes: usize, budget: usize) -> anyhow::Result<Self::Reservation> {
         Ok(self.runtime.reserve_model_memory(bytes, budget)?)
     }
+    fn shrink_residency(
+        &self,
+        reservation: &mut Self::Reservation,
+        bytes: usize,
+    ) -> anyhow::Result<bool> {
+        reservation.shrink_to(&self.runtime.pool, bytes)?;
+        Ok(true)
+    }
     fn execution_boundary(&self) {
         self.runtime.commands.flush_encoder();
     }
@@ -859,6 +1049,15 @@ impl ManagedDevice for MetalDevice {
             self.runtime.commands.flush()?;
         }
         Ok(())
+    }
+    fn submit_after(&self, previous: Option<u64>) -> anyhow::Result<u64> {
+        let commands = &self.runtime.commands;
+        let mark = commands.current_cb_id();
+        commands.flush()?;
+        if let Some(previous) = previous {
+            commands.flush_wait_through(previous)?;
+        }
+        Ok(mark)
     }
     fn enter_scope(&self, scope: ExecutionScope) -> Self::Scope {
         match scope {
@@ -872,7 +1071,9 @@ impl ManagedDevice for MetalDevice {
     }
     fn clear_unused(&self) {
         let _ = self.runtime.synchronize();
-        self.runtime.pool.sweep();
+        self.runtime
+            .pool
+            .sweep_completed(self.runtime.commands.completed_watermark());
     }
     fn trim_unused(&self) {
         crate::ops::memory::trim_cache_on(&self.runtime);

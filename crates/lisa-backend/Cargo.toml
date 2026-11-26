@@ -8,3 +8,6 @@ description = "Portable device import and kernel contracts for LISA"
 [dependencies]
 anyhow.workspace = true
 smallvec = "1"
+
+[lints]
+workspace = true

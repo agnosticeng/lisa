@@ -1,42 +1,5 @@
 #![cfg(test)]
 use super::*;
-use crate::bindings::flux3::tests::compare;
-use lisa_metal::Dtype;
-
-#[test]
-#[ignore = "requires LISA_FLUX2_MODEL and LISA_FLUX2_FIXTURES; one GPU job at a time"]
-fn klein9b_reference_stages() -> anyhow::Result<()> {
-    let dir = PathBuf::from(std::env::var("LISA_FLUX2_MODEL")?);
-    let fixtures = PathBuf::from(std::env::var("LISA_FLUX2_FIXTURES")?);
-    let expected = weights::Weights::load_file(
-        crate::metal_context::execution_context(),
-        &fixtures.join("stages.safetensors"),
-        |_| true,
-    )?;
-    let prompt = std::fs::read_to_string(fixtures.join("prompt.txt"))?;
-    compare(
-        "klein9b.encoder",
-        &text::encode(&dir, &prompt)?,
-        &expected.get("text")?,
-        0.03,
-    )?;
-    lisa_metal::memory::clear_cache();
-    let model = dit::Dit::load(crate::metal_context::execution_context(), &dir)?;
-    let velocity = model.forward(
-        &expected.get("latent")?.as_dtype(Dtype::Bfloat16)?,
-        &expected.get("text")?.as_dtype(Dtype::Bfloat16)?,
-        500.0,
-        4,
-        6,
-    )?;
-    compare(
-        "klein9b.denoiser",
-        &velocity,
-        &expected.get("velocity")?,
-        0.03,
-    )?;
-    Ok(())
-}
 
 #[test]
 fn image_options_preserve_explicit_steps_and_reject_zero() {

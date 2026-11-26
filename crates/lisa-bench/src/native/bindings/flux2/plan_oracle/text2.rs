@@ -3,7 +3,7 @@ use super::{silu, weights::Weights};
 use lisa_metal::{Array, Dtype, fast, ops};
 pub fn forward(w: &Weights, tokens: &[u32], real: usize) -> anyhow::Result<Array> {
     let (hidden, hd, heads, kv, depth) = (128, 128, 2, 1, 27);
-    let ids = Array::from_slice(&tokens, &[512]);
+    let ids = Array::from_slice(tokens, &[512]);
     let ew = w.get("embed_tokens.weight")?.take_axis(&ids, 0)?;
     let es = w.get("embed_tokens.scales")?.take_axis(&ids, 0)?;
     let eb = w.get("embed_tokens.biases")?.take_axis(&ids, 0)?;

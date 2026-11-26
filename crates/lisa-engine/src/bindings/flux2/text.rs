@@ -1,40 +1,16 @@
 use crate::{bindings::BindingDevice, execution::DeviceContext};
 use lisa_backend::{ScalarType, TensorAccess};
-// Tokenization and loaded weights for model-owned FLUX.2 text conditioning.
+// Prepared tensors and token IDs for model-owned FLUX.2 text conditioning.
 use super::weights::Weights;
 
 use lisa_models::flux::text2 as model;
-use std::path::Path;
 pub fn encode<D: BindingDevice + lisa_backend::ManagedDevice>(
     context: &DeviceContext<D>,
-    dir: &Path,
-    prompt: &str,
+    weights: &Weights<D>,
+    ids: &[u32],
+    real: usize,
+    bounded: bool,
 ) -> anyhow::Result<D::Tensor> {
-    let tokenizer = crate::core::tokenizer::Tokenizer::load(&dir.join("tokenizer"))?;
-    let mut ids = tokenizer.encode(&model::prompt(prompt), false)?;
-    let real = model::pad(&mut ids);
-    let binary = crate::checkpoint::catalog::bonsai::is_checkpoint(dir);
-    let mut weights = Weights::load_filtered(
-        context.clone(),
-        &dir.join(if binary {
-            "text_encoder-mlx-4bit"
-        } else {
-            "text_encoder"
-        }),
-        |name| !binary || model::conditioning_weight(name.strip_prefix("model.").unwrap_or(name)),
-    )?;
-    if binary {
-        weights.0 = weights
-            .0
-            .into_iter()
-            .map(|(name, value)| {
-                (
-                    name.strip_prefix("model.").unwrap_or(&name).to_owned(),
-                    value,
-                )
-            })
-            .collect();
-    }
     let schema = weights.schema()?;
     let geometry = model::Geometry::from_schema(&schema)?;
     let program = model::program(&schema, geometry, real)?;
@@ -45,7 +21,7 @@ pub fn encode<D: BindingDevice + lisa_backend::ManagedDevice>(
         ScalarType::U32,
     )?;
     let prepared = weights.prepare(program)?;
-    let out = if binary {
+    let out = if bounded {
         prepared.run_bounded(&[&ids], &mut [], 24)?
     } else {
         prepared.run(&[&ids], &mut [])?

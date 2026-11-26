@@ -56,7 +56,6 @@ fn gdn_parity(t: usize) -> anyhow::Result<(f32, f32)> {
     use crate::recurrent_reference::gated_delta_ops;
     use lisa_metal::kernels::gated_delta_kernel;
     let b = 1usize;
-    let t = t;
     let hk = 16usize;
     let hv = 48usize;
     let dk = 128usize;
@@ -84,12 +83,12 @@ fn gdn_parity(t: usize) -> anyhow::Result<(f32, f32)> {
         &[b as i32, t as i32, hv as i32, dv as i32],
     )
     .as_dtype(Dtype::Bfloat16)?;
-    let g = ops::sigmoid(&Array::from_slice(
+    let g = ops::sigmoid(Array::from_slice(
         &rand_f32(b * t * hv, &mut seed),
         &[b as i32, t as i32, hv as i32],
     ))?
     .as_dtype(Dtype::Float32)?;
-    let beta = ops::sigmoid(&Array::from_slice(
+    let beta = ops::sigmoid(Array::from_slice(
         &rand_f32(b * t * hv, &mut seed),
         &[b as i32, t as i32, hv as i32],
     ))?
@@ -242,7 +241,7 @@ pub fn run_rounding_test() -> anyhow::Result<()> {
     println!("rms_norm weighted-vs-tworound max diff: {d:.6}");
 
     // --- logaddexp(x, 0) f32 vs bf16-stepped ---
-    let la_f32 = ops::logaddexp(&Array::from_f32(0.0), &x.as_dtype(Dtype::Float32)?)?;
+    let la_f32 = ops::logaddexp(Array::from_f32(0.0), &x.as_dtype(Dtype::Float32)?)?;
     // stepped bf16: max(x,0) + log1p(exp(min(x,0)))
     let zero = Array::from_f32(0.0).as_dtype(Dtype::Bfloat16)?;
     let mx_ = ops::maximum(&x, &zero)?;
@@ -354,9 +353,7 @@ fn smoke_rms_row_exact() -> anyhow::Result<()> {
             }
             // pad the `slices` partials to 32, second butterfly
             let mut v2 = vec![0f32; 32];
-            for sl in 0..slices {
-                v2[sl] = v[sl];
-            }
+            v2[..slices].copy_from_slice(&v[..slices]);
             let mut width = 32;
             while width >= 2 {
                 let half = width / 2;
@@ -365,12 +362,6 @@ fn smoke_rms_row_exact() -> anyhow::Result<()> {
                 width = half;
             }
             let total = v2[0];
-            if std::env::var("RMS_TOTALS").is_ok() {
-                eprintln!(
-                    "host total[{r}][{g}] = {total:.6} inv={:.6}",
-                    (total / h as f32 + eps).sqrt().recip()
-                );
-            }
             let inv = (total / h as f32 + eps).sqrt().recip();
             for off in 0..h {
                 let gi = r * wide + base + off;
@@ -456,7 +447,7 @@ pub fn run_cache_test() -> anyhow::Result<()> {
             .index((.., .., (expect_len - 1) as i32, ..))
             .as_dtype(Dtype::Float32)?;
         let row_v = row.as_slice::<f32>();
-        let off = (expect_len - 1 - chunk * 500) as usize * 256;
+        let off = (expect_len - 1 - chunk * 500) * 256;
         let want = &data[off..off + 256];
         let maxd: f32 = row_v
             .iter()

@@ -9,9 +9,9 @@ pub fn dsa_absorbed_attention(
     compact_latents: &Array,
     selected: &Array,
     scale: f32,
-    stream: &Stream,
+    _stream: &Stream,
 ) -> Option<Array> {
-    lisa_engine::bindings::glm53_absorbed_attention::dsa_absorbed_attention(
+    lisa_engine::bindings::glm53::attention::absorbed::dsa_absorbed_attention(
         q,
         kv_weight,
         kv_scales,
@@ -33,9 +33,9 @@ pub fn dsa_absorbed_attention_decode(
     selected: Option<&Array>,
     selected_valid_prefix: usize,
     scale: f32,
-    stream: &Stream,
+    _stream: &Stream,
 ) -> Option<Array> {
-    lisa_engine::bindings::glm53_absorbed_attention::dsa_absorbed_attention_decode(
+    lisa_engine::bindings::glm53::attention::absorbed::dsa_absorbed_attention_decode(
         q,
         kv_weight,
         kv_scales,
@@ -58,9 +58,9 @@ pub fn dsa_absorbed_attention_decode_capture(
     selected: Option<&Array>,
     selected_valid_prefix: usize,
     scale: f32,
-    stream: &Stream,
+    _stream: &Stream,
 ) -> Option<(Array, Array)> {
-    lisa_engine::bindings::glm53_absorbed_attention::dsa_absorbed_attention_decode_capture(
+    lisa_engine::bindings::glm53::attention::absorbed::dsa_absorbed_attention_decode_capture(
         q,
         kv_weight,
         kv_scales,
@@ -83,10 +83,10 @@ pub fn dsa_absorbed_attention_with_valid_prefix(
     selected: &Array,
     selected_valid_prefix: usize,
     scale: f32,
-    stream: &Stream,
+    _stream: &Stream,
     prefill_encoder_boundaries: bool,
 ) -> Option<Array> {
-    lisa_engine::bindings::glm53_absorbed_attention::dsa_absorbed_attention_with_valid_prefix(
+    lisa_engine::bindings::glm53::attention::absorbed::dsa_absorbed_attention_with_valid_prefix(
         q,
         kv_weight,
         kv_scales,
@@ -108,9 +108,9 @@ pub fn dsa_absorbed_attention_dense(
     group_size: usize,
     compact_latents: &Array,
     scale: f32,
-    stream: &Stream,
+    _stream: &Stream,
 ) -> Option<Array> {
-    lisa_engine::bindings::glm53_absorbed_attention::dsa_absorbed_attention_dense(
+    lisa_engine::bindings::glm53::attention::absorbed::dsa_absorbed_attention_dense(
         q,
         kv_weight,
         kv_scales,
@@ -129,9 +129,9 @@ pub fn dsa_absorbed_attention_dense_stages(
     group_size: usize,
     compact_latents: &Array,
     scale: f32,
-    stream: &Stream,
+    _stream: &Stream,
 ) -> Option<(Array, Array, Array)> {
-    lisa_engine::bindings::glm53_absorbed_attention::dsa_absorbed_attention_dense_stages(
+    lisa_engine::bindings::glm53::attention::absorbed::dsa_absorbed_attention_dense_stages(
         q,
         kv_weight,
         kv_scales,
@@ -151,10 +151,10 @@ pub fn dsa_absorbed_attention_stages(
     compact_latents: &Array,
     selected: &Array,
     scale: f32,
-    stream: &Stream,
+    _stream: &Stream,
     prefill_encoder_boundaries: bool,
 ) -> Option<(Array, Array, Array)> {
-    lisa_engine::bindings::glm53_absorbed_attention::dsa_absorbed_attention_stages(
+    lisa_engine::bindings::glm53::attention::absorbed::dsa_absorbed_attention_stages(
         q,
         kv_weight,
         kv_scales,
@@ -176,10 +176,10 @@ pub fn dsa_absorbed_attention_flash_causal_prefill_stages(
     cache: &Array,
     position: usize,
     scale: f32,
-    stream: &Stream,
+    _stream: &Stream,
     boundaries: bool,
 ) -> Option<(Array, Array, Array)> {
-    lisa_engine::bindings::glm53_absorbed_attention::dsa_absorbed_attention_flash_causal_prefill_stages(q,w,s,b,group,cache,position,scale,&crate::metal_context::execution_context(),boundaries)
+    lisa_engine::bindings::glm53::attention::absorbed::dsa_absorbed_attention_flash_causal_prefill_stages(q,w,s,b,group,cache,position,scale,&crate::metal_context::execution_context(),boundaries)
 }
 #[cfg(test)]
 pub fn value_rows(
@@ -189,9 +189,9 @@ pub fn value_rows(
     b: &Array,
     group: usize,
     heads: usize,
-    stream: &Stream,
+    _stream: &Stream,
 ) -> Option<Array> {
-    lisa_engine::bindings::glm53_absorbed_attention::value_rows(
+    lisa_engine::bindings::glm53::attention::absorbed::value_rows(
         x,
         w,
         s,
@@ -215,13 +215,13 @@ fn dsa_absorbed_attention_stages_inner(
     selected: Option<&Array>,
     prefix: usize,
     scale: f32,
-    stream: &Stream,
+    _stream: &Stream,
     capture: bool,
     fused: bool,
     capture_fused: bool,
     boundaries: bool,
 ) -> Option<(Array, Option<Array>, Option<Array>)> {
-    lisa_engine::bindings::glm53_absorbed_attention::dsa_absorbed_attention_stages_inner(
+    lisa_engine::bindings::glm53::attention::absorbed::dsa_absorbed_attention_stages_inner(
         q,
         w,
         s,

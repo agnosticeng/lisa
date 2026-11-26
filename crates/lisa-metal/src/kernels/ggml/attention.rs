@@ -1,11 +1,11 @@
-//! DS4's F16 staging and 32-way split-K attention for V4.1 scalar decode.
+//! The reference's F16 staging and 32-way split-K attention for V4.1 scalar decode.
 
 use super::{f32_input, output};
 use crate::error::{Error, Result};
 use crate::runtime::{ConstVal, Math};
 use crate::{Array, Dtype, Stream};
 
-const SOURCE: &crate::shader_pack::Source = crate::kernel_source!("deepseek41/attention.metal");
+const SOURCE: &crate::shader_pack::Source = crate::kernel_source!("gguf_iq/attention.metal");
 
 /// Reused serial-queue scratch, independent of model layer and context counts.
 /// Every writer/reader must be encoded on this model's one command stream.
@@ -75,7 +75,7 @@ struct AttentionArgs {
 }
 
 /// Attend to the logical raw ring followed by GPU-selected compressed rows.
-/// Uses the original DS4 F16 conversion, padding, vector attention and reduce.
+/// Uses the original reference F16 conversion, padding, vector attention and reduce.
 /// Invalid compressed ids stage zeros without reading outside the cache.
 pub fn attention_decode(
     q: &Array,
@@ -92,7 +92,7 @@ pub fn attention_decode(
     )
 }
 
-/// Optional DS4 heads transform in the split-K reduction, under its original
+/// Optional reference heads transform in the split-K reduction, under its original
 /// 64-head / width-512 / 32-partition gate (the only shapes this API accepts).
 pub fn attention_decode_with_rope(
     q: &Array,
@@ -135,8 +135,8 @@ pub fn attention_decode_with_rope(
         (raw, raw, 0, 0)
     };
     let keys = raw_count + count;
-    let has_pad = keys % 32 != 0;
-    // At most 128 raw + 512 selected keys: DS4's NSG selector is one at
+    let has_pad = !keys.is_multiple_of(32);
+    // At most 128 raw + 512 selected keys: the reference's NSG selector is one at
     // these widths; its NWG remains 32 even for short contexts.
     let stage_args = StageArgs {
         raw_cap: 128,
@@ -404,7 +404,7 @@ mod tests {
         }
         // All ten calls reuse scratch before any readback or explicit wait.
         for (out, expected) in pending {
-            for row in out.as_slice::<f32>().chunks_exact(512) {
+            for row in out.as_slice::<f32>().as_chunks::<512>().0.iter() {
                 for (&actual, &expected) in row.iter().zip(&expected) {
                     assert!(
                         (actual - expected).abs() < 2e-6,

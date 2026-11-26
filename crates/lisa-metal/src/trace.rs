@@ -1,9 +1,9 @@
 //! Lightweight hierarchical tracing for performance work.
 //!
 //! Off by default and near-zero cost (one relaxed atomic load per `span()`).
-//! Enabled with `LISA_TRACE=1`; `LISA_TRACE=filter:<prefixes>` records only
-//! comma-separated span-name prefixes. `LISA_TRACE_JSON=<path>` additionally
-//! writes a Chrome Trace Event file (`chrome://tracing`, or `perfetto.dev`).
+//! [`crate::diagnostics::Diagnostics`] enables it, optionally restricted to
+//! span-name prefixes, and can write a Chrome Trace Event file
+//! (`chrome://tracing`, or `perfetto.dev`).
 //!
 //! Usage:
 //! ```ignore
@@ -12,33 +12,19 @@
 //! Spans nest per thread; `report()` aggregates by name (calls, total, self
 //! — total minus direct children) and folds in the GPU counters from
 //! [`crate::runtime`]. `finish()` is the process-exit hook: prints the report
-//! when `LISA_TRACE` is set and writes the JSON when `LISA_TRACE_JSON` is set.
+//! and writes the Chrome trace when the diagnostics request them.
 
 use std::sync::Mutex;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static INIT: AtomicBool = AtomicBool::new(false);
 static T0: Mutex<Option<Instant>> = Mutex::new(None);
-static SPAN_FILTER: OnceLock<Option<Vec<String>>> = OnceLock::new();
 
 fn span_matches_filter(name: &str) -> bool {
-    let filters = SPAN_FILTER.get_or_init(|| {
-        std::env::var("LISA_TRACE")
-            .ok()
-            .and_then(|value| value.strip_prefix("filter:").map(str::to_owned))
-            .map(|value| {
-                value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|part| !part.is_empty())
-                    .map(str::to_owned)
-                    .collect()
-            })
-    });
-    filters
+    crate::diagnostics::get()
+        .trace
         .as_ref()
         .is_none_or(|filters| trace_name_matches_filters(name, filters))
 }
@@ -73,26 +59,23 @@ fn now_us() -> u64 {
     t0.elapsed().as_micros() as u64
 }
 
-fn init_from_env() {
+fn init_from_diagnostics() {
     if INIT.swap(true, Ordering::Relaxed) {
         return;
     }
-    if std::env::var_os("LISA_TRACE").is_some() {
-        ENABLED.store(true, Ordering::Relaxed);
-    }
-    if std::env::var_os("LISA_TRACE_JSON").is_some() {
+    if crate::diagnostics::get().tracing() {
         ENABLED.store(true, Ordering::Relaxed);
     }
 }
 
-/// Whether tracing is on (`LISA_TRACE=1` or `LISA_TRACE_JSON` set).
+/// Whether tracing is on.
 pub fn enabled() -> bool {
-    init_from_env();
+    init_from_diagnostics();
     ENABLED.load(Ordering::Relaxed)
 }
 
 /// Whether tracing is enabled and the named prefix passes the active filter.
-/// Use this for diagnostic side logs that should respect `LISA_TRACE=filter:`.
+/// Use this for diagnostic side logs that should respect the span filter.
 pub fn enabled_for(prefix: &str) -> bool {
     enabled() && span_matches_filter(prefix)
 }
@@ -212,7 +195,7 @@ pub fn report() {
     let recs = RECORDS.lock().unwrap();
     // Self time: total minus the sum of direct children.
     let mut child_sum: Vec<u64> = vec![0; recs.len()];
-    for (_i, r) in recs.iter().enumerate() {
+    for r in recs.iter() {
         if let Some(p) = r.parent {
             child_sum[p as usize] += r.dur_us;
         }
@@ -245,7 +228,7 @@ pub fn report() {
             )),
         }
     }
-    aggs.sort_by(|a, b| b.1.child_us.cmp(&a.1.child_us));
+    aggs.sort_by_key(|entry| std::cmp::Reverse(entry.1.child_us));
     eprintln!(
         "[trace] {:<22} {:>8} {:>11} {:>11} {:>10} {:>10}",
         "name", "calls", "total ms", "self ms", "avg us", "max us"
@@ -276,20 +259,20 @@ pub fn report() {
     // was never encoded).
     let mut ld = crate::runtime_label_dispatches();
     if !ld.is_empty() {
-        ld.sort_by(|a, b| b.1.cmp(&a.1));
+        ld.sort_by_key(|entry| std::cmp::Reverse(entry.1));
         eprintln!("[trace] kernels dispatched: {:?}", &ld[..]);
     }
     let mut lc = crate::runtime_label_counts();
     if !lc.is_empty() {
-        lc.sort_by(|a, b| b.1.cmp(&a.1));
+        lc.sort_by_key(|entry| std::cmp::Reverse(entry.1));
         eprintln!("[trace] kernels: {:?}", &lc[..]);
     }
     let mut lg = crate::runtime_label_gpu_ms();
     if !lg.is_empty() {
-        lg.sort_by(|a, b| b.1.cmp(&a.1));
+        lg.sort_by_key(|entry| std::cmp::Reverse(entry.1));
         eprintln!(
             "[trace] kernels by gpu ms: {:?}",
-            &lg[..]
+            lg[..]
                 .iter()
                 .map(|(l, ns)| (l.clone(), *ns as f64 / 1e6))
                 .collect::<Vec<(String, f64)>>()
@@ -298,7 +281,7 @@ pub fn report() {
     probe_report();
 }
 
-/// GPU-probe analysis (`LISA_GPU_PROBE=1`): per-command-buffer GPU interval
+/// GPU-probe analysis: per-command-buffer GPU interval
 /// distributions attributed to the single dispatched kernel, plus timeline
 /// gaps. These intervals are not hardware-counter shader occupancy readings.
 fn probe_report() {
@@ -379,15 +362,15 @@ fn probe_report() {
     );
 }
 
-/// Exit hook: print the report when `LISA_TRACE` is set, write the Chrome
-/// JSON when `LISA_TRACE_JSON=<path>` is set. Call once at process end.
+/// Exit hook: print the report and write the Chrome trace when one was
+/// requested. Call once at process end.
 pub fn finish() {
-    init_from_env();
+    init_from_diagnostics();
     if !ENABLED.load(Ordering::Relaxed) {
         return;
     }
     report();
-    if let Some(path) = std::env::var_os("LISA_TRACE_JSON") {
+    if let Some(path) = &crate::diagnostics::get().trace_json {
         match write_chrome(&path.to_string_lossy()) {
             Ok(()) => eprintln!("[trace] chrome trace written to {path:?}"),
             Err(e) => eprintln!("[trace] chrome trace write failed: {e}"),

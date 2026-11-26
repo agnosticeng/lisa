@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use crate::sampler;
+use crate::sampling::sampler;
 
 /// `--model`: a local checkpoint directory, GGUF file or Hugging Face repo id,
 /// resolved to a local path when the arguments are parsed.
@@ -76,40 +76,8 @@ impl std::fmt::Display for DepthArg {
     }
 }
 
-/// Effective PLD depth from the `--pld` / `--pld-depth` pair (0 = off).
-/// Widest draft the verify fast path actually covers.
-///
-/// The split-K verify lane gates `2..=7` rows — one precompiled kernel per M
-/// (`warm_verify_qmm` in `lisa-metal/src/jit/matmul.rs:605-631`); the other
-/// row-fusions stop at 8 as well. A round's draft width is `S = depth + 1`, so a
-/// depth above `FAST_S_MAX - 1` lands every round on the stock qmm path
-/// (measured, bucket <2k: S7 = 78.0 ms → S8 = 108.0 → S9 = 136.8, i.e. 2.16× S5).
-///
-/// NOTE: an earlier backlog item said "align every width up to 32" — that is a
-/// different geometry, not this one's. Here, rounding *up* is strictly
-/// worse: it puts every draft off-lane. Clamp DOWNWARD.
-pub const FAST_S_MAX: usize = 7;
-/// Highest PLD depth whose round still fits the fast lane (`S = depth + 1`).
-pub const PLD_DEPTH_MAX: usize = FAST_S_MAX - 1;
-
-pub fn pld_enable(pld: bool, pld_depth: usize) -> usize {
-    if !pld {
-        0
-    } else if pld_depth == 0 {
-        4
-    } else {
-        if pld_depth > PLD_DEPTH_MAX {
-            eprintln!(
-                "[pld] width engaged at depth {PLD_DEPTH_MAX} (requested {pld_depth}; \
-                 S={pld_depth} falls off the split-K verify lane, S>{FAST_S_MAX} costs ~2× )"
-            );
-        }
-        pld_depth.min(PLD_DEPTH_MAX)
-    }
-}
-
 /// Resolve a `--depth` argument against the sampler/model: `Some(policy)` runs
-/// the speculative path, `None` runs serial (PLD still applies there). `auto`
+/// the speculative path, `None` runs serial. `auto`
 /// means the EV controller when the caller explicitly enables automatic MTP;
 /// CLIs do this for greedy sampling and GLM's target-MTP sampler.
 pub fn resolve_mtp_depth(
@@ -127,6 +95,28 @@ pub fn resolve_mtp_depth(
             None
         }),
     }
+}
+
+pub fn build_sampler<D: crate::cache::indexer::CacheDevice>(
+    temperature: f32,
+    top_k: usize,
+    top_p: f32,
+    min_p: f32,
+    rep_penalty: f32,
+    seed: u64,
+) -> sampler::Sampler<D> {
+    let mut s = sampler::Sampler::new(crate::sampling::Sampler {
+        temperature,
+        top_k,
+        top_p,
+        min_p,
+        repetition_penalty: rep_penalty,
+        ..Default::default()
+    });
+    if seed != 0 {
+        s.seed = seed;
+    }
+    s
 }
 
 #[cfg(test)]
@@ -149,26 +139,4 @@ mod depth_tests {
             None
         );
     }
-}
-
-pub fn build_sampler<D: crate::indexer_cache::CacheDevice>(
-    temperature: f32,
-    top_k: usize,
-    top_p: f32,
-    min_p: f32,
-    rep_penalty: f32,
-    seed: u64,
-) -> sampler::Sampler<D> {
-    let mut s = sampler::Sampler::new(crate::sampling::Sampler {
-        temperature,
-        top_k,
-        top_p,
-        min_p,
-        repetition_penalty: rep_penalty,
-        ..Default::default()
-    });
-    if seed != 0 {
-        s.seed = seed;
-    }
-    s
 }

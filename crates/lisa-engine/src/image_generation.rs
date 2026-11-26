@@ -22,10 +22,10 @@ impl<D: BindingDevice + ManagedDevice> Pipeline<D> {
         }
     }
     pub fn load(context: DeviceContext<D>, dir: &Path) -> anyhow::Result<Self> {
-        let kind = if flux3::is_checkpoint(dir) {
-            Kind::Flux3(flux3::Pipeline::load(context, dir)?)
+        let kind = if crate::weights::flux3::is_checkpoint(dir) {
+            Kind::Flux3(crate::weights::flux3::load(context, dir)?)
         } else {
-            Kind::Flux2(flux2::Pipeline::load(context, dir)?)
+            Kind::Flux2(crate::weights::flux2::load(context, dir)?)
         };
         Ok(Self { kind })
     }

@@ -7,6 +7,10 @@ use super::copy::{bytes_of, copy_gg_source};
 use super::dtype::dtype_of;
 use super::{Array, Dtype, Layout, err};
 
+#[cfg(test)]
+#[path = "pointwise_output_tests.rs"]
+mod pointwise_output_tests;
+
 // ───────────────────────── native ops (stage 3) ─────────────────────────
 
 /// MLX `backend/metal/utils.h:75` `get_work_per_thread`.
@@ -29,6 +33,10 @@ impl Array {
     /// bit-exact with `mlx_rt::unary_op`. `op` is the MLX identifier, e.g.
     /// `"Sigmoid"`, `"Exp"`, `"Log"`.
     pub fn unary(&self, op: &str) -> Result<Self> {
+        self.unary_with_output_policy::<true>(op)
+    }
+
+    fn unary_with_output_policy<const AUDITED: bool>(&self, op: &str) -> Result<Self> {
         let x = self.contiguous()?;
         let size = x.size();
         if size == 0 {
@@ -92,8 +100,15 @@ impl Array {
 
         let out = Self::wrap(
             Arc::clone(&self.rt),
-            self.rt
-                .buffer_for_full_gpu_write(size * self.dtype.size_of(), "unary_out")?,
+            // Exact thread count plus unary_v's tail guard covers every logical
+            // element. The shader never reads output or allocation padding.
+            if AUDITED {
+                self.rt
+                    .buffer_for_audited_full_gpu_write(size * self.dtype.size_of(), "unary_out")?
+            } else {
+                self.rt
+                    .buffer_for_full_gpu_write(size * self.dtype.size_of(), "unary_out")?
+            },
             Layout::contiguous(&x.layout.shape),
             self.dtype,
         );
@@ -269,7 +284,7 @@ fn tg_from_row_size(row_size: usize) -> usize {
     } else if row_size <= 1024 {
         128
     } else {
-        ((row_size.div_ceil(4) + 31) / 32 * 32).min(1024)
+        (row_size.div_ceil(4).div_ceil(32) * 32).min(1024)
     }
 }
 
@@ -343,6 +358,7 @@ impl Array {
                 Arc::clone(rt),
                 {
                     let b = rt.buffer(4, "scalar")?;
+                    // SAFETY: `b` is fresh, page-aligned shared storage of at least 4 bytes with no GPU user.
                     unsafe { *(b.contents() as *mut f32) = v };
                     b
                 },
@@ -353,6 +369,7 @@ impl Array {
                 Arc::clone(rt),
                 {
                     let b = rt.buffer(2, "scalar")?;
+                    // SAFETY: `b` is fresh, page-aligned shared storage of at least 2 bytes with no GPU user.
                     unsafe { *(b.contents() as *mut f16) = f16::from_f32(v) };
                     b
                 },
@@ -363,6 +380,7 @@ impl Array {
                 Arc::clone(rt),
                 {
                     let b = rt.buffer(2, "scalar")?;
+                    // SAFETY: `b` is fresh, page-aligned shared storage of at least 2 bytes with no GPU user.
                     unsafe { *(b.contents() as *mut bf16) = bf16::from_f32(v) };
                     b
                 },
@@ -389,8 +407,10 @@ impl Array {
             other => return Err(err(format!("scalar_raw: unsupported {other:?}"))),
         };
         let b = rt.buffer(dtype.size_of(), "scalar")?;
+        // SAFETY: `bytes` holds 8 >= `dtype.size_of()` bytes and `b` is fresh storage of at
+        // least that size with no GPU user.
         unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), b.contents() as *mut u8, dtype.size_of());
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), b.contents(), dtype.size_of());
         }
         Ok(Self::wrap(
             Arc::clone(rt),
@@ -453,6 +473,14 @@ impl Array {
     /// strided dispatch with the broadcast strides is bit-identical, just
     /// without the fast paths.
     pub fn binary(&self, other: &Array, op: &str) -> Result<Self> {
+        self.binary_with_output_policy::<true>(other, op)
+    }
+
+    fn binary_with_output_policy<const AUDITED: bool>(
+        &self,
+        other: &Array,
+        op: &str,
+    ) -> Result<Self> {
         if self.dtype != other.dtype {
             return Err(err("binary: dtype mismatch"));
         }
@@ -476,8 +504,15 @@ impl Array {
         let n: usize = shape.iter().product();
         let out = Self::wrap(
             Arc::clone(&self.rt),
-            self.rt
-                .buffer_for_full_gpu_write(n * self.dtype.size_of(), "binary_out")?,
+            // The strided kernel assigns each logical i < n from its operands;
+            // it neither reads output nor touches unused allocation padding.
+            if AUDITED {
+                self.rt
+                    .buffer_for_audited_full_gpu_write(n * self.dtype.size_of(), "binary_out")?
+            } else {
+                self.rt
+                    .buffer_for_full_gpu_write(n * self.dtype.size_of(), "binary_out")?
+            },
             Layout::contiguous(&shape),
             self.dtype,
         );
@@ -806,6 +841,8 @@ impl Array {
     pub fn as_slice<T: Copy>(&self) -> &[T] {
         let bytes = self.host.get_or_init(|| {
             let v = self.to_vec::<T>().expect("as_slice");
+            // SAFETY: `v` is a live `Vec<T>` of `size_of_val` bytes; they are initialised because
+            // `T` is a padding-free scalar of the dtype's size (not enforced by the bound).
             unsafe {
                 std::slice::from_raw_parts(
                     v.as_ptr().cast::<u8>(),
@@ -815,6 +852,13 @@ impl Array {
             .to_vec()
         });
         let n = bytes.len() / std::mem::size_of::<T>();
+        assert_eq!(
+            bytes.as_ptr().align_offset(std::mem::align_of::<T>()),
+            0,
+            "host readback cache is not aligned for the requested element type"
+        );
+        // SAFETY: the cached bytes hold `n` immutable `T`s and their alignment was
+        // checked above.
         unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<T>(), n) }
     }
 
@@ -831,7 +875,7 @@ impl Array {
 
     /// Split into `num_splits` equal parts along `axis` (`chunk`).
     pub fn split_equal(&self, num_splits: usize, axis: usize) -> Result<Vec<Self>> {
-        if num_splits == 0 || self.dim(axis) % num_splits != 0 {
+        if num_splits == 0 || !self.dim(axis).is_multiple_of(num_splits) {
             return Err(err("split_equal: axis not divisible"));
         }
         let step = self.dim(axis) / num_splits;
@@ -998,19 +1042,11 @@ impl Array {
         Ok(out)
     }
 
-    /// MLX `max`/`min` over the last axis (`max_all`/`max` route to
-    /// own reduce kernel; this is the MLX row-reduce instead, verified
-    /// bit-identical to `max_all`).
-    pub fn max_last_axis(&self) -> Result<Self> {
-        self.reduce_last_axis("max")
-    }
-
     /// Concatenate along `axis`. All inputs must share a rank and dtype, and
     /// match on every dim but `axis`.
     ///
-    /// each input is copied into the output with a blit; the buffers here
-    /// are shared-storage, so the copy is host-side (a memcpy per outer block).
-    /// A blit/kernel path is a later optimization.
+    /// GPU strided copies write disjoint slices of a contiguous output. The
+    /// command encoder preserves ordering with any pending input producers.
     pub fn cat(arrays: &[Array], axis: usize) -> Result<Self> {
         let first = arrays.first().ok_or_else(|| err("cat: no arrays"))?;
         let rank = first.rank();
@@ -1030,7 +1066,25 @@ impl Array {
         }
         let mut out_shape = shape0.clone();
         out_shape[axis] = arrays.iter().map(|a| a.dim(axis)).sum();
-        let out = Self::zeros(&first.rt, &out_shape, first.dtype)?;
+        let layout = Layout::contiguous(&out_shape);
+        let out = if layout.size() == 0 {
+            Self::zeros(&first.rt, &out_shape, first.dtype)?
+        } else {
+            // Each exact-grid copy_gg dispatch writes every element of its
+            // axis slice without reading the destination. Those slices are
+            // disjoint and cover the entire logical output, so no initial
+            // clear is needed. Live input leases prevent output aliasing;
+            // the allocator retains its existing completion/reuse policy.
+            Self::wrap(
+                Arc::clone(&first.rt),
+                first.rt.buffer_for_audited_full_gpu_write(
+                    layout.size() * first.dtype.size_of(),
+                    "cat_out",
+                )?,
+                layout,
+                first.dtype,
+            )
+        };
         // MLX `concatenate_gpu` (backend/metal/slicing.cpp): slice the output on
         // the concat axis, then dispatch one GeneralGeneral copy per input —
         // src and dst share the iteration shape but have their own strides. No
@@ -1040,6 +1094,13 @@ impl Array {
         let mut off = 0usize;
         for a in arrays {
             let d = a.dim(axis);
+            // An empty slice has no copy work. A nonzero dispatch for its
+            // zero-sized grid would read padding and overwrite the next
+            // output slice (or write beyond the last logical element).
+            if a.size() == 0 {
+                off += d;
+                continue;
+            }
             // The dst slice view (MLX's `out_slice` with
             // data_offset = strides[axis] * offset).
             let dst = out.narrow(axis, off, d)?;
@@ -1071,7 +1132,7 @@ impl Array {
             let rest = data_size / (dim0 * dim1).max(1);
 
             let name = format!("copy_gg_nd{ndim}_{tag}");
-            let pipe = first.rt.compile(&copy_gg_source(), &name)?;
+            let pipe = first.rt.compile(copy_gg_source(), &name)?;
             {
                 let guard = first.rt.commands.encoder()?;
                 let enc = guard.encoder();
@@ -1080,8 +1141,8 @@ impl Array {
                 enc.set_output(1, Some(&out.buf), dst_off_elems * esz);
                 match ndim {
                     1 => {
-                        enc.set_bytes(3, &(src_s[0] as i64));
-                        enc.set_bytes(4, &(dst_s[0] as i64));
+                        enc.set_bytes(3, &{ src_s[0] });
+                        enc.set_bytes(4, &{ dst_s[0] });
                     }
                     _ => {
                         enc.set_bytes_directly(3, ndim * 8, src_s.as_ptr().cast());
@@ -1231,25 +1292,32 @@ impl Array {
         let out = Self::zeros(rt, shape, dtype)?;
         let p = out.buf.contents();
         match dtype {
+            // SAFETY: `out` is fresh, page-aligned, contiguous storage of `out.size()` elements of
+            // `dtype` with no GPU user; each arm writes that element type.
             Dtype::F32 => unsafe { (0..out.size()).for_each(|i| *(p as *mut f32).add(i) = value) },
             Dtype::BF16 => {
                 let v = bf16::from_f32(value);
+                // SAFETY: as for F32, `out.size()` elements of this type fit the idle buffer.
                 unsafe { (0..out.size()).for_each(|i| *(p as *mut bf16).add(i) = v) }
             }
             Dtype::F16 => {
                 let v = f16::from_f32(value);
+                // SAFETY: as for F32, `out.size()` elements of this type fit the idle buffer.
                 unsafe { (0..out.size()).for_each(|i| *(p as *mut f16).add(i) = v) }
             }
             Dtype::U8 | Dtype::Bool => {
                 let v = value as u8;
-                unsafe { (0..out.size()).for_each(|i| *(p as *mut u8).add(i) = v) }
+                // SAFETY: as for F32, `out.size()` elements of this type fit the idle buffer.
+                unsafe { (0..out.size()).for_each(|i| *p.add(i) = v) }
             }
             Dtype::U32 => {
                 let v = value as u32;
+                // SAFETY: as for F32, `out.size()` elements of this type fit the idle buffer.
                 unsafe { (0..out.size()).for_each(|i| *(p as *mut u32).add(i) = v) }
             }
             Dtype::I64 => {
                 let v = value as i64;
+                // SAFETY: as for F32, `out.size()` elements of this type fit the idle buffer.
                 unsafe { (0..out.size()).for_each(|i| *(p as *mut i64).add(i) = v) }
             }
             other => return Err(err(format!("full: unsupported {other:?}"))),
@@ -1415,6 +1483,8 @@ impl Array {
             Layout::contiguous(x.shape()),
             dtype,
         );
+        // SAFETY: every caller passes exactly `x.size() * dtype.size_of()` bytes, which fit the
+        // fresh, GPU-idle `out.buf`.
         let put = |bytes: &[u8]| unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.buf.contents(), bytes.len())
         };

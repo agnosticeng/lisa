@@ -1,5 +1,6 @@
 use objc2_metal::MTLSize;
 
+use super::compile::compile_builtin_lazy;
 use crate::array::Array;
 
 use super::compile::{
@@ -85,7 +86,7 @@ pub fn reduce_last_axis(device: &Device, x: &Tensor, op_name: &str) -> Result<Te
         format!("{MLX_UTILS_PREAMBLE}{MLX_REDUCE_UTILS_PREAMBLE}{MLX_REDUCE_PREAMBLE}{def}");
     let pipeline = compile_builtin(device, &source, &kernel_name)?;
 
-    let obuf = mdev.buffer_for_gpu_write((out_count) as usize * (dt).size_of(), "reduce_out")?;
+    let obuf = mdev.buffer_for_gpu_write((out_count) * (dt).size_of(), "reduce_out")?;
     let out = Array::from_parts(mdev, obuf.clone(), &out_dims.clone(), dt);
 
     let guard = mdev.commands.encoder()?;
@@ -143,16 +144,6 @@ pub fn reduce_axis(device: &Device, x: &Tensor, axis: i32, op_name: &str) -> Res
     r.transpose(ax, rank - 2)?.contiguous()
 }
 
-/// MLX `ops::mean_axis` over the last axis: `multiply(sum(a), 1/n)` where the
-/// normaliser is `1/n` computed in f32 and cast to the array dtype (`ops.cpp:2340`).
-pub fn mean_last_axis(device: &Device, x: &Tensor) -> Result<Tensor> {
-    let dims = x.dims().to_vec();
-    let n = *dims.last().unwrap() as f32;
-    let s = reduce_last_axis(device, x, "sum")?;
-    let norm = Array::scalar_of(device, 1.0f32 / n, x.dtype())?;
-    Ok(s.broadcast_mul(&norm)?)
-}
-
 fn arg_reduce_axis(
     device: &Device,
     x: &Tensor,
@@ -182,8 +173,8 @@ fn arg_reduce_axis(
     let inst = format!(
         "\ntemplate [[host_name(\"{kernel_name}\")]] [[kernel]] decltype(arg_reduce_general<{t}, {op_struct}<{t}>>) arg_reduce_general<{t}, {op_struct}<{t}>>;\n"
     );
-    let source = format!("{MLX_UTILS_PREAMBLE}{MLX_ARG_REDUCE_SOURCE}{inst}");
-    let pipeline = compile_builtin(device, &source, &kernel_name)?;
+    let source = || format!("{MLX_UTILS_PREAMBLE}{MLX_ARG_REDUCE_SOURCE}{inst}");
+    let pipeline = compile_builtin_lazy(device, &kernel_name, source)?;
 
     let strides = layout.stride().to_vec();
     let mut shape: Vec<i32> = Vec::new();
@@ -214,8 +205,7 @@ fn arg_reduce_axis(
     let ndim = out_dims.len();
 
     let out_count: usize = out_dims.iter().product::<usize>().max(1);
-    let obuf =
-        mdev.buffer_for_gpu_write((out_count) as usize * (DType::U32).size_of(), "arg_out")?;
+    let obuf = mdev.buffer_for_gpu_write((out_count) * (DType::U32).size_of(), "arg_out")?;
     let out = Array::from_parts(mdev, obuf.clone(), &out_dims.clone(), DType::U32);
 
     let guard = mdev.commands.encoder()?;
@@ -308,10 +298,7 @@ pub fn reduce_axis0_sum(device: &Device, inter: &Tensor) -> Result<Tensor> {
     let pipeline = compile_builtin(device, &source, &kname)?;
 
     let out_count = rest;
-    let obuf = mdev.buffer_for_gpu_write(
-        (out_count) as usize * (inter.dtype()).size_of(),
-        "colred_out",
-    )?;
+    let obuf = mdev.buffer_for_gpu_write((out_count) * (inter.dtype()).size_of(), "colred_out")?;
     let out_dims = dims[1..].to_vec();
     let out = Array::from_parts(mdev, obuf.clone(), &out_dims, inter.dtype());
 
@@ -404,10 +391,12 @@ mod row_bounds_tests {
                             type_to_name(dtype)?,
                             rows,
                         )?;
-                        let source = format!(
-                            "{MLX_UTILS_PREAMBLE}{MLX_REDUCE_UTILS_PREAMBLE}{MLX_REDUCE_PREAMBLE}{def}"
-                        );
-                        let pipeline = compile_builtin(rt, &source, &name)?;
+                        let source = || {
+                            format!(
+                                "{MLX_UTILS_PREAMBLE}{MLX_REDUCE_UTILS_PREAMBLE}{MLX_REDUCE_PREAMBLE}{def}"
+                            )
+                        };
+                        let pipeline = compile_builtin_lazy(rt, &name, source)?;
                         {
                             let guard = rt.commands.encoder()?;
                             let enc = guard.encoder();

@@ -27,6 +27,25 @@ template <typename T>
     dst[doff] = src[so];
 }
 
+// F32 into an F16 destination; the conversion rounds to nearest even.
+[[kernel]] void copy2_strided_float_to_half(
+    const device float* src [[buffer(0)]],
+    device half* dst [[buffer(1)]],
+    constant Copy2Params& p [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint rem = gid;
+    ulong so = 0;
+    ulong doff = 0;
+    for (int d = int(p.ndim) - 1; d >= 0; --d) {
+        const uint idx = rem % p.shape[d];
+        rem /= p.shape[d];
+        so += (ulong)idx * (ulong)p.src_strides[d];
+        doff += (ulong)idx * (ulong)p.dst_strides[d];
+    }
+    dst[doff] = half(src[so]);
+}
+
 template [[host_name("copy2_strided_uint8_t")]] [[kernel]] decltype(copy2_strided<uchar>) copy2_strided<uchar>;
 template [[host_name("copy2_strided_uint16_t")]] [[kernel]] decltype(copy2_strided<uint16_t>) copy2_strided<uint16_t>;
 template [[host_name("copy2_strided_uint32_t")]] [[kernel]] decltype(copy2_strided<uint>) copy2_strided<uint>;

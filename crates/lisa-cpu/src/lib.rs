@@ -192,7 +192,7 @@ impl Device for CpuDevice {
     }
     fn pull(&self, source: TensorSource<'_>, options: ImportOptions) -> Result<Tensor> {
         require(
-            options.mode == ImportMode::Copy,
+            matches!(options.mode, ImportMode::Copy | ImportMode::CopyCompact),
             "host shared import is not implemented",
         )?;
         let h = source
@@ -202,15 +202,19 @@ impl Device for CpuDevice {
         match h.dtype {
             ScalarType::F32 => Tensor::from_f32(
                 h.bytes
-                    .chunks_exact(4)
-                    .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_le_bytes(*b))
                     .collect(),
                 h.shape,
             ),
             ScalarType::I32 => Tensor::from_i32(
                 h.bytes
-                    .chunks_exact(4)
-                    .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| i32::from_le_bytes(*b))
                     .collect(),
                 h.shape,
             ),
@@ -284,7 +288,7 @@ fn execute(op: &TensorOperation, args: &[&Tensor]) -> Result<Tensor> {
                     .try_fold(1usize, |n, &d| n.checked_mul(d as usize))
                     .ok_or_else(|| Error("reshape overflow".into()))?;
                 require(
-                    known > 0 && x.len() % known == 0,
+                    known > 0 && x.len().is_multiple_of(known),
                     "invalid inferred reshape",
                 )?;
                 shape[i] = i32::try_from(x.len() / known)
@@ -622,26 +626,28 @@ mod tests {
     fn import_is_exact_and_capabilities_do_not_claim_gpu_arithmetic() {
         let values = [0x80000000u32, 0x3f800001, 0x7fc01234];
         let bytes: Vec<_> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let tensor = CpuDevice
-            .pull(
-                HostTensor {
-                    bytes: &bytes,
-                    shape: &[3],
-                    dtype: ScalarType::F32,
-                }
-                .into(),
-                ImportOptions::default(),
-            )
-            .unwrap();
-        assert_eq!(
-            tensor
-                .f32()
-                .unwrap()
-                .iter()
-                .map(|v| v.to_bits())
-                .collect::<Vec<_>>(),
-            values
-        );
+        for mode in [ImportMode::Copy, ImportMode::CopyCompact] {
+            let tensor = CpuDevice
+                .pull(
+                    HostTensor {
+                        bytes: &bytes,
+                        shape: &[3],
+                        dtype: ScalarType::F32,
+                    }
+                    .into(),
+                    ImportOptions { mode },
+                )
+                .unwrap();
+            assert_eq!(
+                tensor
+                    .f32()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+                values
+            );
+        }
         assert!(
             CpuDevice
                 .prepare(Kernel::Tensor(TensorOperation::Unary(Unary::Negate)))
@@ -655,6 +661,7 @@ mod tests {
                 .is_none()
         );
     }
+
     #[test]
     fn tensor_layout_and_broadcast_follow_logical_axes() {
         let x = Tensor::from_f32(vec![0., 1., 2., 3., 4., 5.], &[2, 3]).unwrap();
@@ -723,7 +730,7 @@ impl StorageDevice for CpuDevice {
         let bytes =
             tensor_bytes(shape, dtype).ok_or_else(|| Error("invalid byte view shape".into()))?;
         require(
-            offset % dtype.size_of() == 0
+            offset.is_multiple_of(dtype.size_of())
                 && offset
                     .checked_add(bytes)
                     .is_some_and(|n| n <= source.len() * dtype.size_of()),

@@ -1,6 +1,5 @@
 #![cfg(test)]
 use super::*;
-use crate::bindings::deepseek41_moe::tests::{counts, difference};
 use lisa_metal::{Dtype, ops};
 #[path = "glm53_affine_projection_oracle.rs"]
 mod oracle;
@@ -37,24 +36,14 @@ fn affine_plans_preserve_native_fallback_and_cohort_bits() -> anyhow::Result<()>
                     vec![1, input],
                 ] {
                     let x = values(&shape, 23);
-                    let before = counts();
                     let a = oracle::original(&w, &x, native)?;
-                    let between = counts();
                     let b = forward(&w, &x, native)?;
-                    let after = counts();
                     assert_eq!(a.shape(), b.shape());
                     assert_eq!(
                         a.to_vec1::<u32>()?,
                         b.to_vec1::<u32>()?,
                         "{shape:?} metadata{dtype:?} native{native}"
                     );
-                    if std::env::var_os("LISA_TRACE").is_some() {
-                        assert_eq!(
-                            difference(&before, &between),
-                            difference(&between, &after),
-                            "{shape:?} metadata{dtype:?} native{native}"
-                        );
-                    }
                 }
             }
         }

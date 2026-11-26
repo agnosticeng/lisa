@@ -6,14 +6,14 @@ use super::common::EXACT_HEADER;
 /// `track_p12_moe_sorted_combine`: the routed combine reads the SORTED expert
 /// rows through the inverse permutation the sort already produced, keeping the
 /// float32 products in original (token, slot) order and the same small-column
-/// reduction tree. Replaces the f32 [B,S,K,H] materialisation + scatter + the
+/// reduction tree. Replaces the f32 `[B,S,K,H]` materialisation + scatter + the
 /// 10-op column reduce with one launch.
 ///
 /// `routed` is the sorted down output `[rows*K, H]`, `w` the float32 weights in
 /// ORIGINAL slot order `[rows*K]`, `inverse_order` u32 `[rows*K]`, `shared`
 /// `[rows, H]`, `gate` bf16 `[rows]` -> `[rows, H]`.
 const MOE_COMBINE_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("qwen4/moe_combine.metal");
+    crate::kernel_source!("moe/moe_combine.metal");
 
 static MOE_COMBINE: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 
@@ -76,10 +76,10 @@ pub fn moe_combine(
 /// and a stable counting sort is the unique stable permutation, so the two agree
 /// element for element.
 const ROUTE_BLOCK_COUNTS_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("qwen4/route_block_counts.metal");
+    crate::kernel_source!("moe/route_block_counts.metal");
 
 const ROUTE_COUNTING_SCATTER_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("qwen4/route_counting_scatter.metal");
+    crate::kernel_source!("moe/route_counting_scatter.metal");
 
 static ROUTE_BLOCK_COUNTS: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 static ROUTE_COUNTING_SCATTER: std::sync::OnceLock<Option<MetalKernel>> =
@@ -135,13 +135,13 @@ pub fn route_counting_sort(
     top_k: usize,
     stream: &Stream,
 ) -> Option<(Array, Array, Array)> {
-    if e == 0 || e % 256 != 0 || e > 4096 || top_k == 0 {
+    if e == 0 || !e.is_multiple_of(256) || e > 4096 || top_k == 0 {
         return None;
     }
     let r = ids.dim(0) as usize;
     // The last block may be partial (the kernels pad it with the out-of-range
     // id E, which no bucket counts); only the expert count must divide R.
-    if r == 0 || r % top_k != 0 {
+    if r == 0 || !r.is_multiple_of(top_k) {
         return None;
     }
     let blk = 256i32;
@@ -221,7 +221,7 @@ pub fn route_counting_sort(
 /// `track_router_gemv`: the decode router as a bf16 GEMV with f32 accumulate,
 /// one token (`x` f32 `[K]`, `w` bf16 `[N,K]`) -> logits f32 `[N]`.
 const ROUTER_GEMV_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("qwen4/router_gemv.metal");
+    crate::kernel_source!("moe/router_gemv.metal");
 
 static ROUTER_GEMV: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 

@@ -20,8 +20,7 @@ impl Qwen35Attention {
         let hd = self.head_dim as i32;
         let heads = self.heads as i32;
 
-        let merged = self.gated && self.q_gate_proj.is_some() && s == 1;
-        let joined = if !merged && b == 1 && s <= 8 {
+        let joined = if b == 1 && s <= 8 {
             self.qkv_proj.as_ref().map(|p| p.forward(x)).transpose()?
         } else {
             None
@@ -33,37 +32,26 @@ impl Qwen35Attention {
                 projection.forward(x)
             }
         };
-        let (mut q, mut gate, qg_raw) =
-            if let (true, Some(qg_proj)) = (merged, self.q_gate_proj.as_ref()) {
-                let y = qg_proj.forward(x)?.reshape(&[b, 2 * heads * hd])?; // [b, Q|G]
-                let qn = heads * hd;
-                let q = Some(y.index((.., 0..qn)).reshape(&[b, s, heads, hd])?);
-                let gate = if self.gated {
-                    Some(y.index((.., qn..)).reshape(&[b, s, heads, hd])?)
-                } else {
-                    None
-                };
-                (q, gate, None)
+        let (mut q, mut gate, qg_raw) = {
+            let qg = project(&self.q_proj, 0)?;
+            let qg = qg.split_last_axis(&[heads, 2, hd])?;
+            let eager = s == 1;
+            let q = if eager {
+                Some(qg.index((Ellipsis, 0, ..)).contiguous()?)
             } else {
-                let qg = project(&self.q_proj, 0)?;
-                let qg = qg.split_last_axis(&[heads, 2, hd])?;
-                let eager = s == 1;
-                let q = if eager {
-                    Some(qg.index((Ellipsis, 0, ..)).contiguous()?)
-                } else {
-                    None
-                };
-                let gate = if self.gated {
-                    if eager {
-                        Some(qg.index((Ellipsis, 1, ..)).contiguous()?)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                (q, gate, Some(qg))
+                None
             };
+            let gate = if self.gated {
+                if eager {
+                    Some(qg.index((Ellipsis, 1, ..)).contiguous()?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            (q, gate, Some(qg))
+        };
         let qn = self.q_proj.dims_out() as i32;
         let kn = self.k_proj.dims_out() as i32;
         let k = project(&self.k_proj, qn)?.split_last_axis(&[self.kv_heads as i32, hd])?;
@@ -92,8 +80,8 @@ impl Qwen35Attention {
                 &k,
                 &self.q_norm.weight,
                 &self.k_norm.weight,
-                &cos_bf,
-                &sin_bf,
+                cos_bf,
+                sin_bf,
                 self.q_norm.eps,
                 heads,
                 self.kv_heads as i32,
@@ -107,65 +95,66 @@ impl Qwen35Attention {
                 let out = fast::scaled_dot_product_attention(
                     &qk, &live_k, &live_v, self.scale, sdpa_mask, None,
                 )?;
-                return Ok(self.reference_tail(out, gate, b, s, heads, hd)?);
+                return self.reference_tail(out, gate, b, s, heads, hd);
             }
         }
 
-        if b == 1 && s > 1 && self.gated && attn_mask.is_none() {
-            if let Some(qg) = qg_raw.as_ref() {
-                let stream = lisa_metal::Stream::thread_local_or_default();
-                let (qg2, k2) = if let Some(all) = joined.as_ref() {
-                    let rows = all
-                        .reshape_rows_view(s as usize, all.dim(2) as usize)
-                        .expect("joined projection has uniform rows");
-                    (rows.index((.., 0..qn)), rows.index((.., qn..qn + kn)))
-                } else {
-                    (
-                        qg.reshape(&[s, heads * 2 * hd])?,
-                        k.reshape(&[s, self.kv_heads as i32 * hd])?,
-                    )
+        if b == 1
+            && s > 1
+            && self.gated
+            && attn_mask.is_none()
+            && let Some(qg) = qg_raw.as_ref()
+        {
+            let stream = lisa_metal::Stream::thread_local_or_default();
+            let (qg2, k2) = if let Some(all) = joined.as_ref() {
+                let rows = all
+                    .reshape_rows_view(s as usize, all.dim(2) as usize)
+                    .expect("joined projection has uniform rows");
+                (rows.index((.., 0..qn)), rows.index((.., qn..qn + kn)))
+            } else {
+                (
+                    qg.reshape(&[s, heads * 2 * hd])?,
+                    k.reshape(&[s, self.kv_heads as i32 * hd])?,
+                )
+            };
+            if let Some((qk, kk, gate)) = lisa_metal::kernels::gated_pointwise::qk_norm_rope_rows(
+                &qg2,
+                &k2,
+                &self.q_norm.weight,
+                &self.k_norm.weight,
+                cos_bf,
+                sin_bf,
+                self.q_norm.eps,
+                heads,
+                self.kv_heads as i32,
+                s,
+                &stream,
+            ) {
+                let v = v.transpose_axes(&[0, 2, 1, 3])?;
+                let (live_k, live_v) = match cache.as_deref_mut() {
+                    Some(c) => reference_update(c, &kk, &v)?,
+                    None => (kk, v),
                 };
-                if let Some((qk, kk, gate)) =
-                    lisa_metal::kernels::gated_pointwise::qk_norm_rope_rows(
-                        &qg2,
-                        &k2,
-                        &self.q_norm.weight,
-                        &self.k_norm.weight,
-                        &cos_bf,
-                        &sin_bf,
-                        self.q_norm.eps,
-                        heads,
-                        self.kv_heads as i32,
-                        s,
-                        &stream,
-                    )
-                {
-                    let v = v.transpose_axes(&[0, 2, 1, 3])?;
-                    let (live_k, live_v) = match cache.as_deref_mut() {
-                        Some(c) => reference_update(c, &kk, &v)?,
-                        None => (kk, v),
-                    };
-                    let out = fast::scaled_dot_product_attention(
-                        &qk,
-                        &live_k,
-                        &live_v,
-                        self.scale,
-                        fast::ScaledDotProductAttentionMask::Causal,
-                        None,
-                    )?;
-                    let gate = gate.reshape(&[b, s, heads, hd])?;
-                    return Ok(self.reference_tail(out, Some(gate), b, s, heads, hd)?);
-                }
+                let out = fast::scaled_dot_product_attention(
+                    &qk,
+                    &live_k,
+                    &live_v,
+                    self.scale,
+                    fast::ScaledDotProductAttentionMask::Causal,
+                    None,
+                )?;
+                let gate = gate.reshape(&[b, s, heads, hd])?;
+                return self.reference_tail(out, Some(gate), b, s, heads, hd);
             }
         }
 
-        if q.is_none() {
-            if let Some(qg) = qg_raw.as_ref() {
-                let qg4 = qg.reshape(&[b, s, heads, 2, hd])?;
-                q = Some(qg4.index((Ellipsis, 0, ..)).contiguous()?);
-                if gate.is_none() && self.gated {
-                    gate = Some(qg4.index((Ellipsis, 1, ..)).contiguous()?);
-                }
+        if q.is_none()
+            && let Some(qg) = qg_raw.as_ref()
+        {
+            let qg4 = qg.reshape(&[b, s, heads, 2, hd])?;
+            q = Some(qg4.index((Ellipsis, 0, ..)).contiguous()?);
+            if gate.is_none() && self.gated {
+                gate = Some(qg4.index((Ellipsis, 1, ..)).contiguous()?);
             }
         }
         let q = q.expect("q materialized for the composed path");
@@ -178,8 +167,8 @@ impl Qwen35Attention {
         let q = self.q_norm.forward(&q)?;
         let k = self.k_norm.forward(&k)?;
 
-        let q = rope_partial(&q.transpose_axes(&[0, 2, 1, 3])?, &cos_bf, &sin_bf)?;
-        let k = rope_partial(&k.transpose_axes(&[0, 2, 1, 3])?, &cos_bf, &sin_bf)?;
+        let q = rope_partial(&q.transpose_axes(&[0, 2, 1, 3])?, cos_bf, sin_bf)?;
+        let k = rope_partial(&k.transpose_axes(&[0, 2, 1, 3])?, cos_bf, sin_bf)?;
         let v = v.transpose_axes(&[0, 2, 1, 3])?;
 
         let (live_k, live_v) = match cache.as_deref_mut() {
@@ -335,127 +324,109 @@ fn projection(output: i32, input: i32) -> QuantizedLinear {
 fn attention_plan_matches_original_paths_and_cache_bytes() -> anyhow::Result<()> {
     for width in [128, 256] {
         for gated in [false, true] {
-            for retiled in [false, true] {
-                let (h, kh, hidden) = (4, 2, 256);
-                let q_proj = projection(h * 2 * width, hidden);
-                let q_gate_proj = if retiled && gated {
-                    let g = lisa_models::qwen3_5::attention::retile_projection(h, width);
-                    let mut out = PreparedGraph::new(MetalDevice::system_default(), g, vec![])?
-                        .run(&[&q_proj.weight, &q_proj.scales, &q_proj.biases], &mut [])?
-                        .into_iter();
-                    Some(QuantizedLinear {
-                        weight: out.next().unwrap(),
-                        scales: out.next().unwrap(),
-                        biases: out.next().unwrap(),
-                        group_size: 64,
-                        bits: 4,
-                    })
+            let (h, kh, hidden) = (4, 2, 256);
+            let q_proj = projection(h * 2 * width, hidden);
+            let model =
+                Qwen35Attention(lisa_engine::bindings::qwen35::attention::Qwen35Attention {
+                    context: crate::metal_context::execution_context(),
+                    q_proj,
+                    qkv_proj: None,
+                    k_proj: projection(kh * width, hidden),
+                    v_proj: projection(kh * width, hidden),
+                    o_proj: projection(hidden, h * width),
+                    q_norm: RmsNorm {
+                        weight: tensor(&[width], 7),
+                        eps: 1e-6,
+                        group_size: None,
+                    },
+                    k_norm: RmsNorm {
+                        weight: tensor(&[width], 11),
+                        eps: 1e-6,
+                        group_size: None,
+                    },
+                    heads: h as usize,
+                    kv_heads: kh as usize,
+                    head_dim: width as usize,
+                    scale: (width as f32).powf(-0.5),
+                    gated,
+                    plans: Default::default(),
+                });
+            for batch in [1, 2] {
+                let mut a = FullAttentionCache::new(
+                    crate::metal_context::execution_context(),
+                    kh as usize,
+                    width as usize,
+                );
+                let mut b = FullAttentionCache::new(
+                    crate::metal_context::execution_context(),
+                    kh as usize,
+                    width as usize,
+                );
+                // Starts cold, reuses storage, crosses capacity, then exercises rollback.
+                for (step, rows) in (if batch == 1 {
+                    [1, 2, 7, 9, 256, 1, 3]
                 } else {
-                    None
-                };
-                let model =
-                    Qwen35Attention(lisa_engine::bindings::qwen35_attention::Qwen35Attention {
-                        context: crate::metal_context::execution_context(),
-                        q_proj,
-                        qkv_proj: None,
-                        q_gate_proj,
-                        k_proj: projection(kh * width, hidden),
-                        v_proj: projection(kh * width, hidden),
-                        o_proj: projection(hidden, h * width),
-                        q_norm: RmsNorm {
-                            weight: tensor(&[width], 7),
-                            eps: 1e-6,
-                            group_size: None,
-                        },
-                        k_norm: RmsNorm {
-                            weight: tensor(&[width], 11),
-                            eps: 1e-6,
-                            group_size: None,
-                        },
-                        heads: h as usize,
-                        kv_heads: kh as usize,
-                        head_dim: width as usize,
-                        scale: (width as f32).powf(-0.5),
-                        gated,
-                        plans: Default::default(),
-                    });
-                for batch in [1, 2] {
-                    let mut a = FullAttentionCache::new(
-                        crate::metal_context::execution_context(),
-                        kh as usize,
-                        width as usize,
+                    [1; 7]
+                })
+                .into_iter()
+                .enumerate()
+                {
+                    let x = tensor(&[batch, rows, hidden], step as i32);
+                    let cos = tensor(&[batch, 1, rows, 64], 43);
+                    let sin = tensor(&[batch, 1, rows, 64], 31);
+                    let case = format!(
+                        "width={width} gated={gated} batch={batch} rows={rows} step={step}"
                     );
-                    let mut b = FullAttentionCache::new(
-                        crate::metal_context::execution_context(),
-                        kh as usize,
-                        width as usize,
-                    );
-                    // Starts cold, reuses storage, crosses capacity, then exercises rollback.
-                    for (step, rows) in (if batch == 1 {
-                        [1, 2, 7, 9, 256, 1, 3]
-                    } else {
-                        [1; 7]
-                    })
-                    .into_iter()
-                    .enumerate()
-                    {
-                        let x = tensor(&[batch, rows, hidden], step as i32);
-                        let cos = tensor(&[batch, 1, rows, 64], 43);
-                        let sin = tensor(&[batch, 1, rows, 64], 31);
-                        let case = format!(
-                            "width={width} gated={gated} retiled={retiled} batch={batch} rows={rows} step={step}"
-                        );
-                        let expected = model
-                            .reference_forward(&x, &cos, &sin, Some(&mut a), 0)
-                            .with_context(|| format!("reference {case}"))?;
-                        let got = model
-                            .forward(&x, &cos, &sin, Some(&mut b), 0)
-                            .with_context(|| format!("plan {case}"))?;
-                        equal(&got, &expected, &case);
-                        assert_eq!((a.offset, a.capacity), (b.offset, b.capacity), "{case}");
-                        equal(a.keys.as_ref().unwrap(), b.keys.as_ref().unwrap(), &case);
-                        equal(
-                            a.values.as_ref().unwrap(),
-                            b.values.as_ref().unwrap(),
-                            &case,
-                        );
-                        if step == 4 {
-                            a.trim(3);
-                            b.trim(3);
-                        }
-                    }
-                    let x = tensor(&[batch, 1, hidden], 5);
-                    let cos = tensor(&[batch, 1, 1, 64], 43);
-                    let sin = tensor(&[batch, 1, 1, 64], 31);
+                    let expected = model
+                        .reference_forward(&x, &cos, &sin, Some(&mut a), 0)
+                        .with_context(|| format!("reference {case}"))?;
+                    let got = model
+                        .forward(&x, &cos, &sin, Some(&mut b), 0)
+                        .with_context(|| format!("plan {case}"))?;
+                    equal(&got, &expected, &case);
+                    assert_eq!((a.offset, a.capacity), (b.offset, b.capacity), "{case}");
+                    equal(a.keys.as_ref().unwrap(), b.keys.as_ref().unwrap(), &case);
                     equal(
-                        &model.forward(&x, &cos, &sin, None, 0)?,
-                        &model.reference_forward(&x, &cos, &sin, None, 0)?,
-                        "no cache",
+                        a.values.as_ref().unwrap(),
+                        b.values.as_ref().unwrap(),
+                        &case,
                     );
-                    if batch == 1 {
-                        let cf = cos.as_dtype(Dtype::Float32)?;
-                        let sf = sin.as_dtype(Dtype::Float32)?;
-                        equal(
-                            &model.forward(&x, &cf, &sf, None, 0)?,
-                            &model.reference_forward(&x, &cf, &sf, None, 0)?,
-                            "f32 frequencies",
-                        );
+                    if step == 4 {
+                        a.trim(3);
+                        b.trim(3);
                     }
-                    if batch == 2 {
-                        a.next_pos = Some(vec![a.offset + 1, a.offset - 2]);
-                        b.next_pos = a.next_pos.clone();
-                        let mask = Array::from_slice(
-                            &vec![true; 2 * (a.offset + 1)],
-                            &[2, 1, 1, (a.offset + 1) as i32],
-                        );
-                        a.attn_mask = Some(mask.clone());
-                        b.attn_mask = Some(mask);
-                        equal(
-                            &model.forward(&x, &cos, &sin, Some(&mut b), 0)?,
-                            &model.reference_forward(&x, &cos, &sin, Some(&mut a), 0)?,
-                            "ragged",
-                        );
-                    }
+                }
+                let x = tensor(&[batch, 1, hidden], 5);
+                let cos = tensor(&[batch, 1, 1, 64], 43);
+                let sin = tensor(&[batch, 1, 1, 64], 31);
+                equal(
+                    &model.forward(&x, &cos, &sin, None, 0)?,
+                    &model.reference_forward(&x, &cos, &sin, None, 0)?,
+                    "no cache",
+                );
+                if batch == 1 {
+                    let cf = cos.as_dtype(Dtype::Float32)?;
+                    let sf = sin.as_dtype(Dtype::Float32)?;
+                    equal(
+                        &model.forward(&x, &cf, &sf, None, 0)?,
+                        &model.reference_forward(&x, &cf, &sf, None, 0)?,
+                        "f32 frequencies",
+                    );
+                }
+                if batch == 2 {
+                    a.next_pos = Some(vec![a.offset + 1, a.offset - 2]);
+                    b.next_pos = a.next_pos.clone();
+                    let mask = Array::from_slice(
+                        &vec![true; 2 * (a.offset + 1)],
+                        &[2, 1, 1, (a.offset + 1) as i32],
+                    );
+                    a.attn_mask = Some(mask.clone());
+                    b.attn_mask = Some(mask);
+                    equal(
+                        &model.forward(&x, &cos, &sin, Some(&mut b), 0)?,
+                        &model.reference_forward(&x, &cos, &sin, Some(&mut a), 0)?,
+                        "ragged",
+                    );
                 }
             }
         }
@@ -468,7 +439,7 @@ fn reference_grow(
     needed: usize,
     b: i32,
 ) -> lisa_metal::error::Result<()> {
-    let same_batch = c.keys.as_ref().map_or(true, |k| k.dim(0) == b);
+    let same_batch = c.keys.as_ref().is_none_or(|k| k.dim(0) == b);
     if c.capacity >= needed && same_batch {
         return Ok(());
     }
@@ -523,7 +494,7 @@ fn reference_update(
         let v = c.values.as_mut().unwrap();
         v.index_mut((.., .., range, ..), values.clone());
     }
-    c.offset += s as usize;
+    c.offset += s;
     let live = 0..c.offset as i32;
     Ok((
         c.keys.as_ref().unwrap().index((.., .., live.clone(), ..)),

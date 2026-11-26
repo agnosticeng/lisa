@@ -1,13 +1,19 @@
 //! Native conformance adapters for portable image bindings.
-use lisa_metal::{Array, Dtype, device::MetalDevice};
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-};
+#[cfg(test)]
+use lisa_metal::Array;
+#[cfg(test)]
+use lisa_metal::Dtype;
+#[cfg(test)]
+use lisa_metal::device::MetalDevice;
+#[cfg(test)]
+use std::collections::HashMap;
+#[cfg(test)]
 pub type Weights = lisa_engine::bindings::flux2::weights::Weights<MetalDevice>;
+#[cfg(test)]
 pub(crate) fn info(x: &Array) -> anyhow::Result<lisa_models::flux::symbolic::TensorInfo> {
     lisa_engine::bindings::flux2::weights::info(&crate::metal_context::execution_context(), x)
 }
+#[cfg(test)]
 pub(crate) fn run(graph: lisa_models::graph::Graph, inputs: &[&Array]) -> anyhow::Result<Array> {
     lisa_engine::bindings::flux2::weights::run(
         &crate::metal_context::execution_context(),

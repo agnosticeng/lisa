@@ -1,4 +1,4 @@
-//! Original DS4 MXFP8 row decoder (ds4_engram.c, MIT).
+//! Original reference MXFP8 row decoder (ds4_engram.c, MIT).
 //! Revision b3f50180ec2c7324892be1f50bc83555ccb8d5e7; see LICENSE-DS4.
 //! This custom 264-byte row is explicitly requested by the adapter. It does
 //! not change the standard GGUF meaning of tensor kind 24 (I8).

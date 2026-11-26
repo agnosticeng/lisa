@@ -66,10 +66,26 @@ pub mod readout;
 pub mod entry;
 
 use config::Qwen35Config;
-// Bind cached state to the corrected attention launch before lazy pipelines
-// compile. Legacy Qwen state could contain outputs from the invalid >1024-thread
-// launch; it must not be restored merely because no new SDPA kernel ran yet.
+/// Serial capture schedule shared by prefill, verification and the MTP head.
+const SERIAL_CAPTURE_LAW: &[u8] = b"lisa.qwen35.serial-capture.v3";
+
+/// Round-cost table key suffix for the serial capture schedule.
+pub const SERIAL_CAPTURE_COST_SUFFIX: &str = "-serial-capture-v3";
+
+/// Numerical identity of restorable Qwen MLX state, available before any
+/// pipeline compiles: geometry, device arithmetic, complete convolution history
+/// and the serial capture schedule.
 pub fn cache_law(config: &Qwen35Config, device_arithmetic: &[u8]) -> u64 {
+    let law = crate::gated_delta::complete_history_cache_law(arithmetic_geometry_identity(
+        config,
+        device_arithmetic,
+    ));
+    SERIAL_CAPTURE_LAW.iter().fold(law, |hash, &byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+    })
+}
+
+fn arithmetic_geometry_identity(config: &Qwen35Config, device_arithmetic: &[u8]) -> u64 {
     let mut bytes = b"lisa.qwen35.mlx.valid-head-split.v1".to_vec();
     bytes.extend_from_slice(device_arithmetic);
     for value in [
@@ -88,8 +104,27 @@ pub fn cache_law(config: &Qwen35Config, device_arithmetic: &[u8]) -> u64 {
     })
 }
 
-pub mod tower;
+#[cfg(test)]
+mod history_law_tests {
+    #[test]
+    fn complete_convolution_history_excludes_legacy_prefixes() {
+        let config = super::Qwen35Config::parse("{}").unwrap();
+        let legacy = super::arithmetic_geometry_identity(&config, b"metal:test");
+        let corrected = super::cache_law(&config, b"metal:test");
+        assert_ne!(corrected, legacy);
+        assert_eq!(corrected, super::cache_law(&config, b"metal:test"));
+    }
 
-pub mod dspine;
+    #[test]
+    fn serial_capture_identity_is_frozen() {
+        let config = super::Qwen35Config::parse("{}").unwrap();
+        let history = crate::gated_delta::complete_history_cache_law(
+            super::arithmetic_geometry_identity(&config, b"metal:test"),
+        );
+        assert_ne!(super::cache_law(&config, b"metal:test"), history);
+    }
+}
+
+pub mod tower;
 
 pub mod gguf;

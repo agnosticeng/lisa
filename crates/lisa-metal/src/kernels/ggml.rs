@@ -1,4 +1,4 @@
-//! Native DS4 dispatch ABI. Kernel bodies remain byte-pinned beside the shader.
+//! Native reference dispatch ABI. Kernel bodies remain byte-pinned beside the shader.
 //! In-place operations require caller-owned scratch, not immutable model views.
 
 use crate::error::{Error, Result};
@@ -9,6 +9,14 @@ mod base;
 pub use base::*;
 mod q8_pair;
 pub use q8_pair::*;
+mod ordered_fusions;
+pub use ordered_fusions::*;
+mod reference_planes;
+pub use reference_planes::*;
+mod reference_tree;
+pub use reference_tree::*;
+mod reference_dispatch;
+pub use reference_dispatch::*;
 mod pointwise;
 pub use pointwise::*;
 mod moe;
@@ -18,9 +26,9 @@ pub use attention::*;
 mod indexer;
 pub use indexer::*;
 
-const SOURCE: &crate::shader_pack::Source = crate::kernel_source!("deepseek41/pointwise.metal");
-const Q8_SOURCE: &crate::shader_pack::Source = crate::kernel_source!("deepseek41/q8.metal");
-const IQ_SOURCE: &crate::shader_pack::Source = crate::kernel_source!("deepseek41/iq.metal");
+const SOURCE: &crate::shader_pack::Source = crate::kernel_source!("gguf_iq/pointwise.metal");
+const Q8_SOURCE: &crate::shader_pack::Source = crate::kernel_source!("gguf_iq/q8.metal");
+const IQ_SOURCE: &crate::shader_pack::Source = crate::kernel_source!("gguf_iq/iq.metal");
 
 /// Original GGML block formats. These are not MLX affine quantization modes.
 #[derive(Clone, Copy, Debug)]
@@ -32,6 +40,7 @@ pub enum BlockFormat {
     Q6K,
     Q2K,
     Q4K,
+    Nvfp4,
 }
 
 impl BlockFormat {
@@ -43,6 +52,7 @@ impl BlockFormat {
             Self::Q5K => (176, "lisa_gguf_q5_K_mv", "lisa_gguf_q5_K_id", 16),
             Self::Q6K => (210, "lisa_gguf_q6_K_mv", "lisa_gguf_q6_K_id", 16),
             Self::Q2K => (84, "lisa_gguf_q2_K_mv", "lisa_gguf_q2_K_id", 32),
+            Self::Nvfp4 => (36, "lisa_nvfp4_mv", "lisa_nvfp4_id", 16),
             Self::Q4K => (144, "lisa_gguf_q4_K_mv", "lisa_gguf_q4_K_id", 32),
         }
     }
@@ -59,12 +69,12 @@ impl BlockFormat {
             || weights.dim(rank as i32 - 2) % 8 != 0
             || weights.dim(rank as i32 - 1) % block_bytes != 0
             || !weights.t.buffer_and_layout().1.is_contiguous()
-            || weights.t.buffer_and_layout().1.offset % 2 != 0
+            || !weights.t.buffer_and_layout().1.offset.is_multiple_of(2)
         {
             return Err(Error::msg("unsupported GGUF quantized matvec layout"));
         }
         (weights.dim(rank as i32 - 1) / block_bytes)
-            .checked_mul(256)
+            .checked_mul(if matches!(self, Self::Nvfp4) { 64 } else { 256 })
             .ok_or_else(|| Error::msg("GGUF quantized input width overflow"))
     }
 }
@@ -77,6 +87,13 @@ fn iq_pipeline(
 ) -> Result<crate::runtime::ComputePipeline> {
     use crate::runtime::ConstVal;
     let (_, dense, expert, _) = format.geometry();
+    if matches!(format, BlockFormat::Nvfp4) {
+        return stream.runtime().compile_with(
+            crate::kernel_source!("gguf/nvfp4.metal"),
+            if indirect { expert } else { dense },
+            Math::Safe,
+        );
+    }
     stream.runtime().compile_with_constants(
         IQ_SOURCE,
         if indirect { expert } else { dense },
@@ -215,6 +232,17 @@ pub fn expert_matvec(
     ids: &Array,
     stream: &Stream,
 ) -> Result<Array> {
+    expert_matvec_impl(format, weights, input, ids, true, stream)
+}
+
+fn expert_matvec_impl(
+    format: BlockFormat,
+    weights: &Array,
+    input: &Array,
+    ids: &Array,
+    shared: bool,
+    stream: &Stream,
+) -> Result<Array> {
     let columns = format.columns(weights, 3)?;
     if ids.rank() != 2
         || ids.dim(0) < 1
@@ -262,13 +290,58 @@ pub fn expert_matvec(
         tp_addend: 0,
         tp_expert_base: 0,
     };
-    let pipeline = iq_pipeline(format, true, 1, stream)?;
+    let tiled = shared
+        && matches!(format, BlockFormat::Nvfp4)
+        && (4..=128).contains(&tokens)
+        && weights.dim(0) <= 256;
+    let (route_tiles, tile_count) = if tiled {
+        let routes = (tokens * top_k) as usize;
+        let experts = weights.dim(0) as usize;
+        // Include the invalid-ID bucket. Every route is written exactly once.
+        let count = routes.min(routes.div_ceil(4) + experts);
+        let threads = (experts + 1).next_power_of_two();
+        let map = output(stream, &[count as i32, 5], Dtype::Int32)?;
+        let pipeline = stream.runtime().compile_with(
+            crate::kernel_source!("gguf/nvfp4.metal"),
+            "lisa_nvfp4_route_tiles",
+            Math::Safe,
+        )?;
+        let guard = stream.runtime().commands.encoder()?;
+        let e = guard.encoder();
+        e.set_pipeline(&pipeline);
+        e.set_bytes(
+            0,
+            &[routes as u32, experts as u32, count as u32, threads as u32],
+        );
+        let (b, l) = ids.t.buffer_and_layout();
+        e.set_input(1, Some(b), l.offset * 4);
+        let (b, l) = map.t.buffer_and_layout();
+        e.set_output(2, Some(b), l.offset * 4);
+        e.dispatch_groups((1, 1, 1), (threads, 1, 1));
+        (Some(map), count)
+    } else {
+        (None, (tokens * top_k) as usize)
+    };
+    let pipeline = if tiled {
+        stream.runtime().compile_with(
+            crate::kernel_source!("gguf/nvfp4.metal"),
+            "lisa_nvfp4_id_tiles",
+            Math::Safe,
+        )?
+    } else {
+        iq_pipeline(format, true, 1, stream)?
+    };
+
     let out = output(stream, &[tokens, top_k, rows], Dtype::Float32)?;
     let guard = stream.runtime().commands.encoder()?;
     let encoder = guard.encoder();
     encoder.set_pipeline(&pipeline);
     encoder.set_bytes(0, &args);
-    for (slot, array) in [(1, weights), (2, input), (4, ids)] {
+    for (slot, array) in [
+        (1, weights),
+        (2, input),
+        (4, route_tiles.as_ref().unwrap_or(ids)),
+    ] {
         let (buffer, layout) = array.t.buffer_and_layout();
         encoder.set_input(slot, Some(buffer), layout.offset * array.dtype().size_of());
     }
@@ -279,7 +352,7 @@ pub fn expert_matvec(
         (
             rows as usize / (2 * format.rows_per_simd()) as usize,
             1,
-            tokens as usize * top_k as usize,
+            tile_count,
         ),
         (32, 2, 1),
     );
@@ -309,7 +382,7 @@ struct MatvecArgs {
     r3: i16,
 }
 
-/// Original GGML Q8_0 blocks through DS4's native scalar matvec reductions.
+/// Original GGML Q8_0 blocks through the reference's native scalar matvec reductions.
 /// Two complete output rows are required because the kernel reads both before
 /// its output bounds check. Prefill and small-batch schedules are separate.
 pub fn q8_matvec(
@@ -327,7 +400,7 @@ pub fn q8_matvec(
         || weights.dim(1) % 34 != 0
         || round_input && !round_output
         || !weights.t.buffer_and_layout().1.is_contiguous()
-        || weights.t.buffer_and_layout().1.offset % 2 != 0
+        || !weights.t.buffer_and_layout().1.offset.is_multiple_of(2)
     {
         return Err(Error::msg("unsupported DS4 Q8_0 matvec layout"));
     }
@@ -337,9 +410,9 @@ pub fn q8_matvec(
         .and_then(|n| n.checked_mul(32))
         .ok_or_else(|| Error::msg("Q8_0 input width overflow"))?;
     let rows = weights.dim(0);
-    if input.rank() != 2 || input.dim(0) < 1 || input.dim(0) > 8 {
+    if input.rank() != 2 || input.dim(0) < 1 || input.dim(0) > 65535 {
         return Err(Error::msg(
-            "DS4 Q8_0 scalar matvec supports one to eight input rows",
+            "DS4 Q8_0 scalar matvec supports one to 65535 input rows",
         ));
     }
     let tokens = input.dim(0);
@@ -416,7 +489,7 @@ pub fn q8_expert_matvec(
         || weights.dim(1) % 2 != 0
         || weights.dim(2) % 34 != 0
         || !weights.t.buffer_and_layout().1.is_contiguous()
-        || weights.t.buffer_and_layout().1.offset % 2 != 0
+        || !weights.t.buffer_and_layout().1.offset.is_multiple_of(2)
         || ids.rank() != 2
         || ids.dtype() != Dtype::Int32
         || ids.dim(0) < 1
@@ -530,13 +603,29 @@ fn output(stream: &Stream, shape: &[i32], dtype: Dtype) -> Result<Array> {
     )))
 }
 
+/// Audited full writers publish only their logical output shape. They never
+/// read the allocation's old contents or bucket padding, so a CPU clear is
+/// unnecessary. Keep partial/overprovisioned scratch on `output` instead.
+fn output_full_write(stream: &Stream, shape: &[i32], dtype: Dtype) -> Result<Array> {
+    let bytes = shape
+        .iter()
+        .try_fold(dtype.size_of(), |n, &d| n.checked_mul(d as usize))
+        .ok_or_else(|| Error::msg("packed output size overflow"))?;
+    let runtime = stream.runtime();
+    let buffer = runtime.buffer_for_audited_full_gpu_write(bytes, "packed_full_output")?;
+    let shape: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
+    Ok(Array::new(crate::array::Array::from_parts(
+        runtime, buffer, &shape, dtype,
+    )))
+}
+
 pub struct RouterOutput {
     pub probabilities: Array,
     pub selected: Array,
     pub weights: Array,
 }
 
-/// Exact DS4 softplus/sqrt, biased bitonic selection, and normalized weights.
+/// Exact reference softplus/sqrt, biased bitonic selection, and normalized weights.
 pub fn router(
     logits: &Array,
     bias: &Array,
@@ -664,7 +753,7 @@ pub fn rope_in_place(
     Ok(())
 }
 
-/// DS4's Engram gate, including the unmasked width-5120, rows <=16 split
+/// The reference's Engram gate, including the unmasked width-5120, rows <=16 split
 /// reduction gate. Both kernels retain each lane's original accumulation order.
 pub fn engram_in_place(
     residual: &mut Array,
@@ -746,7 +835,7 @@ pub fn engram_in_place(
     Ok(())
 }
 
-// Test data captured from the pre-extraction DS4 host coefficient routine.
+// Test data captured from the pre-extraction the reference host coefficient routine.
 // Device production code receives coefficients from the caller.
 #[cfg(test)]
 fn fixture_frequencies(compressed: bool) -> [f32; 32] {
@@ -778,7 +867,7 @@ mod tests {
         let stream = Stream::gpu();
         // Non-dyadic activations exercise rounding and cancellation, not merely
         // exactly representable sums. Include duplicate, reordered and invalid ids.
-        let ids_data = [3, 0, 2, 3, -1, 4, 1, 3, 0, 2, 1, 0];
+        let ids_data = [3, 0, 2, 3, -1, 4, 1, 3, 0, 2, 1, 0].repeat(4);
         let mut seed = 0x1783a9d5u32;
         let mut next = || {
             seed ^= seed << 13;
@@ -793,13 +882,20 @@ mod tests {
             (None, 512, 16),
             (None, 544, 16),
             (None, 1280, 16),
+            (Some(BlockFormat::Iq2Xxs), 512, 16),
+            (Some(BlockFormat::Q2K), 512, 16),
             (Some(BlockFormat::Q5K), 768, 384),
             (Some(BlockFormat::Q6K), 768, 384),
+            (Some(BlockFormat::Nvfp4), 1152, 16),
+            (Some(BlockFormat::Nvfp4), 2304, 16),
         ] {
             let (block, block_bytes, scale_offset) = match format {
                 None => (32, 34, 0),
+                Some(BlockFormat::Iq2Xxs) => (256, 66, 0),
+                Some(BlockFormat::Q2K) => (256, 84, 80),
                 Some(BlockFormat::Q5K) => (256, 176, 0),
                 Some(BlockFormat::Q6K) => (256, 210, 208),
+                Some(BlockFormat::Nvfp4) => (64, 36, 0),
                 _ => unreachable!(),
             };
             let row_bytes = columns / block * block_bytes;
@@ -808,8 +904,17 @@ mod tests {
                 *b = next() as u8;
             }
             for b in bytes[2..].chunks_exact_mut(block_bytes) {
+                if matches!(format, Some(BlockFormat::Nvfp4)) {
+                    for s in &mut b[..4] {
+                        *s = (32 + next() % 64) as u8;
+                    }
+                    continue;
+                }
                 let scale = half::f16::from_f32((next() % 127 + 1) as f32 / 3971.);
                 b[scale_offset..scale_offset + 2].copy_from_slice(&scale.to_bits().to_le_bytes());
+                if matches!(format, Some(BlockFormat::Q2K)) {
+                    b[82..84].copy_from_slice(&half::f16::from_f32(0.0137).to_bits().to_le_bytes());
+                }
                 if matches!(format, Some(BlockFormat::Q5K)) {
                     b[2..4].copy_from_slice(&half::f16::from_f32(0.0137).to_bits().to_le_bytes());
                 }
@@ -823,7 +928,7 @@ mod tests {
                 Dtype::Uint8,
             )
             .unwrap();
-            for tokens in [1, 2] {
+            for tokens in [1, 2, 4, 8] {
                 let ids = Array::from_slice(&ids_data[..tokens * 6], &[tokens as i32, 6]);
                 for slots in [1, 6] {
                     let values = (0..tokens * slots * columns)
@@ -1056,6 +1161,162 @@ mod tests {
                 half::bf16::from_f32(original[i]).to_f32()
             };
             assert_eq!(got, want);
+        }
+    }
+}
+
+#[cfg(test)]
+mod nvfp4_tests {
+    use super::*;
+    #[test]
+    fn nvfp4_dense_grouped_and_expert_addressing() {
+        let stream = Stream::gpu();
+        const TABLE: [f32; 16] = [
+            0., 0.5, 1., 1.5, 2., 3., 4., 6., 0., -0.5, -1., -1.5, -2., -3., -4., -6.,
+        ];
+        for cols in [64usize, 1152, 2304] {
+            let rb = cols / 64 * 36;
+            let rows = 8;
+            let groups = 3;
+            let mut bytes = vec![0u8; 2 + groups * rows * rb];
+            let mut expected = Vec::new();
+            for g in 0..groups {
+                for row in 0..rows {
+                    let mut sum = 0.;
+                    for b in 0..cols / 64 {
+                        let at = 2 + (g * rows + row) * rb + b * 36;
+                        bytes[at..at + 4].fill(56);
+                        for j in 0..32 {
+                            bytes[at + 4 + j] =
+                                ((j + row + g) % 16) as u8 | (((2 * j + row + g) % 16) as u8) << 4;
+                        }
+                        for c in 0..64 {
+                            let q = bytes[at + 4 + (c / 16) * 8 + c % 8];
+                            let q = if c % 16 < 8 { q & 15 } else { q >> 4 };
+                            sum += TABLE[q as usize] * ((b * 64 + c) % 7) as f32 / 16.;
+                        }
+                    }
+                    expected.push(sum);
+                }
+            }
+            let storage = Array::from_slice(&bytes, &[bytes.len() as i32]);
+            let (buffer, _) = storage.t.buffer_and_layout();
+            let weights = Array::from_buffer_offset(
+                buffer.clone(),
+                2,
+                &[groups as i32, rows as i32, rb as i32],
+                Dtype::Uint8,
+            )
+            .unwrap();
+            let row = (0..cols).map(|i| (i % 7) as f32 / 16.).collect::<Vec<_>>();
+            let input = Array::from_slice(&row.repeat(groups), &[groups as i32, 1, cols as i32]);
+            let actual =
+                grouped_packed_matvec(BlockFormat::Nvfp4, &weights, &input, &stream).unwrap();
+            assert_eq!(actual.as_slice::<f32>(), expected);
+            let w = Array::from_buffer_offset(
+                buffer.clone(),
+                2,
+                &[rows as i32, rb as i32],
+                Dtype::Uint8,
+            )
+            .unwrap();
+            let x = Array::from_slice(&row, &[1, cols as i32]);
+            assert_eq!(
+                packed_matvec(BlockFormat::Nvfp4, &w, &x, &stream)
+                    .unwrap()
+                    .as_slice::<f32>(),
+                &expected[..rows]
+            );
+            let ids = Array::from_slice(&[2i32, 0, 2, -1, 3, 1, 0, 1], &[2, 4]);
+            for slots in [1, 4] {
+                let x = Array::from_slice(&row.repeat(2 * slots), &[2, slots as i32, cols as i32]);
+                let y = expert_matvec(BlockFormat::Nvfp4, &weights, &x, &ids, &stream).unwrap();
+                for (r, id) in [2i32, 0, 2, -1, 3, 1, 0, 1].iter().enumerate() {
+                    let expected = if (0..3).contains(id) {
+                        expected[*id as usize * rows..(*id as usize + 1) * rows].to_vec()
+                    } else {
+                        vec![0.; rows]
+                    };
+                    assert_eq!(&y.as_slice::<f32>()[r * rows..(r + 1) * rows], expected);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod routed_tile_tests {
+    use super::*;
+    #[test]
+    fn packed_route_tiles_preserve_serial_bits_and_invalid_ids() {
+        let stream = Stream::gpu();
+        for tokens in [4, 7, 8, 32, 64, 128] {
+            for top in [1, 8, 32] {
+                for slots in [1, top] {
+                    for experts in [17usize, 128, 256] {
+                        let (width, rows) = (1152usize, 16usize);
+                        let rb = width / 64 * 36;
+                        let mut seed = 1928347u32;
+                        let mut random = || {
+                            seed ^= seed << 13;
+                            seed ^= seed >> 17;
+                            seed ^= seed << 5;
+                            seed
+                        };
+                        let mut bytes = (0..experts * rows * rb)
+                            .map(|_| random() as u8)
+                            .collect::<Vec<_>>();
+                        for block in bytes.chunks_mut(36) {
+                            for v in &mut block[..4] {
+                                *v %= 127;
+                            }
+                        }
+                        let w =
+                            Array::from_slice(&bytes, &[experts as i32, rows as i32, rb as i32]);
+                        let values = (0..tokens * slots * width)
+                            .map(|_| random() as i32 as f32 / 91823127.)
+                            .collect::<Vec<_>>();
+                        let x = Array::from_slice(
+                            &values,
+                            &[tokens as i32, slots as i32, width as i32],
+                        );
+                        for pattern in 0..3 {
+                            let ids = (0..tokens * top)
+                                .map(|i| match pattern {
+                                    0 => (i % top) as i32,
+                                    1 => (i * 7 % experts) as i32,
+                                    _ => (i % (experts + 2)) as i32 - 1,
+                                })
+                                .collect::<Vec<_>>();
+                            let ids = Array::from_slice(&ids, &[tokens as i32, top as i32]);
+                            let reference = expert_matvec_impl(
+                                BlockFormat::Nvfp4,
+                                &w,
+                                &x,
+                                &ids,
+                                false,
+                                &stream,
+                            )
+                            .unwrap();
+                            let candidate =
+                                expert_matvec_impl(BlockFormat::Nvfp4, &w, &x, &ids, true, &stream)
+                                    .unwrap();
+                            for (i, (a, b)) in reference
+                                .as_slice::<f32>()
+                                .iter()
+                                .zip(candidate.as_slice::<f32>())
+                                .enumerate()
+                            {
+                                assert_eq!(
+                                    a.to_bits(),
+                                    b.to_bits(),
+                                    "tokens={tokens} top={top} slots={slots} pattern={pattern} element={i}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }

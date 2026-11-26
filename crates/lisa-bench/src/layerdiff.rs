@@ -16,8 +16,10 @@ fn load_bin(reference: &Path, name: &str) -> anyhow::Result<Vec<f32>> {
     let p = reference.join(format!("{name}.bin"));
     let data = std::fs::read(&p).with_context(|| format!("reading {}", p.display()))?;
     Ok(data
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect())
 }
 
@@ -392,7 +394,7 @@ fn diff_rest(
     let split = projected.split_equal(2, -1)?;
     let queries = &split[0];
     let gate = split[1].reshape(&[b, s, -1])?;
-    diff("42_q_proj", &queries)?;
+    diff("42_q_proj", queries)?;
     let queries = attn.q_norm.forward(queries)?;
     diff("43_q_norm", &queries)?;
     let keys = attn.k_proj.forward(&mixed3)?;

@@ -58,6 +58,8 @@ impl Array {
         // This constructor immediately copies the complete logical payload, so
         // zeroing the fresh shared buffer first only adds memory traffic.
         let buf = rt.buffer_for_full_write(bytes, "array")?;
+        // SAFETY: `buf` is fresh, unshared storage of at least `bytes` bytes and `data` spans
+        // exactly `bytes` bytes, so the copy is in bounds and cannot overlap.
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, buf.contents(), bytes);
         }
@@ -84,7 +86,22 @@ impl Array {
     /// Zeroed contiguous storage (dtype-typed).
     pub fn zeros(rt: &Arc<MetalRuntime>, shape: &[usize], dtype: Dtype) -> Result<Self> {
         let buf = rt.buffer(Layout::contiguous(shape).size() * dtype.size_of(), "zeros")?;
-        unsafe { std::ptr::write_bytes(buf.contents(), 0, buf.length()) };
+        // buffer() already clears the requested size, including bucket padding.
+        Ok(Self::wrap(
+            Arc::clone(rt),
+            buf,
+            Layout::contiguous(shape),
+            dtype,
+        ))
+    }
+
+    /// Zeroed contiguous storage cleared by a device command on the queue,
+    /// ordered before every later kernel; no host clear.
+    pub fn zeros_on_device(rt: &Arc<MetalRuntime>, shape: &[usize], dtype: Dtype) -> Result<Self> {
+        let buf = rt.buffer_zeroed_on_gpu(
+            Layout::contiguous(shape).size() * dtype.size_of(),
+            "device_zeros",
+        )?;
         Ok(Self::wrap(
             Arc::clone(rt),
             buf,
@@ -138,12 +155,18 @@ impl Array {
 
     /// GPU strided->strided copy: `self` (any layout) into `dst` (any layout),
     /// same shape. The dependency is carried by the command encoder.
+    /// An F32 source may also fill an F16 destination, rounding to nearest even.
     pub fn copy_strided_into(&self, dst: &Array) -> Result<()> {
-        if self.shape() != dst.shape() || self.dtype != dst.dtype {
+        let convert = self.dtype == Dtype::Float32 && dst.dtype == Dtype::Float16;
+        if self.shape() != dst.shape() || (self.dtype != dst.dtype && !convert) {
             return Err(err("copy_strided_into: shape/dtype mismatch"));
         }
         let esz = self.dtype.size_of();
-        let name = format!("copy2_strided_{}", self.dtype.metal_name());
+        let name = if convert {
+            "copy2_strided_float_to_half".to_string()
+        } else {
+            format!("copy2_strided_{}", self.dtype.metal_name())
+        };
         let pipe = self.rt.compile(COPY2_STRIDED_SOURCE, &name)?;
         let params = Copy2Params {
             ndim: self.rank() as u32,
@@ -156,7 +179,7 @@ impl Array {
             let enc = guard.encoder();
             enc.set_pipeline(&pipe);
             enc.set_input(0, Some(&self.buf), self.layout.offset * esz);
-            enc.set_output(1, Some(&dst.buf), dst.layout.offset * esz);
+            enc.set_output(1, Some(&dst.buf), dst.layout.offset * dst.dtype.size_of());
             enc.set_bytes(2, &params);
             let n = self.size();
             enc.dispatch_threads((n, 1, 1), (256.min(n).max(1), 1, 1));
@@ -167,11 +190,6 @@ impl Array {
     /// `dims2()`.
     pub fn dims2(&self) -> (usize, usize) {
         (self.layout.shape[0], self.layout.shape[1])
-    }
-
-    /// `layout()`.
-    pub fn layout_ref(&self) -> &Layout {
-        &self.layout
     }
 
     /// Build from a buffer + shape + dtype: the native equivalent of
@@ -195,6 +213,17 @@ impl Array {
     ) -> Self {
         let mut layout = Layout::contiguous(shape);
         layout.offset = offset;
+        Self::wrap(Arc::clone(rt), buf, layout, dtype)
+    }
+
+    /// Reconstruct a validated dispatch-program output view without retaining
+    /// its previous writable allocation or host readback cache.
+    pub(crate) fn from_program_parts(
+        rt: &Arc<MetalRuntime>,
+        buf: Arc<Buffer>,
+        layout: Layout,
+        dtype: Dtype,
+    ) -> Self {
         Self::wrap(Arc::clone(rt), buf, layout, dtype)
     }
 
@@ -417,8 +446,18 @@ impl Array {
     pub fn copied(&self) -> Result<Self> {
         let out = Self::wrap(
             Arc::clone(&self.rt),
-            self.rt
-                .buffer_for_full_gpu_write(self.size() * self.dtype.size_of(), "contiguous")?,
+            if self.size() == 0 {
+                self.rt.buffer_for_full_gpu_write(0, "contiguous")?
+            } else {
+                // The exact dispatch grid covers every logical destination
+                // element once. copy_strided reads only the source, including
+                // for broadcast/offset views, and never reads output padding.
+                // Keep the allocator's existing completion/lease rules.
+                self.rt.buffer_for_audited_full_gpu_write(
+                    self.size() * self.dtype.size_of(),
+                    "contiguous",
+                )?
+            },
             Layout::contiguous(&self.layout.shape),
             self.dtype,
         );
@@ -475,6 +514,26 @@ impl Array {
         self.rt.commands.flush_and_wait()
     }
 
+    /// The bytes of a row-contiguous array, borrowed from its shared buffer
+    /// once everything queued has completed, without a host copy. For
+    /// storage no later command writes, such as mapped weights.
+    pub fn contiguous_bytes(&self) -> Result<&[u8]> {
+        if !self.layout.is_contiguous() {
+            return Err(err("contiguous_bytes: the array is not row-contiguous"));
+        }
+        self.eval()?;
+        let esz = self.dtype.size_of();
+        // SAFETY: the wait leaves the shared buffer idle; a contiguous layout's
+        // `size()` elements start at its offset inside the buffer, and the
+        // borrow keeps the buffer alive.
+        Ok(unsafe {
+            std::slice::from_raw_parts(
+                self.buf.contents().add(self.layout.offset * esz),
+                self.size() * esz,
+            )
+        })
+    }
+
     /// Flush and wait only until command buffer `cb_id` (captured earlier via
     /// `MetalRuntime::commands.current_cb_id()`) has completed; later buffers
     /// stay in flight (step-overlap readback). See
@@ -513,23 +572,6 @@ impl Array {
     }
 
     fn read_vec_after_wait<T: Copy>(&self) -> Result<Vec<T>> {
-        // Readback-race detector (specs/04 §6): after `eval`, every command
-        // buffer that ever bound this buffer must be at or below the
-        // synchronously-advanced `completed_id`. A hit proves the producing
-        // encoder was still in flight at read time. Gated on the static so the
-        // off-path cost is one relaxed load, not an environment lookup per
-        // readback (this runs per sampled token in serve).
-        static RB_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *RB_DEBUG.get_or_init(|| std::env::var_os("LISA_RB_DEBUG").is_some()) {
-            let used = self.buf.last_used_cb();
-            let waited = self.rt.commands.completed_id();
-            if used > waited {
-                eprintln!(
-                    "[rb-race] buf#{} used_cb={used} > waited_id={waited}",
-                    self.buf.id()
-                );
-            }
-        }
         let base = self.buf.contents() as *const u8;
         let esz = self.dtype.size_of();
         let n = self.size();
@@ -542,6 +584,8 @@ impl Array {
                     .zip(self.layout.strides.iter())
                     .map(|(&i, &s)| i * s)
                     .sum::<usize>();
+            // SAFETY: the wait leaves the buffer idle; `off` is an element of this layout inside the
+            // buffer, `T` has the dtype's size and `read_unaligned` tolerates any alignment.
             unsafe {
                 out.push(std::ptr::read_unaligned(base.add(off * esz) as *const T));
             }
@@ -557,3 +601,7 @@ impl Array {
         Ok(out)
     }
 }
+
+#[cfg(test)]
+#[path = "copy_output_tests.rs"]
+mod copy_output_tests;

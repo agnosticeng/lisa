@@ -96,15 +96,13 @@ impl SparseMoeBlock {
             }
         }
         if lisa_metal::runtime::nax_available()
-            && rows >= 32
-            && rows <= 1024
+            && (32..=1024).contains(&rows)
             && hidden == 2560
             && self.gate.shape() == [512, 2560]
+            && let Some(o) = lisa_metal::prefill_indirect::router(x, &self.gate, rows, &stream)
         {
-            if let Some(o) = lisa_metal::prefill_indirect::router(x, &self.gate, rows, &stream) {
-                let o = o.reshape(&[b, s, 512])?;
-                return Ok(o);
-            }
+            let o = o.reshape(&[b, s, 512])?;
+            return Ok(o);
         }
         ops::matmul(
             &x.as_dtype(Dtype::Float32)?,
@@ -135,14 +133,14 @@ impl SparseMoeBlock {
             return None;
         }
         let br = rows * top_k;
-        if br < 2048 || br >= 512 * 64 {
+        if !(2048..512 * 64).contains(&br) {
             return None;
         }
         let stream = lisa_metal::Stream::thread_local_or_default();
 
         let logits = self.router_logits(x).ok()?;
         let neg = -&logits;
-        let indices = ops::argpartition_axis(&neg, (top_k - 1) as i32, -1).ok()?;
+        let indices = ops::argpartition_axis(&neg, top_k - 1, -1).ok()?;
         let indices = indices.index((.., .., 0..top_k)).contiguous().ok()?;
         let selected = logits.take_along_axis(&indices, -1).ok()?;
         let weights = ops::softmax_axis(&selected, -1, true).ok()?;
@@ -157,7 +155,7 @@ impl SparseMoeBlock {
             None => {
                 let order = ops::argsort(&idx_flat).ok()?;
                 let inv = ops::argsort(&order).ok()?;
-                let ti = ops::floor_divide(&order, &Array::from_int(top_k))
+                let ti = ops::floor_divide(&order, Array::from_int(top_k))
                     .ok()?
                     .as_dtype(Dtype::Uint32)
                     .ok()?;
@@ -203,7 +201,7 @@ impl SparseMoeBlock {
             &stream,
         )?;
         let down = down.reshape(&[br, hidden]).ok()?;
-        return self.prefill_combine(
+        self.prefill_combine(
             x,
             &down,
             &weights,
@@ -213,7 +211,7 @@ impl SparseMoeBlock {
             top_k,
             hidden,
             &stream,
-        );
+        )
     }
 
     /// Shared expert + the sorted combine (same kernels as the fused path).
@@ -239,7 +237,7 @@ impl SparseMoeBlock {
         let shared = {
             let g2 = shared_gate.reshape(&[rows, shared_gate.dim(-1)]).ok()?;
             let u2 = shared_up.reshape(&[rows, shared_up.dim(-1)]).ok()?;
-            match lisa_metal::kernels::swiglu2(&g2, &u2, &stream) {
+            match lisa_metal::kernels::swiglu2(&g2, &u2, stream) {
                 Some(r) => r.reshape(shared_gate.shape()).ok()?,
                 None => crate::core::norm::bf16_silu(&shared_gate)
                     .ok()?
@@ -257,7 +255,7 @@ impl SparseMoeBlock {
             top_k,
             hidden,
             rows,
-            &stream,
+            stream,
         )?;
         out.reshape(&[b, s, hidden]).ok()
     }
@@ -314,21 +312,21 @@ impl SparseMoeBlock {
                 wg.0, wg.1, wg.2, wu.0, wu.1, wu.2, fsw, fss, fsb, &x_flat, &idx_flat, &xrow, br,
                 n, kd, rows, &stream,
             )?;
-            let dc = lisa_metal::moe_decode::down_combine(
+
+            lisa_metal::moe_decode::down_combine(
                 wd.0, wd.1, wd.2, sdd.0, sdd.1, sdd.2, &act, &idx_flat, &w_flat, &gate_flat, top_k,
                 n, hidden, br, rows, &stream,
-            )?;
-            dc
+            )?
         } else {
             let act = lisa_metal::moe_decode::gate_up_act_wide(
                 wg.0, wg.1, wg.2, wu.0, wu.1, wu.2, fsw, fss, fsb, &x_flat, &idx_flat, &xrow, br,
                 n, kd, rows, &stream,
             )?;
-            let r = lisa_metal::moe_decode::down_combine_wide(
+
+            lisa_metal::moe_decode::down_combine_wide(
                 wd.0, wd.1, wd.2, sdd.0, sdd.1, sdd.2, &act, &idx_flat, &w_flat, &gate_flat, top_k,
                 n, hidden, br, rows, &stream,
-            )?;
-            r
+            )?
         };
         out.reshape(&[b, s, hidden]).ok()
     }
@@ -336,16 +334,16 @@ impl SparseMoeBlock {
     /// x: [B, S, hidden] -> [B, S, hidden]
     pub fn forward(&self, x: &Array) -> lisa_metal::error::Result<Array> {
         // Narrow windows (S <= 8) use the engine's fused decode path.
-        if x.dim(1) <= 8 {
-            if let Some(out) = self.forward_decode(x) {
-                return Ok(out);
-            }
+        if x.dim(1) <= 8
+            && let Some(out) = self.forward_decode(x)
+        {
+            return Ok(out);
         }
         // Wide windows use the engine's NAX indirect GEMM (tile table).
-        if x.dim(1) > 8 {
-            if let Some(out) = self.forward_prefill(x) {
-                return Ok(out);
-            }
+        if x.dim(1) > 8
+            && let Some(out) = self.forward_prefill(x)
+        {
+            return Ok(out);
         }
         let b = x.dim(0);
         let s = x.dim(1);
@@ -369,7 +367,7 @@ impl SparseMoeBlock {
 
         let order = ops::argsort(&idx_flat)?;
         let inv_order = ops::argsort(&order)?;
-        let token_idx = ops::floor_divide(&order, &Array::from_int(self.top_k as i32))?;
+        let token_idx = ops::floor_divide(&order, Array::from_int(self.top_k as i32))?;
         // gatherSort indexes the ORIGINAL rows (one row per token), not the
         // repeated array: x_sorted[i] = x_rows[order[i] / top_k].
         let x_sorted = x_rows.take_axis(&token_idx, 0)?;

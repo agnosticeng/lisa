@@ -1,4 +1,4 @@
-//! Frozen outputs from the original DS4 C renderer, parser and byte tracker.
+//! Frozen outputs from the original reference C renderer, parser and byte tracker.
 //! Oracle identity and revision are recorded in deepseek41_provenance.json.
 use super::*;
 

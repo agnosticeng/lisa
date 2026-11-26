@@ -1,5 +1,7 @@
 /// View a POD slice as bytes.
 pub(super) fn bytes_of<T: Copy>(v: &[T]) -> &[u8] {
+    // SAFETY: `v` is a live slice; its `size_of_val(v)` bytes are initialised because callers
+    // pass padding-free numeric `T` (not enforced by the bound).
     unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v)) }
 }
 
@@ -47,6 +49,7 @@ pub(super) const COPY_STRIDED_SOURCE: &crate::shader_pack::Source =
 
 /// Source for a `copy_gg_{ndim}` kernel of `dtype`: the preamble plus the static
 /// template file (which carries every explicit instantiation).
-pub(super) fn copy_gg_source() -> String {
-    format!("{}{COPY_GG_SOURCE}", crate::jit::MLX_UTILS_PREAMBLE)
+pub(super) fn copy_gg_source() -> &'static str {
+    static SOURCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SOURCE.get_or_init(|| format!("{}{COPY_GG_SOURCE}", crate::jit::MLX_UTILS_PREAMBLE))
 }

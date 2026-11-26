@@ -111,7 +111,7 @@ pub fn company_prefill_chunk(chunk: usize, decoding: usize) -> usize {
 
 pub struct Batch<R: BatchRuntime> {
     /// Packed cache rows for models whose batched decode uses packed caches.
-    /// GLM keeps one cache per session, matching ds4's native batch ownership.
+    /// GLM keeps one cache per session, matching the reference's native batch ownership.
     pub caches: Vec<R::Cache>,
     pub(crate) unpacked_caches: Option<Vec<Vec<R::Cache>>>,
     /// Tokens fed per stream (the committed conversation of each).
@@ -153,13 +153,10 @@ impl<R: BatchRuntime> Batch<R> {
         let (mixed, _) = tower.forward(&arr, Some(&mut caches))?;
         let last = R::last_hidden(&mixed)?;
         let logits = tower.head(&last)?; // [N, 1, vocab]
-        let toks = tower.runtime().draw_rows(
-            &logits,
-            n,
-            sampler,
-            &prompts.to_vec(),
-            tower.uses_ds4_sampling(),
-        )?;
+        let toks =
+            tower
+                .runtime()
+                .draw_rows(&logits, n, sampler, prompts, tower.uses_host_sampling())?;
 
         Ok((
             Batch {
@@ -177,7 +174,7 @@ impl<R: BatchRuntime> Batch<R> {
 
     /// Prefill each stream on its own (any length), then prepare lockstep
     /// decode. GLM keeps the per-stream caches independent at every position
-    /// because ds4 advances each session's DSA tape and KDA state separately.
+    /// because the reference advances each session's DSA tape and KDA state separately.
     ///
     /// Attention is packed right-aligned: stream `i`'s `L_i` keys occupy
     /// `[lmax-L_i, lmax)` of a shared buffer, so every stream appends its next
@@ -217,10 +214,10 @@ impl<R: BatchRuntime> Batch<R> {
         for p in prompts {
             tower.clear_context();
             let mut c = tower.new_caches();
-            let last = tower.prefill(p, &mut c)?;
+            let last = tower.prefill_for_generation(p, &mut c)?;
             let logits = tower.head(&last)?;
-            let t = if tower.uses_ds4_sampling() {
-                sampler.draw_ds4(tower.runtime(), &logits, p)?
+            let t = if tower.uses_host_sampling() {
+                sampler.draw_host(tower.runtime(), &logits, p)?
             } else {
                 sampler.draw(tower.runtime(), &logits, p)?
             };
@@ -301,7 +298,7 @@ impl<R: BatchRuntime> Batch<R> {
                 n,
                 sampler,
                 &self.fed,
-                tower.uses_ds4_sampling(),
+                tower.uses_host_sampling(),
             );
         }
 
@@ -332,10 +329,13 @@ impl<R: BatchRuntime> Batch<R> {
         let (mixed, _) = tower.forward(&arr, Some(&mut self.caches))?;
         let last = R::last_hidden(&mixed)?;
         let logits = tower.head(&last)?;
-        let out =
-            tower
-                .runtime()
-                .draw_rows(&logits, n, sampler, &self.fed, tower.uses_ds4_sampling())?;
+        let out = tower.runtime().draw_rows(
+            &logits,
+            n,
+            sampler,
+            &self.fed,
+            tower.uses_host_sampling(),
+        )?;
         for (i, t) in tokens.iter().enumerate() {
             self.fed[i].push(*t);
         }
@@ -441,7 +441,7 @@ impl<R: BatchRuntime> Batch<R> {
                     active.len(),
                     sampler,
                     &active_fed,
-                    tower.uses_ds4_sampling(),
+                    tower.uses_host_sampling(),
                 )?;
                 for (slot, &row) in active.iter().enumerate() {
                     next[row] = next_active[slot];
@@ -533,14 +533,14 @@ impl<R: BatchRuntime> ContinuousBatch<R> {
     ///
     /// The keep-count cap is normally applied when forming each tick's decode
     /// group, decoding the longest rejects serially that tick. Our packed
-    /// cache makes per-tick re-formation a copy storm (specs/13 §3b), and —
+    /// cache makes per-tick re-formation a copy storm, and —
     /// because every stream advances one token per tick — the KV skew is
     /// FIXED at pack time, so the same cap applied at ADMISSION gives the
     /// same protection: a would-be reject waits instead of joining. Past the
     /// per-slot attention floor nothing is padded, so the cap is void —
     /// mirroring the per-slot-capable arm.
     pub fn admits_within_pad_waste(&self, new_len: usize) -> bool {
-        if self.len() == 0 {
+        if self.is_empty() {
             return true;
         }
         let mut lens = self.kv_lens();
@@ -614,8 +614,8 @@ impl<R: BatchRuntime> ContinuousBatch<R> {
         sampler: &mut R::Sampler,
     ) -> anyhow::Result<u32> {
         let logits = tower.head(&per.last_hidden)?;
-        let tok = if tower.uses_ds4_sampling() {
-            sampler.draw_ds4(tower.runtime(), &logits, prompt)?
+        let tok = if tower.uses_host_sampling() {
+            sampler.draw_host(tower.runtime(), &logits, prompt)?
         } else {
             sampler.draw(tower.runtime(), &logits, prompt)?
         };
@@ -723,7 +723,7 @@ impl<R: BatchRuntime> ContinuousBatch<R> {
             n,
             samplers,
             &self.fed,
-            tower.uses_ds4_sampling(),
+            tower.uses_host_sampling(),
         )?;
         if ragged {
             for c in self.caches.iter_mut() {
@@ -751,7 +751,7 @@ impl<R: BatchRuntime> ContinuousBatch<R> {
 
         if let Some(mut unpacked) = self.unpacked_caches.take() {
             for &i in &survivors {
-                per.push(std::mem::replace(&mut unpacked[i], Vec::new()));
+                per.push(std::mem::take(&mut unpacked[i]));
                 lens.push(self.fed[i].len());
                 tails.push(self.tails[i].clone());
                 fed.push(self.fed[i].clone());
@@ -835,19 +835,12 @@ pub fn prefill_one<R: BatchRuntime>(
 ) -> anyhow::Result<Prefilled<R>> {
     tower.clear_context();
     let mut caches = tower.new_caches();
-    let last = tower.prefill(prompt, &mut caches)?;
+    let last = tower.prefill_for_generation(prompt, &mut caches)?;
     Ok(Prefilled {
         caches,
         last_hidden: last,
     })
 }
 
-#[cfg(any(test, feature = "diagnostics"))]
-impl<R: BatchRuntime> ContinuousBatch<R> {
-    pub fn unpacked_caches_for_test(&self) -> &Option<Vec<Vec<R::Cache>>> {
-        &self.unpacked_caches
-    }
-    pub fn unpacked_caches_mut_for_test(&mut self) -> &mut Option<Vec<Vec<R::Cache>>> {
-        &mut self.unpacked_caches
-    }
-}
+#[cfg(test)]
+impl<R: BatchRuntime> ContinuousBatch<R> {}

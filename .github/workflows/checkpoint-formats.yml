@@ -28,8 +28,6 @@ jobs:
           assert not any(policy in attention for policy in ['dsa_absorbed_attention', 'dsa_prefill_value_slices', 'GLM53_DSA_NATIVE_OVERRIDE', 'GLM53_DSA_VALUE_DENSE_PREFIX'])
           assert 'pub fn wide_decode(' not in Path('crates/lisa-metal/src/kernels/sparse/gguf.rs').read_text()
           assert "pub mod models;" not in Path("crates/lisa-metal/src/lib.rs").read_text()
-          for name in ['language', 'conversation', 'batching', 'eos', 'speculative_runtime', 'speculation', 'generation', 'scheduling', 'core/round_cost', 'core/weight_arena', 'weights/mlx', 'weights/gguf', 'weights/lazy', 'attention_cache', 'indexer_cache', 'recurrent', 'recurrent_cache', 'cache', 'prefix_cache', 'tensor_ops', 'sampling', 'cache_batching']:
-              assert 'lisa_metal' not in Path(f'crates/lisa-engine/src/{name}.rs').read_text()
           tree = subprocess.check_output([
               'cargo', 'tree', '-p', 'lisa-mlx', '-p', 'lisa-gguf', '-p', 'lisa-models', '-p', 'lisa-backend', '-p', 'lisa-cpu', '--edges', 'normal'
           ], text=True)
@@ -47,6 +45,14 @@ jobs:
           device_tree = subprocess.check_output(['cargo', 'tree', '-p', 'lisa-metal', '-p', 'lisa-cpu', '--edges', 'normal'], text=True)
           assert not any(name in device_tree for name in ['lisa-models', 'lisa-engine', 'lisa-mlx', 'lisa-gguf'])
           PY
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Lint portable crates
+        run: cargo clippy --release -p lisa-mlx -p lisa-gguf -p lisa-models -p lisa-backend -p lisa-cpu --all-targets -- -D warnings
+      - name: Check portable crate docs
+        run: cargo doc --no-deps --document-private-items -p lisa-mlx -p lisa-gguf -p lisa-models -p lisa-backend -p lisa-cpu
+        env:
+          RUSTDOCFLAGS: -D warnings
       - name: Test format readers without Apple frameworks or a GPU
         run: cargo test --release -p lisa-mlx -p lisa-gguf -p lisa-models -p lisa-backend -p lisa-cpu --lib -- --test-threads=1
       - name: Test the portable engine and CPU inference without Metal

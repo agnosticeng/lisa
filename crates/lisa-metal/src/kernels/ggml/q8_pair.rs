@@ -1,4 +1,4 @@
-//! DS4 paired Q8 query/KV projection, including its literal decode shape.
+//! The reference paired Q8 query/KV projection, including its literal decode shape.
 
 use super::{MatvecArgs, Q8_SOURCE, f32_input, output};
 use crate::error::{Error, Result};

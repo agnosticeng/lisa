@@ -1,12 +1,22 @@
-//! Recurrent-state laws. Compact histories preserve sequential delta arithmetic;
-//! model plans select base/final states and define accepted-prefix restoration.
+//! Recurrent-state laws. Verify captures keep per-position state snapshots;
+//! model plans define accepted-prefix restoration.
 use crate::{
     graph::{Builder, Graph, Value},
     program::Build,
 };
 use lisa_backend::{Kernel, TensorOperation as T};
+
+/// Exclude state produced by the old short-capture convolution history writer.
+/// This versions saved state even when the caller's arithmetic mode is unchanged.
+pub fn complete_history_cache_law(base: u64) -> u64 {
+    b"lisa.gdn.complete-capture-history.v1"
+        .iter()
+        .fold(base, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        })
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReplayGeometry {
+pub struct RecurrenceGeometry {
     pub batch: i32,
     pub tokens: i32,
     pub key_heads: i32,
@@ -14,91 +24,7 @@ pub struct ReplayGeometry {
     pub key_width: i32,
     pub value_width: i32,
 }
-impl ReplayGeometry {
-    pub fn accepts_types(&self, types: [Option<lisa_backend::ScalarType>; 6]) -> bool {
-        use lisa_backend::ScalarType::{BF16, F32};
-        self.supported()
-            && types
-                == [
-                    Some(BF16),
-                    Some(BF16),
-                    Some(BF16),
-                    Some(F32),
-                    Some(F32),
-                    Some(F32),
-                ]
-    }
-    /// Admission for the existing audited compact-history schedule.
-    pub fn supported(&self) -> bool {
-        self.batch == 1
-            && self.tokens > 1
-            && self.key_heads > 0
-            && self.value_heads > 0
-            && self.value_heads % self.key_heads == 0
-            && self.key_width == 128
-            && self.value_width == 128
-    }
-    pub fn capture(&self) -> anyhow::Result<Graph> {
-        anyhow::ensure!(self.supported(), "unsupported compact delta history");
-        let mut b = Builder::new(6, 0, 0);
-        let base = b.one(
-            Kernel::Tensor(T::Reshape(vec![
-                self.batch,
-                self.value_heads,
-                self.value_width,
-                self.key_width,
-            ])),
-            vec![Value::Input(5)],
-        );
-        let out = b.call(
-            Kernel::DeltaReplayCapture,
-            vec![
-                Value::Input(0),
-                Value::Input(1),
-                Value::Input(2),
-                Value::Input(3),
-                Value::Input(4),
-                base,
-            ],
-        );
-        // Activation/final outputs followed by the five immutable history bindings.
-        Ok(b.finish(vec![
-            out[0],
-            out[1],
-            base,
-            out[1],
-            Value::Input(1),
-            Value::Input(3),
-            out[2],
-        ]))
-    }
-    /// Inputs: base, final, keys, decay, delta. Boundary zero and the complete
-    /// window reuse the corresponding immutable state without a replay dispatch.
-    pub fn restore(&self, prefix: usize) -> anyhow::Result<Graph> {
-        anyhow::ensure!(
-            self.supported() && prefix <= self.tokens as usize,
-            "delta replay exceeds captured window"
-        );
-        let mut b = Builder::new(5, 0, 0);
-        let out = if prefix == 0 {
-            Value::Input(0)
-        } else if prefix == self.tokens as usize {
-            Value::Input(1)
-        } else {
-            b.one(
-                Kernel::DeltaReplayRestore { prefix },
-                vec![
-                    Value::Input(0),
-                    Value::Input(2),
-                    Value::Input(3),
-                    Value::Input(4),
-                ],
-            )
-        };
-        Ok(b.finish(vec![out]))
-    }
-}
-/// Snapshot capture layout is [B*S,Hv,Dv,Dk]. The existing serving law restores
+/// Snapshot capture layout is `[B*S,Hv,Dv,Dk]`. The existing serving law restores
 /// a single-stream prefix as a rank-three state, retaining its original offset.
 pub fn snapshot_state(prefix: usize, shape: &[i32]) -> anyhow::Result<Graph> {
     anyhow::ensure!(
@@ -138,21 +64,7 @@ pub fn convolution_prefix(prefix: usize, shape: &[i32], history: usize) -> anyho
 mod tests {
     use super::*;
     #[test]
-    fn replay_boundaries_choose_immutable_state_without_kernels() {
-        let g = ReplayGeometry {
-            batch: 1,
-            tokens: 7,
-            key_heads: 16,
-            value_heads: 48,
-            key_width: 128,
-            value_width: 128,
-        };
-        for n in 0..=7 {
-            let p = g.restore(n).unwrap();
-            p.validate().unwrap();
-            assert_eq!(p.calls.len(), usize::from(n > 0 && n < 7));
-        }
-        assert!(g.restore(8).is_err());
+    fn capture_boundaries_reject_invalid_prefixes() {
         assert!(snapshot_state(0, &[7, 48, 128, 128]).is_err());
         assert!(convolution_prefix(7, &[1, 9, 10240], 3).is_err());
     }
@@ -373,16 +285,15 @@ impl PrepPlan {
 pub enum CaptureKind {
     None,
     Snapshots,
-    Replay,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RecurrencePlan {
-    pub geometry: ReplayGeometry,
+    pub geometry: RecurrenceGeometry,
     pub capture: bool,
-    pub replay: bool,
     pub cache: bool,
     pub swish: bool,
     pub verify_fusion: bool,
+    pub serial_gate: bool,
     pub epsilon: u32,
     pub state_present: bool,
     pub reuse: bool,
@@ -390,24 +301,22 @@ pub struct RecurrencePlan {
 }
 impl RecurrencePlan {
     pub fn capture_kind(&self) -> CaptureKind {
-        if !self.capture {
-            CaptureKind::None
-        } else if self.replay && self.cache && self.geometry.supported() {
-            CaptureKind::Replay
-        } else {
+        if self.capture {
             CaptureKind::Snapshots
+        } else {
+            CaptureKind::None
         }
     }
     pub fn mode(&self) -> lisa_backend::DeltaScan {
         use lisa_backend::DeltaScan;
         if self.capture
-            && !self.replay
             && self.swish
             && self.verify_fusion
             && (2..=16).contains(&self.geometry.tokens)
         {
             DeltaScan::Verify {
                 epsilon: self.epsilon,
+                serial_gate: self.serial_gate,
             }
         } else if self.geometry.tokens > 8 && !self.capture {
             DeltaScan::FourRows
@@ -438,7 +347,7 @@ impl RecurrencePlan {
     /// Inputs q/k/v/decay/beta/z, optional initial state, optional reusable
     /// output/history storage. Weights: RMS scale, output projection triple.
     /// Outputs activation, recurrence output, captured/final state, committed
-    /// state, then optional replay bindings (base, final, keys, decay, deltas).
+    /// state.
     pub fn graph(&self) -> anyhow::Result<Graph> {
         use lisa_backend::ScalarType;
         let g = self.geometry;
@@ -481,44 +390,23 @@ impl RecurrencePlan {
         };
         let mut args = (0..5).map(Value::Input).collect::<Vec<_>>();
         args.push(state);
-        let (out, history) = if kind == CaptureKind::Replay {
-            let base = b.one(
-                Kernel::Tensor(T::Reshape(vec![
-                    g.batch,
-                    g.value_heads,
-                    g.value_width,
-                    g.key_width,
-                ])),
-                vec![state],
-            );
-            args[5] = base;
-            let out = b.call(Kernel::DeltaReplayCapture, args);
-            (
-                vec![out[0], out[1]],
-                vec![base, out[1], Value::Input(1), Value::Input(3), out[2]],
-            )
-        } else {
-            if mode.gated() {
-                args.extend([Value::Input(5), Value::Weight(0)]);
-            }
-            if self.reuse {
-                let i = 6 + usize::from(self.state_present);
-                b.writable_input(i);
-                b.writable_input(i + 1);
-                args.extend([Value::Input(i), Value::Input(i + 1)]);
-            }
-            (
-                b.call(
-                    Kernel::DeltaScan {
-                        mode,
-                        capture: self.capture,
-                        reuse: self.reuse,
-                    },
-                    args,
-                ),
-                vec![],
-            )
-        };
+        if mode.gated() {
+            args.extend([Value::Input(5), Value::Weight(0)]);
+        }
+        if self.reuse {
+            let i = 6 + usize::from(self.state_present);
+            b.writable_input(i);
+            b.writable_input(i + 1);
+            args.extend([Value::Input(i), Value::Input(i + 1)]);
+        }
+        let out = b.call(
+            Kernel::DeltaScan {
+                mode,
+                capture: self.capture,
+                reuse: self.reuse,
+            },
+            args,
+        );
         // Preserve the single-stream snapshot indexing law. The engine does
         // not derive a prefix or interpret the captured tensor's layout.
         let final_state = if kind == CaptureKind::Snapshots && self.cache {
@@ -538,7 +426,7 @@ impl RecurrencePlan {
         } else {
             out[1]
         };
-        let normed = if mode.gated() && kind != CaptureKind::Replay {
+        let normed = if mode.gated() {
             out[0]
         } else {
             b.one(
@@ -547,6 +435,7 @@ impl RecurrencePlan {
                     width: g.value_width,
                     epsilon: self.epsilon,
                     swish: self.swish,
+                    serial_gate: self.serial_gate,
                 },
                 vec![out[0], Value::Input(5), Value::Weight(0)],
             )
@@ -566,9 +455,7 @@ impl RecurrencePlan {
             },
             vec![normed, Value::Weight(1), Value::Weight(2), Value::Weight(3)],
         );
-        let mut result = vec![activation, out[0], out[1], final_state];
-        result.extend(history);
-        Ok(b.finish(result))
+        Ok(b.finish(vec![activation, out[0], out[1], final_state]))
     }
 }
 
@@ -675,7 +562,7 @@ impl BindingSchema {
         anyhow::ensure!(
             key_heads > 0
                 && value_heads > 0
-                && value_heads % key_heads == 0
+                && value_heads.is_multiple_of(key_heads)
                 && key_width > 0
                 && value_width > 0,
             "invalid delta head geometry"
@@ -696,17 +583,74 @@ pub struct Plan {
     pub decode: DecodePlan,
     pub tokens: i32,
     pub capture: bool,
-    pub replay: bool,
     pub cache: bool,
     pub verify_fusion: bool,
     pub reuse: bool,
     pub input_projections: [(i32, i32); 5],
+    /// Captured reference rows retain the single-query projection and gate laws.
+    pub serial_capture: bool,
+}
+
+#[cfg(test)]
+mod serial_capture_tests {
+    use super::*;
+
+    #[test]
+    fn serial_gate_changes_only_the_explicit_gate_contract() {
+        for (tokens, fusion) in [(1, false), (7, false), (7, true), (16, true)] {
+            let mut plan = RecurrencePlan {
+                geometry: RecurrenceGeometry {
+                    batch: 1,
+                    tokens,
+                    key_heads: 4,
+                    value_heads: 16,
+                    key_width: 128,
+                    value_width: 128,
+                },
+                capture: true,
+                cache: true,
+                swish: true,
+                verify_fusion: fusion,
+                serial_gate: false,
+                epsilon: 1e-6f32.to_bits(),
+                state_present: true,
+                reuse: false,
+                projection: (64, 4),
+            };
+            let ordinary = plan.graph().unwrap();
+            plan.serial_gate = true;
+            let captured = plan.graph().unwrap();
+            ordinary.validate().unwrap();
+            captured.validate().unwrap();
+            assert_eq!(ordinary.calls.len(), captured.calls.len());
+            assert_eq!(ordinary.outputs, captured.outputs);
+            let mut gates = 0;
+            for (ordinary, captured) in ordinary.calls.iter().zip(&captured.calls) {
+                assert_eq!(ordinary.inputs, captured.inputs);
+                let mut expected = ordinary.kernel.clone();
+                match &mut expected {
+                    Kernel::GatedRms { serial_gate, .. }
+                    | Kernel::DeltaScan {
+                        mode: lisa_backend::DeltaScan::Verify { serial_gate, .. },
+                        ..
+                    } => {
+                        assert!(!*serial_gate);
+                        *serial_gate = true;
+                        gates += 1;
+                    }
+                    _ => {}
+                }
+                assert_eq!(captured.kernel, expected);
+            }
+            assert_eq!(gates, 1);
+        }
+    }
 }
 impl Plan {
     pub fn recurrence(&self) -> RecurrencePlan {
         let s = self.decode.kernel;
         RecurrencePlan {
-            geometry: ReplayGeometry {
+            geometry: RecurrenceGeometry {
                 batch: self.decode.batch,
                 tokens: self.tokens,
                 key_heads: s.key_heads,
@@ -715,10 +659,10 @@ impl Plan {
                 value_width: s.value_width,
             },
             capture: self.capture,
-            replay: self.replay,
             cache: self.cache,
             swish: s.swish,
             verify_fusion: self.verify_fusion,
+            serial_gate: self.serial_capture,
             epsilon: s.epsilon,
             state_present: self.decode.state_present,
             reuse: self.reuse,
@@ -803,14 +747,15 @@ impl Plan {
             match self.capture_kind() {
                 CaptureKind::None => {}
                 CaptureKind::Snapshots => out.extend([scan[1], scan[2], prepared[7]]),
-                CaptureKind::Replay => {
-                    out.push(prepared[7]);
-                    out.extend_from_slice(&scan[4..]);
-                }
             }
             out
         };
         let graph = b.finish(outputs);
+        let graph = if self.serial_capture {
+            graph.with_serial_affine(true)
+        } else {
+            graph
+        };
         graph.validate().map_err(anyhow::Error::msg)?;
         Ok(graph)
     }

@@ -19,3 +19,6 @@ clap.workspace = true
 lisa-metal.workspace = true
 serde_json.workspace = true
 lisa-serve.workspace = true
+
+[lints]
+workspace = true

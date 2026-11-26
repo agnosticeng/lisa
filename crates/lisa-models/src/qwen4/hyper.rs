@@ -42,7 +42,7 @@ pub fn names(prefix: &str, inject: bool) -> Names {
 }
 pub fn decode_order(hidden: usize, streams: usize, output: usize) -> Option<Vec<i32>> {
     if streams != 4
-        || hidden % 2 != 0
+        || !hidden.is_multiple_of(2)
         || hidden.checked_mul(streams) != Some(output)
         || output > i32::MAX as usize
     {
@@ -96,6 +96,75 @@ pub fn inject(shape: &[i32]) -> Result<Graph> {
     Ok(p.finish(vec![out])?.graph)
 }
 impl Spec {
+    /// Captured rows use the actual one-row mixer, including its split-K down
+    /// and packed up paths. Those kernels do not expose an independent row
+    /// grid, so this localized graph unrolls only the mixer, not the decoder.
+    pub fn graph_captured(self, shape: &[i32], mode: Mode) -> Result<Graph> {
+        ensure!(
+            shape.len() == 3 && shape.iter().all(|&n| n > 0),
+            "invalid captured residual shape"
+        );
+        let [batch, rows, width] = <[i32; 3]>::try_from(shape).unwrap();
+        let count = batch
+            .checked_mul(rows)
+            .ok_or_else(|| anyhow::anyhow!("residual row overflow"))?;
+        if count == 1 {
+            return self.graph(shape, mode);
+        }
+        let scalar = self.graph(&[1, 1, width], mode)?;
+        let widths = match mode {
+            Mode::Norm => vec![width],
+            Mode::Mixed => vec![self.hidden],
+            Mode::Mix(_) => vec![self.hidden, self.streams],
+            Mode::WithInject => vec![self.hidden, width, self.streams],
+        };
+        let mut graph = crate::graph::Builder::new(14, 0, 0);
+        let flat = graph.one(
+            Kernel::Tensor(T::Reshape(vec![count, width])),
+            vec![V::Input(0)],
+        );
+        let mut outputs = vec![Vec::new(); widths.len()];
+        for row in 0..count {
+            let x = graph.one(
+                Kernel::Tensor(T::Slice {
+                    axis: 0,
+                    start: row,
+                    end: row + 1,
+                }),
+                vec![flat],
+            );
+            let x = graph.one(Kernel::Tensor(T::Contiguous), vec![x]);
+            let x = graph.one(Kernel::Tensor(T::Reshape(vec![1, 1, width])), vec![x]);
+            let mut inputs = vec![x];
+            inputs.extend((1..14).map(V::Input));
+            for (values, value) in outputs.iter_mut().zip(
+                graph
+                    .append(scalar.clone(), &inputs, &[], &[])
+                    .map_err(anyhow::Error::msg)?,
+            ) {
+                values.push(value);
+            }
+        }
+        let outputs: Vec<_> = outputs
+            .into_iter()
+            .zip(widths)
+            .map(|(values, width)| {
+                let joined = graph.one(
+                    Kernel::Tensor(T::Concatenate {
+                        axis: 1,
+                        inputs: values.len(),
+                    }),
+                    values,
+                );
+                graph.one(
+                    Kernel::Tensor(T::Reshape(vec![batch, rows, width])),
+                    vec![joined],
+                )
+            })
+            .collect();
+        Ok(graph.finish(outputs))
+    }
+
     /// Inputs: state, norm scale, down triple, up triple, inject triple,
     /// decode-packed up triple. Unused triples can alias their source weights.
     pub fn graph(self, shape: &[i32], mode: Mode) -> Result<Graph> {
@@ -314,6 +383,18 @@ pub fn inject_norm(
 }
 /// Final carried injection followed by the inject-less stream mixer.
 pub fn finish(spec: Spec, shape: &[i32], epsilon: u32, inject: bool) -> Result<Graph> {
+    finish_with_capture_law(spec, shape, epsilon, inject, false)
+}
+pub fn finish_captured(spec: Spec, shape: &[i32], epsilon: u32, inject: bool) -> Result<Graph> {
+    finish_with_capture_law(spec, shape, epsilon, inject, true)
+}
+fn finish_with_capture_law(
+    spec: Spec,
+    shape: &[i32],
+    epsilon: u32,
+    inject: bool,
+    captured: bool,
+) -> Result<Graph> {
     let mut g = crate::graph::Builder::new(16, 0, 0);
     let scale = g
         .append(norm_scale(spec.streams), &[V::Input(3)], &[], &[])
@@ -328,8 +409,57 @@ pub fn finish(spec: Spec, shape: &[i32], epsilon: u32, inject: bool) -> Result<G
         .map_err(anyhow::Error::msg)?;
     let mut inputs = vec![normalized[1]];
     inputs.extend((3..16).map(V::Input));
+    let mixer = if captured {
+        spec.graph_captured(shape, Mode::Mix(false))?
+    } else {
+        spec.graph(shape, Mode::Mix(false))?
+    };
     let mixed = g
-        .append(spec.graph(shape, Mode::Mix(false))?, &inputs, &[], &[])
+        .append(mixer, &inputs, &[], &[])
         .map_err(anyhow::Error::msg)?;
     Ok(g.finish(vec![mixed[0], normalized[0]]))
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+
+    #[test]
+    fn captured_mixer_retains_each_packed_single_row_contract() {
+        let spec = Spec {
+            streams: 4,
+            hidden: 2560,
+            rank: 320,
+            down: (32, 4),
+            up: (32, 4),
+            inject: Some((32, 4)),
+            packed: true,
+            epsilon: 1e-6f32.to_bits(),
+            force_norm_operations: false,
+        };
+        for (batch, rows) in [(1, 1), (1, 7), (2, 2)] {
+            let graph = spec
+                .graph_captured(&[batch, rows, 10240], Mode::Mix(true))
+                .unwrap();
+            graph.validate().unwrap();
+            let mut down = 0;
+            let mut up = 0;
+            for call in &graph.calls {
+                match call.kernel {
+                    Kernel::ResidualBf16(R::DownInject { rows, .. }) => {
+                        assert_eq!(rows, 1);
+                        down += 1;
+                    }
+                    Kernel::ResidualBf16(R::UpMix { rows, packed, .. }) => {
+                        assert_eq!(rows, 1);
+                        assert!(packed);
+                        up += 1;
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(down, batch * rows);
+            assert_eq!(up, batch * rows);
+        }
+    }
 }

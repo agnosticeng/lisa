@@ -45,7 +45,7 @@ fn fixture(index: usize, h: i32) -> Bound {
     for (name, n, k) in matrices {
         let name = format!("{p}.{name}.weight");
         let mut bytes = vec![0u8; (n * k / 256 * 84) as usize];
-        for block in bytes.chunks_exact_mut(84) {
+        for block in bytes.as_chunks_mut::<84>().0.iter_mut() {
             for value in &mut block[..80] {
                 seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
                 *value = (seed >> 24) as u8;
@@ -58,7 +58,7 @@ fn fixture(index: usize, h: i32) -> Bound {
         projections.insert(
             name,
             model::Projection {
-                encoding: 10,
+                encoding: lisa_backend::OrderedBlockEncoding::Q2K,
                 input: k,
                 output: n,
             },
@@ -259,7 +259,7 @@ fn packed_mtp_plans_preserve_input_last_row_and_cache() -> anyhow::Result<()> {
         let h = norm(&hidden, "hnorm")?;
         let input = Array::concatenate(&[&e, &h], -1)?;
         let input = lisa_metal::kernels::blockwise::matvec(
-            10,
+            lisa_backend::OrderedBlockEncoding::Q2K,
             &weights.arrays["blk.64.nextn.eh_proj.weight"],
             &input.reshape(&[rows, 10240])?,
             &lisa_metal::Stream::thread_local_or_default(),

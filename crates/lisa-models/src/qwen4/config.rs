@@ -155,7 +155,7 @@ struct RawConfig {
 }
 
 impl ModelConfig {
-    pub fn from_str(data: &str) -> anyhow::Result<Self> {
+    pub fn parse(data: &str) -> anyhow::Result<Self> {
         let raw: RawConfig = serde_json::from_str(data)?;
         // The nested text_config wins when present; the root is the fallback
         // (and the transformed tree's only source).

@@ -1,4 +1,4 @@
-//! DS4 affine projection crossover and exact fallback chains.
+//! The reference affine projection crossover and exact fallback chains.
 use crate::{
     graph::{Graph, Value as V},
     program::Build,

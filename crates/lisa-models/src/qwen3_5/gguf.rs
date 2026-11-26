@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Projection {
-    pub encoding: u32,
+    pub encoding: lisa_backend::OrderedBlockEncoding,
     pub input: i32,
     pub output: i32,
 }
@@ -366,7 +366,7 @@ pub const CHUNK: usize = 16;
 pub const MAX_DRAFT_DEPTH: usize = 2;
 pub const COST_KEY: &str = "qwen35-gguf-q2-xl-f32-v2";
 pub fn full_attention(index: usize) -> bool {
-    index == 64 || (index + 1) % 4 == 0
+    index == 64 || (index + 1).is_multiple_of(4)
 }
 pub fn embedding_shape(rows: usize) -> anyhow::Result<Vec<i32>> {
     Ok(vec![1, i32::try_from(rows)?, 5120])
@@ -442,10 +442,16 @@ pub fn draft_finish(schema: &Schema, rows: i32, epsilon: f32) -> anyhow::Result<
     b.finish(vec![x])
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TensorEncoding {
+    F32,
+    Block(lisa_backend::OrderedBlockEncoding),
+    Unsupported,
+}
 /// Parser-neutral checkpoint metadata used by the model's schema contract.
 pub struct TensorInfo {
     pub dimensions: Vec<u64>,
-    pub encoding: u32,
+    pub encoding: TensorEncoding,
 }
 pub struct Checkpoint {
     pub architecture: String,
@@ -498,12 +504,9 @@ pub fn validate(p: &Checkpoint) -> anyhow::Result<Config> {
         );
         ensure!(
             if plain {
-                t.encoding == 0
+                t.encoding == TensorEncoding::F32
             } else {
-                matches!(
-                    t.encoding,
-                    8 | 10 | 11 | 12 | 13 | 14 | 16 | 17 | 18 | 19 | 21 | 22 | 23 | 29
-                )
+                matches!(t.encoding, TensorEncoding::Block(_))
             },
             "unsupported Qwen GGUF {name} type {:?}",
             t.encoding
@@ -512,7 +515,8 @@ pub fn validate(p: &Checkpoint) -> anyhow::Result<Config> {
     };
     tensor("token_embd.weight", &[5120, 248320], false)?;
     ensure!(
-        p.tensors["token_embd.weight"].encoding == 10,
+        p.tensors["token_embd.weight"].encoding
+            == TensorEncoding::Block(lisa_backend::OrderedBlockEncoding::Q2K),
         "Qwen GGUF embedding currently requires original Q2_K blocks"
     );
     tensor("output.weight", &[5120, 248320], false)?;

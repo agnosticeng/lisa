@@ -1,4 +1,4 @@
-//! DS4 V4.1 chat rendering and DSML boundaries, ported from ds4_server.c and
+//! The reference V4.1 chat rendering and DSML boundaries, ported from ds4_server.c and
 //! ds4_tool_text.h at b3f50180ec2c7324892be1f50bc83555ccb8d5e7 (MIT).
 //! Copyright (c) 2026 The ds4.c authors. See LICENSE-DS4 and NOTICE.
 
@@ -99,7 +99,7 @@ pub(super) fn visible_end(text: &str) -> usize {
             }
         }
     }
-    // DS4 trims separator whitespace before calls. Keep it pending until a
+    // The reference trims separator whitespace before calls. Keep it pending until a
     // later ordinary character proves it belongs to content; SSE cannot retract.
     while end > 0 && text.as_bytes()[end - 1].is_ascii_whitespace() {
         end -= 1;
@@ -374,7 +374,7 @@ pub(super) fn render(
     Ok(out)
 }
 
-fn parameter<'a>(text: &'a str, s: Syntax, depth: usize) -> Result<(String, Value, &'a str)> {
+fn parameter(text: &str, s: Syntax, depth: usize) -> Result<(String, Value, &str)> {
     ensure!(depth < 32, "DSML nesting exceeds 32");
     ensure!(text.starts_with(s.param), "expected DSML parameter");
     let (tag, mut tail) = text
@@ -475,7 +475,7 @@ impl Parser {
             escaped: false,
         }
     }
-    /// Byte cursor matches DS4, including JSON strings and partial closing tags.
+    /// Byte cursor matches the reference, including JSON strings and partial closing tags.
     /// A replacement glyph at the decoder's unfinished UTF-8 tail stays pending.
     pub(super) fn update(&mut self, text: &str) -> DsmlDecodeState {
         // The decoder can replace one or two unfinished UTF-8 bytes with this

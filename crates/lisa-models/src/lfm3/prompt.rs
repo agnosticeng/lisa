@@ -5,10 +5,8 @@ pub fn turn(system: Option<&str>, user: &str, first: bool, thinking: bool) -> St
     } else {
         "<|im_end|>\n".to_owned()
     };
-    if first {
-        if let Some(s) = system.map(str::trim).filter(|s| !s.is_empty()) {
-            out.push_str(&format!("<|im_start|>system\n{s}<|im_end|>\n"));
-        }
+    if first && let Some(s) = system.map(str::trim).filter(|s| !s.is_empty()) {
+        out.push_str(&format!("<|im_start|>system\n{s}<|im_end|>\n"));
     }
     out.push_str(&format!(
         "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n<think>",

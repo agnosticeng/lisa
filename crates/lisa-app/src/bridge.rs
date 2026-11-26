@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
 struct App {
-    commands: mpsc::Sender<Command>,
+    commands: Arc<mpsc::Sender<Command>>,
     events: Arc<Mutex<Vec<UiEvent>>>,
     cancel: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
@@ -39,18 +39,19 @@ fn text<'a>(request: &'a Value, key: &str) -> Result<&'a str> {
 fn model_list() -> Value {
     let local = models::discover_models();
     let budget = models::model_ram_budget();
+    let metal4 = lisa_metal::runtime::metal4_supported();
     let mut result = Vec::new();
     for entry in catalog::MODELS {
         let found = local.iter().find(|model| model.repo_id == entry.repo_id);
-        let size = found.map_or_else(|| catalog::bundle_download_bytes(entry), |model| model.size);
+        let size = found.map_or(entry.download_bytes, |model| model.size);
         let resident = found
             .and_then(|model| model.resident_bytes)
             .or(entry.resident_bytes)
             .unwrap_or(size);
         result.push(
-            json!({"id":entry.repo_id,"name":entry.name,"detail":entry.description,
+            json!({"id":entry.repo_id,"name":entry.name,"quantization":entry.quantization,"family":entry.family,"features":entry.features,"generates":entry.generates,"released":entry.released,"detail":entry.description,
             "size":size,"local":found.is_some(),"path":found.map(|model| &model.path),
-            "fits":budget > 0 && resident <= budget}),
+            "fits":budget > 0 && resident <= budget && (metal4 || !entry.metal4)}),
         );
     }
     json!({"models":result,"budget":budget,"physical_ram":lisa_engine::memory::physical_ram(),"available_ram":lisa_engine::memory::available_ram()})
@@ -67,9 +68,16 @@ impl App {
         #[cfg(target_os = "ios")]
         lisa_engine::checkpoint::hf::configure_cache_root(storage.join("models"))?;
         let (commands, rx) = mpsc::channel();
+        let commands = Arc::new(commands);
         let events = Arc::new(Mutex::new(Vec::new()));
         let cancel = Arc::new(AtomicBool::new(false));
-        let worker = backend::spawn_controlled(rx, events.clone(), cancel.clone(), storage.join("generated-images"))?;
+        let worker = backend::spawn_controlled(
+            rx,
+            Arc::downgrade(&commands),
+            events.clone(),
+            cancel.clone(),
+            storage.join("generated-images"),
+        )?;
         Ok(Self {
             commands,
             events,
@@ -300,7 +308,10 @@ impl App {
                     stop: self.server_stop.clone(),
                 })?;
             }
-            "stop_server" => self.server_stop.store(true, Ordering::Release),
+            "stop_server" => {
+                self.server_stop.store(true, Ordering::Release);
+                let _ = self.commands.send(Command::ServeWake);
+            }
             "browser_result" => {
                 let id = request["id"]
                     .as_u64()
@@ -327,6 +338,22 @@ impl App {
     }
 }
 
+/// The `--ram-cap-gb <GiB>` launch argument, which can only lower the budget.
+fn ram_cap_argument(mut args: impl Iterator<Item = String>) -> Result<Option<usize>> {
+    while let Some(arg) = args.next() {
+        if arg == "--ram-cap-gb" {
+            let gib = args
+                .next()
+                .context("--ram-cap-gb needs a value in GiB")?
+                .parse::<usize>()
+                .context("--ram-cap-gb must be a positive integer")?;
+            ensure!(gib > 0, "--ram-cap-gb must be a positive integer");
+            return Ok(Some(gib));
+        }
+    }
+    Ok(None)
+}
+
 /// # Safety
 /// `input` must point to a live, NUL-terminated UTF-8 string for this call.
 /// Calls are serialized; no Rust references or callbacks cross the ABI.
@@ -334,12 +361,17 @@ impl App {
 pub unsafe extern "C" fn lisa_app_request(input: *const c_char) -> *mut c_char {
     let result = std::panic::catch_unwind(|| -> Result<Value> {
         ensure!(!input.is_null(), "Null request");
+        // SAFETY: `input` is non-null and, per this function's contract, points to a
+        // caller-owned NUL-terminated string that outlives this call; `to_str` checks UTF-8.
         let request: Value = serde_json::from_str(unsafe { CStr::from_ptr(input) }.to_str()?)?;
         let mut state = APP
             .lock()
             .map_err(|_| anyhow::anyhow!("Application state failed; restart Lisa"))?;
         if text(&request, "op")? == "initialize" {
             ensure!(state.is_none(), "Lisa is already initialized");
+            if let Some(gib) = ram_cap_argument(std::env::args())? {
+                lisa_engine::memory::set_ram_cap_gib(gib);
+            }
             *state = Some(App::new(PathBuf::from(text(&request, "storage")?))?);
             return Ok(json!({"version":1}));
         }
@@ -362,6 +394,8 @@ pub unsafe extern "C" fn lisa_app_request(input: *const c_char) -> *mut c_char {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lisa_app_free(string: *mut c_char) {
     if !string.is_null() {
+        // SAFETY: per the contract, a non-null `string` came from `CString::into_raw` in
+        // `lisa_app_request` and has not been freed, so ownership returns here exactly once.
         drop(unsafe { CString::from_raw(string) });
     }
 }
@@ -373,23 +407,47 @@ mod tests {
     fn abi_reports_invalid_input_and_preserves_unicode() {
         for input in ["{", r#"{"op":"not-initialized","text":"Café 🙂"}"#] {
             let input = CString::new(input).unwrap();
+            // SAFETY: `input` is a live, NUL-terminated UTF-8 `CString` owned by this loop
+            // iteration and outlives the call.
             let output = unsafe { lisa_app_request(input.as_ptr()) };
+            // SAFETY: `output` is a non-null `CString::into_raw` result from `lisa_app_request`
+            // that stays live until `lisa_app_free` below.
             let value: Value =
                 serde_json::from_str(unsafe { CStr::from_ptr(output) }.to_str().unwrap()).unwrap();
             assert_eq!(value["ok"], false);
             assert!(value["error"].as_str().is_some());
+            // SAFETY: `output` came from `lisa_app_request`, is no longer borrowed, and is
+            // freed exactly once.
             unsafe { lisa_app_free(output) };
         }
+        // SAFETY: `lisa_app_request` checks for null before dereferencing `input`.
         let output = unsafe { lisa_app_request(std::ptr::null()) };
+        // SAFETY: `output` is a non-null `CString::into_raw` result that stays live until the
+        // `lisa_app_free` call below.
         assert!(
             unsafe { CStr::from_ptr(output) }
                 .to_str()
                 .unwrap()
                 .contains("Null request")
         );
+        // SAFETY: `output` is an unreleased `lisa_app_request` result freed exactly once, and
+        // `lisa_app_free` ignores null.
         unsafe {
             lisa_app_free(output);
             lisa_app_free(std::ptr::null_mut())
         };
+    }
+
+    fn ram_cap(args: &[&str]) -> anyhow::Result<Option<usize>> {
+        super::ram_cap_argument(args.iter().map(|arg| arg.to_string()))
+    }
+
+    #[test]
+    fn ram_cap_argument_is_optional_and_validated() {
+        assert_eq!(ram_cap(&["Lisa"]).unwrap(), None);
+        assert_eq!(ram_cap(&["Lisa", "--ram-cap-gb", "4"]).unwrap(), Some(4));
+        assert!(ram_cap(&["Lisa", "--ram-cap-gb"]).is_err());
+        assert!(ram_cap(&["Lisa", "--ram-cap-gb", "0"]).is_err());
+        assert!(ram_cap(&["Lisa", "--ram-cap-gb", "four"]).is_err());
     }
 }

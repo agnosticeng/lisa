@@ -1,12 +1,11 @@
 #![cfg(test)]
-#![allow(dead_code)]
 //! Frozen dense/shared expert orchestration before extraction.
 use crate::bindings::glm53_oracle_helpers::narrow;
 use crate::core::quant::QuantizedLinearExecution;
-use crate::core::{capture::Capture, loader::TensorSource, quant::QuantizedLinear};
+use crate::core::{capture::Capture, quant::QuantizedLinear};
 use lisa_metal::{Array, Dtype, ops};
 /// Concatenate gate and up output rows so one affine-quant projection computes
-/// both results. Real layer-0 weights match the separate DS4 production path
+/// both results. Real layer-0 weights match the separate reference production path
 /// for decode and prefill shapes; the layer-45 shared expert has the same
 /// checkpoint-backed exactness check.
 pub fn fuse_gate_up(
@@ -48,6 +47,7 @@ pub fn clamped_swiglu(up: &Array, gate: &Array, limit: f32) -> anyhow::Result<Ar
 /// The paired Q8 projection is the production path. The separate mode keeps
 /// the original two-dispatch schedule available for controlled end-to-end
 /// measurements; it is selected once while loading the model.
+#[allow(clippy::large_enum_variant, reason = "one value per layer")]
 pub(super) enum GateUpProjection {
     Paired {
         projection: QuantizedLinear,
@@ -66,17 +66,6 @@ struct ActivatedProjection {
 }
 
 impl GateUpProjection {
-    fn load_mode() -> anyhow::Result<bool> {
-        match std::env::var("LISA_GLM53_Q8_GATE_UP").as_deref() {
-            Ok("separate") => Ok(false),
-            Ok("paired") | Err(std::env::VarError::NotPresent) => Ok(true),
-            Ok(value) => {
-                anyhow::bail!("LISA_GLM53_Q8_GATE_UP must be `paired` or `separate`, got {value:?}")
-            }
-            Err(error) => anyhow::bail!("cannot read LISA_GLM53_Q8_GATE_UP: {error}"),
-        }
-    }
-
     pub(super) fn from_parts(
         gate: QuantizedLinear,
         up: QuantizedLinear,
@@ -139,8 +128,8 @@ impl GateUpProjection {
         let rows = shape[..shape.len() - 1].iter().product::<i32>() as usize;
         let k = x.dim(-1) as usize;
         if !(1..=16).contains(&rows)
-            || k % 128 != 0
-            || self.inter() % 2 != 0
+            || !k.is_multiple_of(128)
+            || !self.inter().is_multiple_of(2)
             || x.dtype() != Dtype::Float32
         {
             return Ok(None);
@@ -168,7 +157,7 @@ impl GateUpProjection {
         }
         let output_shape = [&shape[..shape.len() - 1], &[self.inter() as i32]].concat();
         if !capture_projections {
-            let activated = lisa_metal::jit::glm53_affine_q8_swiglu_native(
+            let activated = lisa_metal::jit::affine_q8_swiglu_native(
                 flat.t.device(),
                 &flat.t,
                 &gate.weight.t,
@@ -185,7 +174,7 @@ impl GateUpProjection {
                 activated,
             }));
         }
-        let (g, u, activated) = lisa_metal::jit::glm53_affine_q8_gate_up_native(
+        let (g, u, activated) = lisa_metal::jit::affine_q8_gate_up_native(
             flat.t.device(),
             &flat.t,
             &gate.weight.t,
@@ -215,45 +204,6 @@ pub struct DenseMlp {
 }
 
 impl DenseMlp {
-    /// The projection mode captured at load, independent of later environment changes.
-    pub(super) fn paired_storage(&self) -> bool {
-        matches!(&self.gate_up, GateUpProjection::Paired { .. })
-    }
-
-    pub fn load<S: TensorSource>(w: &mut S, prefix: &str, limit: f32) -> anyhow::Result<Self> {
-        let (gate, up, down) = Self::load_parts(w, prefix)?;
-        Ok(Self {
-            gate_up: GateUpProjection::from_parts(gate, up, GateUpProjection::load_mode()?)?,
-            down,
-            limit,
-        })
-    }
-
-    fn load_shared<S: TensorSource>(w: &mut S, prefix: &str, limit: f32) -> anyhow::Result<Self> {
-        Self::load::<S>(w, prefix, limit)
-    }
-
-    fn load_parts<S: TensorSource>(
-        w: &mut S,
-        prefix: &str,
-    ) -> anyhow::Result<(QuantizedLinear, QuantizedLinear, QuantizedLinear)> {
-        let mut gate = QuantizedLinear::load(w, &format!("{prefix}.gate_proj"), "")?;
-        let mut up = QuantizedLinear::load(w, &format!("{prefix}.up_proj"), "")?;
-        let mut down = QuantizedLinear::load(w, &format!("{prefix}.down_proj"), "")?;
-        for q in [&mut gate, &mut up, &mut down] {
-            q.set_quant(64, 8);
-            if q.scales.dtype() != Dtype::Bfloat16 {
-                q.scales = q.scales.as_dtype(Dtype::Float32)?;
-                q.biases = q.biases.as_dtype(Dtype::Float32)?;
-            }
-        }
-        Ok((gate, up, down))
-    }
-
-    pub fn forward(&self, x: &Array) -> anyhow::Result<Array> {
-        self.forward_with_capture(x, None, 0)
-    }
-
     pub fn forward_with_capture(
         &self,
         x: &Array,
@@ -299,7 +249,7 @@ impl DenseMlp {
         Ok(out)
     }
 
-    /// Use DS4's row-count-specific Q8 projection schedule over the original
+    /// Use the reference's row-count-specific Q8 projection schedule over the original
     /// affine storage: M=1, small-row and matrix paths keep their own arithmetic.
     fn forward_projection(
         &self,

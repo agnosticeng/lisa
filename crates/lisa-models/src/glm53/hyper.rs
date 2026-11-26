@@ -1,4 +1,4 @@
-//! DS4 GLM four-stream split/collapse/expansion and its projection shape gates.
+//! The reference GLM four-stream split/collapse/expansion and its projection shape gates.
 use crate::{
     graph::{Graph, Value as V},
     program::Build,

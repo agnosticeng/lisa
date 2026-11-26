@@ -203,12 +203,14 @@ mod tests {
             device.full_write_workspace(&mut slot, &[16], ScalarType::F32, "scratch-test")?
         };
         let first_id = device.allocation_id(&first);
+        // SAFETY: as above, the scratch is only inspected for allocation identity.
         let grown = unsafe {
             device.full_write_workspace(&mut slot, &[8192], ScalarType::F32, "scratch-test")?
         };
         assert_ne!(first_id, device.allocation_id(&grown));
         let grown_id = device.allocation_id(&grown);
         drop(grown);
+        // SAFETY: as above, the scratch is only inspected for allocation identity.
         let reused = unsafe {
             device.full_write_workspace(&mut slot, &[32], ScalarType::F32, "scratch-test")?
         };

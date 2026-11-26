@@ -1,0 +1,29 @@
+{
+  "general.architecture": "clip",
+  "general.type": "mmproj",
+  "general.name": "Inkling-2-Mini",
+  "general.size_label": "318M",
+  "general.file_type": 1,
+  "clip.has_vision_encoder": true,
+  "clip.vision.projection_dim": 2304,
+  "clip.vision.image_size": 640,
+  "clip.vision.patch_size": 20,
+  "clip.vision.embedding_length": 1024,
+  "clip.vision.feed_forward_length": 4096,
+  "clip.vision.block_count": 23,
+  "clip.vision.attention.head_count": 16,
+  "clip.vision.image_mean": [
+    0.5,
+    0.5,
+    0.5
+  ],
+  "clip.vision.image_std": [
+    0.5,
+    0.5,
+    0.5
+  ],
+  "clip.vision.projector_type": "inkling2v",
+  "clip.vision.attention.layer_norm_epsilon": 9.999999747378752e-06,
+  "clip.vision.spatial_merge_size": 2,
+  "general.quantization_version": 2
+}

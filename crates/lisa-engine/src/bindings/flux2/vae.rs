@@ -1,17 +1,8 @@
 use crate::{bindings::BindingDevice, execution::DeviceContext};
 use lisa_backend::{ScalarType, TensorAccess};
-// Checkpoint bindings and execution for the model-owned FLUX autoencoder.
+// Prepared tensors and execution for the model-owned FLUX autoencoder.
 use super::weights::Weights;
 
-use std::path::Path;
-pub fn decode<D: BindingDevice>(
-    context: &DeviceContext<D>,
-    dir: &Path,
-    packed: &D::Tensor,
-) -> anyhow::Result<D::Tensor> {
-    let weights = Weights::load(context.clone(), &dir.join("vae"))?;
-    decode_weights(&weights, packed, ScalarType::BF16)
-}
 pub fn decode_weights<D: BindingDevice>(
     weights: &Weights<D>,
     packed: &D::Tensor,
@@ -51,35 +42,14 @@ pub fn decode_weights<D: BindingDevice>(
 
 /// Decode Bonsai's original Diffusers VAE in overlapping 128px tiles. Only one
 /// tile's activations is live; the final RGB-sized accumulation stays on host.
-pub fn decode_binary<D: BindingDevice + lisa_backend::ManagedDevice>(
+pub fn decode_tiled<D: BindingDevice + lisa_backend::ManagedDevice>(
     context: &DeviceContext<D>,
-    dir: &Path,
+    weights: &Weights<D>,
     packed: &D::Tensor,
     progress: &mut dyn FnMut(&str, u32, u32) -> anyhow::Result<()>,
 ) -> anyhow::Result<Vec<f32>> {
     use super::weights::run;
     use lisa_models::flux::{pipeline, tiles};
-    let original = Weights::load_file(
-        context.clone(),
-        &dir.join("vae/diffusion_pytorch_model.safetensors"),
-        |key| {
-            key.starts_with("decoder.")
-                || key.starts_with("post_quant_conv.")
-                || key.starts_with("bn.running_")
-        },
-    )?;
-    let mut tensors = std::collections::HashMap::new();
-    for (name, value) in original.0 {
-        let (name, prepare) =
-            pipeline::decoder_weight(&name.replace(".to_out.0.", ".to_out."), value.shape())?;
-        let value = if let Some(graph) = prepare {
-            run(context, graph, &[&value])?
-        } else {
-            value
-        };
-        tensors.insert(name, value);
-    }
-    let weights = Weights::from_map(context.clone(), tensors);
     let (h, w) = (packed.dim(2) as usize, packed.dim(3) as usize);
     let mut output = vec![0.0; h * w * 256 * 3];
     let mut count = vec![0.0; h * w * 256];
@@ -87,7 +57,7 @@ pub fn decode_binary<D: BindingDevice + lisa_backend::ManagedDevice>(
     for (i, tile) in tiles.iter().enumerate() {
         progress("Decoding image", i as u32, tiles.len() as u32)?;
         let input = run(context, tile.graph(), &[packed])?;
-        let decoded = decode_weights(&weights, &input, ScalarType::BF16)?;
+        let decoded = decode_weights(weights, &input, ScalarType::BF16)?;
         let pixels = run(context, pipeline::pixel_readback(), &[&decoded])?;
         pixels.eval()?;
         tile.blend(h * 16, w * 16, &pixels.read_f32()?, &mut output, &mut count)?;

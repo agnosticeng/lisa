@@ -28,8 +28,8 @@ impl Options {
         ensure!(
             (64..=1024).contains(&self.width)
                 && (64..=1024).contains(&self.height)
-                && self.width % 32 == 0
-                && self.height % 32 == 0,
+                && self.width.is_multiple_of(32)
+                && self.height.is_multiple_of(32),
             "image width and height must be multiples of 32 between 64 and 1024"
         );
         ensure!(

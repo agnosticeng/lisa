@@ -18,6 +18,8 @@ fn sources(dir: &Path, paths: &mut Vec<PathBuf>) {
     }
 }
 
+include!("src/shader_expand.rs");
+
 fn write_changed(path: &Path, bytes: &[u8]) {
     if fs::read(path).ok().as_deref() != Some(bytes) {
         let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
@@ -35,7 +37,7 @@ fn main() {
     let mut source = Vec::new();
     let mut index = String::from("macro_rules! kernel_source {\n");
     for path in paths {
-        let bytes = fs::read(&path).expect("read shader source");
+        let bytes = expand(root, &fs::read(&path).expect("read shader source"));
         std::str::from_utf8(&bytes).expect("UTF-8 shader source");
         let name = path.strip_prefix(root).unwrap().to_str().unwrap();
         index.push_str(&format!(

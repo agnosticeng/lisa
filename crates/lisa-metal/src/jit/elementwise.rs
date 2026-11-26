@@ -1,5 +1,6 @@
 use objc2_metal::MTLSize;
 
+use super::compile::compile_builtin_lazy;
 use crate::array::Array;
 
 use super::compile::{
@@ -72,11 +73,12 @@ pub fn unary_op(device: &Device, x: &Tensor, op: &str) -> Result<Tensor> {
         &[arg(in_t), arg(out_t), arg(op), arg("4")],
     ));
 
-    let source = format!("{MLX_UTILS_PREAMBLE}{MLX_UNARY_OPS_PREAMBLE}{MLX_UNARY_PREAMBLE}{defs}");
-    let pipeline = compile_builtin(device, &source, &kernel_name)?;
+    let source =
+        || format!("{MLX_UTILS_PREAMBLE}{MLX_UNARY_OPS_PREAMBLE}{MLX_UNARY_PREAMBLE}{defs}");
+    let pipeline = compile_builtin_lazy(device, &kernel_name, source)?;
 
-    let ybuf = mdev.buffer_for_full_gpu_write((size) as usize * (out_dt).size_of(), "unary_out")?;
-    let y = Array::from_parts(mdev, ybuf.clone(), &x.dims().to_vec(), out_dt);
+    let ybuf = mdev.buffer_for_full_gpu_write((size) * (out_dt).size_of(), "unary_out")?;
+    let y = Array::from_parts(mdev, ybuf.clone(), x.dims(), out_dt);
 
     let guard = mdev.commands.encoder()?;
     let enc = guard.encoder();
@@ -114,7 +116,7 @@ pub fn sigmoid(device: &Device, x: &Tensor) -> Result<Tensor> {
 /// MLX `nn.silu` is `x * sigmoid(x)`.
 pub fn silu(device: &Device, x: &Tensor) -> Result<Tensor> {
     let s = sigmoid(device, x)?;
-    Ok(x.mul(&s)?)
+    x.mul(&s)
 }
 
 /// MLX's other built-in unary ops (all via the generic `unary_op` kernel path).
@@ -201,9 +203,8 @@ pub fn binary_op(device: &Device, a: &Tensor, b: &Tensor, op: &str) -> Result<Te
         format!("{MLX_UTILS_PREAMBLE}{MLX_BINARY_OPS_PREAMBLE}{MLX_BINARY_PREAMBLE}{defs}");
     let pipeline = compile_builtin(device, &source, &kernel_name)?;
 
-    let cbuf =
-        mdev.buffer_for_full_gpu_write((size) as usize * (out_dt).size_of(), "binary_out")?;
-    let c = Array::from_parts(mdev, cbuf.clone(), &a.dims().to_vec(), out_dt);
+    let cbuf = mdev.buffer_for_full_gpu_write((size) * (out_dt).size_of(), "binary_out")?;
+    let c = Array::from_parts(mdev, cbuf.clone(), a.dims(), out_dt);
 
     let guard = mdev.commands.encoder()?;
     let enc = guard.encoder();

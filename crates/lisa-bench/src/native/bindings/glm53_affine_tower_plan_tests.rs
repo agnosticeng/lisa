@@ -1,6 +1,5 @@
 #![cfg(test)]
 use super::*;
-use crate::bindings::deepseek41_moe::tests::{counts, difference};
 use crate::bindings::glm53_oracle_helpers::mm;
 use crate::core::quant::QuantizedEmbeddingExecution;
 #[path = "glm53_affine_tower_oracle.rs"]
@@ -27,15 +26,9 @@ fn check(
     old: impl FnOnce() -> anyhow::Result<Array>,
     new: impl FnOnce() -> anyhow::Result<Array>,
 ) -> anyhow::Result<()> {
-    let before = counts();
     let a = old()?;
-    let middle = counts();
     let b = new()?;
-    let after = counts();
     equal(&a, &b)?;
-    if std::env::var_os("LISA_TRACE").is_some() {
-        assert_eq!(difference(&before, &middle), difference(&middle, &after));
-    }
     Ok(())
 }
 fn quant(n: i32, k: i32, bits: i32, group: i32, seed: usize) -> QuantizedLinear {
@@ -142,7 +135,6 @@ fn affine_draft_input_and_residual_plans_preserve_original_chains() -> anyhow::R
         let enorm = values(&[h], 43);
         let hnorm = values(&[h], 47);
         let eh = values(&[h, 2 * h], 53).as_dtype(dtype)?;
-        let before = counts();
         let (a, b, c) = oracle::draft_inputs(
             &embed,
             &target,
@@ -154,7 +146,6 @@ fn affine_draft_input_and_residual_plans_preserve_original_chains() -> anyhow::R
             7,
             1e-5,
         )?;
-        let middle = counts();
         let ids = Array::from_slice(&[7i32], &[1, 1]);
         let x = plans::embedding(&embed, &ids)?;
         let new_a = mtp_rms(&x, &enorm, 1e-5)?;
@@ -177,35 +168,24 @@ fn affine_draft_input_and_residual_plans_preserve_original_chains() -> anyhow::R
             },
             &[&new_a, &new_b, &eh],
         )?;
-        let after = counts();
         equal(&a, &new_a)?;
         equal(&b, &new_b)?;
         equal(&c, &new_c)?;
-        if std::env::var_os("LISA_TRACE").is_some() {
-            assert_eq!(difference(&before, &middle), difference(&middle, &after));
-        }
         let s = lisa_metal::Stream::thread_local_or_default();
         let attended = values(&[1, 1, h], 59);
-        let before = counts();
-        let (sum, norm) = lisa_metal::kernels::sparse::kernels::glm53_mtp_add_rms_norm(
-            &c, &attended, &enorm, 1e-5, &s,
-        )
-        .unwrap();
-        let middle = counts();
+        let (sum, norm) =
+            lisa_metal::kernels::sparse::kernels::mtp_add_rms_norm(&c, &attended, &enorm, 1e-5, &s)
+                .unwrap();
         let out = plans::run(
             R::AddNorm {
                 epsilon: 1e-5f32.to_bits(),
             },
             &[&c, &attended, &enorm],
         )?;
-        let after = counts();
         equal(&sum, &out[0])?;
         equal(&norm, &out[1])?;
-        if std::env::var_os("LISA_TRACE").is_some() {
-            assert_eq!(difference(&before, &middle), difference(&middle, &after));
-        }
         check(
-            || Ok(lisa_metal::kernels::sparse::kernels::glm53_mtp_add3(&c, &a, &b, &s).unwrap()),
+            || Ok(lisa_metal::kernels::sparse::kernels::mtp_add3(&c, &a, &b, &s).unwrap()),
             || plan_one(R::AddThree, &[&c, &a, &b]),
         )?;
     }
@@ -244,7 +224,7 @@ fn hyper(h: i32, seed: usize) -> anyhow::Result<Hc> {
     )
 }
 fn tower_fixture() -> anyhow::Result<Tower> {
-    let config = ModelConfig::from_str(
+    let config = ModelConfig::parse(
         r#"{"hidden_size":4096,"num_hidden_layers":2,"vocab_size":32,"layer_types":["linear_attention","deepseek_sparse_attention"]}"#,
     )?;
     let emb = quant(32, 4096, 8, 64, 61);
@@ -346,21 +326,11 @@ fn affine_decoder_and_ragged_plans_preserve_original_outputs_and_caches() -> any
                     &(0..b * n).map(|i| (i * 7 + 3) % 32).collect::<Vec<_>>(),
                     &[b, n],
                 );
-                let before = counts();
                 let (a, am) = tower.forward_inner_until_oracle(&ids, &mut ac, None)?;
-                let middle = counts();
                 let (z, zm) = tower.forward_inner_until(&ids, &mut bc, None)?;
-                let after = counts();
                 equal(&a, &z)?;
                 equal(&am, &zm)?;
                 caches_equal(&ac, &bc)?;
-                if std::env::var_os("LISA_TRACE").is_some() {
-                    assert_eq!(
-                        difference(&before, &middle),
-                        difference(&middle, &after),
-                        "native{native} B{b} T{n} prefill{prefill}"
-                    );
-                }
             }
         }
         tower.prefill_mode = false;
@@ -374,9 +344,7 @@ fn affine_decoder_and_ragged_plans_preserve_original_outputs_and_caches() -> any
                 ..Default::default()
             });
             INC_STEP.store(0, std::sync::atomic::Ordering::Relaxed);
-            let before = counts();
             let (a, am) = tower.forward_inner_until_oracle(&ids, &mut ac, Some(0))?;
-            let middle = counts();
             let old = tower.capture.take().unwrap();
             tower.capture = Some(Capture {
                 layers: vec![0, 1],
@@ -385,14 +353,10 @@ fn affine_decoder_and_ragged_plans_preserve_original_outputs_and_caches() -> any
             });
             INC_STEP.store(0, std::sync::atomic::Ordering::Relaxed);
             let (b, bm) = tower.forward_inner_until(&ids, &mut bc, Some(0))?;
-            let after = counts();
             let new = tower.capture.take().unwrap();
             equal(&a, &b)?;
             equal(&am, &bm)?;
             caches_equal(&ac, &bc)?;
-            if std::env::var_os("LISA_TRACE").is_some() {
-                assert_eq!(difference(&before, &middle), difference(&middle, &after));
-            }
             if preserve {
                 let a = old.pending.lock().unwrap();
                 let b = new.pending.lock().unwrap();
@@ -424,18 +388,12 @@ fn affine_decoder_and_ragged_plans_preserve_original_outputs_and_caches() -> any
         }
         for _ in 0..2 {
             let ids = Array::from_slice(&[5i32, 7], &[2, 1]);
-            let before = counts();
             let (a, am) = tower.forward_ragged_inner_oracle(&ids, &mut ac)?;
-            let middle = counts();
             let (b, bm) = tower.forward_ragged_inner(&ids, &mut bc)?;
-            let after = counts();
             equal(&a, &b)?;
             equal(&am, &bm)?;
             for (a, b) in ac.iter().zip(&bc) {
                 caches_equal(a, b)?;
-            }
-            if std::env::var_os("LISA_TRACE").is_some() {
-                assert_eq!(difference(&before, &middle), difference(&middle, &after));
             }
         }
     }
@@ -468,7 +426,6 @@ fn affine_mtp_plan_preserves_original_logits_and_private_tape() -> anyhow::Resul
         let mut bc = IndexerTape::new(crate::metal_context::execution_context());
         for position in 0..4 {
             let target = values(&[1, 1, 16384], 163 + position);
-            let before = counts();
             let a = block.forward_oracle(
                 &tower.config,
                 &tower.embed,
@@ -479,7 +436,6 @@ fn affine_mtp_plan_preserves_original_logits_and_private_tape() -> anyhow::Resul
                 position,
                 0,
             )?;
-            let middle = counts();
             let b = block.forward(
                 &tower.config,
                 &tower.embed,
@@ -490,16 +446,12 @@ fn affine_mtp_plan_preserves_original_logits_and_private_tape() -> anyhow::Resul
                 position,
                 0,
             )?;
-            let after = counts();
             equal(&a, &b)?;
             assert_eq!(ac.compact_total(), bc.compact_total());
             equal(
                 &ac.compact_slice(0, position + 1).unwrap(),
                 &bc.compact_slice(0, position + 1).unwrap(),
             )?;
-            if std::env::var_os("LISA_TRACE").is_some() {
-                assert_eq!(difference(&before, &middle), difference(&middle, &after));
-            }
         }
     }
     Ok(())

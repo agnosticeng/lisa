@@ -2,7 +2,7 @@ use crate::metadata::Metadata;
 use anyhow::{Result, ensure};
 
 /// Geometry read from the file, including the pruned Coder's 192 experts.
-/// DS4's unpruned model has 384; this is never inferred from a repository name.
+/// The reference's unpruned model has 384; this is never inferred from a repository name.
 #[derive(Clone, Debug)]
 pub struct Config {
     pub layers: usize,
@@ -203,16 +203,5 @@ impl Config {
             kv_sources: kv_sources.into_iter().map(|v| v as u32).collect(),
             index_sources: index_sources.into_iter().map(|v| v as u32).collect(),
         })
-    }
-
-    /// DS4's bounded prefill chunk. Carry storage is accounted separately.
-    pub fn prefill_capacity(context: usize) -> usize {
-        if context < 8192 {
-            context.min(2048)
-        } else if context < 16384 {
-            4096
-        } else {
-            8192
-        }
     }
 }

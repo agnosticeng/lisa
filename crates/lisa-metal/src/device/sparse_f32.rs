@@ -137,6 +137,7 @@ pub(super) fn capabilities(triple_linear: bool) -> Vec<KernelCapability> {
         cap(K::RouterLinear, &[F32, F32]),
         cap(K::RouteSigmoid, &[F32, FLOAT]),
         cap(K::ClampedSwiGlu, &[F32, F32]),
+        cap(K::WeightedClampedSwiGlu, &[F32, F32, F32]),
         cap(K::SumEight, &[F32]),
     ];
     for schedule in [
@@ -237,14 +238,13 @@ pub(super) fn invoke(
                 return Ok(None);
             }
         }
-        SparseF32::DeltaOutput { heads, .. } => {
-            if a[0].rank() != 2
+        SparseF32::DeltaOutput { heads, .. }
+            if (a[0].rank() != 2
                 || a[0].dim(1) != (*heads * 128) as i32
                 || a[1].shape() != a[0].shape()
-                || a[2].size() != 128
-            {
-                return Ok(None);
-            }
+                || a[2].size() != 128) =>
+        {
+            return Ok(None);
         }
         _ => {}
     }
@@ -287,7 +287,7 @@ pub(super) fn invoke(
                 tensor.eval_enqueue()?;
             }
             if *capture {
-                let (g, u, y) = crate::jit::glm53_affine_q8_gate_up_native(
+                let (g, u, y) = crate::jit::affine_q8_gate_up_native(
                     a[0].t.device(),
                     &a[0].t,
                     &a[1].t,
@@ -304,7 +304,7 @@ pub(super) fn invoke(
                     Array::new(y),
                 ])));
             }
-            Some(Array::new(crate::jit::glm53_affine_q8_swiglu_native(
+            Some(Array::new(crate::jit::affine_q8_swiglu_native(
                 a[0].t.device(),
                 &a[0].t,
                 &a[1].t,
@@ -336,21 +336,21 @@ pub(super) fn invoke(
                 return Ok(None);
             }
             match schedule {
-                P::Matrix => Some(Array::new(crate::jit::glm53_affine_q8_prefill(
-                    &x.t.device(),
+                P::Matrix => Some(Array::new(crate::jit::affine_q8_prefill(
+                    x.t.device(),
                     &x.t,
                     &w.t,
                     &scales.t,
                     &biases.t,
                 )?)),
-                P::Tiny => Some(Array::new(crate::jit::glm53_affine_q8_tiny_native(
-                    &x.t.device(),
+                P::Tiny => Some(Array::new(crate::jit::affine_q8_tiny_native(
+                    x.t.device(),
                     &x.t,
                     &w.t,
                     &scales.t,
                     &biases.t,
                 )?)),
-                P::Vector => native::glm53_affine_q8_mv_ds4(w, scales, biases, x, stream),
+                P::Vector => native::affine_q8_mv_ds4(w, scales, biases, x, stream),
                 P::Generic => Some(crate::ops::quantized_matmul(
                     x,
                     w,
@@ -373,7 +373,7 @@ pub(super) fn invoke(
         }
 
         SparseF32::QueryLatentRmsRows { epsilon } => {
-            return Ok(native::glm53_dsa_qkv_rms_norm_rows(
+            return Ok(native::dsa_qkv_rms_norm_rows(
                 a[0],
                 a[1],
                 a[2],
@@ -384,7 +384,7 @@ pub(super) fn invoke(
             .map(|(q, c)| Outputs::Two([q, c])));
         }
         SparseF32::QueryLatentRmsCompact { epsilon } => {
-            return Ok(native::glm53_qkv_norm_compact(
+            return Ok(native::qkv_norm_compact(
                 a[0],
                 a[1],
                 a[2],
@@ -394,7 +394,7 @@ pub(super) fn invoke(
             )
             .map(|(q, c)| Outputs::Two([q, c])));
         }
-        SparseF32::QueryLatentRmsInto { epsilon, position } => native::glm53_qkv_norm_compact_into(
+        SparseF32::QueryLatentRmsInto { epsilon, position } => native::qkv_norm_compact_into(
             a[0],
             a[1],
             a[2],
@@ -477,10 +477,10 @@ pub(super) fn invoke(
             )?,
         )),
         SparseF32::OrderedRms { epsilon } => {
-            native::glm53_ds4_rms_norm(a[0], a[1], f32::from_bits(*epsilon), stream)
+            native::ds4_rms_norm(a[0], a[1], f32::from_bits(*epsilon), stream)
         }
         SparseF32::OrderedAddRms { epsilon } => {
-            return Ok(native::glm53_mtp_add_rms_norm(
+            return Ok(native::mtp_add_rms_norm(
                 a[0],
                 a[1],
                 a[2],
@@ -489,7 +489,7 @@ pub(super) fn invoke(
             )
             .map(|(a, b)| Outputs::Two([a, b])));
         }
-        SparseF32::OrderedAddThree => native::glm53_mtp_add3(a[0], a[1], a[2], stream),
+        SparseF32::OrderedAddThree => native::mtp_add3(a[0], a[1], a[2], stream),
         SparseF32::Q8HeadQuery => Some(crate::kernels::sparse::gguf::qk(a[0], a[1], stream)?),
         SparseF32::Q8HeadValue => Some(crate::kernels::sparse::gguf::value(a[0], a[1], stream)?),
         SparseF32::Q8IndexedDecode { dense } => Some(crate::kernels::sparse::gguf::decode(
@@ -519,9 +519,9 @@ pub(super) fn invoke(
             schedule,
         } => {
             let f = match schedule {
-                lisa_backend::ScoreSchedule::Scalar => native::glm53_indexer_scores,
-                lisa_backend::ScoreSchedule::Rows4 => native::glm53_indexer_scores_rows4,
-                lisa_backend::ScoreSchedule::Batch => native::glm53_indexer_scores_batch,
+                lisa_backend::ScoreSchedule::Scalar => native::indexer_scores,
+                lisa_backend::ScoreSchedule::Rows4 => native::indexer_scores_rows4,
+                lisa_backend::ScoreSchedule::Batch => native::indexer_scores_batch,
             };
             f(
                 a[0],
@@ -545,14 +545,14 @@ pub(super) fn invoke(
             position,
             pool_size,
             tail,
-        } => native::glm53_expand_pool_selection_for_attention(
+        } => native::expand_pool_selection_for_attention(
             a[0], *tokens, *position, *pool_size, *tail, stream,
         ),
         SparseF32::WeightedRms { epsilon, latent } => {
             if *latent {
-                native::glm53_mtp_kv_lora_rms_norm(a[0], a[1], f32::from_bits(*epsilon), stream)
+                native::mtp_kv_lora_rms_norm(a[0], a[1], f32::from_bits(*epsilon), stream)
             } else {
-                native::glm53_mtp_rms_norm(a[0], a[1], f32::from_bits(*epsilon), stream)
+                native::mtp_rms_norm(a[0], a[1], f32::from_bits(*epsilon), stream)
             }
         }
         SparseF32::DeltaDecode {
@@ -615,24 +615,22 @@ pub(super) fn invoke(
             native::kda_output_norm(a[0], a[1], a[2], *heads, f32::from_bits(*epsilon), stream)
         }
         SparseF32::Bf16PairLinear => {
-            return Ok(native::glm53_bf16_pair_gemv(a[0], a[1], a[2], a[3], stream)
+            return Ok(native::bf16_pair_gemv(a[0], a[1], a[2], a[3], stream)
                 .map(|(x, y)| Outputs::Two([x, y])));
         }
         SparseF32::Bf16TripleLinear => {
-            return Ok(native::glm53_bf16_qkv(a[0], a[1], a[2], a[3], stream)
+            return Ok(native::bf16_qkv(a[0], a[1], a[2], a[3], stream)
                 .map(|(x, y, z)| Outputs::Many(vec![x, y, z])));
         }
         SparseF32::Bf16PackedSix { groups } => {
-            return Ok(native::glm53_bf16_kda_project_with_nsg(
+            return Ok(native::bf16_kda_project_with_nsg(
                 a[0], a[1], a[2], a[3], a[4], a[5], a[6], *groups, stream,
             )
             .map(|(x, y, z)| Outputs::Many(vec![x, y, z])));
         }
-        SparseF32::MixRms { epsilon } => {
-            native::glm53_hc_mix_rms(a[0], f32::from_bits(*epsilon), stream)
-        }
+        SparseF32::MixRms { epsilon } => native::hc_mix_rms(a[0], f32::from_bits(*epsilon), stream),
         SparseF32::MixRmsBf16Linear { epsilon } => {
-            native::glm53_hc_mix_rms_bf16_gemv(a[0], a[1], f32::from_bits(*epsilon), stream)
+            native::hc_mix_rms_bf16_gemv(a[0], a[1], f32::from_bits(*epsilon), stream)
         }
         SparseF32::SplitSinkhorn4 {
             epsilon,
@@ -669,9 +667,9 @@ pub(super) fn invoke(
         SparseF32::Expand4 => native::hc_expand4(a[0], a[1], a[2], a[3], stream),
         SparseF32::Bf16Linear { wide } => {
             if *wide {
-                native::glm53_bf16_gemm(a[0], a[1], stream)
+                native::bf16_gemm(a[0], a[1], stream)
             } else {
-                native::glm53_bf16_gemv(a[0], a[1], stream)
+                native::bf16_gemv(a[0], a[1], stream)
             }
         }
         SparseF32::RouterLinear => native::router_matvec_f32(a[0], a[1], stream),
@@ -687,6 +685,9 @@ pub(super) fn invoke(
         }
         SparseF32::ClampedSwiGlu { limit } => {
             native::swiglu_fused(a[0], a[1], f32::from_bits(*limit), stream)
+        }
+        SparseF32::WeightedClampedSwiGlu { limit } => {
+            native::weighted_clamped_swiglu(a[0], a[1], a[2], f32::from_bits(*limit), stream)
         }
         SparseF32::SumEight { rows, width } => native::moe_sum8(a[0], *rows, *width, stream),
     };
@@ -708,6 +709,9 @@ mod tests {
             SparseF32::ClampedSwiGlu {
                 limit: f32::NAN.to_bits(),
             },
+            SparseF32::WeightedClampedSwiGlu {
+                limit: (-1f32).to_bits(),
+            },
             SparseF32::SumEight {
                 rows: usize::MAX,
                 width: 1,
@@ -724,6 +728,25 @@ mod tests {
         let x = Array::from_slice(&[1f32; 16], &[1, 16]);
         let short = Array::from_slice(&[0f32; 8], &[8]);
         assert!(d.dispatch(&h, &[&x, &short], &stream)?.is_none());
+        let weighted = d
+            .prepare(Kernel::SparseF32(SparseF32::WeightedClampedSwiGlu {
+                limit: 10f32.to_bits(),
+            }))?
+            .unwrap();
+        let gate = Array::from_slice(&[1f32; 32], &[1, 8, 4]);
+        let weights = Array::from_slice(&[0.25f32; 8], &[1, 8]);
+        assert!(
+            d.dispatch(&weighted, &[&gate, &gate, &short], &stream)?
+                .is_none()
+        );
+        let output = d
+            .dispatch(&weighted, &[&gate, &gate, &weights], &stream)?
+            .unwrap()
+            .output;
+        assert_eq!(
+            output.into_one().map_err(anyhow::Error::msg)?.shape(),
+            gate.shape()
+        );
         let wrong = x.as_dtype(Dtype::Bfloat16)?;
         assert!(d.dispatch(&h, &[&wrong, &short], &stream).is_err());
         assert!(

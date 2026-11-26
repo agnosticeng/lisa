@@ -1,0 +1,10 @@
+{
+  "repository": "https://github.com/ggml-org/llama.cpp",
+  "revision": "29b52d398b294509746ec0a3f28948a3107c0213",
+  "sources": {
+    "ggml/src/ggml-quants.c": "1665bffa9c0ef0e692f8799523a729879960a6aa07adaa32f9efb41f7076a3da",
+    "ggml/src/ggml-impl.h": "5c7f5db22ec6d3d23e6e30790bd87765987ae303e7cb72ad2db3a3f669d50086"
+  },
+  "oracle": "Unmodified dequantize_row_nvfp4 and ggml_ue4m3_to_fp32; clang -O2 -ffp-contract=off. All 256 scale bytes and all 16 nibbles, F32 little-endian, scale-major. Includes reserved encodings to pin current GGML semantics.",
+  "fixture_sha256": "dcdd9098ab446ceeca1b42f79ad627ee6d4d6da2c782b01070267a6e1c3cf18d"
+}

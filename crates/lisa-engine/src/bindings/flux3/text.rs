@@ -1,6 +1,6 @@
 use crate::{bindings::BindingDevice, execution::DeviceContext};
 use lisa_backend::{ScalarType, TensorAccess};
-// Tokenization, checkpoint imports and cache handles for FLUX 3 text plans.
+// Tokenization, prepared tensors and cache handles for FLUX 3 text plans.
 use crate::{
     bindings::flux2::weights::{Weights, info},
     core::tokenizer::Tokenizer,
@@ -9,7 +9,6 @@ use anyhow::{Context, ensure};
 
 use lisa_models::flux::{symbolic::Schema, text3 as model};
 use model::DEPTH;
-use std::path::Path;
 type Cache<T> = Vec<Option<(T, T)>>;
 pub struct Encoder<D: BindingDevice> {
     pub context: DeviceContext<D>,
@@ -18,33 +17,18 @@ pub struct Encoder<D: BindingDevice> {
     tokenizer: Tokenizer,
 }
 impl<D: BindingDevice> Encoder<D> {
-    pub fn load(context: DeviceContext<D>, dir: &Path) -> anyhow::Result<Self> {
-        let dir = dir.join("text_encoder");
-        let config = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
-        let loaded = Weights::load_filtered(context.clone(), &dir, |key| {
-            key.starts_with("model.language_model.")
-        })?;
-        let weights = Weights::from_map(
-            context.clone(),
-            loaded
-                .0
-                .into_iter()
-                .map(|(key, value)| {
-                    (
-                        key.trim_start_matches("model.language_model.").to_owned(),
-                        value,
-                    )
-                })
-                .collect(),
-        );
-        let schema = weights.schema()?;
-        model::validate(&config, &schema)?;
-        Ok(Self {
+    pub fn from_prepared(
+        context: DeviceContext<D>,
+        weights: Weights<D>,
+        schema: Schema,
+        tokenizer: Tokenizer,
+    ) -> Self {
+        Self {
             context,
             weights,
             schema,
-            tokenizer: Tokenizer::load(&dir)?,
-        })
+            tokenizer,
+        }
     }
     fn forward(
         &self,

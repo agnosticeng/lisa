@@ -1,16 +1,13 @@
-//! Original MLX payload binding and immutable LFM3 session state.
+//! Prepared tensor binding and immutable LFM3 session state.
 use super::BindingDevice;
+use crate::bindings::shared::capture::Capture;
 use crate::{
     cache::{LayerCache, NativeCache, NativeState},
-    core::{capture::Capture, graph::PreparedGraph},
-    language::LanguageModel,
-    language_runtime::Runtime,
-    sampler::Sampler,
+    core::graph::{PlanCache, PreparedGraph},
+    language::{LanguageModel, runtime::Runtime},
+    sampling::sampler::Sampler,
     tensor_ops::{TensorLaw, TensorOps},
-    weights::{
-        mlx::{Checkpoint, Shard},
-        source::{Weights, get_tensor},
-    },
+    weights::source::Weights,
 };
 use anyhow::{Context, Result, ensure};
 use lisa_backend::{
@@ -20,7 +17,7 @@ use lisa_models::lfm3::{
     config::{Config, Layer},
     graph::{self, Definition},
 };
-use std::{cell::RefCell, path::Path, sync::Arc};
+use std::{cell::RefCell, sync::Arc};
 #[derive(Clone)]
 struct State<T> {
     position: usize,
@@ -52,9 +49,11 @@ pub struct Tower<D: BindingDevice + ManagedDevice + ReadbackDevice> {
     capacity: usize,
     layers: Vec<BoundLayer<D>>,
     embedding: Vec<D::Tensor>,
+    rotary: Vec<PlanCache<D, usize>>,
     norm: D::Tensor,
     heads: RefCell<Vec<(usize, PreparedGraph<D>)>>,
     capture: Option<Capture<D::Tensor>>,
+    warmed: bool,
 }
 fn bind<D: BindingDevice>(
     device: &D,
@@ -81,31 +80,12 @@ impl<D: BindingDevice + ManagedDevice + ReadbackDevice> Tower<D>
 where
     D::Error: From<anyhow::Error>,
 {
-    pub fn load(runtime: Runtime<D, Sampler<D>>, path: &Path) -> Result<Self> {
-        let config = Config::parse(&std::fs::read(path.join("config.json"))?)?;
-        let checkpoint = Checkpoint::open(path)?;
-        let mut files = checkpoint.weight_map.values().cloned().collect::<Vec<_>>();
-        files.sort();
-        files.dedup();
-        let bytes = files.iter().try_fold(0u64, |n, f| {
-            Ok::<_, anyhow::Error>(n + std::fs::metadata(path.join(f))?.len())
-        })?;
-        ensure!(
-            bytes.saturating_add(256 * 1024 * 1024) <= crate::memory::ram_budget() as u64,
-            "LFM3 weights and working memory exceed the device memory budget"
-        );
+    pub fn from_prepared(
+        runtime: Runtime<D, Sampler<D>>,
+        config: Config,
+        weights: Weights<D::Tensor>,
+    ) -> Result<Self> {
         let device = runtime.context.device();
-        let mut weights = Weights::new();
-        for file in files {
-            let shard = Shard::open(device.clone(), &path.join(file))?;
-            for name in shard.tensor_names() {
-                let key = name
-                    .strip_prefix("language_model.")
-                    .unwrap_or(name)
-                    .to_string();
-                weights.insert(key, get_tensor(&shard, name)?);
-            }
-        }
         let head = graph::head(&config, 1);
         let embedding = bind(device, &head, &weights, "")?;
         let norm = weights
@@ -126,6 +106,18 @@ where
                 plans: vec![((1, 0, 0), plan)],
             });
         }
+        let mut rotary = Vec::new();
+        for kind in [Layer::FullAttention, Layer::SlidingAttention] {
+            let frequencies = PreparedGraph::new(
+                device.clone(),
+                graph::rotary_frequencies(config.rope(kind), config.head_dim),
+                vec![],
+            )?
+            .run(&[], &mut [])?
+            .into_one()
+            .map_err(anyhow::Error::msg)?;
+            rotary.push(PlanCache::bound(device.clone(), 2, vec![frequencies]));
+        }
         let head = PreparedGraph::new(device.clone(), head.graph, embedding.clone())?;
         Ok(Self {
             capacity: config.max_position_embeddings,
@@ -133,12 +125,14 @@ where
             runtime,
             layers,
             embedding,
+            rotary,
             norm,
             heads: RefCell::new(vec![(1, head)]),
             capture: None,
+            warmed: false,
         })
     }
-    fn run(&mut self, ids: &D::Tensor, caches: &mut Vec<LayerCache<D>>) -> Result<D::Tensor> {
+    fn run(&mut self, ids: &D::Tensor, caches: &mut [LayerCache<D>]) -> Result<D::Tensor> {
         let _trace = self.runtime.context.trace("lfm3.forward");
         ensure!(
             ids.rank() == 2 && ids.dim(0) == 1 && ids.dim(1) > 0,
@@ -163,6 +157,18 @@ where
             .map(|v| v as f32)
             .collect::<Vec<_>>();
         let positions = super::tensor_io::pull_f32(context, &pos, &[rows as i32, 1])?;
+        // Preserve the original device arithmetic, but compute each RoPE law
+        // once per forward instead of independently for every layer's Q and K.
+        let mut factors = Vec::with_capacity(2);
+        for rotary in &mut self.rotary {
+            factors.push(
+                rotary
+                    .get_or_prepare(rows, || graph::rotary_factors(rows, self.config.head_dim))?
+                    .run(&[&positions], &mut [])?
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+            );
+        }
         let mut x = super::affine::lookup(
             context,
             ids,
@@ -184,7 +190,12 @@ where
             } else {
                 state[0].dim(2) as usize
             };
-            let cursor = next.cursors[i];
+            // Convolution plans do not depend on the attention cursor.
+            let cursor = if kind == Layer::Conv {
+                0
+            } else {
+                next.cursors[i]
+            };
             let key = (rows, history, cursor);
             if !layer.plans.iter().any(|(k, _)| *k == key) {
                 let def = graph::layer(&self.config, kind, rows, history, cursor);
@@ -215,26 +226,31 @@ where
                 &unused
             };
             let second = state.get(1).unwrap_or(&unused);
-            let mask = if kind == Layer::Conv {
+            let mask = if kind == Layer::Conv
+                || rows == 1
+                || kind == Layer::FullAttention
+                || history.min(self.config.sliding_window - 1) + rows <= self.config.sliding_window
+            {
                 unused.clone()
             } else {
                 let values = graph::attention_mask(kind, self.config.sliding_window, history, rows);
                 let total = values.len() / rows;
                 super::tensor_io::pull_f32(context, &values, &[1, 1, rows as i32, total as i32])?
             };
+            let f = &factors[usize::from(kind == Layer::SlidingAttention)];
             let mut output = plan
-                .run(&[&x, first, second, &positions, &mask], &mut [])?
+                .run(&[&x, first, second, &f[0], &f[1], &mask], &mut [])?
                 .into_iter();
             x = output.next().context("missing LFM3 layer output")?;
             next.layers[i] = output.collect();
             next.cursors[i] =
                 graph::next_cursor(kind, self.config.sliding_window, history, cursor, rows);
-            if let Some(c) = &self.capture {
-                if c.wants(i) {
-                    c.store(&format!("p{offset}.layer{i}"), &x);
-                    for (j, t) in next.layers[i].iter().enumerate() {
-                        c.store(&format!("p{offset}.layer{i}.state{j}"), t);
-                    }
+            if let Some(c) = &self.capture
+                && c.wants(i)
+            {
+                c.store(&format!("p{offset}.layer{i}"), &x);
+                for (j, t) in next.layers[i].iter().enumerate() {
+                    c.store(&format!("p{offset}.layer{i}.state{j}"), t);
                 }
             }
             // Bound outstanding temporaries on mobile without changing graph arithmetic.
@@ -261,6 +277,12 @@ where
 {
     fn runtime(&self) -> &Runtime<D, Sampler<D>> {
         &self.runtime
+    }
+    fn prefix_cache_granularity(&self) -> Option<usize> {
+        Some(8)
+    }
+    fn cache_numerical_law(&self) -> Option<u64> {
+        Some(0x4c464d3300000001)
     }
     fn max_position_embeddings(&self) -> usize {
         self.capacity
@@ -411,10 +433,19 @@ where
         result.map_err(Into::into)
     }
     fn warmup(&mut self, seed: &[u32]) -> Result<()> {
+        if self.warmed {
+            return Ok(());
+        }
+        let token = seed.first().copied().unwrap_or(0);
+        // Cover every possible eight-row prefill tail, including serial
+        // continuation, with 36 private tokens independent of request length.
         let mut c = self.new_caches();
-        let x = self.prefill(if seed.is_empty() { &[0] } else { seed }, &mut c)?;
-        self.head(&x)?.eval()?;
+        for rows in (1..=8).rev() {
+            let x = self.prefill(&vec![token; rows], &mut c)?;
+            self.head(&x)?.eval()?;
+        }
         self.runtime.context.device().clear_unused();
+        self.warmed = true;
         Ok(())
     }
     fn enable_logit_capture(&mut self) -> Result<()> {

@@ -65,16 +65,8 @@ pub enum Mode {
     Prefill,
     Diagnostic,
 }
-pub fn mode(
-    batch: usize,
-    tokens: usize,
-    prior_state: bool,
-    prefill: bool,
-    diagnostic: bool,
-) -> Mode {
-    if diagnostic {
-        Mode::Diagnostic
-    } else if batch > 1 && tokens == 1 && !prefill {
+pub fn mode(batch: usize, tokens: usize, prior_state: bool, prefill: bool) -> Mode {
+    if batch > 1 && tokens == 1 && !prefill {
         Mode::Cohort
     } else if batch == 1 && tokens == 1 && prior_state && !prefill {
         Mode::Decode
@@ -267,12 +259,11 @@ mod tests {
     use super::*;
     #[test]
     fn recurrent_modes_preserve_prefill_tail_and_row_local_decode() {
-        assert_eq!(mode(1, 1, true, false, false), Mode::Decode);
-        assert_eq!(mode(1, 1, false, false, false), Mode::Prefill);
-        assert_eq!(mode(1, 1, true, true, false), Mode::Prefill);
-        assert_eq!(mode(2, 1, false, false, false), Mode::Cohort);
-        assert_eq!(mode(2, 2, true, false, false), Mode::Diagnostic);
-        assert_eq!(mode(1, 1, true, false, true), Mode::Diagnostic);
+        assert_eq!(mode(1, 1, true, false), Mode::Decode);
+        assert_eq!(mode(1, 1, false, false), Mode::Prefill);
+        assert_eq!(mode(1, 1, true, true), Mode::Prefill);
+        assert_eq!(mode(2, 1, false, false), Mode::Cohort);
+        assert_eq!(mode(2, 2, true, false), Mode::Diagnostic);
     }
 }
 use crate::program::Build;
@@ -639,15 +630,11 @@ pub struct Forward {
     pub conv: bool,
     pub state_rank: usize,
     pub prefill: bool,
-    pub diagnostic: bool,
     pub fused: bool,
     pub triple: bool,
     pub paired: bool,
     pub groups: Option<usize>,
-    pub observe: bool,
     pub capture: bool,
-    pub capture_prefill: bool,
-    pub capture_input: bool,
 }
 pub struct ForwardPlan {
     pub graph: Graph,
@@ -673,7 +660,7 @@ impl Forward {
         let mut observations = vec![];
         let mut values = vec![];
         let mut record = |name: &str, value: V| {
-            if (self.observe && name.starts_with("@")) || (self.capture && !name.starts_with("@")) {
+            if self.capture && !name.starts_with('@') {
                 observations.push(name.to_string());
                 values.push(value);
             }
@@ -701,9 +688,7 @@ impl Forward {
             &[fa, ga, w(5), w(7)],
         )?;
         let (raw_gate, output_gate) = (g[0], g[1]);
-        if !self.capture_prefill || self.capture_input {
-            record("kda_input", V::Input(0));
-        }
+        record("kda_input", V::Input(0));
         for (name, value) in [
             ("kda_q_proj", q),
             ("kda_k_proj", k),
@@ -714,25 +699,8 @@ impl Forward {
         ] {
             record(name, value);
         }
-        if !self.capture_prefill {
-            record("kda_fa_proj", fa);
-            record("kda_ga_proj", ga);
-        }
-        // Diagnostic observations are separately named to preserve their raw
-        // projection values even when the public prefill capture is filtered.
-        for (name, value) in [
-            ("@input", V::Input(0)),
-            ("@q_proj", q),
-            ("@k_proj", k),
-            ("@v_proj", v),
-            ("@fa_proj", fa),
-            ("@ga_proj", ga),
-            ("@beta_proj", beta),
-            ("@raw_gate", raw_gate),
-            ("@output_gate", output_gate),
-        ] {
-            record(name, value);
-        }
+        record("kda_fa_proj", fa);
+        record("kda_ga_proj", ga);
         let initial = append(
             &mut b,
             spec.graph(Stage::InitialState {
@@ -740,13 +708,7 @@ impl Forward {
             })?,
             &state.into_iter().collect::<Vec<_>>(),
         )?[0];
-        let mode = mode(
-            batch as usize,
-            t as usize,
-            state.is_some(),
-            self.prefill,
-            self.diagnostic,
-        );
+        let mode = mode(batch as usize, t as usize, state.is_some(), self.prefill);
         let (out, next_conv, next_state) = match mode {
             Mode::Decode | Mode::Prefill | Mode::Cohort => {
                 let cohort = mode == Mode::Cohort;
@@ -772,17 +734,7 @@ impl Forward {
                 };
                 record("kda_initial_conv", c);
                 record("kda_initial_ssm", s);
-                record("@conv_in", c);
-                record("@state_in", s);
                 // These observations serve the explicit binary input dump.
-                for (name, value) in [
-                    ("@dump_q", prepared[0]),
-                    ("@dump_k", prepared[1]),
-                    ("@dump_v", prepared[2]),
-                    ("@dump_gate", prepared[3]),
-                ] {
-                    record(name, value);
-                }
                 if mode != Mode::Prefill {
                     let a = if cohort {
                         vec![
@@ -827,9 +779,6 @@ impl Forward {
                     record("kda_decode_out", out[0]);
                     record("kda_decode_conv_state", out[1]);
                     record("kda_decode_state", out[2]);
-                    record("@decode_out", out[0]);
-                    record("@conv_out", out[1]);
-                    record("@state_out", out[2]);
                     if cohort {
                         let state =
                             append(&mut b, spec.graph(Stage::StateContiguous)?, &[out[2]])?[0];
@@ -857,16 +806,7 @@ impl Forward {
                         ],
                     )?;
                     let nc = append(&mut b, spec.graph(Stage::CommitConv)?, &[a[4]])?[0];
-                    for (name, value) in [
-                        ("@q_conv", a[0]),
-                        ("@k_conv", a[1]),
-                        ("@v_conv", a[2]),
-                        ("@g", a[3]),
-                        ("@conv_out", a[4]),
-                    ] {
-                        record(name, value);
-                    }
-                    if self.capture && !self.capture_prefill {
+                    if self.capture {
                         for (name, value) in [
                             ("kda_qc", a[0]),
                             ("kda_kc", a[1]),
@@ -884,11 +824,7 @@ impl Forward {
                         spec.graph(Stage::Recurrence)?,
                         &[a[0], a[1], a[2], a[3], beta, s],
                     )?;
-                    record("@recurrence_y", y[0]);
-                    record("@state_out", y[1]);
-                    if !self.capture_prefill {
-                        record("fused_y", y[0]);
-                    }
+                    record("fused_y", y[0]);
                     record("fused_state", y[1]);
                     let ns = append(&mut b, spec.graph(Stage::StateContiguous)?, &[y[1]])?[0];
                     let out = append(
@@ -896,7 +832,6 @@ impl Forward {
                         spec.graph(Stage::Output)?,
                         &[y[0], output_gate, w(14)],
                     )?[0];
-                    record("@decode_out", out);
                     record("kda_outnorm", out);
                     if t == 1 {
                         record("dec_outnorm", out);
@@ -932,11 +867,11 @@ impl Forward {
                     &mut b,
                     spec.graph(Stage::NaiveRecurrence {
                         state_rank: self.state_rank,
-                        capture: self.observe || self.capture,
+                        capture: self.capture,
                     })?,
                     &args,
                 )?;
-                if self.observe || self.capture {
+                if self.capture {
                     if t == 1 {
                         record("dec_q_s{step}", a[0]);
                         record("dec_g_s{step}", g);
@@ -964,7 +899,6 @@ impl Forward {
             super::kda_projection::one(self.projections[3], &[batch, t, n])?,
             &[w(3), out],
         )?[0];
-        record("@o_proj", out);
         if mode == Mode::Cohort {
             record("kda_o_proj", out);
         }

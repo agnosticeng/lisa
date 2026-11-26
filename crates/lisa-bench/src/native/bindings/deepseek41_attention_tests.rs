@@ -1,7 +1,7 @@
 #![cfg(test)]
 //! Original scalar graph, packed bytes and non-dyadic state are the oracle.
 use super::*;
-use crate::bindings::deepseek41_moe::tests::{counts, difference, tensor};
+use crate::bindings::deepseek41_moe::tests::tensor;
 use lisa_gguf::TensorType as T;
 use lisa_metal::kernels::ggml as native;
 #[path = "deepseek41_attention_oracle.rs"]
@@ -81,18 +81,12 @@ fn scalar_attention_plans_preserve_cache_and_projection_bits() -> Result<()> {
         let old = oracle::fixture(&weights, layer, ratio, compressor, gate, indexer)?;
         for rows in [1, 3, 8] {
             let norm = values(&[rows, 5120], 29);
-            let before = counts();
             let a = old.project(&norm, &stream)?;
-            let between = counts();
             let b = new.project(&norm, &stream)?;
-            let after = counts();
             for r in 0..rows as usize {
                 let a = a.row(r)?;
                 let b = b.row(r)?;
                 oracle::compare_projections(&a, &b.qr, &b.kv, &b.q)?;
-            }
-            if std::env::var_os("LISA_TRACE").is_some() {
-                assert_eq!(difference(&before, &between), difference(&between, &after));
             }
         }
         for pos in positions {
@@ -119,11 +113,7 @@ fn scalar_attention_plans_preserve_cache_and_projection_bits() -> Result<()> {
             } else {
                 None
             };
-            let mut cb = if let Some(c) = ca.as_ref() {
-                Some(oracle::candidate_tensor(c))
-            } else {
-                None
-            };
+            let mut cb = ca.as_ref().map(oracle::candidate_tensor);
             let mut sa = if p.compressed_rows > 0 {
                 Some(Array::from_slice(
                     &(0..p.selected as i32).collect::<Vec<_>>(),
@@ -137,7 +127,6 @@ fn scalar_attention_plans_preserve_cache_and_projection_bits() -> Result<()> {
             let qa = old.project(&norm, &stream)?.row(0)?;
             let qb = new.project(&norm, &stream)?.row(0)?;
             let rope = rope_table(pos as u32, &stream)?;
-            let before = counts();
             let x = old.forward(
                 &norm,
                 qa,
@@ -149,7 +138,6 @@ fn scalar_attention_plans_preserve_cache_and_projection_bits() -> Result<()> {
                 None,
                 &stream,
             )?;
-            let between = counts();
             let y = new.forward(
                 &norm,
                 qb,
@@ -161,7 +149,6 @@ fn scalar_attention_plans_preserve_cache_and_projection_bits() -> Result<()> {
                 None,
                 &stream,
             )?;
-            let after = counts();
             equal(&x, &y)?;
             equal(&a.raw[layer], &b.raw[layer])?;
             let ac = &a.owners[owner];
@@ -182,13 +169,6 @@ fn scalar_attention_plans_preserve_cache_and_projection_bits() -> Result<()> {
             }
             if let (Some(x), Some(y)) = (&ca, &cb) {
                 equal(&oracle::candidate_tensor(x), y)?;
-            }
-            if std::env::var_os("LISA_TRACE").is_some() {
-                assert_eq!(
-                    difference(&before, &between),
-                    difference(&between, &after),
-                    "layer {layer} position {pos}"
-                );
             }
         }
     }

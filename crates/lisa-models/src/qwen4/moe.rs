@@ -80,7 +80,52 @@ impl Spec {
     /// Inputs: activation, router, routed gate/up/down triples, shared
     /// gate/up/down triples, shared selector triple, optional joined gate/up.
     pub fn graph(self, shape: &[i32], features: Features) -> Result<Graph> {
-        let branch = self.branch(shape, features)?;
+        self.graph_impl(shape, features, false)
+    }
+
+    /// Captured rows use the same branch as independent single-token calls.
+    pub fn branch_captured(self, shape: &[i32], features: Features) -> Result<Branch> {
+        self.branch(shape, features)?;
+        self.branch(&[1, 1, self.hidden], features)
+    }
+
+    /// Keep the serial router, shared selector and expert projection laws.
+    /// The narrow expert kernels already dispatch independent rows on their
+    /// grid, so only the single-vector router and selector require row calls.
+    pub fn graph_captured(self, shape: &[i32], features: Features) -> Result<Graph> {
+        let branch = self.branch_captured(shape, features)?;
+        if branch == Branch::Decode {
+            return self.graph_impl(shape, features, true);
+        }
+        let [b, s, h] = <[i32; 3]>::try_from(shape).unwrap();
+        let rows = b * s;
+        let single = self.graph(&[1, 1, h], features)?;
+        let schema = Default::default();
+        let mut p = Build::new(single.inputs, &schema);
+        let flat = p.reshape(V::Input(0), &[rows, h]);
+        let mut outputs = Vec::with_capacity(rows as usize);
+        for row in 0..rows {
+            let x = p.slice(flat, 0, row, row + 1);
+            let x = p.reshape(x, &[1, 1, h]);
+            let mut inputs = vec![x];
+            inputs.extend((1..single.inputs).map(V::Input));
+            let result = p
+                .graph
+                .append(single.clone(), &inputs, &[], &[])
+                .map_err(anyhow::Error::msg)?;
+            outputs.push(result[0]);
+        }
+        let output = p.concat(outputs, 1);
+        let output = p.reshape(output, &[b, s, h]);
+        Ok(p.finish(vec![output])?.graph)
+    }
+
+    fn graph_impl(self, shape: &[i32], features: Features, serial_capture: bool) -> Result<Graph> {
+        let branch = if serial_capture {
+            self.branch_captured(shape, features)?
+        } else {
+            self.branch(shape, features)?
+        };
         let [b, s, h] = <[i32; 3]>::try_from(shape).unwrap();
         let rows = b * s;
         let k = self.top_k;
@@ -89,8 +134,28 @@ impl Spec {
         let n = self.intermediate;
         let schema = Default::default();
         let mut p = Build::new(if branch == Branch::Decode { 26 } else { 23 }, &schema);
-        let x = V::Input(0);
-        let logits = if b == 1 && s == 1 {
+        // Generic shared projections and tiled experts require dense storage.
+        // Decode materializes its activation through the row reshape below.
+        let x = if branch == Branch::Decode {
+            V::Input(0)
+        } else {
+            p.contiguous(V::Input(0))
+        };
+        let logits = if serial_capture && rows > 1 {
+            let xf = p.cast(x, D::F32);
+            let xf = p.reshape(xf, &[rows, h]);
+            let mut output = Vec::with_capacity(rows as usize);
+            for row in 0..rows {
+                let x = p.slice(xf, 0, row, row + 1);
+                let x = p.reshape(x, &[h]);
+                let y = p
+                    .graph
+                    .one(Kernel::AffineExperts(E::RouterVector), vec![x, V::Input(1)]);
+                output.push(p.reshape(y, &[1, e]));
+            }
+            let output = p.concat(output, 0);
+            p.reshape(output, &[b, s, e])
+        } else if b == 1 && s == 1 {
             let xf = p.cast(x, D::F32);
             let xf = p.reshape(xf, &[h]);
             let y = p.graph.one(
@@ -112,15 +177,39 @@ impl Spec {
         if branch == Branch::Decode {
             let flat = p.reshape(x, &[rows, h]);
             let logits = p.reshape(logits, &[rows, e]);
-            let route = p.graph.call(
-                Kernel::AffineExperts(E::Route {
-                    top_k: k,
-                    experts: e,
-                    hidden: h,
-                    rows,
-                }),
-                vec![logits, flat, V::Input(20), V::Input(21), V::Input(22)],
-            );
+            let route = if serial_capture && rows > 1 {
+                let mut output: [Vec<V>; 3] = std::array::from_fn(|_| Vec::new());
+                for row in 0..rows {
+                    let logits = p.slice(logits, 0, row, row + 1);
+                    let x = p.slice(flat, 0, row, row + 1);
+                    let routed = p.graph.call(
+                        Kernel::AffineExperts(E::Route {
+                            top_k: k,
+                            experts: e,
+                            hidden: h,
+                            rows: 1,
+                        }),
+                        vec![logits, x, V::Input(20), V::Input(21), V::Input(22)],
+                    );
+                    for (column, value) in output.iter_mut().zip(routed) {
+                        column.push(value);
+                    }
+                }
+                output
+                    .into_iter()
+                    .map(|values| p.concat(values, 0))
+                    .collect()
+            } else {
+                p.graph.call(
+                    Kernel::AffineExperts(E::Route {
+                        top_k: k,
+                        experts: e,
+                        hidden: h,
+                        rows,
+                    }),
+                    vec![logits, flat, V::Input(20), V::Input(21), V::Input(22)],
+                )
+            };
             let ids = p.reshape(route[0], &[br]);
             let xrow = p.graph.constant(
                 (0..br)
@@ -137,7 +226,7 @@ impl Spec {
                     hidden: h,
                     intermediate: n,
                     rows,
-                    wide: s != 1,
+                    wide: !serial_capture && s != 1,
                 }),
                 vec![
                     V::Input(2),
@@ -160,7 +249,7 @@ impl Spec {
                     hidden: h,
                     intermediate: n,
                     rows,
-                    wide: s != 1,
+                    wide: !serial_capture && s != 1,
                 }),
                 vec![
                     V::Input(8),
@@ -382,5 +471,73 @@ mod tests {
         )));
         assert!(spec.graph(&[1, 205, 128], enabled).is_err());
         assert!(spec.graph(&[i32::MAX, 256, 2560], enabled).is_err());
+    }
+
+    #[test]
+    fn captured_experts_keep_single_token_router_selector_and_projection_laws() {
+        let spec = Spec {
+            experts: 512,
+            hidden: 2560,
+            intermediate: 640,
+            shared: 640,
+            top_k: 10,
+            quant: [(32, 4); 4],
+        };
+        let features = Features {
+            matrix_router: true,
+            tiled_experts: true,
+        };
+        for shape in [[1, 2, 2560], [1, 7, 2560], [1, 9, 2560], [2, 7, 2560]] {
+            let graph = spec.graph_captured(&shape, features).unwrap();
+            graph.validate().unwrap();
+            assert_eq!(graph.inputs, 26);
+            let rows = shape[0] * shape[1];
+            let mut routers = 0;
+            let mut selectors = 0;
+            let mut projections = 0;
+            for call in &graph.calls {
+                match call.kernel {
+                    Kernel::AffineExperts(E::RouterVector) => routers += 1,
+                    Kernel::AffineExperts(E::Route { rows, .. }) => {
+                        assert_eq!(rows, 1);
+                        selectors += 1;
+                    }
+                    Kernel::AffineExperts(
+                        E::GateUp { wide, rows: n, .. } | E::DownCombine { wide, rows: n, .. },
+                    ) => {
+                        assert!(!wide);
+                        assert_eq!(n, rows);
+                        projections += 1;
+                    }
+                    Kernel::AffineExperts(_) | Kernel::Tensor(T::Matmul) => {
+                        panic!("captured decode selected a different arithmetic law")
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!((routers, selectors, projections), (rows, rows, 2));
+        }
+
+        let fallback = Spec {
+            experts: 32,
+            ..spec
+        };
+        let graph = fallback.graph_captured(&[2, 3, 2560], features).unwrap();
+        graph.validate().unwrap();
+        assert_eq!(graph.inputs, 23);
+        assert_eq!(
+            graph
+                .calls
+                .iter()
+                .filter(|call| matches!(call.kernel, Kernel::AffineExperts(E::RouterVector)))
+                .count(),
+            6,
+        );
+        assert!(!graph.calls.iter().any(|call| matches!(
+            call.kernel,
+            Kernel::AffineExperts(
+                E::RouterMatrix { .. } | E::TiledGateUp { .. } | E::TiledDown { .. }
+            )
+        )));
     }
 }

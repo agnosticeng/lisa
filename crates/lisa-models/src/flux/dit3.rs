@@ -117,9 +117,9 @@ fn rotations(trace: &Trace, ids: &[[f32; 4]]) -> (Array, Array) {
     (trace.constant(&cos, &shape), trace.constant(&sin, &shape))
 }
 fn modulate(x: &Array, m: &Modulation) -> anyhow::Result<Array> {
-    Ok(layer_norm(x)?
+    layer_norm(x)?
         .multiply(&m[1].add(&x.scalar_bf16(1.0))?)?
-        .add(&m[0])?)
+        .add(&m[0])
 }
 impl Dit<'_> {
     fn time(&self, value: f32, prefix: &str) -> anyhow::Result<Array> {
@@ -150,8 +150,8 @@ impl Dit<'_> {
         ])
     }
     fn heads(&self, x: &Array) -> anyhow::Result<Array> {
-        Ok(x.reshape(&[1, x.dim(1), self.heads, self.head_dim])?
-            .transpose_axes(&[0, 2, 1, 3])?)
+        x.reshape(&[1, x.dim(1), self.heads, self.head_dim])?
+            .transpose_axes(&[0, 2, 1, 3])
     }
     fn norm_rope(&self, x: &Array, key: &str, rot: &(Array, Array)) -> anyhow::Result<Array> {
         let x = self.heads(x)?.as_dtype(Dtype::F32)?.contiguous()?;
@@ -164,11 +164,9 @@ impl Dit<'_> {
         let im = pairs.slice(-1, 1, 2)?.reshape(&[1, self.heads, n, 64])?;
         let r = re.multiply(&rot.0)?.subtract(&im.multiply(&rot.1)?)?;
         let i = re.multiply(&rot.1)?.add(&im.multiply(&rot.0)?)?;
-        Ok(
-            ops::concatenate(&[&r.expand_dims(-1)?, &i.expand_dims(-1)?], -1)?
-                .reshape(&[1, self.heads, n, self.head_dim])?
-                .as_dtype(Dtype::BF16)?,
-        )
+        ops::concatenate(&[&r.expand_dims(-1)?, &i.expand_dims(-1)?], -1)?
+            .reshape(&[1, self.heads, n, self.head_dim])?
+            .as_dtype(Dtype::BF16)
     }
     fn block(
         &self,
@@ -248,13 +246,10 @@ impl Dit<'_> {
         let joined: Vec<_> = ii.into_iter().chain(ti).collect();
         let r = rotations(&self.weights.trace, &joined);
         let broadcast =
-            |x: &Array, n| -> anyhow::Result<Array> { Ok(x.broadcast_to(&[1, n, self.hidden])?) };
+            |x: &Array, n| -> anyhow::Result<Array> { x.broadcast_to(&[1, n, self.hidden]) };
         let m: Modulation = [0, 1, 2]
             .map(|i| -> anyhow::Result<Array> {
-                Ok(ops::concatenate(
-                    &[&broadcast(&si[i], ni)?, &broadcast(&st[i], nt)?],
-                    1,
-                )?)
+                ops::concatenate(&[&broadcast(&si[i], ni)?, &broadcast(&st[i], nt)?], 1)
             })
             .into_iter()
             .collect::<anyhow::Result<Vec<_>>>()?

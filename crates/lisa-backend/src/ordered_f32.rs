@@ -1,9 +1,47 @@
 //! Independent packed projection and ordered F32 primitive contracts.
+/// Original block payload encodings supported by the ordered F32 projection.
+/// These names describe arithmetic layouts, independent of any file container.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OrderedBlockEncoding {
+    Q8_0,
+    Q2K,
+    Q3K,
+    Q4K,
+    Q5K,
+    Q6K,
+    Iq2Xxs,
+    Iq2Xs,
+    Iq3Xxs,
+    Iq1S,
+    Iq3S,
+    Iq2S,
+    Iq4Xs,
+    Iq1M,
+}
+impl OrderedBlockEncoding {
+    pub const ALL: [Self; 14] = [
+        Self::Q8_0,
+        Self::Q2K,
+        Self::Q3K,
+        Self::Q4K,
+        Self::Q5K,
+        Self::Q6K,
+        Self::Iq2Xxs,
+        Self::Iq2Xs,
+        Self::Iq3Xxs,
+        Self::Iq1S,
+        Self::Iq3S,
+        Self::Iq2S,
+        Self::Iq4Xs,
+        Self::Iq1M,
+    ];
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OrderedF32 {
-    /// Original GGML block bytes `[outputs, row_bytes]`, activation `[rows, inputs]`.
+    /// Original packed block bytes `[outputs, row_bytes]`, activation `[rows, inputs]`.
     BlockLinear {
-        encoding: u32,
+        encoding: OrderedBlockEncoding,
     },
     UnitRms {
         epsilon: u32,
@@ -23,7 +61,7 @@ pub enum OrderedF32 {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OrderedF32Kind {
-    BlockLinear(u32),
+    BlockLinear(OrderedBlockEncoding),
     UnitRms,
     DepthwiseConv4Silu,
     DecayGates,

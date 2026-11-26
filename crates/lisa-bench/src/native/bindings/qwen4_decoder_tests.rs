@@ -36,6 +36,7 @@ fn residual() -> anyhow::Result<GatedResidual> {
         block_inject: Some(linear(4, 10240, 37)?),
         hc_count: 4,
         hidden: 10240,
+        force_norm_operations: false,
     })
 }
 fn same(a: &Array, b: &Array) -> anyhow::Result<()> {

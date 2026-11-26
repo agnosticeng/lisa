@@ -1,7 +1,9 @@
 //! Application aliases and native conformance oracles for portable normalization bindings.
 use crate::core::loader::TensorSource;
-use lisa_engine::bindings::normalization as portable;
-use lisa_metal::{Array, Dtype};
+use lisa_engine::bindings::shared::normalization as portable;
+use lisa_metal::Array;
+#[cfg(test)]
+use lisa_metal::Dtype;
 fn context() -> lisa_engine::execution::DeviceContext<lisa_metal::device::MetalDevice> {
     crate::metal_context::execution_context()
 }
@@ -207,7 +209,7 @@ mod plan_parity {
                     weight: weight.clone(),
                     eps: 1e-6,
                 };
-                let g = ops::sigmoid(&r.as_dtype(Dtype::Float32).unwrap()).unwrap();
+                let g = ops::sigmoid(r.as_dtype(Dtype::Float32).unwrap()).unwrap();
                 let expected = (g * lisa_metal::fast::rms_norm(&x, Some(&weight), 1e-6)
                     .unwrap()
                     .as_dtype(Dtype::Float32)
@@ -223,9 +225,9 @@ mod plan_parity {
                     let second = rotated.index((Ellipsis, d / 2..d));
                     let swapped = ops::concatenate(&[&(-second), &first], -1).unwrap();
                     let out = rotated
-                        .multiply(&cos.as_dtype(dtype).unwrap())
+                        .multiply(cos.as_dtype(dtype).unwrap())
                         .unwrap()
-                        .add(&swapped.multiply(&sin.as_dtype(dtype).unwrap()).unwrap())
+                        .add(swapped.multiply(sin.as_dtype(dtype).unwrap()).unwrap())
                         .unwrap();
                     let expected = if d == shape[2] {
                         out

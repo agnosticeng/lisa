@@ -18,6 +18,9 @@ mod indexing;
 mod layout;
 mod ops;
 
+#[cfg(test)]
+mod cat_tests;
+
 pub use copy::MAX_COPY_RANK;
 pub use core::Array;
 pub use dtype::{Dtype, dtype_of};

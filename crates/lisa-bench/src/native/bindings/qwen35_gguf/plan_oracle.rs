@@ -7,7 +7,7 @@ use lisa_metal::ops::indexing::IndexOp;
 use lisa_metal::{Array, Stream, fast, ops};
 struct Projection {
     bytes: Array,
-    kind: u32,
+    kind: lisa_backend::OrderedBlockEncoding,
 }
 impl Projection {
     pub fn forward(&self, x: &Array) -> lisa_metal::error::Result<Array> {
@@ -43,6 +43,8 @@ struct Gdn {
     dt: Array,
     norm: Array,
 }
+
+#[allow(clippy::large_enum_variant, reason = "one value per layer")]
 enum Mixer {
     Full(Attention),
     Linear(Gdn),
@@ -68,7 +70,7 @@ impl Layer {
             })
         };
         let p = |n: &str| -> Result<Array> { Ok(w.arrays[&format!("blk.{i}.{n}")].clone()) };
-        let mixer = if i == 64 || (i + 1) % 4 == 0 {
+        let mixer = if i == 64 || (i + 1).is_multiple_of(4) {
             Mixer::Full(Attention {
                 q: proj("attn_q")?,
                 k: proj("attn_k")?,

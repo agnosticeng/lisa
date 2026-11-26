@@ -246,7 +246,7 @@ pub fn answer(
     let (bucket, scale) = scale;
     let z: Vec<f32> = logits.iter().map(|&x| x / scale).collect();
     let p = softmax(&z);
-    let act = softmax(&action);
+    let act = softmax(action);
 
     let mut ans = json!({
         "type": q.t.name(),

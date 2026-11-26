@@ -329,10 +329,10 @@ mod copy_rows_tests {
                 &[b as _, hk as _, cap as _, d as _],
             )
         };
-        let mut dst_a = mk_dst();
-        let mut dst_b = mk_dst();
-        let ra = super::copy_rows_into(&dense, &mut dst_a, off as i32, &stream);
-        let rb = super::copy_rows_into(&strided, &mut dst_b, off as i32, &stream);
+        let dst_a = mk_dst();
+        let dst_b = mk_dst();
+        let ra = super::copy_rows_into(&dense, &dst_a, off as i32, &stream);
+        let rb = super::copy_rows_into(&strided, &dst_b, off as i32, &stream);
         assert!(ra.is_some(), "dense src declined");
         assert!(rb.is_some(), "strided src declined (strides not engaged)");
         dst_a.eval().expect("eval a");
@@ -346,7 +346,7 @@ mod copy_rows_tests {
             .count();
         assert_eq!(mism, 0, "strided-src copy differs from contiguous-src copy");
         // And the rows actually landed at `off` (dst [b, hk, cap, d]).
-        let base = (off * d) as usize;
+        let base = off * d;
         assert!(!va[base].to_f32().is_nan());
     }
 }

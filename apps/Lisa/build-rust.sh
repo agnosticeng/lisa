@@ -28,7 +28,7 @@ RESOURCES="$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH"
 mkdir -p "$RESOURCES/Licenses"
 cp "$CARGO_TARGET_DIR/$RUST_TARGET/$OUTPUT/kernels.bin" "$RESOURCES/kernels.bin"
 cp LICENSE NOTICE "$RESOURCES/"
-cp crates/lisa-metal/src/shaders/deepseek41/LICENSE "$RESOURCES/Licenses/DS4.txt"
+cp crates/lisa-metal/src/shaders/gguf_iq/LICENSE "$RESOURCES/Licenses/DS4.txt"
 cp crates/lisa-gguf/src/LICENSE-GGML "$RESOURCES/Licenses/GGML.txt"
 cp crates/lisa-models/src/flux/LICENSE.flux3 "$RESOURCES/Licenses/Apache-2.0.txt"
 if [ "${PLATFORM_NAME:-macosx}" = macosx ]; then

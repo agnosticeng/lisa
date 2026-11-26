@@ -1,4 +1,4 @@
-//! DS4 n-gram history, metadata contract and row hashing, independent of storage.
+//! The reference n-gram history, metadata contract and row hashing, independent of storage.
 //! Ported from ds4_engram.c at b3f50180ec2c7324892be1f50bc83555ccb8d5e7 (MIT).
 use crate::metadata::Metadata;
 use anyhow::{Context, Result, ensure};
@@ -153,7 +153,7 @@ impl Layout {
     }
 
     /// Validate the entire request before changing history. Masked image tokens
-    /// break every n-gram crossing that position, as in DS4.
+    /// break every n-gram crossing that position, as in the reference.
     pub fn hash(
         &self,
         history: &mut History,
@@ -204,6 +204,23 @@ impl Layout {
         }
         Ok(result)
     }
+}
+
+/// Ordered normalized four-stream gate. The device exposes this operation;
+/// checkpoint policy chooses its inputs, epsilon and placement in the tower.
+pub fn gate() -> crate::graph::Graph {
+    use crate::graph::{Builder, Value as V};
+    use lisa_backend::{Kernel, PackedCompute};
+    let mut b = Builder::new(4, 0, 0);
+    b.writable_input(0);
+    let x = b.one(
+        Kernel::PackedCompute(PackedCompute::GatedResidual4 {
+            epsilon: 1e-20f32.to_bits(),
+            masked: false,
+        }),
+        vec![V::Input(0), V::Input(1), V::Input(2), V::Input(3)],
+    );
+    b.finish(vec![x])
 }
 
 #[cfg(test)]
@@ -274,21 +291,4 @@ mod tests {
         assert!(History::restore([-2, 0, 0], &l).is_err());
         assert!(History::restore([101, 0, 0], &l).is_err());
     }
-}
-
-/// Ordered normalized four-stream gate. The device exposes this operation;
-/// checkpoint policy chooses its inputs, epsilon and placement in the tower.
-pub fn gate() -> crate::graph::Graph {
-    use crate::graph::{Builder, Value as V};
-    use lisa_backend::{Kernel, PackedCompute};
-    let mut b = Builder::new(4, 0, 0);
-    b.writable_input(0);
-    let x = b.one(
-        Kernel::PackedCompute(PackedCompute::GatedResidual4 {
-            epsilon: 1e-20f32.to_bits(),
-            masked: false,
-        }),
-        vec![V::Input(0), V::Input(1), V::Input(2), V::Input(3)],
-    );
-    b.finish(vec![x])
 }

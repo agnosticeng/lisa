@@ -37,6 +37,13 @@ pub fn prepare_convolution(shape: &[i32]) -> Graph {
     p.finish(vec![v])
 }
 impl Spec {
+    /// Projections retain the decode reduction tree for every captured row.
+    /// The gating reductions and dilated convolution already operate on
+    /// independent rows with fixed accumulation order.
+    pub fn graph_captured(self, shape: &[i32], has_state: bool) -> Result<Graph> {
+        Ok(self.graph(shape, has_state)?.with_serial_affine(false))
+    }
+
     /// Inputs: hidden, embedding, key triple, value triple, norm_key,
     /// norm_query, norm_conv, convolution weight, optional previous state.
     /// Outputs: result, cast embedding, gated stream, next state, full history.
@@ -147,5 +154,50 @@ pub fn names(prefix: &str) -> Names {
         norm_key: format!("{prefix}.norm_key"),
         norm_query: format!("{prefix}.norm_query"),
         norm_convolution: format!("{prefix}.norm_conv"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_changes_only_projection_law_and_keeps_wide_history() {
+        let spec = Spec {
+            hidden: 128,
+            streams: 4,
+            dilation: 3,
+            state_rows: 9,
+            epsilon: 1e-6f32.to_bits(),
+            key: (32, 4),
+            value: (32, 4),
+        };
+        for rows in [1, 2, 7] {
+            for state in [false, true] {
+                let serial = spec.graph(&[1, rows, 512], state).unwrap();
+                let captured = spec.graph_captured(&[1, rows, 512], state).unwrap();
+                captured.validate().unwrap();
+                assert_eq!(serial.outputs, captured.outputs);
+                assert_eq!(serial.calls.len(), captured.calls.len());
+                let mut projections = 0;
+                for (original, capture) in serial.calls.iter().zip(&captured.calls) {
+                    assert_eq!(original.inputs, capture.inputs);
+                    if let Kernel::AffineLinear { group_size, bits } = original.kernel {
+                        assert_eq!(
+                            capture.kernel,
+                            Kernel::AffineSerialLinear {
+                                group_size,
+                                bits,
+                                allow_verify_splitk: false,
+                            }
+                        );
+                        projections += 1;
+                    } else {
+                        assert_eq!(original.kernel, capture.kernel);
+                    }
+                }
+                assert_eq!(projections, 2);
+            }
+        }
     }
 }

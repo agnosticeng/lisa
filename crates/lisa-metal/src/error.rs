@@ -5,6 +5,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug)]
 pub enum Error {
     Msg(String),
+    /// Device allocation or host admission could not provide the requested
+    /// contiguous storage. GPU submission/completion failures remain distinct.
+    AllocationUnavailable(String),
 }
 
 impl Error {
@@ -16,7 +19,7 @@ impl Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::Msg(m) => write!(f, "{m}"),
+            Error::Msg(m) | Error::AllocationUnavailable(m) => write!(f, "{m}"),
         }
     }
 }

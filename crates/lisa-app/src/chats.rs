@@ -87,10 +87,14 @@ impl Store {
                 }
             }
             if let Some(path) = &mut turn.generated_image {
-                if let Some(suffix) = owned_suffix(path, "/Library/Application Support/Lisa/generated-images/") {
+                if let Some(suffix) =
+                    owned_suffix(path, "/Library/Application Support/Lisa/generated-images/")
+                {
                     if let Some(storage) = root.parent() {
                         let candidate = storage.join("generated-images").join(suffix);
-                        if candidate.is_file() { *path = candidate; }
+                        if candidate.is_file() {
+                            *path = candidate;
+                        }
                     }
                 }
                 if let Some(suffix) = owned_suffix(path, "/Pictures/Lisa/") {

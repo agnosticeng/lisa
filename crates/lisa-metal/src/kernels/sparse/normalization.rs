@@ -1,8 +1,8 @@
-//! Normalization operations with the pinned DS4 arithmetic.
+//! Normalization operations with the pinned reference arithmetic.
 use super::*;
 
-
-pub(super) const RMS_ROW_SOURCE: &crate::shader_pack::Source = crate::kernel_source!("glm53/rms_row.metal");
+pub(super) const RMS_ROW_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("norm/rms_row.metal");
 
 pub(super) fn rms_row_kernel() -> &'static Option<MetalKernel> {
     static K: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
@@ -23,7 +23,7 @@ pub(super) fn rms_row_kernel() -> &'static Option<MetalKernel> {
     })
 }
 
-/// Fused row/group RMS norm (ds4 norm.metal port): x bf16 [..., w_full] with
+/// Fused row/group RMS norm (the reference norm.metal port): x bf16 [..., w_full] with
 /// w_full = h * n_groups, h = 128. One kernel replaces the ~30-op grouped
 /// butterfly dance (two f32 casts materialised, per-lane sums, two butterflies)
 /// with the same pinned association: 4 sequential squares per lane, simd_sum
@@ -39,7 +39,7 @@ pub fn rms_row_fused(x: &Array, eps: f32, h: usize, stream: &Stream) -> Option<A
         .map_err(|e| eprintln!("[rms-row-eval] {e}"))
         .ok();
     let w_full = *x.shape().last().unwrap() as usize;
-    if w_full % h != 0 {
+    if !w_full.is_multiple_of(h) {
         return None;
     }
     let n_groups = w_full / h;
@@ -70,10 +70,11 @@ pub fn rms_row_fused(x: &Array, eps: f32, h: usize, stream: &Stream) -> Option<A
             return None;
         }
     };
-    Some(out.into_iter().next()?)
+    out.into_iter().next()
 }
 
-pub(super) const SWIGLU_SOURCE: &crate::shader_pack::Source = crate::kernel_source!("glm53/swiglu.metal");
+pub(super) const SWIGLU_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("pointwise/clamped_swiglu.metal");
 
 pub(super) fn swiglu_kernel() -> &'static Option<MetalKernel> {
     static K: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
@@ -94,7 +95,7 @@ pub(super) fn swiglu_kernel() -> &'static Option<MetalKernel> {
     })
 }
 
-/// Fused clamped SwiGLU (ds4 glu.metal port): gate/up f32 `[N]` -> f32 `[N]`,
+/// Fused clamped SwiGLU (the reference glu.metal port): gate/up f32 `[N]` -> f32 `[N]`,
 /// one dispatch replaces the min/max/silu/multiply op chain.
 pub fn swiglu_fused(gate: &Array, up: &Array, limit: f32, stream: &Stream) -> Option<Array> {
     let kernel = swiglu_kernel().as_ref()?;
@@ -124,14 +125,15 @@ pub fn swiglu_fused(gate: &Array, up: &Array, limit: f32, stream: &Stream) -> Op
             return None;
         }
     };
-    Some(out.into_iter().next()?)
+    out.into_iter().next()
 }
 
 pub(super) const MTP_RMS_NORM_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/mtp_rms_norm.metal");
+    crate::kernel_source!("mtp/mtp_rms_norm.metal");
 pub(super) const MTP_ADD_RMS_NORM_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/mtp_add_rms_norm.metal");
-pub(super) const MTP_ADD3_SOURCE: &crate::shader_pack::Source = crate::kernel_source!("glm53/mtp_add3.metal");
+    crate::kernel_source!("mtp/mtp_add_rms_norm.metal");
+pub(super) const MTP_ADD3_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("mtp/mtp_add3.metal");
 
 pub(super) fn ds4_rms_norm_kernel() -> &'static Option<MetalKernel> {
     static K: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
@@ -152,19 +154,14 @@ pub(super) fn ds4_rms_norm_kernel() -> &'static Option<MetalKernel> {
     })
 }
 
-/// GLM-5.3 weighted RMSNorm using DS4's float4/SIMD reduction order.
-pub fn glm53_ds4_rms_norm(
-    input: &Array,
-    weight: &Array,
-    eps: f32,
-    stream: &Stream,
-) -> Option<Array> {
+/// GLM-5.3 weighted RMSNorm using the reference's float4/SIMD reduction order.
+pub fn ds4_rms_norm(input: &Array, weight: &Array, eps: f32, stream: &Stream) -> Option<Array> {
     let kernel = ds4_rms_norm_kernel().as_ref()?;
     if input.dtype() != Dtype::Float32 || input.rank() == 0 {
         return None;
     }
     let n = input.dim(input.rank() as i32 - 1) as usize;
-    if n == 0 || n % 4 != 0 || weight.size() != n {
+    if n == 0 || !n.is_multiple_of(4) || weight.size() != n {
         return None;
     }
     let rows = input.size() / n;
@@ -183,7 +180,7 @@ pub fn glm53_ds4_rms_norm(
     let eps_a = Array::from_f32_as(eps, Dtype::Float32);
     let inputs: [&Array; 5] = [&n_a, &rows_a, &eps_a, input, &weight_f32];
     let output = [OutputArg {
-        shape: input.shape().iter().map(|&d| d as i32).collect(),
+        shape: input.shape().to_vec(),
         dtype: Dtype::Float32,
     }];
     let all: Vec<&Array> = inputs.iter().map(|a| &**a).collect();
@@ -214,14 +211,9 @@ pub fn glm53_ds4_rms_norm(
     Some(out)
 }
 
-/// GLM-5.3 MTP weighted RMSNorm using DS4's float4/SIMD reduction order.
-pub fn glm53_mtp_rms_norm(
-    input: &Array,
-    weight: &Array,
-    eps: f32,
-    stream: &Stream,
-) -> Option<Array> {
-    glm53_ds4_rms_norm(input, weight, eps, stream)
+/// GLM-5.3 MTP weighted RMSNorm using the reference's float4/SIMD reduction order.
+pub fn mtp_rms_norm(input: &Array, weight: &Array, eps: f32, stream: &Stream) -> Option<Array> {
+    ds4_rms_norm(input, weight, eps, stream)
 }
 
 pub(super) fn mtp_add_rms_norm_kernel() -> &'static Option<MetalKernel> {
@@ -244,9 +236,9 @@ pub(super) fn mtp_add_rms_norm_kernel() -> &'static Option<MetalKernel> {
     })
 }
 
-/// DS4's one-row MTP residual add and weighted RMSNorm, returning both the
+/// The reference's one-row MTP residual add and weighted RMSNorm, returning both the
 /// residual sum and normalized row so the same sum can feed the next residual.
-pub fn glm53_mtp_add_rms_norm(
+pub fn mtp_add_rms_norm(
     a: &Array,
     b: &Array,
     weight: &Array,
@@ -261,7 +253,7 @@ pub fn glm53_mtp_add_rms_norm(
         return None;
     }
     let n = a.dim(a.rank() as i32 - 1) as usize;
-    if n == 0 || n % 4 != 0 || weight.size() != n {
+    if n == 0 || !n.is_multiple_of(4) || weight.size() != n {
         return None;
     }
     let rows = a.size() / n;
@@ -276,7 +268,7 @@ pub fn glm53_mtp_add_rms_norm(
     let rows_a = Array::from_int(rows as i32);
     let eps_a = Array::from_f32_as(eps, Dtype::Float32);
     let inputs: [&Array; 6] = [&n_a, &rows_a, &eps_a, a, b, &weight];
-    let shape: Vec<i32> = a.shape().iter().map(|&dim| dim as i32).collect();
+    let shape: Vec<i32> = a.shape().to_vec();
     let outputs = [
         OutputArg {
             shape: shape.clone(),
@@ -330,8 +322,8 @@ pub(super) fn mtp_add3_kernel() -> &'static Option<MetalKernel> {
     })
 }
 
-/// DS4's ordered F32 residual + routed + shared MTP output sum.
-pub fn glm53_mtp_add3(a: &Array, b: &Array, c: &Array, stream: &Stream) -> Option<Array> {
+/// The reference's ordered F32 residual + routed + shared MTP output sum.
+pub fn mtp_add3(a: &Array, b: &Array, c: &Array, stream: &Stream) -> Option<Array> {
     let kernel = mtp_add3_kernel().as_ref()?;
     if a.dtype() != Dtype::Float32
         || b.dtype() != Dtype::Float32
@@ -351,7 +343,7 @@ pub fn glm53_mtp_add3(a: &Array, b: &Array, c: &Array, stream: &Stream) -> Optio
     let n_a = Array::from_int(n as i32);
     let inputs: [&Array; 4] = [&n_a, a, b, c];
     let outputs = [OutputArg {
-        shape: a.shape().iter().map(|&dim| dim as i32).collect(),
+        shape: a.shape().to_vec(),
         dtype: Dtype::Float32,
     }];
     let threads = n.min(256);
@@ -371,9 +363,9 @@ pub fn glm53_mtp_add3(a: &Array, b: &Array, c: &Array, stream: &Stream) -> Optio
 }
 
 pub(super) const MTP_KV_LORA_RMS_NORM_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/mtp_kv_lora_rms_norm.metal");
+    crate::kernel_source!("mtp/mtp_kv_lora_rms_norm.metal");
 pub(super) const QKV_NORM_COMPACT_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/qkv_norm_compact.metal");
+    crate::kernel_source!("sparse_attention/qkv_norm_compact.metal");
 
 pub(super) fn mtp_kv_lora_rms_norm_kernel() -> &'static Option<MetalKernel> {
     static K: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
@@ -394,8 +386,8 @@ pub(super) fn mtp_kv_lora_rms_norm_kernel() -> &'static Option<MetalKernel> {
     })
 }
 
-/// GLM MTP `kv_a_layernorm` using ds4's scalar strided reduction and tree.
-pub fn glm53_mtp_kv_lora_rms_norm(
+/// GLM MTP `kv_a_layernorm` using the reference's scalar strided reduction and tree.
+pub fn mtp_kv_lora_rms_norm(
     input: &Array,
     weight: &Array,
     eps: f32,
@@ -408,7 +400,7 @@ pub fn glm53_mtp_kv_lora_rms_norm(
     let raw_dim = input.dim(input.rank() as i32 - 1) as usize;
     let n = weight.size();
     // GLM-5.3's MTP KV-LoRA vector is exactly 512 values. The shader's
-    // reduction scratch and ds4 launch shape are both specialized to 128
+    // reduction scratch and the reference launch shape are both specialized to 128
     // threads; reject other shapes rather than allowing a mismatched
     // threadgroup to index beyond that scratch allocation.
     if n != 512 || raw_dim != 512 || weight.rank() != 1 {
@@ -435,13 +427,7 @@ pub fn glm53_mtp_kv_lora_rms_norm(
             .shape()
             .iter()
             .enumerate()
-            .map(|(i, &d)| {
-                if i + 1 == input.rank() {
-                    n as i32
-                } else {
-                    d as i32
-                }
-            })
+            .map(|(i, &d)| if i + 1 == input.rank() { n as i32 } else { d })
             .collect(),
         dtype: Dtype::Float32,
     }];
@@ -496,9 +482,9 @@ pub(super) fn qkv_norm_compact_kernel() -> &'static Option<MetalKernel> {
     })
 }
 
-/// Fused DS4-order q_a/kv_a normalization. Returns weighted q rows as F32 and
-/// normalized compact latents as F16, matching DS4's fused norm-and-store path.
-pub fn glm53_qkv_norm_compact(
+/// Fused reference-order q_a/kv_a normalization. Returns weighted q rows as F32 and
+/// normalized compact latents as F16, matching the reference's fused norm-and-store path.
+pub fn qkv_norm_compact(
     q_input: &Array,
     q_weight: &Array,
     kv_input: &Array,
@@ -520,9 +506,9 @@ pub fn glm53_qkv_norm_compact(
     let q_dim = q_input.dim(q_input.rank() as i32 - 1) as usize;
     let kv_dim = kv_input.dim(kv_input.rank() as i32 - 1) as usize;
     if q_dim == 0
-        || q_dim % 4 != 0
+        || !q_dim.is_multiple_of(4)
         || kv_dim != kv_weight.size()
-        || kv_dim % 4 != 0
+        || !kv_dim.is_multiple_of(4)
         || q_weight.size() != q_dim
         || q_input.shape()[..q_input.rank() - 1] != kv_input.shape()[..kv_input.rank() - 1]
     {
@@ -596,7 +582,7 @@ pub fn glm53_qkv_norm_compact(
 /// Fused q_a/kv_a normalization with the F16 compact latent written directly
 /// into an existing cache buffer at `cache_pos`, avoiding a temporary latent
 /// array and the subsequent cache-copy dispatch.
-pub fn glm53_qkv_norm_compact_into(
+pub fn qkv_norm_compact_into(
     q_input: &Array,
     q_weight: &Array,
     kv_input: &Array,
@@ -627,7 +613,7 @@ pub fn glm53_qkv_norm_compact_into(
     let rows = q_input.dim(1) as usize;
     let cache_cap = cache.dim(1) as usize;
     if q_dim == 0
-        || q_dim % 4 != 0
+        || !q_dim.is_multiple_of(4)
         || kv_dim != 512
         || kv_weight.size() != kv_dim
         || cache.dim(2) as usize != kv_dim
@@ -661,7 +647,7 @@ pub fn glm53_qkv_norm_compact_into(
     // `apply_into` binds preallocated outputs at buffer offset zero. The
     // compact-cache output is therefore the whole contiguous cache, and the
     // kernel applies `cache_pos` to each written row.
-    let q_norm = crate::ops::zeros::<f32>(&q_input.shape().to_vec()).ok()?;
+    let q_norm = crate::ops::zeros::<f32>(q_input.shape()).ok()?;
     let q_dim_arg = Array::from_int(q_dim as i32);
     let kv_dim_arg = Array::from_int(kv_dim as i32);
     let rows_arg = Array::from_int(rows as i32);
@@ -702,4 +688,68 @@ pub fn glm53_qkv_norm_compact_into(
         .ok()?
         .into_iter();
     out.next()
+}
+/// Standalone clamped SwiGLU's F32 result, then one route weight per row.
+/// The volatile shader boundary preserves the old activation store rounding.
+pub fn weighted_clamped_swiglu(
+    gate: &Array,
+    up: &Array,
+    weights: &Array,
+    limit: f32,
+    stream: &Stream,
+) -> Option<Array> {
+    if gate.rank() != 3
+        || gate.dim(0) < 1
+        || gate.dim(1) < 1
+        || gate.dim(2) < 1
+        || gate.shape() != up.shape()
+        || weights.shape() != [gate.dim(0), gate.dim(1)]
+        || gate.size() > i32::MAX as usize
+        || !limit.is_finite()
+        || limit < 0.
+        || [gate, up, weights]
+            .iter()
+            .any(|a| a.dtype() != Dtype::Float32 || !a.t.buffer_and_layout().1.is_contiguous())
+    {
+        return None;
+    }
+    static K: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
+    let kernel = K
+        .get_or_init(|| {
+            MetalKernel::new_with_math(
+                "weighted_clamped_swiglu_f32",
+                &["n", "width", "limit", "alpha", "gate", "up", "weights"],
+                &["out"],
+                crate::kernel_source!("packed_pointwise/weighted_swiglu.metal"),
+                EXACT_HEADER,
+                true,
+                false,
+                crate::runtime::Math::CompilerDefault,
+            )
+            .map(MetalKernel::with_full_write_outputs)
+            .ok()
+        })
+        .as_ref()?;
+    for a in [gate, up, weights] {
+        a.eval_enqueue().ok()?;
+    }
+    let n = Array::from_int(gate.size() as i32);
+    let width = Array::from_int(gate.dim(2));
+    let lim = Array::from_f32_as(limit, Dtype::Float32);
+    let alpha = Array::from_f32_as(1., Dtype::Float32);
+    kernel
+        .apply(
+            &[&n, &width, &lim, &alpha, gate, up, weights],
+            &[],
+            (gate.size() as i32, 1, 1),
+            (256, 1, 1),
+            &[OutputArg {
+                shape: gate.shape().to_vec(),
+                dtype: Dtype::Float32,
+            }],
+            stream,
+        )
+        .ok()?
+        .into_iter()
+        .next()
 }

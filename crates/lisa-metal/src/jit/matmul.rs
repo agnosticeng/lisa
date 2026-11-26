@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use super::compile::{compile_builtin_lazy, compile_builtin_math_lazy};
 use objc2_metal::MTLSize;
 
 use super::buf::add_strides_and_shapes;
@@ -7,8 +8,7 @@ use crate::array::{Array, Dtype};
 use crate::error::{Error, Result};
 use crate::runtime::{Buffer, ComputePipeline, ConstVal, MetalRuntime};
 
-use super::compile::compile_builtin_math;
-use super::compile::{builtin_template_def, compile_builtin, get_2d_grid_dims, type_string};
+use super::compile::{builtin_template_def, get_2d_grid_dims, type_string};
 use super::reduce::reduce_axis0_sum;
 use super::{Device, Tensor};
 use super::{
@@ -27,107 +27,21 @@ fn qmv_fast_k_alignment(bits: i32) -> i32 {
 /// [`affine_verify_qmm`] so the verify-width kernel is only taken exactly
 /// where it is bit-identical to the per-row qmv_fast chain.
 pub(crate) fn qmv_fast_eligible(k: usize, n: usize, bits: i32) -> bool {
-    n % 8 == 0 && (k as i32) % qmv_fast_k_alignment(bits) == 0
+    n.is_multiple_of(8) && (k as i32) % qmv_fast_k_alignment(bits) == 0
 }
 
-/// Precompile the verify-width specializations M = 2..=7 (bf16) so the MTP
-/// verify never pays a runtime JIT stall (the kernels are shape-independent
-/// — K/N ride as runtime constants — so one compile per M covers every
-/// projection). Mirrors `warm_kernels` for the fast ops.
-pub fn warm_verify_qmm(device: &Device, group_size: i32, bits: i32) {
-    let type_str = match type_string(crate::array::Dtype::Bfloat16) {
-        Ok(t) => t,
-        Err(_) => return,
-    };
-    for m in 2..=7usize {
-        let kname = format!("affine_verify_qmm_{type_str}_gs_{group_size}_b_{bits}_m_{m}");
-        let template_def = builtin_template_def(
-            &kname,
-            "affine_verify_qmm",
-            &[
-                type_str.to_string(),
-                group_size.to_string(),
-                bits.to_string(),
-                m.to_string(),
-            ],
-        );
-        let source = format!(
-            "{MLX_UTILS_PREAMBLE}{MLX_GEMM_PREAMBLE}{MLX_QUANTIZED_UTILS_PREAMBLE}{MLX_QUANTIZED_PREAMBLE}{VERIFY_QMM_SOURCE}{template_def}"
-        );
-        let _ = compile_builtin(device, &source, &kname);
-        // The split-K lane: one specialization per (M, K_PARTS); BN is derived
-        // from M. Both K_PARTS variants warmed — the tower
-        // mixes N >= 4096 and N < 4096 projections.
-        for k_parts in [2usize, 4] {
-            let bn = 2; // measured BN for every M (see verify_qmm_splitk_lane)
-            let kname = format!(
-                "affine_verify_qmm_splitk_{type_str}_gs_{group_size}_b_{bits}_m_{m}_bn_{bn}_kp_{k_parts}_ppt_1"
-            );
-            let template_def = builtin_template_def(
-                &kname,
-                "affine_verify_qmm_splitk",
-                &[
-                    type_str.to_string(),
-                    group_size.to_string(),
-                    bits.to_string(),
-                    m.to_string(),
-                    bn.to_string(),
-                    k_parts.to_string(),
-                    "1".to_string(),
-                    "0".to_string(),
-                ],
-            );
-            let source = format!(
-                "{MLX_UTILS_PREAMBLE}{MLX_GEMM_PREAMBLE}{MLX_QUANTIZED_UTILS_PREAMBLE}{MLX_QUANTIZED_PREAMBLE}{VERIFY_QMM_SOURCE}{template_def}"
-            );
-            let _ = compile_builtin(device, &source, &kname);
-        }
-        // The msg lane (huge-N, lm_head class): one specialization per
-        // (M, BN); BN is derived from M.
-        if let Some(bn) = verify_qmm_msg_lane(m, 5120, 151_936, bits) {
-            let kname =
-                format!("affine_verify_qmm_msg_{type_str}_gs_{group_size}_b_{bits}_m_{m}_bn_{bn}");
-            let template_def = builtin_template_def(
-                &kname,
-                "affine_verify_qmm_msg",
-                &[
-                    type_str.to_string(),
-                    group_size.to_string(),
-                    bits.to_string(),
-                    m.to_string(),
-                    bn.to_string(),
-                    "8".to_string(),
-                ],
-            );
-            let source = format!(
-                "{MLX_UTILS_PREAMBLE}{MLX_GEMM_PREAMBLE}{MLX_QUANTIZED_UTILS_PREAMBLE}{MLX_QUANTIZED_PREAMBLE}{VERIFY_QMM_SOURCE}{template_def}"
-            );
-            let _ = compile_builtin(device, &source, &kname);
-        }
-    }
-}
-
-/// Affine `quantized_matmul` for a single-batch (B = 1) vector input, matching
-/// MLX's `qmv`/`qmv_fast` path (`quantized.cpp:461`). `w` is the packed uint32
-/// weight `[N, K*bits/32]`; `scales`/`biases` are `[N, K/group_size]`.
-///
-/// Returns `(kernel_name, generated_source, func)` for the chosen variant.
-pub fn affine_qmv_source(
-    x: &Tensor,
-    w: &Tensor,
-    group_size: i32,
-    bits: i32,
-) -> Result<(String, String)> {
-    affine_qmv_source_results(x, w, group_size, bits, 4)
-}
-
-fn affine_qmv_source_results(
+/// Affine `quantized_matmul` pipeline for a single-batch (B = 1) vector input,
+/// matching MLX's `qmv`/`qmv_fast` path (`quantized.cpp:461`). `w` is the
+/// packed uint32 weight `[N, K*bits/32]`; `scales`/`biases` are
+/// `[N, K/group_size]`. The kernel source is assembled only on a cache miss.
+fn affine_qmv_pipeline(
+    device: &Device,
     x: &Tensor,
     w: &Tensor,
     group_size: i32,
     bits: i32,
     results_per_simdgroup: usize,
-) -> Result<(String, String)> {
+) -> Result<ComputePipeline> {
     let (_, k) = x.dims2();
     let (n, _) = w.dims2();
     if !matches!(results_per_simdgroup, 4 | 8) {
@@ -148,25 +62,25 @@ fn affine_qmv_source_results(
         kname.push_str(&format!("_rpsg{results_per_simdgroup}"));
     }
     kname.push_str("_batch_0");
-    // template args: type, group_size, bits, batched=false, has_global_scale=false,
-    // results_per_simdgroup is 4 on the MLX path; the GLM huge-vocabulary
-    // candidate can instantiate 8 while retaining each output row's math.
-    let template_def = builtin_template_def(
-        &kname,
-        func,
-        &[
-            type_str.to_string(),
-            group_size.to_string(),
-            bits.to_string(),
-            "0".to_string(),
-            "0".to_string(),
-            results_per_simdgroup.to_string(),
-        ],
-    );
-    let source = format!(
-        "{MLX_UTILS_PREAMBLE}{MLX_GEMM_PREAMBLE}{MLX_QUANTIZED_UTILS_PREAMBLE}{MLX_QUANTIZED_PREAMBLE}{template_def}"
-    );
-    Ok((kname, source))
+    compile_builtin_lazy(device, &kname, || {
+        // Template args: type, group_size, bits, batched=false,
+        // has_global_scale=false, results per SIMD group (4 on the MLX path).
+        let template_def = builtin_template_def(
+            &kname,
+            func,
+            &[
+                type_str.to_string(),
+                group_size.to_string(),
+                bits.to_string(),
+                "0".to_string(),
+                "0".to_string(),
+                results_per_simdgroup.to_string(),
+            ],
+        );
+        format!(
+            "{MLX_UTILS_PREAMBLE}{MLX_GEMM_PREAMBLE}{MLX_QUANTIZED_UTILS_PREAMBLE}{MLX_QUANTIZED_PREAMBLE}{template_def}"
+        )
+    })
 }
 
 /// JIT-compile the affine qmv variant for these shapes through the runtime.
@@ -177,8 +91,7 @@ pub fn affine_qmv_pipeline_jit(
     group_size: i32,
     bits: i32,
 ) -> Result<ComputePipeline> {
-    let (kname, source) = affine_qmv_source(x, w, group_size, bits)?;
-    compile_builtin(device, &source, &kname)
+    affine_qmv_pipeline(device, x, w, group_size, bits, 4)
 }
 
 /// Affine `quantized_matmul` using a JIT-compiled pipeline (see
@@ -220,8 +133,7 @@ pub fn affine_qmv_fast_results(
             "affine_qmv_fast_results: unsupported shape M={m} K={k} N={n}, rows-per-SIMD-group={results_per_simdgroup}"
         );
     }
-    let (kname, source) = affine_qmv_source_results(x, w, group_size, bits, results_per_simdgroup)?;
-    let pipeline = compile_builtin(device, &source, &kname)?;
+    let pipeline = affine_qmv_pipeline(device, x, w, group_size, bits, results_per_simdgroup)?;
     affine_qmv_dispatch_results(
         device,
         &pipeline,
@@ -260,8 +172,8 @@ fn affine_qmv_dispatch_results(
     let out_dtype = x.dtype();
 
     let ycount = m * n;
-    let ybuf = mdev.buffer_for_gpu_write((ycount) as usize * (out_dtype).size_of(), "qmv_out")?;
-    let y = Array::from_parts(mdev, ybuf.clone(), &vec![m, n], out_dtype);
+    let ybuf = mdev.buffer_for_gpu_write((ycount) * (out_dtype).size_of(), "qmv_out")?;
+    let y = Array::from_parts(mdev, ybuf.clone(), &[m, n], out_dtype);
 
     let guard = mdev.commands.encoder()?;
     let enc = guard.encoder();
@@ -301,281 +213,6 @@ fn affine_qmv_dispatch_results(
     Ok(y)
 }
 
-/// Norm-in-qmv mega-kernel (specs/16 phase 1): ONE dispatch computes
-/// `(bf16(x + r), rms_norm(bf16(x + r)), qmv(rms_norm))` — the fused
-/// residual-add + RMSNorm prologue inside `affine_qmv_fast`. Bit-exactness
-/// argument lives in the shader header; pinned word-for-word by the
-/// `qmv_addnorm_bitexact_vs_fused_chain` test. Decode GEMV shapes only
-/// (`qmv_fast_eligible`, axis_size > 4096 so the looped-rms association
-/// applies, group_size 64 / bits 4, bf16).
-///
-/// Returns `(y, sum)` plus `normed` when `write_norm` is set (the GDN
-/// in_proj site still consumes the normed row downstream).
-#[allow(clippy::too_many_arguments)]
-pub fn affine_qmv_fast_addnorm(
-    device: &Device,
-    x: &Tensor,
-    r: &Tensor,
-    norm_weight: &Tensor,
-    w: &Tensor,
-    scales: &Tensor,
-    biases: &Tensor,
-    eps: f32,
-    group_size: i32,
-    bits: i32,
-    write_norm: bool,
-) -> Result<(Tensor, Tensor, Option<Tensor>)> {
-    if group_size != 64 || bits != 4 {
-        crate::bail!("addnorm qmv: only gs64/b4 is pinned");
-    }
-    let (m, k) = x.dims2();
-    let (n, _) = w.dims2();
-    if m != 1 {
-        crate::bail!("addnorm qmv: decode GEMV only (M=1)");
-    }
-    if !qmv_fast_eligible(k, n, bits) || k <= 4096 {
-        crate::bail!("addnorm qmv: shape ineligible (k={k}, n={n})");
-    }
-    let axis_size = k as u32;
-    let emu = super::norm::looped_rms_tgs();
-    if emu == 0 || emu > 1024 || emu % 32 != 0 {
-        crate::bail!("addnorm qmv: bad emulated threadgroup size {emu}");
-    }
-    let type_str = type_string(x.dtype())?;
-    if type_str != "bfloat16_t" {
-        crate::bail!("addnorm qmv: only bfloat16 pinned");
-    }
-    let wn = if write_norm { 1 } else { 0 };
-    let kname = format!("affine_qmv_fast_addnorm_{type_str}_gs_{group_size}_b_{bits}_wn_{wn}");
-    let template_def = builtin_template_def(
-        &kname,
-        "affine_qmv_fast_addnorm",
-        &[
-            type_str.to_string(),
-            group_size.to_string(),
-            bits.to_string(),
-            wn.to_string(),
-        ],
-    );
-    let source = format!(
-        "{MLX_UTILS_PREAMBLE}{MLX_GEMM_PREAMBLE}{MLX_QUANTIZED_UTILS_PREAMBLE}{MLX_QUANTIZED_PREAMBLE}{}{template_def}",
-        crate::jit::MLX_NORM_QMV_SOURCE
-    );
-    let pipeline = compile_builtin(device, &source, &kname)?;
-
-    let out_dtype = x.dtype();
-    let ybuf = device.buffer_for_gpu_write((m * n) as usize * out_dtype.size_of(), "qmv_out")?;
-    let y = Array::from_parts(device, ybuf.clone(), &vec![m, n], out_dtype);
-    let sbuf =
-        device.buffer_for_gpu_write(k as usize * out_dtype.size_of(), "fused_add_rms_sum")?;
-    let sum = Array::from_parts(device, sbuf.clone(), &vec![m, k], out_dtype);
-    // ALWAYS allocated and bound: the kernel stages the normed row to this
-    // scratch unconditionally (the stock qmv_fast_impl re-reads it); nil
-    // buffer bindings are UB on the write + read-back path.
-    let nb = device.buffer_for_gpu_write(k as usize * out_dtype.size_of(), "fused_add_rms_norm")?;
-    let normed = if write_norm {
-        Some(Array::from_parts(
-            device,
-            nb.clone(),
-            &vec![m, k],
-            out_dtype,
-        ))
-    } else {
-        None
-    };
-
-    let bind = |enc: &crate::runtime::ComputeEncoder, index: usize, t: &Tensor| -> Result<()> {
-        let (ms, layout) = t.buffer_and_layout();
-        if !layout.is_contiguous() {
-            crate::bail!("addnorm qmv: non-contiguous input");
-        }
-        enc.set_input(index, Some(ms), layout.offset * t.dtype().size_of());
-        Ok(())
-    };
-
-    let guard = device.commands.encoder()?;
-    let enc = guard.encoder();
-    enc.set_pipeline(&pipeline);
-    bind(&enc, 0, w)?;
-    bind(&enc, 1, scales)?;
-    bind(&enc, 2, biases)?;
-    bind(&enc, 3, x)?;
-    bind(&enc, 4, r)?;
-    {
-        let (ms, wl) = norm_weight.buffer_and_layout();
-        if !wl.is_contiguous() {
-            crate::bail!("addnorm qmv: non-contiguous norm weight");
-        }
-        enc.set_input(5, Some(ms), wl.offset * norm_weight.dtype().size_of());
-        let stride: u32 = if norm_weight.rank() == 1 {
-            wl.stride()[0] as u32
-        } else {
-            0
-        };
-        enc.set_bytes(13, &stride);
-    }
-    enc.set_output(6, Some(&sbuf), 0);
-    enc.set_output(7, Some(&nb), 0);
-    enc.set_output(8, Some(&ybuf), 0);
-    enc.set_bytes(9, &eps);
-    let kk = k as i32;
-    enc.set_bytes(10, &kk);
-    let nn = n as i32;
-    enc.set_bytes(11, &nn);
-    enc.set_bytes(12, &axis_size);
-    enc.set_bytes(14, &emu);
-
-    let bn = 8usize;
-    enc.dispatch_groups_size(
-        MTLSize {
-            width: m,
-            height: n.div_ceil(bn),
-            depth: 1,
-        },
-        MTLSize {
-            width: 32,
-            height: 2,
-            depth: 1,
-        },
-    );
-    Ok((y, sum, normed))
-}
-
-/// Tail-ULP variant of [`affine_qmv_fast_addnorm`] (specs/16 §7, campaign
-/// close): same signature and contract as the bit-exact mega-kernel except
-/// the norm numerics relax to the §9.7 tail-ULP rule (<= 1 bf16 ULP + argmax
-/// equality vs `fast::fused_add_rms_norm` + `quantized_matmul`, pinned by
-/// `qmv_addnorm_tailulp_vs_fused_chain`). The prologue is a plain 64-thread
-/// strided reduction with the s row resident in THREADGROUP memory — no
-/// emulated-lane replay, no device scratch, no device barrier (the two costs
-/// that made phase 1b regress in situ, §5.2). Deterministic: every
-/// threadgroup of a row derives bit-identical values; only tid.y==0 writes
-/// the device outputs.
-#[allow(clippy::too_many_arguments)]
-pub fn affine_qmv_fast_addnorm_tu(
-    device: &Device,
-    x: &Tensor,
-    r: &Tensor,
-    norm_weight: &Tensor,
-    w: &Tensor,
-    scales: &Tensor,
-    biases: &Tensor,
-    eps: f32,
-    group_size: i32,
-    bits: i32,
-    write_norm: bool,
-) -> Result<(Tensor, Tensor, Option<Tensor>)> {
-    if group_size != 64 || bits != 4 {
-        crate::bail!("addnorm-tu qmv: only gs64/b4 is pinned");
-    }
-    let (m, k) = x.dims2();
-    let (n, _) = w.dims2();
-    if m != 1 {
-        crate::bail!("addnorm-tu qmv: decode GEMV only (M=1)");
-    }
-    if k > 5120 {
-        crate::bail!("addnorm-tu qmv: threadgroup row buffer sized for k<=5120 (k={k})");
-    }
-    if !qmv_fast_eligible(k, n, bits) || k <= 4096 {
-        crate::bail!("addnorm-tu qmv: shape ineligible (k={k}, n={n})");
-    }
-    let axis_size = k as u32;
-    let type_str = type_string(x.dtype())?;
-    if type_str != "bfloat16_t" {
-        crate::bail!("addnorm-tu qmv: only bfloat16 pinned");
-    }
-    let wn = if write_norm { 1 } else { 0 };
-    let kname = format!("affine_qmv_fast_addnorm_tu_{type_str}_gs_{group_size}_b_{bits}_wn_{wn}");
-    let template_def = builtin_template_def(
-        &kname,
-        "affine_qmv_fast_addnorm_tu",
-        &[
-            type_str.to_string(),
-            group_size.to_string(),
-            bits.to_string(),
-            wn.to_string(),
-        ],
-    );
-    let source = format!(
-        "{MLX_UTILS_PREAMBLE}{MLX_GEMM_PREAMBLE}{MLX_QUANTIZED_UTILS_PREAMBLE}{MLX_QUANTIZED_PREAMBLE}{}{template_def}",
-        crate::jit::MLX_NORM_QMV_SOURCE
-    );
-    let pipeline = compile_builtin(device, &source, &kname)?;
-
-    let out_dtype = x.dtype();
-    let ybuf = device.buffer_for_gpu_write((m * n) as usize * out_dtype.size_of(), "qmv_out")?;
-    let y = Array::from_parts(device, ybuf.clone(), &vec![m, n], out_dtype);
-    let sbuf =
-        device.buffer_for_gpu_write(k as usize * out_dtype.size_of(), "fused_add_rms_sum")?;
-    let sum = Array::from_parts(device, sbuf.clone(), &vec![m, k], out_dtype);
-    let nb = device.buffer_for_gpu_write(k as usize * out_dtype.size_of(), "fused_add_rms_norm")?;
-    let normed = if write_norm {
-        Some(Array::from_parts(
-            device,
-            nb.clone(),
-            &vec![m, k],
-            out_dtype,
-        ))
-    } else {
-        None
-    };
-
-    let bind = |enc: &crate::runtime::ComputeEncoder, index: usize, t: &Tensor| -> Result<()> {
-        let (ms, layout) = t.buffer_and_layout();
-        if !layout.is_contiguous() {
-            crate::bail!("addnorm-tu qmv: non-contiguous input");
-        }
-        enc.set_input(index, Some(ms), layout.offset * t.dtype().size_of());
-        Ok(())
-    };
-
-    let guard = device.commands.encoder()?;
-    let enc = guard.encoder();
-    enc.set_pipeline(&pipeline);
-    bind(&enc, 0, w)?;
-    bind(&enc, 1, scales)?;
-    bind(&enc, 2, biases)?;
-    bind(&enc, 3, x)?;
-    bind(&enc, 4, r)?;
-    {
-        let (ms, wl) = norm_weight.buffer_and_layout();
-        if !wl.is_contiguous() {
-            crate::bail!("addnorm-tu qmv: non-contiguous norm weight");
-        }
-        enc.set_input(5, Some(ms), wl.offset * norm_weight.dtype().size_of());
-        let stride: u32 = if norm_weight.rank() == 1 {
-            wl.stride()[0] as u32
-        } else {
-            0
-        };
-        enc.set_bytes(13, &stride);
-    }
-    enc.set_output(6, Some(&sbuf), 0);
-    enc.set_output(7, Some(&nb), 0);
-    enc.set_output(8, Some(&ybuf), 0);
-    enc.set_bytes(9, &eps);
-    let kk = k as i32;
-    enc.set_bytes(10, &kk);
-    let nn = n as i32;
-    enc.set_bytes(11, &nn);
-    enc.set_bytes(12, &axis_size);
-
-    let bn = 8usize;
-    enc.dispatch_groups_size(
-        MTLSize {
-            width: m,
-            height: n.div_ceil(bn),
-            depth: 1,
-        },
-        MTLSize {
-            width: 32,
-            height: 2,
-            depth: 1,
-        },
-    );
-    Ok((y, sum, normed))
-}
-
 /// Verify-width quantized matmul (the `verifyQmm` lane,
 /// split-K family):
 /// M = 2..8 input rows served by ONE weight stream. Tiling collapses the
@@ -598,7 +235,7 @@ pub fn affine_verify_qmm(
 ) -> Result<Tensor> {
     let (m, k) = x.dims2();
     let (n, _) = w.dims2();
-    debug_assert!(m >= 2 && m <= 16);
+    debug_assert!((2..=16).contains(&m));
     debug_assert!(qmv_fast_eligible(k, n, bits));
     let type_str = type_string(x.dtype())?;
     // One specialization per M (distinct host_name — two specializations
@@ -614,16 +251,17 @@ pub fn affine_verify_qmm(
             m.to_string(),
         ],
     );
-    let source = format!(
-        "{MLX_UTILS_PREAMBLE}{MLX_GEMM_PREAMBLE}{MLX_QUANTIZED_UTILS_PREAMBLE}{MLX_QUANTIZED_PREAMBLE}{VERIFY_QMM_SOURCE}{template_def}"
-    );
-    let pipeline = compile_builtin(device, &source, &kname)?;
+    let source = || {
+        format!(
+            "{MLX_UTILS_PREAMBLE}{MLX_GEMM_PREAMBLE}{MLX_QUANTIZED_UTILS_PREAMBLE}{MLX_QUANTIZED_PREAMBLE}{VERIFY_QMM_SOURCE}{template_def}"
+        )
+    };
+    let pipeline = compile_builtin_lazy(device, &kname, source)?;
 
     let out_dtype = x.dtype();
     let ycount = m * n;
-    let ybuf =
-        device.buffer_for_gpu_write(ycount as usize * out_dtype.size_of(), "verify_qmm_out")?;
-    let y = Array::from_parts(device, ybuf.clone(), &vec![m, n], out_dtype);
+    let ybuf = device.buffer_for_gpu_write(ycount * out_dtype.size_of(), "verify_qmm_out")?;
+    let y = Array::from_parts(device, ybuf.clone(), &[m, n], out_dtype);
 
     let guard = device.commands.encoder()?;
     let enc = guard.encoder();
@@ -670,7 +308,7 @@ pub fn affine_verify_qmm(
 /// below); K_PARTS (2 for N >= 4096, else 4). Returns the (bn, k_parts) tile
 /// when the lane applies. 4-bit only (the shipping trunk class; mixed-plain
 /// stays off here).
-/// Shipped packs-per-thread for the split-K verify tile (specs/15 §6): the
+/// Shipped packs-per-thread for the split-K verify tile: the
 /// PPT extension over the 1-pack body. 1 = the exact shipped loop
 /// shape — FALSIFIED in situ (5 interleaved base/new round-cost pairs,
 /// 27B): the isolated-bench win (~8% at M=5) does NOT convert — S7
@@ -685,60 +323,27 @@ pub fn verify_qmm_splitk_lane(m: usize, k: usize, n: usize, bits: i32) -> Option
     if !(2..=8).contains(&m) {
         return None;
     }
-    // M=8 joined the split-K verify tile (specs/08 m16 campaign): the only
+    // M=8 joined the split-K verify tile: the only
     // wider MROWS that does not spill (M>=9 measures 1500-4500 us/dis
     // isolated vs 180 at M=8) — measured, isolated bench_verify_qmm_m_sweep.
-    if n < 512 || n >= 100_000 {
+    if !(512..100_000).contains(&n) {
         return None;
     }
-    if k % 64 != 0 || k % 8 != 0 {
+    if !k.is_multiple_of(64) || !k.is_multiple_of(8) {
         return None;
     }
-    if n % 2 != 0 {
+    if !n.is_multiple_of(2) {
         return None;
     }
     let k_parts = if n >= 4096 { 2 } else { 4 };
-    if (k / 8) % k_parts != 0 {
+    if !(k / 8).is_multiple_of(k_parts) {
         return None;
     }
     // BN = 2 for every M — a MEASURED deviation (the obvious 4 columns through
     // M=6 does not hold). A BN=4 tile stack-spills on our Metal
     // compiler at M=5 (2.85 ms vs 0.65 ms at M=5, isolated single-shot);
     // the SIMD lanes differ — measure, don't inherit.
-    // In-situ A/B seam (specs/09c sweep): `LISA_VERIFY_QMM_TILE=bn:kp`
-    // overrides the resolved tile for the eligibility-unchanged lane. Host
-    // side only; unset means the measured constants above.
-    if let Some((bn, kp)) = tile_env_override() {
-        if n % bn != 0 || (k / 8) % kp != 0 {
-            return None;
-        }
-        return Some((bn, kp));
-    }
     Some((2, k_parts))
-}
-
-/// The `LISA_VERIFY_QMM_TILE=bn:kp` A/B override, parsed once per process.
-/// Malformed or out-of-range values resolve to None (stock tile); the
-/// eligibility gates above still apply to the overridden tile.
-fn tile_env_override() -> Option<(usize, usize)> {
-    use std::sync::OnceLock;
-    static TILE: OnceLock<Option<(usize, usize)>> = OnceLock::new();
-    *TILE.get_or_init(|| {
-        std::env::var("LISA_VERIFY_QMM_TILE")
-            .ok()
-            .and_then(|raw| parse_tile_override(&raw))
-    })
-}
-
-/// Pure parser for the tile override (test seam; `bn:kp`, bn 1..=8, kp 1..=32).
-pub fn parse_tile_override(raw: &str) -> Option<(usize, usize)> {
-    let mut it = raw.split(':');
-    let bn: usize = it.next()?.parse().ok()?;
-    let kp: usize = it.next()?.parse().ok()?;
-    if !(1..=8).contains(&bn) || !(1..=32).contains(&kp) || it.next().is_some() {
-        return None;
-    }
-    Some((bn, kp))
 }
 
 /// Raw split-K verify tile dispatch with EXPLICIT tile parameters (bn,
@@ -768,6 +373,7 @@ pub fn affine_verify_qmm_splitk_tile(
 ///   16-byte uint4 per column (VLOAD template) — requires per_part % 4 == 0.
 /// - `fast_math`: compile the specialization with `Math::Fast` (Metal fast
 ///   math) instead of the stock `SafeNoLang`.
+///
 /// Both change fp32 codegen ONLY (no numerics pin yet for fast-math — the
 /// tail-ULP tests cover each combination they exercise).
 pub fn affine_verify_qmm_splitk_tile_ex(
@@ -791,7 +397,7 @@ pub fn affine_verify_qmm_splitk_tile_ex(
             "affine_verify_qmm_splitk_tile: bad tile (m={m} k={k} n={n} bn={bn} kp={k_parts} ppt={ppt})"
         );
     }
-    if vload && ((k / 8 / k_parts) % 4 != 0) {
+    if vload && !(k / 8 / k_parts).is_multiple_of(4) {
         crate::bail!(
             "affine_verify_qmm_splitk_tile: vload needs per_part % 4 == 0 (k={k} kp={k_parts})"
         );
@@ -824,22 +430,22 @@ pub fn affine_verify_qmm_splitk_tile_ex(
         ],
     );
 
-    let source = format!(
-        "{MLX_UTILS_PREAMBLE}{MLX_GEMM_PREAMBLE}{MLX_QUANTIZED_UTILS_PREAMBLE}{MLX_QUANTIZED_PREAMBLE}{VERIFY_QMM_SOURCE}{template_def}"
-    );
+    let source = || {
+        format!(
+            "{MLX_UTILS_PREAMBLE}{MLX_GEMM_PREAMBLE}{MLX_QUANTIZED_UTILS_PREAMBLE}{MLX_QUANTIZED_PREAMBLE}{VERIFY_QMM_SOURCE}{template_def}"
+        )
+    };
     let pipeline = if fast_math {
-        compile_builtin_math(device, &source, &kname, crate::runtime::Math::Fast)?
+        compile_builtin_math_lazy(device, &kname, crate::runtime::Math::Fast, source)?
     } else {
-        compile_builtin(device, &source, &kname)?
+        compile_builtin_lazy(device, &kname, source)?
     };
 
     let out_dtype = x.dtype();
     let ycount = m * n;
-    let ybuf = device.buffer_for_gpu_write(
-        ycount as usize * out_dtype.size_of(),
-        "verify_qmm_splitk_out",
-    )?;
-    let y = Array::from_parts(device, ybuf.clone(), &vec![m, n], out_dtype);
+    let ybuf =
+        device.buffer_for_gpu_write(ycount * out_dtype.size_of(), "verify_qmm_splitk_out")?;
+    let y = Array::from_parts(device, ybuf.clone(), &[m, n], out_dtype);
 
     let guard = device.commands.encoder()?;
     let enc = guard.encoder();
@@ -921,14 +527,14 @@ pub fn affine_verify_qmm_splitk(
 /// (per-part chains + part-ordered reduction) — legal reorder, goldens
 /// re-captured.
 pub fn qmv_splitk_lane(k: usize, n: usize, bits: i32) -> Option<usize> {
-    if bits != 4 || n < 512 || n >= 100_000 {
+    if bits != 4 || !(512..100_000).contains(&n) {
         return None;
     }
-    if k % 64 != 0 || k % 8 != 0 || n % 2 != 0 {
+    if !k.is_multiple_of(64) || !k.is_multiple_of(8) || !n.is_multiple_of(2) {
         return None;
     }
     let k_parts = if n >= 4096 { 2 } else { 4 };
-    if (k / 8) % k_parts != 0 {
+    if !(k / 8).is_multiple_of(k_parts) {
         return None;
     }
     Some(k_parts)
@@ -937,7 +543,7 @@ pub fn qmv_splitk_lane(k: usize, n: usize, bits: i32) -> Option<usize> {
 /// Dispatch the serial split-K qmv tile (`affine_verify_qmm_splitk` at
 /// MROWS = 1): the decode GEMV path. Gated by [`qmv_splitk_lane`].
 /// Kernel-level opt-in — NOT wired into `quantized_matmul` (FALSIFIED in
-/// situ, specs/07 §7): goldens pass 310/310 with the lane wired, but the
+/// situ): goldens pass 310/310 with the lane wired, but the
 /// serial 27B step is a wash (paired interleaved audits, base/new/new/base:
 /// 36.66/37.21 vs 36.75/36.20 ms median) and the kp=4 sweep on the wide-N
 /// projections regresses hard (85-88 ms vs 36). Kept as opt-in infra for a
@@ -977,14 +583,16 @@ pub fn affine_qmv_splitk(
             "0".to_string(),
         ],
     );
-    let source = format!(
-        "{MLX_UTILS_PREAMBLE}{MLX_GEMM_PREAMBLE}{MLX_QUANTIZED_UTILS_PREAMBLE}{MLX_QUANTIZED_PREAMBLE}{VERIFY_QMM_SOURCE}{template_def}"
-    );
-    let pipeline = compile_builtin(device, &source, &kname)?;
+    let source = || {
+        format!(
+            "{MLX_UTILS_PREAMBLE}{MLX_GEMM_PREAMBLE}{MLX_QUANTIZED_UTILS_PREAMBLE}{MLX_QUANTIZED_PREAMBLE}{VERIFY_QMM_SOURCE}{template_def}"
+        )
+    };
+    let pipeline = compile_builtin_lazy(device, &kname, source)?;
 
     let out_dtype = x.dtype();
     let ybuf = device.buffer_for_gpu_write(n * out_dtype.size_of(), "qmv_splitk_out")?;
-    let y = Array::from_parts(device, ybuf.clone(), &vec![1, n], out_dtype);
+    let y = Array::from_parts(device, ybuf.clone(), &[1, n], out_dtype);
 
     let guard = device.commands.encoder()?;
     let enc = guard.encoder();
@@ -1043,11 +651,11 @@ pub fn verify_qmm_msg_lane(m: usize, k: usize, n: usize, bits: i32) -> Option<us
     if bits != 4 || !(2..=7).contains(&m) {
         return None;
     }
-    if n < 100_000 || k % 64 != 0 || k % 8 != 0 {
+    if n < 100_000 || !k.is_multiple_of(64) || !k.is_multiple_of(8) {
         return None;
     }
     let bn = if m <= 6 { 4 } else { 2 };
-    if n % bn != 0 {
+    if !n.is_multiple_of(bn) {
         return None;
     }
     Some(bn)
@@ -1055,7 +663,7 @@ pub fn verify_qmm_msg_lane(m: usize, k: usize, n: usize, bits: i32) -> Option<us
 
 /// Dispatch the msg verify tile (`affine_verify_qmm_msg`): the
 /// huge-N lane. NOT wired into
-/// `quantized_matmul` — FALSIFIED in situ (specs/19 ledger): the tile wins
+/// `quantized_matmul` — FALSIFIED in situ: the tile wins
 /// isolated single-shot (1.48 vs 1.95 ms at m=7 k=5120 n=151936) but loses
 /// the production e2e decode wall consistently, order-independently
 /// (128-tok d6: 2.56 s base vs 3.7-5.4 s msg) — the full-K strided
@@ -1095,16 +703,17 @@ pub fn affine_verify_qmm_msg(
             NSG.to_string(),
         ],
     );
-    let source = format!(
-        "{MLX_UTILS_PREAMBLE}{MLX_GEMM_PREAMBLE}{MLX_QUANTIZED_UTILS_PREAMBLE}{MLX_QUANTIZED_PREAMBLE}{VERIFY_QMM_SOURCE}{template_def}"
-    );
-    let pipeline = compile_builtin(device, &source, &kname)?;
+    let source = || {
+        format!(
+            "{MLX_UTILS_PREAMBLE}{MLX_GEMM_PREAMBLE}{MLX_QUANTIZED_UTILS_PREAMBLE}{MLX_QUANTIZED_PREAMBLE}{VERIFY_QMM_SOURCE}{template_def}"
+        )
+    };
+    let pipeline = compile_builtin_lazy(device, &kname, source)?;
 
     let out_dtype = x.dtype();
     let ycount = m * n;
-    let ybuf =
-        device.buffer_for_gpu_write(ycount as usize * out_dtype.size_of(), "verify_qmm_msg_out")?;
-    let y = Array::from_parts(device, ybuf.clone(), &vec![m, n], out_dtype);
+    let ybuf = device.buffer_for_gpu_write(ycount * out_dtype.size_of(), "verify_qmm_msg_out")?;
+    let y = Array::from_parts(device, ybuf.clone(), &[m, n], out_dtype);
 
     let guard = device.commands.encoder()?;
     let enc = guard.encoder();
@@ -1131,7 +740,7 @@ pub fn affine_verify_qmm_msg(
     // threadgroup column per NSG*BN output columns; the in-kernel n0 guard
     // covers the ceil-div tail.
     let cols = bn * NSG;
-    let tg_count = (n + cols - 1) / cols;
+    let tg_count = n.div_ceil(cols);
     enc.dispatch_groups_size(
         MTLSize {
             width: 1,
@@ -1169,23 +778,23 @@ pub(crate) const VERIFY_QMM_NAX_M16_SOURCE: &crate::shader_pack::Source =
 pub fn verify_qmm_nax_m16_lane(m: usize, k: usize, n: usize, bits: i32, group_size: i32) -> bool {
     bits == 4
         && (8..=16).contains(&m)
-        && n % 32 == 0
-        && k % 128 == 0
+        && n.is_multiple_of(32)
+        && k.is_multiple_of(128)
         && group_size % 16 == 0
-        && k % group_size.max(1) as usize == 0
+        && k.is_multiple_of(group_size.max(1) as usize)
         && n < 100_000
 }
 
 /// Dispatch the NAX m16 verify tile — kernel-level opt-in (the msg tile
 /// precedent), NOT wired into `quantized_matmul`. The MPP probe diagnosis
-/// (specs/08 item 2): the kernel never needed additive-binary linkage — it
+///: the kernel never needed additive-binary linkage — it
 /// needed (a) the NAX compile class (`compile_nax_jit`, Metal 4 language —
 /// MSL 3.2 rejects the MPP+bfloat16 source outright) and (b) the template
 /// type spelled `bfloat16_t` (the bare `bfloat16` name is ambiguous under
 /// Metal 4) and (c) the grid on the X axis (MPP kernels silently skip
 /// threadgroups launched with grid.y > 0). With all three the kernel
 /// compiles and executes through lisa's ordinary `newLibraryWithSource`
-/// path, but it measured SLOWER than stock at every M (specs/08 step 3) —
+/// path, but it measured SLOWER than stock at every M —
 /// unwired. `x` must be the PADDED [16, K] tile; returns [16, N].
 pub fn affine_verify_qmm_nax_m16(
     device: &Device,
@@ -1228,18 +837,18 @@ pub fn affine_verify_qmm_nax_m16(
     );
     // The MLX preambles define `bfloat16_t` (the template type name the
     // specialization instantiates); MPP supplies the tensor ops.
-    let source = format!(
-        "{MLX_UTILS_PREAMBLE}{MLX_GEMM_PREAMBLE}{MLX_QUANTIZED_UTILS_PREAMBLE}{MLX_QUANTIZED_PREAMBLE}{VERIFY_QMM_NAX_M16_SOURCE}{template_def}"
-    );
+    let source = || {
+        format!(
+            "{MLX_UTILS_PREAMBLE}{MLX_GEMM_PREAMBLE}{MLX_QUANTIZED_UTILS_PREAMBLE}{MLX_QUANTIZED_PREAMBLE}{VERIFY_QMM_NAX_M16_SOURCE}{template_def}"
+        )
+    };
     // The NAX compile class (Math::Safe -> Metal 4 language version): the MPP
     // tensor ops are Metal-4 language features. The old `compile_builtin`
     // (Math::SafeNoLang -> MSL 3.2) could not compile this source at all.
-    let pipeline = super::nax::compile_nax_jit(device, &source, &kname, &[])?;
+    let pipeline = super::nax::compile_nax_jit_lazy(device, &kname, &[], source)?;
 
-    let ybuf = device.buffer_for_gpu_write(
-        16 * n as usize * x.dtype().size_of(),
-        "verify_qmm_nax_m16_out",
-    )?;
+    let ybuf =
+        device.buffer_for_gpu_write(16 * n * x.dtype().size_of(), "verify_qmm_nax_m16_out")?;
     let guard = device.commands.encoder()?;
     let enc = guard.encoder();
     enc.set_pipeline(&pipeline);
@@ -1260,8 +869,7 @@ pub fn affine_verify_qmm_nax_m16(
     let nn = n as i32;
     enc.set_bytes(5, &nn);
     // threadgroup = 256 threads (8 simdgroups); one threadgroup per 32
-    // output columns. The grid rides the X axis: the MPP probe (specs/08
-    // item 2) showed MPP tensor-op kernels silently SKIP every threadgroup
+    // output columns. The grid rides the X axis: MPP tensor-op kernels silently SKIP every threadgroup
     // launched with grid.y > 0 (no GPU error, no output) — the reference
     // dispatches (256, N/32, 1), keeping the varying axis on X.
     enc.dispatch_groups_size(
@@ -1276,12 +884,7 @@ pub fn affine_verify_qmm_nax_m16(
             depth: 1,
         },
     );
-    Ok(Array::from_parts(
-        device,
-        ybuf,
-        &vec![16, n as usize],
-        x.dtype(),
-    ))
+    Ok(Array::from_parts(device, ybuf, &[16, n], x.dtype()))
 }
 
 /// `GemmParams` (`kernels/mlx_gemm.rs`).
@@ -1348,10 +951,12 @@ pub fn affine_dequantize(
             "0".to_string(),
         ],
     );
-    let source = format!(
-        "{MLX_UTILS_PREAMBLE}{MLX_GEMM_PREAMBLE}{MLX_QUANTIZED_UTILS_PREAMBLE}{MLX_QUANTIZED_PREAMBLE}{template_def}"
-    );
-    let pipeline = compile_builtin(device, &source, &kname)?;
+    let source = || {
+        format!(
+            "{MLX_UTILS_PREAMBLE}{MLX_GEMM_PREAMBLE}{MLX_QUANTIZED_UTILS_PREAMBLE}{MLX_QUANTIZED_PREAMBLE}{template_def}"
+        )
+    };
+    let pipeline = compile_builtin_lazy(device, &kname, source)?;
 
     // MLX dims: one thread per pack (8 values for 4-bit); 2-D grid.
     let packs_per_int: usize = if bits == 3 || bits == 5 {
@@ -1523,13 +1128,8 @@ fn dense_gemv(
         "{}_{}_bm{}_bn{}_sm{}_sn{}_tm{}_tn{}_nc0_axpby0",
         kernel_prefix, dtype_str, bm, bn, sm, sn, tm, tn
     );
-    let source = if transpose_mat {
-        DENSE_GEMV
-    } else {
-        DENSE_GEMV
-    };
     let pipeline =
-        rt.compile_with_constants(source, &name, crate::runtime::Math::SafeNoLang, &[])?;
+        rt.compile_with_constants(DENSE_GEMV, &name, crate::runtime::Math::SafeNoLang, &[])?;
 
     let _esz = dt.size_of();
     let guard = rt.commands.encoder()?;
@@ -1892,15 +1492,16 @@ pub fn qmv_wide(
             "0".to_string(),
         ],
     );
-    let source = format!(
-        "{MLX_UTILS_PREAMBLE}{MLX_GEMM_PREAMBLE}{MLX_QUANTIZED_UTILS_PREAMBLE}{MLX_QUANTIZED_PREAMBLE}{template_def}"
-    );
-    let pipeline = compile_builtin(device, &source, &kname)?;
+    let source = || {
+        format!(
+            "{MLX_UTILS_PREAMBLE}{MLX_GEMM_PREAMBLE}{MLX_QUANTIZED_UTILS_PREAMBLE}{MLX_QUANTIZED_PREAMBLE}{template_def}"
+        )
+    };
+    let pipeline = compile_builtin_lazy(device, &kname, source)?;
 
     let count = m * n;
-    let obuf =
-        mdev.buffer_for_gpu_write((count) as usize * (x.dtype()).size_of(), "qmv_wide_out")?;
-    let out = Array::from_parts(mdev, obuf.clone(), &vec![m, n], x.dtype());
+    let obuf = mdev.buffer_for_gpu_write((count) * (x.dtype()).size_of(), "qmv_wide_out")?;
+    let out = Array::from_parts(mdev, obuf.clone(), &[m, n], x.dtype());
     let guard = mdev.commands.encoder()?;
     let enc = guard.encoder();
     enc.set_pipeline(&pipeline);
@@ -1989,18 +1590,17 @@ pub fn affine_qmm_splitk(
             (if aligned { "true" } else { "false" }).to_string(),
         ],
     );
-    let source = format!(
-        "{MLX_UTILS_PREAMBLE}{MLX_GEMM_PREAMBLE}{MLX_QUANTIZED_UTILS_PREAMBLE}{MLX_QUANTIZED_PREAMBLE}{def}"
-    );
-    let pipeline = compile_builtin(device, &source, &kname)?;
+    let source = || {
+        format!(
+            "{MLX_UTILS_PREAMBLE}{MLX_GEMM_PREAMBLE}{MLX_QUANTIZED_UTILS_PREAMBLE}{MLX_QUANTIZED_PREAMBLE}{def}"
+        )
+    };
+    let pipeline = compile_builtin_lazy(device, &kname, source)?;
 
     // intermediate [split_k, m, n]
     let icount = split_k * m * n;
-    let ibuf = mdev.buffer_for_gpu_write(
-        (icount) as usize * (x.dtype()).size_of(),
-        "qmm_splitk_inter",
-    )?;
-    let inter = Array::from_parts(mdev, ibuf.clone(), &vec![split_k, m, n], x.dtype());
+    let ibuf = mdev.buffer_for_gpu_write((icount) * (x.dtype()).size_of(), "qmm_splitk_inter")?;
+    let inter = Array::from_parts(mdev, ibuf.clone(), &[split_k, m, n], x.dtype());
 
     let guard = mdev.commands.encoder()?;
     let enc = guard.encoder();
@@ -2074,10 +1674,12 @@ pub fn affine_qmm(
             "false".to_string(),
         ],
     );
-    let source = format!(
-        "{MLX_UTILS_PREAMBLE}{MLX_GEMM_PREAMBLE}{MLX_QUANTIZED_UTILS_PREAMBLE}{MLX_QUANTIZED_PREAMBLE}{template_def}"
-    );
-    let pipeline = compile_builtin(device, &source, &kname)?;
+    let source = || {
+        format!(
+            "{MLX_UTILS_PREAMBLE}{MLX_GEMM_PREAMBLE}{MLX_QUANTIZED_UTILS_PREAMBLE}{MLX_QUANTIZED_PREAMBLE}{template_def}"
+        )
+    };
+    let pipeline = compile_builtin_lazy(device, &kname, source)?;
     let out = device.buffer_for_gpu_write(m * n * x.dtype().size_of(), "qmm_out")?;
     let result = Array::from_parts(device, out.clone(), &[m, n], x.dtype());
 
@@ -2102,7 +1704,7 @@ pub fn affine_qmm(
         scales.stride(),
         Some(biases.stride()),
     );
-    metadata.bind(&enc, 8);
+    metadata.bind(enc, 8);
     enc.dispatch_groups_size(
         MTLSize {
             width: n.div_ceil(bn),

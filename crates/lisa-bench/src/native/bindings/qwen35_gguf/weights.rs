@@ -1,4 +1,6 @@
 //! Provider specialization retained by native conformance fixtures.
-pub use lisa_engine::bindings::qwen35_gguf::weights::{Config, validate};
+#[cfg(test)]
+pub use lisa_engine::weights::qwen35::gguf::Config;
+#[cfg(test)]
 pub type Bound =
-    lisa_engine::bindings::qwen35_gguf::weights::Bound<lisa_metal::device::MetalDevice>;
+    lisa_engine::bindings::qwen35::gguf::weights::Bound<lisa_metal::device::MetalDevice>;

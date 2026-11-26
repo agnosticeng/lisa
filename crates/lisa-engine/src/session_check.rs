@@ -1,6 +1,6 @@
 //! Portable incremental-prefill diagnostic, with explicit model ownership.
 use crate::{
-    conversation::Conversation, language::LanguageModel, speculative_runtime::SpeculativeRuntime,
+    conversation::Conversation, language::LanguageModel, speculation::runtime::SpeculativeRuntime,
 };
 use lisa_backend::TensorAccess;
 

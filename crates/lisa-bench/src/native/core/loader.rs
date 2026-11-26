@@ -81,17 +81,6 @@ impl LazyTensorStore {
             )?,
         ))
     }
-    #[cfg(test)]
-    pub(crate) fn from_checkpoint(dir: &Path, checkpoint: &Checkpoint) -> anyhow::Result<Self> {
-        Ok(Self::bind(
-            crate::weights::lazy::LazyTensorStore::from_checkpoint(
-                crate::metal_context::device(),
-                dir,
-                checkpoint,
-                sanitize_name,
-            )?,
-        ))
-    }
     pub fn tensor_dtype(&self, name: &str) -> anyhow::Result<Dtype> {
         self.0.tensor_dtype(name).map(crate::metal_storage::dtype)
     }
@@ -187,6 +176,7 @@ mod tests {
 
     #[test]
     fn prefetch_many_disjoint_ranges_preserves_all_page_hints() {
+        // SAFETY: getpagesize takes no arguments and only reads the system page size.
         let page = unsafe { getpagesize() } as usize;
         let count = 40usize;
         let stride = page * 3;
@@ -207,7 +197,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let mut header = serde_json::to_vec(&serde_json::Value::Object(tensors)).unwrap();
-        while header.len() % 8 != 0 {
+        while !header.len().is_multiple_of(8) {
             header.push(b' ');
         }
 
@@ -240,6 +230,7 @@ mod tests {
 
     #[test]
     fn mincore_marks_touched_mapped_pages_resident() {
+        // SAFETY: getpagesize takes no arguments and only reads the system page size.
         let page = unsafe { getpagesize() } as usize;
         let payload_len = page * 3;
         let mut tensors = serde_json::Map::new();
@@ -252,7 +243,7 @@ mod tests {
             }),
         );
         let mut header = serde_json::to_vec(&serde_json::Value::Object(tensors)).unwrap();
-        while header.len() % 8 != 0 {
+        while !header.len().is_multiple_of(8) {
             header.push(b' ');
         }
         let path = std::env::temp_dir().join(format!(
@@ -352,7 +343,7 @@ mod tests {
             }
         }))
         .unwrap();
-        while header.len() % 8 != 0 {
+        while !header.len().is_multiple_of(8) {
             header.push(b' ');
         }
 
@@ -369,6 +360,7 @@ mod tests {
             .unwrap();
         file.write_all(&header).unwrap();
         file.write_all(&payload_bytes).unwrap();
+        // SAFETY: getpagesize takes no arguments and only reads the system page size.
         let page_size = unsafe { getpagesize() } as usize;
         let file_len = 8 + header.len() + payload_bytes.len();
         let padded_len = file_len.div_ceil(page_size) * page_size;
@@ -415,6 +407,7 @@ mod tests {
         let first = [3u8, 5, 7, 11];
         let second = [13u8, 17, 19, 23];
         let typed = [0x80u8, 0x3f, 0x00, 0x3f];
+        // SAFETY: getpagesize takes no arguments and only reads the system page size.
         let large = vec![0x5au8; unsafe { getpagesize() } as usize + 777];
         let mut header = serde_json::to_vec(&serde_json::json!({
             "expert_a": {
@@ -439,7 +432,7 @@ mod tests {
             }
         }))
         .unwrap();
-        while header.len() % 8 != 0 {
+        while !header.len().is_multiple_of(8) {
             header.push(b' ');
         }
 
@@ -459,6 +452,7 @@ mod tests {
         file.write_all(&second).unwrap();
         file.write_all(&typed).unwrap();
         file.write_all(&large).unwrap();
+        // SAFETY: getpagesize takes no arguments and only reads the system page size.
         let page_size = unsafe { getpagesize() } as usize;
         let file_len = 8 + header.len() + first.len() + second.len() + typed.len() + large.len();
         file.set_len((file_len.div_ceil(page_size) * page_size) as u64)

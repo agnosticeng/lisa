@@ -52,6 +52,9 @@ impl Spec {
             pool: (active && pooled < blocks).then_some(pooled..blocks),
         })
     }
+    pub fn project_captured(self, shape: &[i32]) -> Result<Graph> {
+        Ok(self.project(shape)?.with_serial_affine(false))
+    }
     pub fn project(self, shape: &[i32]) -> Result<Graph> {
         ensure!(
             shape.len() == 3 && shape.iter().all(|&d| d > 0),
@@ -125,6 +128,98 @@ impl Spec {
                 .is_some_and(|end| blocks == end / 4)
             && blocks <= 65536
     }
+
+    /// Native selection already has one fixed reduction per query and never
+    /// scores future blocks. The generic fallback instead retains the decode
+    /// matmul shape and partition extent independently for each prefix.
+    pub fn select_captured(
+        self,
+        batch: i32,
+        rows: i32,
+        offset: usize,
+        blocks: usize,
+        native: bool,
+    ) -> Result<Graph> {
+        if native || rows == 1 {
+            return self.select(batch, rows, offset, blocks, native);
+        }
+        let end = offset
+            .checked_add(rows as usize)
+            .ok_or_else(|| anyhow::anyhow!("indexer offset overflow"))?;
+        ensure!(
+            batch > 0 && rows > 0 && self.ratio > 0 && blocks > 0 && end <= i32::MAX as usize,
+            "invalid captured indexer selection span"
+        );
+        let schema = Default::default();
+        let mut p = Build::new(3, &schema);
+        let width = self.top_k.min(blocks) as i32;
+        let mut outputs: [Vec<V>; 4] = Default::default();
+        for row in 0..rows {
+            let position = offset + row as usize;
+            let prefix_blocks = blocks.min((position + 1) / self.ratio);
+            let row_width = if prefix_blocks == 0 {
+                width
+            } else {
+                self.top_k.min(prefix_blocks) as i32
+            };
+            let mut result = if prefix_blocks == 0 {
+                vec![
+                    p.graph.one(
+                        Kernel::Zeros {
+                            shape: vec![batch, 1, width],
+                            dtype: D::U32,
+                        },
+                        vec![],
+                    ),
+                    p.graph.one(
+                        Kernel::Zeros {
+                            shape: vec![batch, 1, width],
+                            dtype: D::Bool,
+                        },
+                        vec![],
+                    ),
+                    p.graph.constant_f32(&[0.], &[1, 1]),
+                    p.graph.constant_i32(&[position as i32], &[1, 1]),
+                ]
+            } else {
+                let q = p.slice(V::Input(0), 1, row, row + 1);
+                let pooled = p.slice(V::Input(1), 1, 0, prefix_blocks as i32);
+                p.graph
+                    .append(
+                        self.select(batch, 1, position, prefix_blocks, false)?,
+                        &[q, pooled, V::Input(2)],
+                        &[],
+                        &[],
+                    )
+                    .map_err(anyhow::Error::msg)?
+            };
+            if row_width < width {
+                let padding = vec![batch, 1, width - row_width];
+                let ids = p.graph.one(
+                    Kernel::Zeros {
+                        shape: padding.clone(),
+                        dtype: D::U32,
+                    },
+                    vec![],
+                );
+                let valid = p.graph.one(
+                    Kernel::Zeros {
+                        shape: padding,
+                        dtype: D::Bool,
+                    },
+                    vec![],
+                );
+                result[0] = p.concat(vec![result[0], ids], 2);
+                result[1] = p.concat(vec![result[1], valid], 2);
+            }
+            for (all, value) in outputs.iter_mut().zip(result) {
+                all.push(value);
+            }
+        }
+        let out: Vec<_> = outputs.into_iter().map(|v| p.concat(v, 1)).collect();
+        Ok(p.finish(out)?.graph)
+    }
+
     /// Inputs: query projection, pooled tape, query-normalization scale.
     /// Outputs: block IDs, valid flags, completed-block counts, query positions.
     pub fn select(
@@ -282,9 +377,95 @@ pub fn pool_without_tape(spec: Spec, batch: i32, _rows: i32, blocks: usize) -> R
         .map_err(anyhow::Error::msg)?;
     Ok(g.finish(out))
 }
+
+/// Fixed geometry of this checkpoint family, independently of its provider.
+pub const GEOMETRY: (usize, usize, usize, usize, usize) = (4, 128, 2048, 4, 512);
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn spec() -> Spec {
+        Spec {
+            heads: 4,
+            width: 128,
+            budget: 2048,
+            ratio: 4,
+            top_k: 512,
+            quant: (32, 4),
+            epsilon: 1e-6f32.to_bits(),
+            key_epsilon: 1e-6f32.to_bits(),
+            rotary: 64,
+            base: 10000000f32.to_bits(),
+        }
+    }
+
+    #[test]
+    fn captured_projection_and_fallback_preserve_decode_shapes() {
+        let s = spec();
+        for rows in [1, 2, 7] {
+            let projection = s.project_captured(&[1, rows, 1024]).unwrap();
+            projection.validate().unwrap();
+            assert!(projection.calls.iter().any(|c| matches!(
+                c.kernel,
+                Kernel::AffineSerialLinear {
+                    allow_verify_splitk: false,
+                    ..
+                }
+            )));
+            let offset = 2046;
+            let blocks = (offset + rows as usize) / s.ratio;
+            let selection = s.select_captured(1, rows, offset, blocks, false).unwrap();
+            selection.validate().unwrap();
+            let matmuls = selection
+                .calls
+                .iter()
+                .filter(|c| c.kernel == Kernel::Tensor(T::Matmul))
+                .count();
+            assert_eq!(matmuls, rows as usize);
+            assert!(!selection.calls.iter().any(|c| matches!(&c.kernel,
+                Kernel::Tensor(T::Reshape(shape)) if shape == &vec![1, rows * s.heads, s.width]
+                    && rows > 1)));
+            let positions = selection
+                .constants
+                .iter()
+                .filter(|c| c.dtype == D::I32 && c.shape == [1, 1])
+                .map(|c| i32::from_ne_bytes(c.bytes[..4].try_into().unwrap()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                positions,
+                (offset as i32..offset as i32 + rows).collect::<Vec<_>>()
+            );
+        }
+        // Before the first complete block, placeholders are invalid rather
+        // than attempting a zero-column top-k operation.
+        s.select_captured(1, 7, 0, 1, false)
+            .unwrap()
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
+    fn captured_native_selection_keeps_independent_row_grid() {
+        let graph = spec().select_captured(1, 7, 2048, 513, true).unwrap();
+        graph.validate().unwrap();
+        assert_eq!(
+            graph
+                .calls
+                .iter()
+                .filter(|c| matches!(
+                    c.kernel,
+                    Kernel::BlockAttention(BlockAttention::Select { .. })
+                ))
+                .count(),
+            1
+        );
+        assert!(
+            !graph
+                .calls
+                .iter()
+                .any(|c| c.kernel == Kernel::Tensor(T::Matmul))
+        );
+    }
+
     #[test]
     fn pooling_boundary_is_lazy_and_incremental() {
         let s = Spec {
@@ -316,6 +497,3 @@ mod tests {
         assert!(!s.native_select(1, 1, 2048, 512, false));
     }
 }
-
-/// Fixed geometry of this checkpoint family, independently of its provider.
-pub const GEOMETRY: (usize, usize, usize, usize, usize) = (4, 128, 2048, 4, 512);

@@ -1,7 +1,20 @@
 //! Application bindings for portable packed projections.
 use crate::core::gguf_resident::PackedTensor;
 use anyhow::Result;
-pub use lisa_engine::bindings::deepseek41_projection::{block_format, bound, matrix, plain_view};
+pub fn block_format(kind: lisa_gguf::TensorType) -> Result<lisa_backend::PackedEncoding> {
+    lisa_engine::bindings::deepseek41::projection::block_format(
+        lisa_engine::weights::gguf::projection(kind)?,
+    )
+}
+pub fn matrix(w: &PackedTensor) -> Result<lisa_models::deepseek41::projection::Matrix> {
+    lisa_engine::bindings::deepseek41::projection::matrix(&w.clone().into_prepared()?)
+}
+pub fn bound(w: &PackedTensor) -> Result<Array> {
+    lisa_engine::bindings::deepseek41::projection::bound(&w.clone().into_prepared()?)
+}
+pub fn plain_view(w: &PackedTensor) -> Result<Array> {
+    lisa_engine::bindings::deepseek41::projection::plain_view(&w.clone().into_prepared()?)
+}
 use lisa_metal::{Array, Stream};
 struct StreamContext {
     runtime: std::sync::Arc<lisa_metal::runtime::MetalRuntime>,
@@ -30,7 +43,12 @@ pub(super) fn context_for(
 pub fn linear(w: &PackedTensor, x: &Array, round: bool, stream: &Stream) -> Result<Array> {
     let owned = context_for(stream);
     let context = &owned;
-    lisa_engine::bindings::deepseek41_projection::linear(w, x, round, context)
+    lisa_engine::bindings::deepseek41::projection::linear(
+        &w.clone().into_prepared()?,
+        x,
+        round,
+        context,
+    )
 }
 pub fn linear_rows(
     w: &PackedTensor,
@@ -42,7 +60,14 @@ pub fn linear_rows(
 ) -> Result<Array> {
     let owned = context_for(stream);
     let context = &owned;
-    lisa_engine::bindings::deepseek41_projection::linear_rows(w, first, count, x, round, context)
+    lisa_engine::bindings::deepseek41::projection::linear_rows(
+        &w.clone().into_prepared()?,
+        first,
+        count,
+        x,
+        round,
+        context,
+    )
 }
 pub fn query_kv_pair(
     a: &PackedTensor,
@@ -52,10 +77,19 @@ pub fn query_kv_pair(
 ) -> Result<(Array, Array)> {
     let owned = context_for(stream);
     let context = &owned;
-    lisa_engine::bindings::deepseek41_projection::query_kv_pair(a, b, x, context)
+    lisa_engine::bindings::deepseek41::projection::query_kv_pair(
+        &a.clone().into_prepared()?,
+        &b.clone().into_prepared()?,
+        x,
+        context,
+    )
 }
 pub fn attention_output_groups(w: &PackedTensor, x: &Array, stream: &Stream) -> Result<Array> {
     let owned = context_for(stream);
     let context = &owned;
-    lisa_engine::bindings::deepseek41_projection::attention_output_groups(w, x, context)
+    lisa_engine::bindings::deepseek41::projection::attention_output_groups(
+        &w.clone().into_prepared()?,
+        x,
+        context,
+    )
 }

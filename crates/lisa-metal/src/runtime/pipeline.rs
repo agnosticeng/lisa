@@ -4,34 +4,41 @@ use objc2_metal::MTLComputePipelineState;
 
 // ───────────────────────────── pipelines ─────────────────────────────
 
+/// A compiled kernel. Cloning retains the Metal object and shares the name;
+/// the attribution label is interned once, when the pipeline is created.
 #[derive(Clone)]
 pub struct ComputePipeline {
     pub(super) raw: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// The kernel function name; used as the per-label GPU-time attribution key.
-    pub name: String,
-    /// Interned id for `name` (None = not yet interned). `set_pipeline` reads
-    /// this instead of cloning the String through a Mutex on every dispatch.
-    pub(super) label: std::cell::OnceCell<u32>,
+    pub name: std::sync::Arc<str>,
+    pub(super) label: u32,
 }
 
+// SAFETY: MTLComputePipelineState is immutable and thread-safe; `name` is `Arc<str>`
+// and `label` a plain `u32`.
 unsafe impl Send for ComputePipeline {}
 unsafe impl Sync for ComputePipeline {}
 
 impl ComputePipeline {
-    /// Wrap an already-built pipeline.
-    pub fn from_raw(raw: Retained<ProtocolObject<dyn MTLComputePipelineState>>) -> Self {
+    pub(super) fn new(
+        raw: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        name: &str,
+    ) -> Self {
         Self {
             raw,
-            name: "raw".to_string(),
-            label: std::cell::OnceCell::new(),
+            name: name.into(),
+            label: super::env::intern_label(name),
         }
     }
 
-    /// The interned label id (ids start at 1); registers `name` on first use.
+    /// Wrap an already-built pipeline.
+    pub fn from_raw(raw: Retained<ProtocolObject<dyn MTLComputePipelineState>>) -> Self {
+        Self::new(raw, "raw")
+    }
+
+    /// The interned label id (ids start at 1).
     pub(super) fn label_id(&self) -> u32 {
-        *self
-            .label
-            .get_or_init(|| super::env::intern_label(&self.name))
+        self.label
     }
 
     pub fn raw(&self) -> &ProtocolObject<dyn MTLComputePipelineState> {

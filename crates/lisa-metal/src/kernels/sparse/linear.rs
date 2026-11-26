@@ -1,19 +1,20 @@
-//! Linear operations with the pinned DS4 arithmetic.
+//! Linear operations with the pinned reference arithmetic.
 use super::*;
 
 pub(super) const BF16_GEMV_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/bf16_gemv.metal");
+    crate::kernel_source!("common/matmul/bf16_gemv.metal");
 pub(super) const BF16_GEMV_ROWS2_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/bf16_gemv_rows2.metal");
+    crate::kernel_source!("common/matmul/bf16_gemv_rows2.metal");
 pub(super) const BF16_PAIR_GEMV_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/bf16_pair_gemv.metal");
-pub(super) const BF16_QKV_SOURCE: &crate::shader_pack::Source = crate::kernel_source!("glm53/bf16_qkv.metal");
+    crate::kernel_source!("common/matmul/bf16_pair_gemv.metal");
+pub(super) const BF16_QKV_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("common/matmul/bf16_qkv.metal");
 pub(super) const BF16_GEMM_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/bf16_gemm.metal");
+    crate::kernel_source!("common/matmul/bf16_gemm.metal");
 pub(super) const BF16_KDA_PROJECT_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/bf16_kda_project.metal");
+    crate::kernel_source!("kda/bf16_kda_project.metal");
 pub(super) const AFFINE_Q8_MV_DS4_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/affine_q8_mv_ds4.metal");
+    crate::kernel_source!("common/matmul/affine_q8_mv_ds4.metal");
 
 pub(super) fn bf16_gemv_kernel() -> &'static Option<MetalKernel> {
     static K: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
@@ -176,7 +177,7 @@ pub(super) fn bf16_kda_project_kernel() -> &'static Option<MetalKernel> {
     })
 }
 
-/// ds4 uses four simdgroups per threadgroup only on M3 Ultra; other devices
+/// The reference uses four simdgroups per threadgroup only on M3 Ultra; other devices
 /// use eight. Keep the same scheduling split for both BF16 projection kernels.
 pub(super) fn bf16_projection_nsg(x: &Array) -> usize {
     static NSG: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -195,9 +196,9 @@ pub(super) fn bf16_projection_nsg(x: &Array) -> usize {
     })
 }
 
-/// F32-accumulating BF16 GEMV ported from ds4's GLM BF16 row kernel.
+/// F32-accumulating BF16 GEMV ported from the reference's GLM BF16 row kernel.
 /// `weights=[N,K]` BF16 and `x=[M,K]` F32 produce `[M,N]` F32.
-pub fn glm53_bf16_gemv(weights: &Array, x: &Array, stream: &Stream) -> Option<Array> {
+pub fn bf16_gemv(weights: &Array, x: &Array, stream: &Stream) -> Option<Array> {
     if weights.rank() != 2
         || x.rank() != 2
         || weights.dtype() != Dtype::Bfloat16
@@ -293,10 +294,10 @@ pub(super) fn affine_q8_mv_ds4_kernel() -> &'static Option<MetalKernel> {
     })
 }
 
-/// DS4's direct MLX-affine Q8 matvec schedule. Each output/token pair uses one
+/// The reference's direct MLX-affine Q8 matvec schedule. Each output/token pair uses one
 /// SIMD group: lanes walk the same modulo-32 input slices, dequantize each
 /// code, FMA-accumulate against the activation, then use one SIMD reduction.
-pub fn glm53_affine_q8_mv_ds4(
+pub fn affine_q8_mv_ds4(
     weights: &Array,
     scales: &Array,
     biases: &Array,
@@ -371,11 +372,11 @@ pub fn glm53_affine_q8_mv_ds4(
     out.into_iter().next()
 }
 
-/// Paired BF16-weight/F32-activation GEMV. Each result uses the same DS4
-/// lane-strided FMA and SIMD reduction as `glm53_bf16_gemv`, but both
+/// Paired BF16-weight/F32-activation GEMV. Each result uses the same reference
+/// lane-strided FMA and SIMD reduction as `bf16_gemv`, but both
 /// projections share one dispatch. Inputs are `[M,K_a]` and `[M,K_b]`;
 /// weights are `[N_a,K_a]` and `[N_b,K_b]`.
-pub fn glm53_bf16_pair_gemv(
+pub fn bf16_pair_gemv(
     weights_a: &Array,
     x_a: &Array,
     weights_b: &Array,
@@ -465,9 +466,9 @@ pub fn glm53_bf16_pair_gemv(
 }
 
 /// One-dispatch KDA input projections for one to eight rows, preserving the
-/// BF16 GEMV lane order used by `glm53_bf16_gemv`. The packed first output is
+/// BF16 GEMV lane order used by `bf16_gemv`. The packed first output is
 /// row-major `[q | k | v | beta]`; the other outputs are `f_a(x)` and `g_a(x)`.
-pub fn glm53_bf16_kda_project(
+pub fn bf16_kda_project(
     weights_q: &Array,
     weights_k: &Array,
     weights_v: &Array,
@@ -477,7 +478,7 @@ pub fn glm53_bf16_kda_project(
     x: &Array,
     stream: &Stream,
 ) -> Option<(Array, Array, Array)> {
-    glm53_bf16_kda_project_with_nsg(
+    bf16_kda_project_with_nsg(
         weights_q,
         weights_k,
         weights_v,
@@ -491,8 +492,8 @@ pub fn glm53_bf16_kda_project(
 }
 
 /// Fused KDA projection with an optional simdgroup-count override used by the
-/// serial-audit schedule experiment. `None` retains the DS4 device schedule.
-pub fn glm53_bf16_kda_project_with_nsg(
+/// serial-audit schedule experiment. `None` retains the reference device schedule.
+pub fn bf16_kda_project_with_nsg(
     weights_q: &Array,
     weights_k: &Array,
     weights_v: &Array,
@@ -602,11 +603,11 @@ pub fn glm53_bf16_kda_project_with_nsg(
     Some((out.next()?, out.next()?, out.next()?))
 }
 
-/// Tiled BF16-weight/F32-activation GEMM for GLM prefill. This follows ds4's
+/// Tiled BF16-weight/F32-activation GEMM for GLM prefill. This follows the reference's
 /// large-row route: 64x32 output tiles across four simdgroups, 32-wide
 /// reductions, F16 operand staging, and F32 accumulation. `weights=[N,K]`,
 /// `x=[M,K]` -> `[M,N]`.
-pub fn glm53_bf16_gemm(weights: &Array, x: &Array, stream: &Stream) -> Option<Array> {
+pub fn bf16_gemm(weights: &Array, x: &Array, stream: &Stream) -> Option<Array> {
     const TILE_N: usize = 64;
     const TILE_M: usize = 32;
     let kernel = bf16_gemm_kernel().as_ref()?;
@@ -665,24 +666,24 @@ pub fn glm53_bf16_gemm(weights: &Array, x: &Array, stream: &Stream) -> Option<Ar
     out.into_iter().next()
 }
 
-/// Fused BF16 q/k/v projection ported from ds4's decode kernel.
+/// Fused BF16 q/k/v projection ported from the reference's decode kernel.
 /// Each matrix is `[N,K]` BF16; the common input is `[1,K]` F32.
-pub fn glm53_bf16_qkv(
+pub fn bf16_qkv(
     weights_q: &Array,
     weights_k: &Array,
     weights_v: &Array,
     x: &Array,
     stream: &Stream,
 ) -> Option<(Array, Array, Array)> {
-    // ds4 only uses its fused QKV lane on M3 Ultra. Other devices perform
+    // The reference only uses its fused QKV lane on M3 Ultra. Other devices perform
     // three independent BF16 GEMVs, which benchmark better there.
     if bf16_projection_nsg(x) != 4 {
         return None;
     }
-    glm53_bf16_qkv_inner(weights_q, weights_k, weights_v, x, stream)
+    bf16_qkv_inner(weights_q, weights_k, weights_v, x, stream)
 }
 
-pub(super) fn glm53_bf16_qkv_inner(
+pub(super) fn bf16_qkv_inner(
     weights_q: &Array,
     weights_k: &Array,
     weights_v: &Array,

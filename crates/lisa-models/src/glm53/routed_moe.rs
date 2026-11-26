@@ -23,7 +23,7 @@ pub struct Spec {
     pub capture: bool,
     pub preserve: bool,
 }
-/// DS4 shape gate for grouped expert prefill.
+/// The reference shape gate for grouped expert prefill.
 pub const GROUPED_MOE_MIN_ROWS: usize = 96;
 impl Spec {
     pub fn rows(&self) -> usize {
@@ -38,8 +38,8 @@ impl Spec {
     ) -> bool {
         rows >= GROUPED_MOE_MIN_ROWS
             && top_k == 8
-            && intermediate % 64 == 0
-            && hidden % 128 == 0
+            && intermediate.is_multiple_of(64)
+            && hidden.is_multiple_of(128)
             && enabled.unwrap_or(rows >= GROUPED_MOE_MIN_ROWS)
     }
     pub fn fused_down(&self) -> bool {
@@ -377,10 +377,10 @@ impl Request {
                     (value, Some(slots))
                 };
                 let mut out = vec![value];
-                if s.capture || shadow {
-                    if let Some(slots) = slots {
-                        out.push(slots);
-                    }
+                if (s.capture || shadow)
+                    && let Some(slots) = slots
+                {
+                    out.push(slots);
                 }
                 out
             }
@@ -408,7 +408,7 @@ impl GroupedRouter {
         anyhow::ensure!(
             self.groups > 0
                 && e > 0
-                && e % self.groups == 0
+                && e.is_multiple_of(self.groups)
                 && bias.len() == e
                 && self.selected_groups > 0
                 && self.selected_groups <= self.groups

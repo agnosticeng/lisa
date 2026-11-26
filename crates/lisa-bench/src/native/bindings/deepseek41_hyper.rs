@@ -2,11 +2,10 @@
 use crate::core::gguf_resident::ResidentWeights;
 use anyhow::Result;
 use lisa_metal::{Array, Stream, device::MetalDevice};
-use lisa_models::deepseek41::hyper as model;
-pub type Input = lisa_engine::bindings::deepseek41_hyper::Input<Array>;
-pub struct Hc(lisa_engine::bindings::deepseek41_hyper::Hc<MetalDevice>);
+pub type Input = lisa_engine::bindings::deepseek41::hyper::Input<Array>;
+pub struct Hc(lisa_engine::bindings::deepseek41::hyper::Hc<MetalDevice>);
 impl std::ops::Deref for Hc {
-    type Target = lisa_engine::bindings::deepseek41_hyper::Hc<MetalDevice>;
+    type Target = lisa_engine::bindings::deepseek41::hyper::Hc<MetalDevice>;
     fn deref(&self) -> &Self::Target {
         &self.0
     }
@@ -18,7 +17,7 @@ impl Hc {
         kind: &str,
         stream: &Stream,
     ) -> Result<Self> {
-        Ok(Self(lisa_engine::bindings::deepseek41_hyper::Hc::load(
+        Ok(Self(lisa_engine::bindings::deepseek41::hyper::Hc::load(
             &**weights,
             layer,
             kind,
@@ -31,16 +30,16 @@ impl Hc {
         weights: Vec<Array>,
         stream: &Stream,
     ) -> Result<Self> {
-        Ok(Self(lisa_engine::bindings::deepseek41_hyper::Hc::bound(
+        Ok(Self(lisa_engine::bindings::deepseek41::hyper::Hc::bound(
             matrix,
             weights,
             &MetalDevice::on_stream(stream),
         )?))
     }
 }
-pub struct ResidualPlans(lisa_engine::bindings::deepseek41_hyper::ResidualPlans<MetalDevice>);
+pub struct ResidualPlans(lisa_engine::bindings::deepseek41::hyper::ResidualPlans<MetalDevice>);
 impl std::ops::Deref for ResidualPlans {
-    type Target = lisa_engine::bindings::deepseek41_hyper::ResidualPlans<MetalDevice>;
+    type Target = lisa_engine::bindings::deepseek41::hyper::ResidualPlans<MetalDevice>;
     fn deref(&self) -> &Self::Target {
         &self.0
     }
@@ -48,7 +47,7 @@ impl std::ops::Deref for ResidualPlans {
 impl ResidualPlans {
     pub fn new(stream: &Stream) -> Result<Self> {
         Ok(Self(
-            lisa_engine::bindings::deepseek41_hyper::ResidualPlans::new(&MetalDevice::on_stream(
+            lisa_engine::bindings::deepseek41::hyper::ResidualPlans::new(&MetalDevice::on_stream(
                 stream,
             ))?,
         ))

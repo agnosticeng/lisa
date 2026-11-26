@@ -19,12 +19,12 @@ fn is_prime(value: usize) -> bool {
     if value < 2 {
         return false;
     }
-    if value % 2 == 0 {
+    if value.is_multiple_of(2) {
         return value == 2;
     }
     let mut d: usize = 3;
-    while d.checked_mul(d).map_or(false, |dd| dd <= value) {
-        if value % d == 0 {
+    while d.checked_mul(d).is_some_and(|dd| dd <= value) {
+        if value.is_multiple_of(d) {
             return false;
         }
         d += 2;
@@ -144,6 +144,48 @@ impl NgramConstants {
     }
 }
 
+impl NgramConstants {
+    /// Request rows share a rectangular token window; previous histories may
+    /// have different lengths. The hash law is applied independently per row.
+    pub fn batch_ids(
+        &self,
+        ids: &[Vec<i64>],
+        history: &[Vec<i64>],
+        eos: i64,
+        size: usize,
+        heads: usize,
+    ) -> anyhow::Result<Vec<i64>> {
+        anyhow::ensure!(
+            !ids.is_empty() && ids.len() == history.len(),
+            "invalid n-gram batch"
+        );
+        let count = ids[0].len();
+        anyhow::ensure!(
+            count > 0 && ids.iter().all(|row| row.len() == count),
+            "invalid n-gram token window"
+        );
+        let mut out = Vec::new();
+        for (row, previous) in ids.iter().zip(history) {
+            let mut tokens = previous.clone();
+            tokens.extend_from_slice(row);
+            out.extend(self.row_ids(&tokens, count, eos, size, heads));
+        }
+        Ok(out)
+    }
+}
+/// Physical layout of one original affine n-gram shard, never requantized.
+pub fn table_rows(weight: &[i32], scales: &[i32], biases: &[i32]) -> anyhow::Result<usize> {
+    anyhow::ensure!(
+        weight.len() == 2
+            && weight[0] > 0
+            && weight[1] == 20
+            && scales == [weight[0], 5]
+            && biases == scales,
+        "invalid n-gram affine storage geometry"
+    );
+    Ok(weight[0] as usize)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,46 +252,4 @@ mod tests {
         };
         assert_eq!(c.row_ids(&[2, 3], 2, 0, 3, 1), [5, 16, 3, 10]);
     }
-}
-
-impl NgramConstants {
-    /// Request rows share a rectangular token window; previous histories may
-    /// have different lengths. The hash law is applied independently per row.
-    pub fn batch_ids(
-        &self,
-        ids: &[Vec<i64>],
-        history: &[Vec<i64>],
-        eos: i64,
-        size: usize,
-        heads: usize,
-    ) -> anyhow::Result<Vec<i64>> {
-        anyhow::ensure!(
-            !ids.is_empty() && ids.len() == history.len(),
-            "invalid n-gram batch"
-        );
-        let count = ids[0].len();
-        anyhow::ensure!(
-            count > 0 && ids.iter().all(|row| row.len() == count),
-            "invalid n-gram token window"
-        );
-        let mut out = Vec::new();
-        for (row, previous) in ids.iter().zip(history) {
-            let mut tokens = previous.clone();
-            tokens.extend_from_slice(row);
-            out.extend(self.row_ids(&tokens, count, eos, size, heads));
-        }
-        Ok(out)
-    }
-}
-/// Physical layout of one original affine n-gram shard, never requantized.
-pub fn table_rows(weight: &[i32], scales: &[i32], biases: &[i32]) -> anyhow::Result<usize> {
-    anyhow::ensure!(
-        weight.len() == 2
-            && weight[0] > 0
-            && weight[1] == 20
-            && scales == [weight[0], 5]
-            && biases == scales,
-        "invalid n-gram affine storage geometry"
-    );
-    Ok(weight[0] as usize)
 }

@@ -33,6 +33,8 @@ pub struct Plan {
     pub ragged: bool,
     pub selection: Option<Selection>,
     pub block_kernel: bool,
+    pub serial_capture: bool,
+    pub selection_budget: usize,
 }
 pub fn use_indexer_tape(ragged: bool, indexer_ok: bool) -> bool {
     !ragged && indexer_ok
@@ -170,7 +172,20 @@ impl Plan {
             k = output[2];
             v = output[3];
         }
-        let out = if self.ragged {
+        let out = if self.serial_capture {
+            ensure!(
+                !self.ragged,
+                "captured Qwen4 attention does not support ragged masks"
+            );
+            if self.selection.is_none() {
+                p.op(
+                    T::AttentionSerialCausal { scale: self.scale },
+                    vec![q, k, v],
+                )
+            } else {
+                self.captured_sparse_attention(&mut p, q, k, v, sparse_slot)?
+            }
+        } else if self.ragged {
             p.op(
                 T::Attention {
                     scale: self.scale,
@@ -216,6 +231,7 @@ impl Plan {
                 let causal = p.op(T::Compare(C::GreaterEqual), vec![left, right]);
                 let causal = p.reshape(causal, &[1, s, total]);
                 let mask = p.op(T::LogicalAnd, vec![causal, keep]);
+                let mask = p.reshape(mask, &[1, 1, s, total]);
                 p.op(
                     T::Attention {
                         scale: self.scale,
@@ -242,7 +258,89 @@ impl Plan {
         let output = linear(&mut p, gated, 11, self.quant[3]);
         let mut outputs = vec![output];
         outputs.extend(storage);
-        Ok(p.finish(outputs)?.graph)
+        let graph = p.finish(outputs)?.graph;
+        Ok(if self.serial_capture {
+            graph.with_serial_affine(false)
+        } else {
+            graph
+        })
+    }
+
+    /// Preserve each serial query's visible KV length and dense/sparse boundary.
+    /// Sparse attention has no independent-prefix operation, so only its read
+    /// stage is unrolled; projections and cache writes remain shared.
+    fn captured_sparse_attention(
+        &self,
+        p: &mut Build<'_>,
+        q: V,
+        k: V,
+        v: V,
+        slot: usize,
+    ) -> Result<V> {
+        let selection = self.selection.as_ref().unwrap();
+        ensure!(
+            self.batch == 1,
+            "captured sparse attention requires one stream"
+        );
+        let use_blocks = self.block_kernel
+            && self.heads == 24
+            && self.key_heads == 2
+            && self.width == 256
+            && selection.width == 512;
+        let keep = if use_blocks {
+            None
+        } else {
+            Some(dense_keep(p, self.rows, selection, slot)?)
+        };
+        let mut rows = Vec::with_capacity(self.rows as usize);
+        for row in 0..self.rows {
+            let offset = self.offset + row as usize;
+            let visible = (offset + 1) as i32;
+            let query = p.slice(q, 2, row, row + 1);
+            let query = p.contiguous(query);
+            let keys = p.slice(k, 2, 0, visible);
+            let values = p.slice(v, 2, 0, visible);
+            let out = if offset < self.selection_budget {
+                p.op(
+                    T::Attention {
+                        scale: self.scale,
+                        mask: AttentionMask::Causal,
+                    },
+                    vec![query, keys, values],
+                )
+            } else if use_blocks && offset >= 2048 {
+                let ids = p.slice(V::Input(slot), 1, row, row + 1);
+                let ids = p.reshape(ids, &[1, 512]);
+                let valid = p.slice(V::Input(slot + 1), 1, row, row + 1);
+                let valid = p.reshape(valid, &[1, 512]);
+                p.graph.one(
+                    Kernel::BlockAttention(A::Attend {
+                        offset: offset as i32,
+                        total: visible,
+                        scale: self.scale,
+                    }),
+                    vec![query, keys, values, ids, valid],
+                )
+            } else {
+                let keep = match keep {
+                    Some(keep) => keep,
+                    None => dense_keep(p, self.rows, selection, slot)?,
+                };
+                let mask = p.slice(keep, 1, row, row + 1);
+                let mask = p.slice(mask, 2, 0, visible);
+                let mask = p.contiguous(mask);
+                let mask = p.reshape(mask, &[1, 1, 1, visible]);
+                p.op(
+                    T::Attention {
+                        scale: self.scale,
+                        mask: AttentionMask::Tensor,
+                    },
+                    vec![query, keys, values, mask],
+                )
+            };
+            rows.push(out);
+        }
+        Ok(p.concat(rows, 2))
     }
 }
 fn dense_keep(p: &mut Build<'_>, s: i32, sel: &Selection, slot: usize) -> Result<V> {

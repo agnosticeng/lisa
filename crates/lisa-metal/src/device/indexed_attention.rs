@@ -30,14 +30,14 @@ const U32: TensorConstraint = TensorConstraint {
 // representation is opaque to arithmetic. Bind it as F16 without conversion.
 pub(super) fn capabilities() -> Vec<KernelCapability> {
     use IndexedAttentionKind as K;
-    let cap = |kind, inputs, mutations| KernelCapability {
+    let cap = |kind, inputs, mutations: &'static [usize]| KernelCapability {
         kind: KernelKind::IndexedAttention(kind),
         law: NumericalLaw::IndexedAttentionV1,
         inputs,
         variadic: false,
         shape: ShapeRelation::TensorOperation,
         encoding: None,
-        workspace: if mutations == &[] {
+        workspace: if mutations.is_empty() {
             Workspace::ProviderManaged
         } else {
             Workspace::CallerOutputs { inputs: mutations }

@@ -1,30 +1,30 @@
-//! Moe operations with the pinned DS4 arithmetic.
+//! Moe operations with the pinned reference arithmetic.
 use super::*;
 
-
 pub(super) const MOE_GATHER_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/moe_gather.metal");
+    crate::kernel_source!("moe/moe_gather.metal");
 pub(super) const MOE_PAIR_SWIGLU_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/moe_pair_swiglu.metal");
+    crate::kernel_source!("moe/moe_pair_swiglu.metal");
 pub(super) const MOE_GATHER_ADDR_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/moe_gather_addr.metal");
+    crate::kernel_source!("moe/moe_gather_addr.metal");
 pub(super) const MOE_GATHER_ADDR_DS4_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/moe_gather_addr_ds4.metal");
+    crate::kernel_source!("moe/moe_gather_addr_ds4.metal");
 pub(super) const MOE_GATHER_SUM8_ADDR_DS4_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/moe_gather_sum8_addr_ds4.metal");
+    crate::kernel_source!("moe/moe_gather_sum8_addr_ds4.metal");
 pub(super) const MOE_GATHER_SUM8_ADDR_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/moe_gather_sum8_addr.metal");
+    crate::kernel_source!("moe/moe_gather_sum8_addr.metal");
 pub(super) const MOE_PAIR_SWIGLU_ADDR_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/moe_pair_swiglu_addr.metal");
+    crate::kernel_source!("moe/moe_pair_swiglu_addr.metal");
 pub(super) const MOE_EXPERT_ROUTE_MAP_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/moe_expert_route_map.metal");
+    crate::kernel_source!("moe/moe_expert_route_map.metal");
 pub(super) const MOE_MAPPED_RESOURCE_HELPER: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/moe_mapped_resource.metal");
+    crate::kernel_source!("moe/moe_mapped_resource.metal");
 pub(super) const MOE_PAIR_SWIGLU_MAPPED_BODY: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/moe_pair_swiglu_mapped.metal");
+    crate::kernel_source!("moe/moe_pair_swiglu_mapped.metal");
 pub(super) const MOE_GATHER_SUM8_MAPPED_BODY: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/moe_gather_sum8_mapped.metal");
-pub(super) const MOE_SUM8_SOURCE: &crate::shader_pack::Source = crate::kernel_source!("glm53/moe_sum8.metal");
+    crate::kernel_source!("moe/moe_gather_sum8_mapped.metal");
+pub(super) const MOE_SUM8_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("moe/moe_sum8.metal");
 pub(super) const MOE_MAPPED_RESOURCE_INPUTS: [&str; 16] = [
     "resource_00",
     "resource_01",
@@ -50,7 +50,7 @@ pub(super) const MOE_MAPPED_RESOURCE_INPUTS: [&str; 16] = [
 /// The high byte of each Int64 entry stores the resource slot; the lower 56
 /// bits store the byte offset into that encoder-bound MTLBuffer.
 pub fn moe_mapped_resource_table(fields: &[&Array]) -> Option<(Array, Vec<Array>)> {
-    if fields.is_empty() || fields.len() % 9 != 0 {
+    if fields.is_empty() || !fields.len().is_multiple_of(9) {
         return None;
     }
 
@@ -373,7 +373,7 @@ pub fn moe_expert_route_map(
     // which bounds each expert's route list to n_tokens entries.
     let route_id_count = n_tokens.checked_mul(n_experts)?;
     let max_work_items = selected.dim(0).checked_div(tile_size as i32)? as usize
-        + usize::from(selected.dim(0) as usize % tile_size != 0)
+        + usize::from(!(selected.dim(0) as usize).is_multiple_of(tile_size))
         + n_experts;
     let work_item_values = max_work_items.checked_mul(2)?;
     if work_item_values > i32::MAX as usize {
@@ -544,11 +544,11 @@ pub fn moe_pair_swiglu_addr(
     let in_vec_size = x.dim(1) as usize;
     let n_experts = address_table.dim(0) as usize / 9;
     if n_slots == 0
-        || n_slots % slots_per_token != 0
+        || !n_slots.is_multiple_of(slots_per_token)
         || x.dim(0) != (n_slots / slots_per_token) as i32
         || weights.dim(0) as usize != n_slots
         || in_vec_size == 0
-        || in_vec_size % 512 != 0
+        || !in_vec_size.is_multiple_of(512)
         || n_experts == 0
     {
         return None;
@@ -626,7 +626,7 @@ pub(super) fn padded_moe_resource_inputs(resources: &[Array]) -> Option<Vec<Arra
 
 /// Fused gate/up SwiGLU with MLX expert buffers bound as ordinary Metal
 /// resources. The table stores one packed resource slot and byte offset for
-/// each of the nine expert fields. This mirrors ds4's normal encoder bindings
+/// each of the nine expert fields. This mirrors the reference's normal encoder bindings
 /// and avoids both raw GPU-address dereferences and selected-ID readback.
 pub fn moe_pair_swiglu_mapped(
     resource_table: &Array,
@@ -662,11 +662,11 @@ pub fn moe_pair_swiglu_mapped(
     let in_vec_size = x.dim(1) as usize;
     let n_experts = resource_table.dim(0) as usize / 9;
     if n_slots == 0
-        || n_slots % slots_per_token != 0
+        || !n_slots.is_multiple_of(slots_per_token)
         || x.dim(0) != (n_slots / slots_per_token) as i32
         || weights.dim(0) as usize != n_slots
         || in_vec_size == 0
-        || in_vec_size % 512 != 0
+        || !in_vec_size.is_multiple_of(512)
         || n_experts == 0
     {
         return None;
@@ -744,7 +744,7 @@ pub fn moe_gather_qmv_addr(
         || x.rank() != 2
         || !matches!(x.dtype(), Dtype::Float32 | Dtype::Float16)
         || out_rows == 0
-        || out_rows % 8 != 0
+        || !out_rows.is_multiple_of(8)
     {
         return None;
     }
@@ -754,7 +754,7 @@ pub fn moe_gather_qmv_addr(
     if n_slots == 0
         || x.dim(0) as usize != if x_per_slot { n_slots } else { 1 }
         || in_vec_size == 0
-        || in_vec_size % 512 != 0
+        || !in_vec_size.is_multiple_of(512)
         || n_experts == 0
     {
         return None;
@@ -815,7 +815,7 @@ pub fn moe_gather_qmv_addr(
     result.ok()?.into_iter().next()
 }
 
-/// Q2 affine per-route down projection with DS4's exact one-token arithmetic
+/// Q2 affine per-route down projection with the reference's exact one-token arithmetic
 /// schedule. Every output/route pair uses one SIMD group, whose lanes visit
 /// `k = lane + 32n`, FMA-accumulate in order, then perform one SIMD reduction.
 pub fn moe_gather_qmv_addr_ds4(
@@ -851,7 +851,7 @@ pub fn moe_gather_qmv_addr_ds4(
         || n_slots > i32::MAX as usize
         || x.dim(0) as usize != if x_per_slot { n_slots } else { 1 }
         || in_vec_size == 0
-        || in_vec_size % 128 != 0
+        || !in_vec_size.is_multiple_of(128)
         || in_vec_size > i32::MAX as usize
         || n_experts == 0
         || n_experts > i32::MAX as usize
@@ -898,8 +898,8 @@ pub fn moe_gather_qmv_addr_ds4(
     result.ok()?.into_iter().next()
 }
 
-/// DS4-exact Q2 down projection for eight routed experts in one dispatch.
-/// Each SIMD group computes one expert's DS4 affine matvec for four output
+/// reference-exact Q2 down projection for eight routed experts in one dispatch.
+/// Each SIMD group computes one expert's reference affine matvec for four output
 /// rows; the group leader adds the eight reduced values in route order.
 pub fn moe_gather_qmv_sum8_addr_ds4(
     address_table: &Array,
@@ -935,7 +935,7 @@ pub fn moe_gather_qmv_sum8_addr_ds4(
     let in_vec_size = x.dim(1) as usize;
     let n_experts = address_table.dim(0) as usize / 9;
     if in_vec_size == 0
-        || in_vec_size % 128 != 0
+        || !in_vec_size.is_multiple_of(128)
         || in_vec_size > i32::MAX as usize
         || n_experts == 0
         || n_experts > i32::MAX as usize
@@ -1001,7 +1001,7 @@ pub fn moe_gather_qmv_sum8_addr_ds4(
     result.ok()?.into_iter().next()
 }
 
-/// Selected-expert QMV for eight routed rows per token. This follows ds4's
+/// Selected-expert QMV for eight routed rows per token. This follows the reference's
 /// down-projection schedule: each output tile visits expert slots in order,
 /// keeps their F32 reductions local, and writes one `[token, out_rows]` row.
 /// `x` contains one already route-weighted input row per selected expert.
@@ -1110,7 +1110,7 @@ pub(super) fn moe_gather_qmv_sum8_addr_impl(
         || x.rank() != 2
         || !matches!(x.dtype(), Dtype::Float32 | Dtype::Float16)
         || out_rows == 0
-        || out_rows % 8 != 0
+        || !out_rows.is_multiple_of(8)
     {
         return None;
     }
@@ -1118,10 +1118,10 @@ pub(super) fn moe_gather_qmv_sum8_addr_impl(
     let in_vec_size = x.dim(1) as usize;
     let n_experts = address_table.dim(0) as usize / 9;
     if n_slots == 0
-        || n_slots % 8 != 0
+        || !n_slots.is_multiple_of(8)
         || x.dim(0) as usize != n_slots
         || in_vec_size == 0
-        || in_vec_size % 512 != 0
+        || !in_vec_size.is_multiple_of(512)
         || n_experts == 0
     {
         return None;
@@ -1154,7 +1154,7 @@ pub(super) fn moe_gather_qmv_sum8_addr_impl(
             || shared_x.dtype() != Dtype::Float32
             || shared_x.dim(0) != n_tokens as i32
             || shared_in == 0
-            || shared_in % 256 != 0
+            || !shared_in.is_multiple_of(256)
             || shared_w.rank() != 2
             || shared_w.dtype() != Dtype::Uint32
             || shared_w.dim(0) != out_rows as i32
@@ -1256,7 +1256,7 @@ pub(super) fn moe_gather_qmv_sum8_addr_impl(
 }
 
 /// Selected-expert sum8 down projection with each MLX backing buffer supplied
-/// as an ordinary encoder input, matching ds4's normal resource binding.
+/// as an ordinary encoder input, matching the reference's normal resource binding.
 pub fn moe_gather_qmv_sum8_mapped(
     resource_table: &Array,
     x: &Array,
@@ -1286,10 +1286,10 @@ pub fn moe_gather_qmv_sum8_mapped(
     let in_vec_size = x.dim(1) as usize;
     let n_experts = resource_table.dim(0) as usize / 9;
     if n_slots == 0
-        || n_slots % 8 != 0
+        || !n_slots.is_multiple_of(8)
         || x.dim(0) as usize != n_slots
         || in_vec_size == 0
-        || in_vec_size % 128 != 0
+        || !in_vec_size.is_multiple_of(128)
         || in_vec_size > i32::MAX as usize
         || n_experts == 0
         || n_experts > i32::MAX as usize
@@ -1346,7 +1346,7 @@ pub fn moe_gather_qmv_sum8_mapped(
 }
 
 /// Reduce eight ordered routed-expert rows per token into one F32 row. This
-/// follows ds4's `kernel_dsv4_moe_sum8_f32` and replaces seven separate tensor
+/// follows the reference's `kernel_dsv4_moe_sum8_f32` and replaces seven separate tensor
 /// additions after the down projections.
 pub fn moe_sum8(experts: &Array, n_tokens: usize, width: usize, stream: &Stream) -> Option<Array> {
     let kernel = moe_sum8_kernel().as_ref()?;
@@ -1406,7 +1406,12 @@ pub fn moe_gather_qmv(
     }
     let n_slots = selected.dim(0) as usize;
     let k = x.dim(x.rank() as i32 - 1) as usize;
-    if n_slots == 0 || out_rows == 0 || out_rows % 8 != 0 || k == 0 || k % 512 != 0 {
+    if n_slots == 0
+        || out_rows == 0
+        || !out_rows.is_multiple_of(8)
+        || k == 0
+        || !k.is_multiple_of(512)
+    {
         return None;
     }
     let template = [TemplateArg::Dtype("T", dtype)];
@@ -1438,10 +1443,10 @@ pub fn moe_gather_qmv(
             return None;
         }
     };
-    Some(out.into_iter().next()?)
+    out.into_iter().next()
 }
 
-/// Gathered gate/up projection fused with ds4's clamped SwiGLU and route
+/// Gathered gate/up projection fused with the reference's clamped SwiGLU and route
 /// weighting. MLX packed Q2 weights remain in their native layout; `selected`
 /// and `weights` are read per slot on the GPU. Returns `[n_slots, mid_dim]`.
 pub fn moe_pair_swiglu(
@@ -1477,10 +1482,10 @@ pub fn moe_pair_swiglu(
     let n_slots = selected.dim(0) as usize;
     let in_vec_size = x.dim(1) as usize;
     if n_slots == 0
-        || n_slots % slots_per_token != 0
+        || !n_slots.is_multiple_of(slots_per_token)
         || x.dim(0) != (n_slots / slots_per_token) as i32
         || in_vec_size == 0
-        || in_vec_size % 512 != 0
+        || !in_vec_size.is_multiple_of(512)
         || pools_s.dim(1) != (2 * mid_dim) as i32
         || pools_s.dim(2) != (in_vec_size / 128) as i32
     {

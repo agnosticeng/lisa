@@ -5,5 +5,7 @@ pub use lisa_engine::vision::{
 };
 mod context;
 pub use context::Vision;
+#[cfg(test)]
 pub mod glm;
+#[cfg(test)]
 pub mod qwen;

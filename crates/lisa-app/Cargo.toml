@@ -20,3 +20,10 @@ objc2-foundation = { workspace = true, features = ["NSDate"] }
 name = "lisa_app"
 crate-type = ["rlib", "staticlib"]
 path = "src/lib.rs"
+
+[dev-dependencies]
+lisa-backend.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true

@@ -1,6 +1,5 @@
 #![cfg(test)]
 //! Frozen pre-migration compositor. Only primitive adapter names changed.
-#![allow(dead_code)]
 use crate::bindings::glm53_attention_mode::*;
 use lisa_metal::kernels::sparse::kernels::{self as native, dsa_indexed_lora_wide_native};
 use lisa_metal::{Array, Dtype, Stream};
@@ -92,255 +91,11 @@ fn dsa_indexed_decode_fused(
         glm53_dsa_native_enabled() && g == 64,
     )
 }
-/// GLM DSA attention in absorbed MLA form, reading the packed MLX affine
-/// `kv_b` weights directly. `q=[B,heads,T,256]`, `kv_weight=[32768,128]`
-/// packed U32 (8-bit, 512 inputs), scales/biases `[32768,8]` F32,
-/// `compact_latents=[B,tc,512]` F16, and `selected=[B,T,M]` absolute token
-/// ids. Returns `[B,heads,T,256]` F32. Native single-row decode fuses attention
-/// and value projection through 2051 selected rows; longer private MTP windows
-/// use DS4's staged indexed-lora kernel followed by its value projection.
-pub fn dsa_absorbed_attention(
-    q: &Array,
-    kv_weight: &Array,
-    kv_scales: &Array,
-    kv_biases: &Array,
-    group_size: usize,
-    compact_latents: &Array,
-    selected: &Array,
-    scale: f32,
-    stream: &Stream,
-) -> Option<Array> {
-    dsa_absorbed_attention_stages_inner(
-        q,
-        kv_weight,
-        kv_scales,
-        kv_biases,
-        group_size,
-        compact_latents,
-        Some(selected),
-        0,
-        scale,
-        stream,
-        false,
-        false,
-        false,
-        false,
-    )
-    .map(|(out, _, _)| out)
-}
 
-/// Explicit fused one-token decode path. The fused schedule is separate from
-/// DS4's staged MLX-affine path and must only be selected by callers that have
-/// validated its numerics for their weight representation.
-#[allow(clippy::too_many_arguments)]
-pub fn dsa_absorbed_attention_decode(
-    q: &Array,
-    kv_weight: &Array,
-    kv_scales: &Array,
-    kv_biases: &Array,
-    group_size: usize,
-    compact_latents: &Array,
-    selected: Option<&Array>,
-    selected_valid_prefix: usize,
-    scale: f32,
-    stream: &Stream,
-) -> Option<Array> {
-    dsa_absorbed_attention_stages_inner(
-        q,
-        kv_weight,
-        kv_scales,
-        kv_biases,
-        group_size,
-        compact_latents,
-        selected,
-        selected_valid_prefix,
-        scale,
-        stream,
-        false,
-        true,
-        false,
-        false,
-    )
-    .map(|(out, _, _)| out)
-}
-
-/// Capture the intermediate weighted latent from the native fused decode
-/// kernel. This diagnostic entry point adds one output buffer and is never
-/// used by production inference.
-#[allow(clippy::too_many_arguments)]
-pub fn dsa_absorbed_attention_decode_capture(
-    q: &Array,
-    kv_weight: &Array,
-    kv_scales: &Array,
-    kv_biases: &Array,
-    group_size: usize,
-    compact_latents: &Array,
-    selected: Option<&Array>,
-    selected_valid_prefix: usize,
-    scale: f32,
-    stream: &Stream,
-) -> Option<(Array, Array)> {
-    dsa_absorbed_attention_stages_inner(
-        q,
-        kv_weight,
-        kv_scales,
-        kv_biases,
-        group_size,
-        compact_latents,
-        selected,
-        selected_valid_prefix,
-        scale,
-        stream,
-        false,
-        true,
-        true,
-        false,
-    )
-    .and_then(|(out, _, fused_lora)| Some((out, fused_lora?)))
-}
-
-/// DSA decode variant for selectors that guarantee a live-cache prefix in
-/// every selected row. Entries at and after `selected_valid_prefix` remain
-/// bounds-checked, so the causal-tail padding can use `-1`/`UINT32_MAX`.
-/// Prefill and arbitrary selections should use [`dsa_absorbed_attention`].
-#[allow(clippy::too_many_arguments)]
-pub fn dsa_absorbed_attention_with_valid_prefix(
-    q: &Array,
-    kv_weight: &Array,
-    kv_scales: &Array,
-    kv_biases: &Array,
-    group_size: usize,
-    compact_latents: &Array,
-    selected: &Array,
-    selected_valid_prefix: usize,
-    scale: f32,
-    stream: &Stream,
-    prefill_encoder_boundaries: bool,
-) -> Option<Array> {
-    dsa_absorbed_attention_stages_inner(
-        q,
-        kv_weight,
-        kv_scales,
-        kv_biases,
-        group_size,
-        compact_latents,
-        Some(selected),
-        selected_valid_prefix,
-        scale,
-        stream,
-        false,
-        false,
-        false,
-        prefill_encoder_boundaries,
-    )
-    .map(|(out, _, _)| out)
-}
-
-/// Dense-equivalent one-token DSA decode with contiguous cache rows supplied
-/// implicitly. This avoids uploading `[0..tc)` as a selected-ID tensor.
-#[allow(clippy::too_many_arguments)]
-pub fn dsa_absorbed_attention_dense(
-    q: &Array,
-    kv_weight: &Array,
-    kv_scales: &Array,
-    kv_biases: &Array,
-    group_size: usize,
-    compact_latents: &Array,
-    scale: f32,
-    stream: &Stream,
-) -> Option<Array> {
-    dsa_absorbed_attention_stages_inner(
-        q,
-        kv_weight,
-        kv_scales,
-        kv_biases,
-        group_size,
-        compact_latents,
-        None,
-        0,
-        scale,
-        stream,
-        false,
-        false,
-        false,
-        false,
-    )
-    .map(|(out, _, _)| out)
-}
-
-/// Dense compact-cache attention with QK-lowrank and attention-weighted latent
-/// intermediates returned for non-perturbing differential capture. At short
-/// windows this uses the same dispatch sequence as `dsa_absorbed_attention_dense`;
-/// the capture flag only prevents the long-window fused decode branch.
-#[allow(clippy::too_many_arguments)]
-pub fn dsa_absorbed_attention_dense_stages(
-    q: &Array,
-    kv_weight: &Array,
-    kv_scales: &Array,
-    kv_biases: &Array,
-    group_size: usize,
-    compact_latents: &Array,
-    scale: f32,
-    stream: &Stream,
-) -> Option<(Array, Array, Array)> {
-    dsa_absorbed_attention_stages_inner(
-        q,
-        kv_weight,
-        kv_scales,
-        kv_biases,
-        group_size,
-        compact_latents,
-        None,
-        0,
-        scale,
-        stream,
-        true,
-        false,
-        false,
-        false,
-    )
-    .and_then(|(out, q_low, lora)| Some((out, q_low?, lora?)))
-}
-
-/// Same DSA path with the QK low-rank and attention-weighted latent outputs
-/// returned for differential capture. Runtime callers should use
-/// `dsa_absorbed_attention` unless they need those intermediate tensors.
-#[allow(clippy::too_many_arguments)]
-pub fn dsa_absorbed_attention_stages(
-    q: &Array,
-    kv_weight: &Array,
-    kv_scales: &Array,
-    kv_biases: &Array,
-    group_size: usize,
-    compact_latents: &Array,
-    selected: &Array,
-    scale: f32,
-    stream: &Stream,
-    prefill_encoder_boundaries: bool,
-) -> Option<(Array, Array, Array)> {
-    dsa_absorbed_attention_stages_inner(
-        q,
-        kv_weight,
-        kv_scales,
-        kv_biases,
-        group_size,
-        compact_latents,
-        Some(selected),
-        0,
-        scale,
-        stream,
-        true,
-        false,
-        false,
-        prefill_encoder_boundaries,
-    )
-    .and_then(|(out, q_low, lora)| Some((out, q_low?, lora?)))
-}
-
-/// DS4's dense-causal FlashAttention prefill path for MLX-affine DSA V-B.
+/// The reference's dense-causal FlashAttention prefill path for MLX-affine DSA V-B.
 /// It keeps the query projection and F16 compact cache separate, runs the
 /// reference FlashAttention schedule for attention-lora, then applies the
-/// same split affine value projection as DS4.
+/// same split affine value projection as the reference.
 #[allow(clippy::too_many_arguments)]
 pub fn dsa_absorbed_attention_flash_causal_prefill_stages(
     q: &Array,
@@ -471,7 +226,7 @@ pub fn dsa_absorbed_attention_stages_inner(
     ] {
         a.eval_enqueue().ok()?;
     }
-    // DS4 switches a long private MTP window to its indexed batch-lora
+    // The reference switches a long private MTP window to its indexed batch-lora
     // kernel with n_tokens=1. Keep the already admitted shorter/batched
     // routes unchanged and reject unrelated unsupported wide layouts.
     let wide_mtp_window = requested_selected > 2051;
@@ -515,7 +270,7 @@ pub fn dsa_absorbed_attention_stages_inner(
 
     let q_low = dsa_qk_lowrank_project(&q, &kv_weight, &kv_scales, &kv_biases, group_size, stream)?;
     q_low.eval_enqueue().ok()?;
-    // DS4 indexed prefill closes the encoder after qk_low and again after
+    // The reference indexed prefill closes the encoder after qk_low and again after
     // attention plus value projection. Both remain in the same command buffer.
     if prefill_encoder_boundaries {
         stream.runtime().commands.flush_encoder();

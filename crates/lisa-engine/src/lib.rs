@@ -7,15 +7,42 @@
 //! provider construction lives at the application composition boundary.
 
 pub mod batching;
+pub mod bindings;
+pub mod cache;
 pub mod checkpoint;
+pub mod cli;
 pub mod conversation;
 pub mod core;
 pub mod decision;
 pub mod device;
 pub mod eos;
+pub mod execution;
+pub mod generation;
+pub mod image_generation;
 pub mod language;
 pub mod laya;
 pub mod loading;
+pub mod memory;
+pub mod model_binding;
+pub mod recurrent;
+pub mod sampling;
+pub mod scheduling;
+pub mod session_check;
+pub mod speculation;
+pub mod storage;
+pub mod tensor_ops;
+pub mod vision;
+pub mod weights;
+
+// Public aliases for callers using the flat module paths.
+pub use cache::{
+    attention as attention_cache, batching as cache_batching, indexer as indexer_cache,
+    prefix as prefix_cache, recurrent as recurrent_cache,
+};
+pub use conversation::cache as conversation_cache;
+pub use language::runtime as language_runtime;
+pub use sampling::sampler;
+pub use speculation::runtime as speculative_runtime;
 
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -29,7 +56,7 @@ pub fn ttft_init() {
     let _ = TTFT_T0.set(Instant::now());
 }
 
-/// One stderr milestone line for the TTFT decomposition (specs/05): phase
+/// One stderr milestone line for the TTFT decomposition: phase
 /// name plus seconds since process start. One line per phase, per process.
 pub fn ttft_mark(label: &str) {
     if let Some(t0) = TTFT_T0.get() {
@@ -43,51 +70,5 @@ pub use decision::DecisionModel;
 pub use language::LanguageModel;
 pub use loading::Loaded;
 
-pub mod generation;
-pub mod speculation;
-pub mod speculative_runtime;
-
-pub mod scheduling;
-
-pub mod weights;
-
-pub mod execution;
-
-pub mod storage;
-
-pub mod memory;
-
-pub mod indexer_cache;
-
-pub mod attention_cache;
-
-pub mod recurrent;
-
-pub mod recurrent_cache;
-
-pub mod cache;
-
-pub mod prefix_cache;
-
-pub mod sampling;
-pub mod tensor_ops;
-
-pub mod cache_batching;
-
-pub mod bindings;
-
-pub mod language_runtime;
-
-pub mod sampler;
-
-pub mod vision;
-
-pub mod image_generation;
-
-pub mod cli;
-
-pub mod model_binding;
-
-pub mod conversation_cache;
-
-pub mod session_check;
+#[cfg(test)]
+mod boundary_tests;

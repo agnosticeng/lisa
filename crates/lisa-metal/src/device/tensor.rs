@@ -18,6 +18,24 @@ const ANY: TensorConstraint = TensorConstraint {
     layout: LayoutSupport::Strided,
     alignment: 1,
 };
+/// Byte copies also move INT8 key/value rows.
+const COPYABLE: TensorConstraint = TensorConstraint {
+    dtypes: &[
+        ScalarType::Bool,
+        ScalarType::I8,
+        ScalarType::U8,
+        ScalarType::U32,
+        ScalarType::I32,
+        ScalarType::I64,
+        ScalarType::F16,
+        ScalarType::BF16,
+        ScalarType::F32,
+    ],
+    min_rank: 0,
+    max_rank: None,
+    layout: LayoutSupport::Strided,
+    alignment: 1,
+};
 const FLOATING: TensorConstraint = TensorConstraint {
     dtypes: &[ScalarType::F16, ScalarType::BF16, ScalarType::F32],
     ..ANY
@@ -99,7 +117,11 @@ pub(super) fn capabilities() -> Vec<KernelCapability> {
     ] {
         add(K::Binary(k), &[FLOATING, FLOATING], false);
     }
-    const STATE_F32: TensorConstraint = TensorConstraint { dtypes: &[ScalarType::F32], layout: LayoutSupport::RowContiguous, ..ANY };
+    const STATE_F32: TensorConstraint = TensorConstraint {
+        dtypes: &[ScalarType::F32],
+        layout: LayoutSupport::RowContiguous,
+        ..ANY
+    };
     add(K::Mamba3Mimo, &[STATE_F32; 8], false);
     add(K::GeodesicResidual, &[STATE_F32; 4], false);
     add(K::Matmul, &[FLOATING, FLOATING], false);
@@ -158,6 +180,19 @@ pub(super) fn capabilities() -> Vec<KernelCapability> {
     add(K::LogicalOr, &[BOOL, BOOL], false);
     add(K::PutAlong, &[BOOL, INTEGER, BOOL], false);
     add(K::Rotary, &[FLOATING], false);
+    add(
+        K::RotaryAt,
+        &[
+            FLOATING,
+            TensorConstraint {
+                dtypes: &[ScalarType::I32],
+                min_rank: 1,
+                max_rank: Some(1),
+                ..ANY
+            },
+        ],
+        false,
+    );
     add(K::Sum, &[FLOATING], false);
     add(K::SumAll, &[FLOATING], false);
     add(K::MaxAll, &[FLOATING], false);
@@ -195,6 +230,11 @@ pub(super) fn capabilities() -> Vec<KernelCapability> {
         add(K::Attention(mask), &[FLOATING, FLOATING, FLOATING], false);
     }
     add(
+        K::AttentionSerialCausal,
+        &[FLOATING, FLOATING, FLOATING],
+        false,
+    );
+    add(
         K::Attention(AttentionMask::Tensor),
         &[FLOATING, FLOATING, FLOATING, MASK],
         false,
@@ -202,7 +242,16 @@ pub(super) fn capabilities() -> Vec<KernelCapability> {
     result.push(KernelCapability {
         kind: KernelKind::Tensor(K::CopySliceInto),
         law: NumericalLaw::TensorV1,
-        inputs: &[ANY, ANY],
+        inputs: &[COPYABLE, COPYABLE],
+        variadic: false,
+        shape: ShapeRelation::TensorOperation,
+        encoding: None,
+        workspace: Workspace::CallerOutputs { inputs: &[1] },
+    });
+    result.push(KernelCapability {
+        kind: KernelKind::Tensor(K::CopyTailInto),
+        law: NumericalLaw::TensorV1,
+        inputs: &[COPYABLE, COPYABLE],
         variadic: false,
         shape: ShapeRelation::TensorOperation,
         encoding: None,
@@ -248,18 +297,29 @@ pub(super) fn invoke(
     {
         return Err(Error::msg("layer normalization: incompatible affine shape"));
     }
-    if let TensorOperation::Transpose(axes) = op {
-        if axes.len() != x.rank() {
-            return Err(Error::msg("transpose: axis count differs from rank"));
-        }
+    if let TensorOperation::Transpose(axes) = op
+        && axes.len() != x.rank()
+    {
+        return Err(Error::msg("transpose: axis count differs from rank"));
     }
 
     let output = match op {
         TensorOperation::Mamba3Mimo { heads, epsilon } => {
-            let (y, state) = crate::kernels::recurrent_mimo::step(inputs, *heads as usize, f32::from_bits(*epsilon), stream)?;
+            let (y, state) = crate::kernels::recurrent_mimo::step(
+                inputs,
+                *heads as usize,
+                f32::from_bits(*epsilon),
+                stream,
+            )?;
             return Ok(Some(Outputs::Two([y, state])));
         }
-        TensorOperation::GeodesicResidual { inverse_depth } => crate::kernels::recurrent_mimo::geodesic(inputs, f32::from_bits(*inverse_depth), stream)?,
+        TensorOperation::GeodesicResidual { inverse_depth } => {
+            crate::kernels::recurrent_mimo::geodesic(
+                inputs,
+                f32::from_bits(*inverse_depth),
+                stream,
+            )?
+        }
         TensorOperation::SequentialLinear { .. }
         | TensorOperation::SequentialLayerNorm { .. }
         | TensorOperation::SequentialAttention => {
@@ -289,6 +349,28 @@ pub(super) fn invoke(
                 return Err(Error::msg("byte-copy source shape differs"));
             }
             let slice = (*start..*end).apply(&dst.t, axis as usize)?.0;
+            x.t.copy_strided_into(&slice)?;
+            dst.clone()
+        }
+        TensorOperation::CopyTailInto { axis } => {
+            let dst = inputs[1];
+            let rank = dst.rank() as i32;
+            let axis = if *axis < 0 { rank + axis } else { *axis };
+            let converts = x.dtype() == Dtype::Float32 && dst.dtype() == Dtype::Float16;
+            if axis < 0
+                || axis >= rank
+                || x.rank() != dst.rank()
+                || (x.dtype() != dst.dtype() && !converts)
+            {
+                return Err(Error::msg("invalid tail byte-copy"));
+            }
+            let start = dst.dim(axis) - x.dim(axis);
+            let mut shape = dst.shape().to_vec();
+            shape[axis as usize] = x.dim(axis);
+            if start < 0 || x.shape() != shape {
+                return Err(Error::msg("tail byte-copy source shape differs"));
+            }
+            let slice = (start..dst.dim(axis)).apply(&dst.t, axis as usize)?.0;
             x.t.copy_strided_into(&slice)?;
             dst.clone()
         }
@@ -382,6 +464,9 @@ pub(super) fn invoke(
             *offset,
             None,
         )?,
+        TensorOperation::RotaryAt { dimensions, base } => {
+            crate::fast::rope_at(x, *dimensions, false, f32::from_bits(*base), 1., inputs[1])?
+        }
         TensorOperation::SumAll => x.sum(None)?,
         TensorOperation::MaxAll => x.max(None)?,
         TensorOperation::Sum { axis, keep_dims } => x.sum_axis(*axis, *keep_dims)?,
@@ -451,6 +536,66 @@ pub(super) fn invoke(
                 None,
             )?
         }
+        TensorOperation::AttentionSerialCausal { scale } => {
+            Array::new(crate::jit::sdpa_serial_causal(
+                x.t.device(),
+                &x.t,
+                &inputs[1].t,
+                &inputs[2].t,
+                f32::from_bits(*scale),
+            )?)
+        }
     };
     Ok(Some(Outputs::One(output)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ops::indexing::IndexOp;
+
+    #[test]
+    fn tail_copy_writes_the_final_rows_of_a_strided_view() -> Result<()> {
+        let device = MetalDevice::system_default();
+        let stream = device.stream();
+        let data = (0..2 * 7 * 3).map(|i| i as f32).collect::<Vec<_>>();
+        let buffer = Array::from_slice(&data, &[2, 7, 3]);
+        // Rows 2..5 of a seven-row buffer: the tail row is buffer row 4.
+        let view = buffer.index((.., 2..5, ..));
+        let source = Array::from_slice(&[-1f32, -2., -3., -4., -5., -6.], &[2, 1, 3]);
+        let handle = device
+            .prepare(Kernel::Tensor(TensorOperation::CopyTailInto { axis: 1 }))?
+            .unwrap();
+        let written = device
+            .dispatch(&handle, &[&source, &view], &stream)?
+            .unwrap()
+            .output
+            .into_one()
+            .unwrap();
+        assert_eq!(written.shape(), [2, 3, 3]);
+        let mut expected = data.clone();
+        expected[12..15].copy_from_slice(&[-1., -2., -3.]);
+        expected[33..36].copy_from_slice(&[-4., -5., -6.]);
+        assert_eq!(device.read_f32(&buffer)?, expected);
+        let wide = Array::from_slice(&[0f32; 24], &[2, 4, 3]);
+        assert!(device.dispatch(&handle, &[&wide, &view], &stream).is_err());
+        // F32 rows fill an F16 destination with round-to-nearest-even values.
+        let cache = Array::from_slice(&data, &[2, 7, 3]).as_dtype(Dtype::Float16)?;
+        let source = Array::from_slice(&[1.0f32 / 3.0, 65504.0, -0.1, 2.5, 1e-8, -7.0], &[2, 1, 3]);
+        device
+            .dispatch(&handle, &[&source, &cache.index((.., 2..5, ..))], &stream)?
+            .unwrap();
+        let mut expected = data
+            .iter()
+            .map(|&v| half::f16::from_f32(v).to_f32())
+            .collect::<Vec<_>>();
+        for (i, &v) in [1.0f32 / 3.0, 65504.0, -0.1].iter().enumerate() {
+            expected[12 + i] = half::f16::from_f32(v).to_f32();
+        }
+        for (i, &v) in [2.5f32, 1e-8, -7.0].iter().enumerate() {
+            expected[33 + i] = half::f16::from_f32(v).to_f32();
+        }
+        assert_eq!(device.read_f32(&cache.as_dtype(Dtype::Float32)?)?, expected);
+        Ok(())
+    }
 }

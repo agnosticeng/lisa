@@ -59,8 +59,10 @@ pub trait HostAccessDevice: crate::StorageDevice {
         let bytes = self.read_bytes(tensor)?;
         anyhow::ensure!(bytes.len() % 4 == 0, "unaligned I32 readback");
         Ok(bytes
-            .chunks_exact(4)
-            .map(|b| i32::from_ne_bytes(b.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| i32::from_ne_bytes(*b))
             .collect())
     }
     /// Read F32 elements after their producer completes. Providers with a serial
@@ -73,8 +75,10 @@ pub trait HostAccessDevice: crate::StorageDevice {
         let bytes = self.read_bytes(tensor)?;
         anyhow::ensure!(bytes.len() % 4 == 0, "unaligned F32 readback");
         Ok(bytes
-            .chunks_exact(4)
-            .map(|b| f32::from_ne_bytes(b.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_ne_bytes(*b))
             .collect())
     }
     fn layout(&self, tensor: &Self::Tensor) -> TensorLayout;

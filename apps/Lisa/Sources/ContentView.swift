@@ -549,38 +549,209 @@ struct LocalImage: View {
     }
 }
 
+/// A quiet tag beside a model's name: its family and quantization (filled)
+/// or a feature (outlined).
+struct ModelTag: View {
+    let text: String
+    var outlined = false
+    var body: some View {
+        Text(text)
+            .font(.caption2.weight(.medium))
+            .lineLimit(1)
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .background {
+                let shape = RoundedRectangle(cornerRadius: 4, style: .continuous)
+                if outlined { shape.strokeBorder(.tertiary, lineWidth: 1) } else { shape.fill(.quaternary.opacity(0.6)) }
+            }
+    }
+}
+
+/// A model's tile: what it generates, text or images.
+struct ModelKindMark: View {
+    let generates: String
+    var body: some View {
+        RoundedRectangle(cornerRadius: 7, style: .continuous)
+            .fill(.quaternary.opacity(0.6))
+            .frame(width: 30, height: 30)
+            .overlay(
+                Image(systemName: generates == "image" ? "photo" : "text.bubble")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.secondary)
+            )
+            .accessibilityLabel(generates == "image" ? "Image generation" : "Text generation")
+    }
+}
+
+/// The model library's sort orders.
+enum ModelOrder: String, CaseIterable, Identifiable {
+    case name, release, type
+    var id: Self { self }
+    var title: String {
+        switch self {
+        case .name: "Name"
+        case .release: "Release"
+        case .type: "Type"
+        }
+    }
+    /// Name A to Z; newest release first; text models before image
+    /// generators. Ties fall back to the name.
+    func precedes(_ a: ModelChoice, _ b: ModelChoice) -> Bool {
+        let byName = a.name.localizedStandardCompare(b.name) == .orderedAscending
+        switch self {
+        case .name: return byName
+        case .release: return a.released != b.released ? a.released > b.released : byName
+        case .type: return a.generates != b.generates ? a.generates == "text" : byName
+        }
+    }
+}
+
 struct ModelLibrary: View {
     @EnvironmentObject private var store: AppStore
     @Environment(\.dismiss) private var dismiss
+    @State private var query = ""
+    @State private var generates = ""
+    @State private var family = ""
+    @State private var feature = ""
+    @State private var order = ModelOrder.name
+    /// One margin for the header, search, filters and rows.
+    private let margin: CGFloat = 20
+    private let mark: CGFloat = 30
     var body: some View {
-        NavigationStack {
-            List(store.models.filter(\.fits)) { model in
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack { Text(model.name).font(.headline); Spacer(); Text(model.sizeLabel).font(.caption).foregroundStyle(.secondary) }
-                    Text(model.detail).font(.subheadline).foregroundStyle(.secondary)
-                    if store.downloading == model.id { ProgressView(value: store.downloadProgress) }
-                    else if model.local {
-                        Button(store.loadedModel == model.id ? "Loaded" : "Load model") { Task { await store.loadModel(model.id); dismiss() } }
-                            .disabled(!model.fits || store.busy || store.loadedModel == model.id)
-                    } else {
-                        Button("Download") { Task { await store.download(model.id) } }
-                            .disabled(!store.ready || store.downloading != nil || !model.fits)
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("Models").font(.title2.weight(.semibold))
+                Spacer()
+                Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
+            }
+            .padding(.horizontal, margin)
+            .padding(.top, 18)
+            .padding(.bottom, 12)
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                TextField("Search", text: $query).textFieldStyle(.plain)
+                if !query.isEmpty {
+                    Button { query = "" } label: { Image(systemName: "xmark.circle.fill") }
+                        .buttonStyle(.plain).foregroundStyle(.secondary)
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(.quaternary.opacity(0.5)))
+            .padding(.horizontal, margin)
+            HStack(spacing: 10) {
+                Picker("Generates", selection: $generates) {
+                    Text("All").tag("")
+                    Text("Text").tag("text")
+                    Text("Image").tag("image")
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .fixedSize()
+                filterMenu("All families", selection: $family, options: families)
+                filterMenu("All features", selection: $feature, options: features)
+                Spacer()
+                Picker("Sort", selection: $order) {
+                    ForEach(ModelOrder.allCases) { Text("Sort: \($0.title)").tag($0) }
+                }
+                .pickerStyle(.menu)
+                .labelsHidden()
+                .fixedSize()
+                .help("Sort models")
+            }
+            .padding(.horizontal, margin)
+            .padding(.vertical, 12)
+            Divider()
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(shown) { model in
+                        row(model)
+                            .padding(.horizontal, margin)
+                            .padding(.vertical, 9)
+                        if model.id != shown.last?.id {
+                            Divider().padding(.leading, margin + mark + 12)
+                        }
                     }
-                }.padding(.vertical, 8)
+                }
             }
             .overlay {
-                if !store.models.contains(where: \.fits) {
-                    Text("No models fit the currently available memory.")
+                if shown.isEmpty {
+                    Text(fitting.isEmpty ? "No models fit the currently available memory." : "No models match your search.")
                         .font(.subheadline).foregroundStyle(.secondary).padding()
                 }
             }
-            .navigationTitle("Model library")
-            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
-            .task {
-                do { try await store.refreshModels() }
-                catch { store.error = error.localizedDescription }
+        }
+        .frame(minWidth: 720, idealWidth: 820, minHeight: 420, idealHeight: 600)
+        .task {
+            do { try await store.refreshModels() }
+            catch { store.error = error.localizedDescription }
+        }
+    }
+    private var fitting: [ModelChoice] { store.models.filter(\.fits) }
+    private var families: [String] {
+        fitting.reduce(into: [String]()) { if !$0.contains($1.family) { $0.append($1.family) } }
+    }
+    private var features: [String] {
+        fitting.flatMap(\.features).reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } }
+    }
+    private func filterMenu(_ all: String, selection: Binding<String>, options: [String]) -> some View {
+        Picker(all, selection: selection) {
+            Text(all).tag("")
+            Divider()
+            ForEach(options, id: \.self) { Text($0).tag($0) }
+        }
+        .pickerStyle(.menu)
+        .labelsHidden()
+        .fixedSize()
+    }
+    /// Models passing the filters and matching every word of the search in
+    /// their name, family, quantization, features or description.
+    private var shown: [ModelChoice] {
+        let words = query.lowercased().split(whereSeparator: \.isWhitespace)
+        return fitting.filter { model in
+            guard (generates.isEmpty || model.generates == generates)
+                && (family.isEmpty || model.family == family)
+                && (feature.isEmpty || model.features.contains(feature)) else { return false }
+            let haystack = ([model.name, model.family, model.quantization, model.detail] + model.features)
+                .joined(separator: " ").lowercased()
+            return words.allSatisfy { haystack.contains($0) }
+        }
+        .sorted(by: order.precedes)
+    }
+    private func row(_ model: ModelChoice) -> some View {
+        HStack(spacing: 12) {
+            ModelKindMark(generates: model.generates)
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 5) {
+                    Text(model.name).font(.body.weight(.semibold)).lineLimit(1)
+                    ModelTag(text: model.family)
+                    ModelTag(text: model.quantization)
+                    ForEach(model.features, id: \.self) { ModelTag(text: $0, outlined: true) }
+                }
+                Text(model.detail).font(.callout).foregroundStyle(.secondary).lineLimit(1)
+                    .help(model.detail)
             }
-        }.frame(idealWidth: 600, idealHeight: 640)
+            Spacer(minLength: 12)
+            Text(model.sizeLabel).font(.callout).monospacedDigit().foregroundStyle(.secondary)
+            action(model).frame(width: 84, alignment: .trailing)
+        }
+        .contentShape(Rectangle())
+    }
+    @ViewBuilder private func action(_ model: ModelChoice) -> some View {
+        if store.downloading == model.id {
+            ProgressView(value: store.downloadProgress).controlSize(.small)
+        } else if store.loadedModel == model.id {
+            Label("In use", systemImage: "checkmark").font(.callout).foregroundStyle(.secondary)
+        } else if model.local {
+            Button("Load") { Task { await store.loadModel(model.id); dismiss() } }
+                .controlSize(.small)
+                .disabled(store.busy)
+        } else {
+            Button("Get") { Task { await store.download(model.id) } }
+                .controlSize(.small)
+                .disabled(!store.ready || store.downloading != nil)
+        }
     }
 }
 

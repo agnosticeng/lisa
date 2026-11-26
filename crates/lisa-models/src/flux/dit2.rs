@@ -104,21 +104,19 @@ fn slice(x: &Array, start: i32, end: i32) -> Array {
     x.slice(-1, start, end).expect("validated FLUX slice")
 }
 fn modulate(x: &Array, m: &[Array], shift: usize, scale: usize) -> anyhow::Result<Array> {
-    Ok(layer_norm(x)?
+    layer_norm(x)?
         .multiply(&m[scale].add(&x.scalar(1.0))?)?
-        .add(&m[shift])?)
+        .add(&m[shift])
 }
 impl Dit<'_> {
     fn heads(&self, x: Array) -> anyhow::Result<Array> {
-        Ok(x.reshape(&[1, x.dim(1), self.heads, self.hd])?
-            .transpose_axes(&[0, 2, 1, 3])?)
+        x.reshape(&[1, x.dim(1), self.heads, self.hd])?
+            .transpose_axes(&[0, 2, 1, 3])
     }
     fn heads_norm(&self, x: Array, key: &str) -> anyhow::Result<Array> {
         let x = self.heads(x)?.as_dtype(Dtype::F32)?.contiguous()?;
-        Ok(
-            x.rms(&self.w.get(key)?.as_dtype(Dtype::F32)?, self.rms_epsilon)?
-                .as_dtype(Dtype::BF16)?,
-        )
+        x.rms(&self.w.get(key)?.as_dtype(Dtype::F32)?, self.rms_epsilon)?
+            .as_dtype(Dtype::BF16)
     }
     fn attention(
         &self,
@@ -141,19 +139,16 @@ impl Dit<'_> {
                 .reshape(&[1, self.heads, x.dim(2), 64])?;
             let r = re.multiply(cos)?.subtract(&im.multiply(sin)?)?;
             let i = im.multiply(cos)?.add(&re.multiply(sin)?)?;
-            Ok(
-                ops::concatenate(&[&r.expand_dims(-1)?, &i.expand_dims(-1)?], -1)?
-                    .reshape(shape)?
-                    .as_dtype(Dtype::BF16)?,
-            )
+            ops::concatenate(&[&r.expand_dims(-1)?, &i.expand_dims(-1)?], -1)?
+                .reshape(shape)?
+                .as_dtype(Dtype::BF16)
         };
         let q = rope(&q)?.as_dtype(v.dtype())?;
         let k = rope(&k)?.as_dtype(v.dtype())?;
         let out = ops::attention(&q, &k, &v, 1.0 / (self.hd as f32).sqrt(), None)?;
-        Ok(out
-            .transpose_axes(&[0, 2, 1, 3])?
+        out.transpose_axes(&[0, 2, 1, 3])?
             .contiguous()?
-            .reshape(&[1, q.dim(2), self.inner])?)
+            .reshape(&[1, q.dim(2), self.inner])
     }
     fn ff(&self, x: &Array, p: &str) -> anyhow::Result<Array> {
         let x = self.w.lin(&format!("{p}.linear_in"), x)?;

@@ -36,6 +36,7 @@ pub struct MetalKernel {
     inner: crate::jit::MetalKernel,
 }
 
+// SAFETY: `inner` is `jit::MetalKernel`, which is Send + Sync; this wrapper adds no state.
 unsafe impl Send for MetalKernel {}
 unsafe impl Sync for MetalKernel {}
 
@@ -116,6 +117,20 @@ impl MetalKernel {
     /// element before reading it. Partial or atomic outputs must not opt in.
     pub fn with_full_write_outputs(mut self) -> Self {
         self.inner = self.inner.with_full_write_outputs();
+        self
+    }
+
+    /// Fully overwritten outputs may skip the CPU clear while retaining normal
+    /// completion gating. This does not enable ordered GPU reuse.
+    pub fn with_audited_full_write_outputs(mut self) -> Self {
+        self.inner = self.inner.with_audited_full_write_outputs();
+        self
+    }
+
+    /// Apply the audited full-write allocation contract only to these output
+    /// slots. Unused/partial outputs keep the existing initialized policy.
+    pub fn with_audited_full_write_output_indices(mut self, indices: &[usize]) -> Self {
+        self.inner = self.inner.with_audited_full_write_output_indices(indices);
         self
     }
 

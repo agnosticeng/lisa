@@ -1,12 +1,10 @@
 #![cfg(test)]
-#![allow(dead_code)]
-//! Split K/V GGUF attention, using the shared DS4 indexer and cache contracts.
-use crate::bindings::glm53_indexer::Indexer;
+//! Split K/V GGUF attention, using the shared reference indexer and cache contracts.
 use crate::bindings::glm53_projection::ProjectionExecution;
-use crate::core::cache::{FullAttentionCache, IndexerTape};
+use crate::core::cache::IndexerTape;
 use lisa_metal::Array;
 fn glm53_weighted_rms_norm(x: &Array, w: &Array, eps: f32) -> Result<Array> {
-    lisa_metal::kernels::sparse::kernels::glm53_mtp_rms_norm(
+    lisa_metal::kernels::sparse::kernels::mtp_rms_norm(
         x,
         w,
         eps,
@@ -15,7 +13,7 @@ fn glm53_weighted_rms_norm(x: &Array, w: &Array, eps: f32) -> Result<Array> {
     .context("RMS declined")
 }
 fn glm53_kv_lora_rms_norm(x: &Array, w: &Array, eps: f32) -> Result<Array> {
-    lisa_metal::kernels::sparse::kernels::glm53_mtp_kv_lora_rms_norm(
+    lisa_metal::kernels::sparse::kernels::mtp_kv_lora_rms_norm(
         x,
         w,
         eps,
@@ -24,8 +22,8 @@ fn glm53_kv_lora_rms_norm(x: &Array, w: &Array, eps: f32) -> Result<Array> {
     .context("latent RMS declined")
 }
 
-use crate::bindings::glm53_projection::{Projection, plain};
-use crate::core::gguf_resident::{PackedTensor, ResidentWeights};
+use crate::bindings::glm53_projection::Projection;
+use crate::core::gguf_resident::PackedTensor;
 use anyhow::{Context, Result, ensure};
 use lisa_metal::Stream;
 use lisa_metal::kernels::sparse::gguf as gpu;
@@ -39,45 +37,8 @@ pub struct GgufDsa {
     pub(super) value: PackedTensor,
     pub(super) qnorm: Array,
     pub(super) kvnorm: Array,
-    pub(super) indexer: Indexer,
 }
 impl GgufDsa {
-    pub fn load(w: &ResidentWeights, layer: usize) -> Result<Self> {
-        let p = |name: &str| format!("blk.{layer}.{name}");
-        let f = |name: &str| plain(w, &p(name));
-        let projection = |name: &str| Projection::load(w, &p(name));
-        let packed = |name: &str| {
-            w.tensors
-                .get(&p(name))
-                .cloned()
-                .context("missing GLM attention weight")
-        };
-        Ok(Self {
-            qa: projection("attn_q_a.weight")?,
-            qb: projection("attn_q_b.weight")?,
-            kva: projection("attn_kv_a_mqa.weight")?,
-            output: projection("attn_output.weight")?,
-            key: packed("attn_k_b.weight")?,
-            value: packed("attn_v_b.weight")?,
-            qnorm: f("attn_q_a_norm.weight")?,
-            kvnorm: f("attn_kv_a_norm.weight")?,
-            indexer: Indexer {
-                context: crate::metal_context::execution_context(),
-                wq_b_w: f("indexer.attn_q_b.weight")?,
-                wk_w: f("indexer.attn_k.weight")?,
-                k_norm_w: f("indexer.k_norm.weight")?,
-                k_norm_b: f("indexer.k_norm.bias")?,
-                weights_w: f("indexer.proj.weight")?,
-                gate_w: f("indexer.pool_gate.weight")?,
-                ape: f("indexer.pool_ape.weight")?,
-                heads: 32,
-                head_dim: 128,
-                topk: 2048,
-                kpool: 4,
-                always_tail: true,
-            },
-        })
-    }
     pub(super) fn project(&self, x: &Array) -> Result<(Array, Array, Array)> {
         ensure!(
             x.shape() == [1, 1, 4096],
@@ -114,48 +75,6 @@ impl GgufDsa {
             gpu::decode(&low, compact, ids, self.value.packed_bytes(), dense, &s)?
         };
         self.output.forward(&attended)
-    }
-    pub fn forward(
-        &self,
-        x: &Array,
-        cache: &mut FullAttentionCache,
-        layer: usize,
-    ) -> Result<Array> {
-        let (qr, q, latent) = self.project(x)?;
-        let (key, gate) =
-            self.indexer
-                .project_pair(x, &self.indexer.wk_w, x, &self.indexer.gate_w)?;
-        cache.indexer_tape.append_fields(&key, &gate, 4)?;
-        cache.indexer_tape.append_compact_f16(&latent)?;
-        self.indexer
-            .update_pooled_cache(&mut cache.indexer_tape, None, layer)?;
-        cache.offset = cache.indexer_tape.total;
-        let total = cache.offset;
-        let dense = total <= 2051;
-        let ids = if dense {
-            Array::from_slice(
-                &(0..total as i32).collect::<Vec<_>>(),
-                &[1, 1, total as i32],
-            )
-        } else {
-            self.indexer
-                .select_ids_gpu(
-                    &mut cache.indexer_tape,
-                    x,
-                    &qr,
-                    total,
-                    1,
-                    None,
-                    layer,
-                    false,
-                )?
-                .0
-        };
-        let compact = cache
-            .indexer_tape
-            .compact_slice(0, total)
-            .context("missing GLM compact cache")?;
-        self.attend(&q, &compact, &ids, dense)
     }
     pub fn mtp(
         &self,

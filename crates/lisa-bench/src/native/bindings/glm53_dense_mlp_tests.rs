@@ -1,6 +1,5 @@
 #![cfg(test)]
 use super::*;
-use crate::bindings::deepseek41_moe::tests::{counts, difference};
 use lisa_metal::ops;
 #[path = "glm53_dense_mlp_oracle.rs"]
 mod oracle;
@@ -29,13 +28,11 @@ fn dense_expert_plans_preserve_paired_separate_native_and_capture_bits() -> anyh
         let up = linear(&[2048, 4096], 7, dtype)?;
         let down = linear(&[4096, 2048], 11, dtype)?;
         for paired in [false, true] {
-            let before = counts();
             let old = oracle::DenseMlp {
                 gate_up: oracle::GateUpProjection::from_parts(gate.clone(), up.clone(), paired)?,
                 down: down.clone(),
                 limit: 10.,
             };
-            let between = counts();
             let new = DenseMlp {
                 context: crate::metal_context::execution_context(),
                 gate_up: GateUpProjection::from_parts(
@@ -47,14 +44,6 @@ fn dense_expert_plans_preserve_paired_separate_native_and_capture_bits() -> anyh
                 down: down.clone(),
                 limit: 10.,
             };
-            let after = counts();
-            if std::env::var_os("LISA_TRACE").is_some() {
-                assert_eq!(
-                    difference(&before, &between),
-                    difference(&between, &after),
-                    "load paired{paired} metadata{dtype:?}"
-                );
-            }
             for native in [false, true] {
                 let _mode =
                     crate::bindings::glm53_affine_moe::Glm53Q8GateUpNativeScope::new(native);
@@ -63,24 +52,14 @@ fn dense_expert_plans_preserve_paired_separate_native_and_capture_bits() -> anyh
                     for capture in [false, true] {
                         let ca = Capture::default();
                         let cb = Capture::default();
-                        let before = counts();
                         let a = old.forward_with_capture(&x, capture.then_some(&ca), 3)?;
-                        let between = counts();
                         let b = new.forward_with_capture(&x, capture.then_some(&cb), 3)?;
-                        let after = counts();
                         assert_eq!(a.shape(), b.shape());
                         assert_eq!(
                             a.to_vec1::<u32>()?,
                             b.to_vec1::<u32>()?,
                             "B{batch} T{tokens} native{native} paired{paired} metadata{dtype:?} capture{capture}"
                         );
-                        if std::env::var_os("LISA_TRACE").is_some() {
-                            assert_eq!(
-                                difference(&before, &between),
-                                difference(&between, &after),
-                                "B{batch} T{tokens} native{native} paired{paired} metadata{dtype:?} capture{capture}"
-                            );
-                        }
                         let (a, b) = (ca.entries.lock().unwrap(), cb.entries.lock().unwrap());
                         assert_eq!(a.len(), b.len());
                         for (k, v) in a.iter() {

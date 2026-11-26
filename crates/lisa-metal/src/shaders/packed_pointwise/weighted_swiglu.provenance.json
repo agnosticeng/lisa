@@ -1,0 +1,12 @@
+{
+  "oracle_commit": "956c8a9",
+  "oracle": "Existing native clamped SwiGLU followed by F32 route-weight multiplication. No new full-model DS4 parity claim.",
+  "upstream": "antirez/ds4",
+  "upstream_revision": "b3f50180ec2c7324892be1f50bc83555ccb8d5e7",
+  "sources": {
+    "crates/lisa-metal/src/shaders/pointwise/clamped_swiglu.metal": "00b0577137836cad3f7f05778d10332625f10946454d2a8a000c74684552ca22",
+    "crates/lisa-metal/src/shaders/common/elementwise/elementwise_binary.metal": "d36cd447c7a78fb1189e37ff20d49a158c14b8348ca37fcbcfe5707aa9473498"
+  },
+  "local_sha256": "f23c12d30c7eb528d91abb67473d89bed95a1ceb13babe025b8c3d021b1176ce",
+  "changes": "Retain CompilerDefault activation math and alpha parameter; a volatile F32 intermediate preserves the former activation store before route weighting. No reductions or weight format changes."
+}

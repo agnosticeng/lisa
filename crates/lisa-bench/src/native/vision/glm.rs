@@ -1,16 +1,8 @@
 //! Native conformance fixtures for the portable glm encoder.
 pub type Encoder = lisa_engine::vision::glm::Encoder<lisa_metal::device::MetalDevice>;
 #[cfg(test)]
-use crate::core::program;
-#[cfg(test)]
 use lisa_metal::Array;
-#[cfg(test)]
-use lisa_models::vision::glm as definition;
 pub use lisa_models::vision::glm::Config;
-#[cfg(test)]
-use serde_json::Value;
-#[cfg(test)]
-use std::{cell::RefCell, collections::HashMap};
 #[cfg(test)]
 mod plan_tests {
     use super::*;

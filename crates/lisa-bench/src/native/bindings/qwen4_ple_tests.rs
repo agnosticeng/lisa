@@ -41,6 +41,8 @@ pub(crate) fn layer() -> anyhow::Result<PleLayer> {
         file.write_all(&bf16::from_f32(-0.14).to_le_bytes())?;
     }
     file.flush()?;
+    // SAFETY: the temporary file is fully written and flushed, owned by this test and
+    // // never truncated or rewritten while the read-only mapping is alive.
     let map = Arc::new(unsafe { Mmap::map(file.as_file())? });
     let maps = (0..4)
         .map(|i| {

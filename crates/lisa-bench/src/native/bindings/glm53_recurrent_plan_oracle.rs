@@ -1,6 +1,5 @@
 #![cfg(test)]
-#![allow(dead_code, unused_imports)]
-//! KDA (`linear_attention`) layers for GLM-5.3, following ds4's float graph.
+//! KDA (`linear_attention`) layers for GLM-5.3, following the reference's float graph.
 //!
 //! Kimi Delta Attention: depthwise
 //! causal short conv (k=4) over the fused q|k|v stream, l2-normalized q/k
@@ -9,40 +8,15 @@
 //! `sigmoid(b_proj(x))`, and the
 //! delta-rule recurrence on an F32 state `[B, 64, 128, 128]`.
 //!
-//! The normal single-stream path uses the ds4 prepare, recurrence, and output
+//! The normal single-stream path uses the reference prepare, recurrence, and output
 //! kernels. The Array-op path remains an explicit diagnostic fallback.
 
 use crate::bindings::glm53_oracle_helpers::{concat, concat_refs, fscalar, narrow};
 use crate::bindings::glm53_projection::Projection;
 use crate::core::cache::GdnCache;
 use crate::core::capture;
-use crate::core::loader::{TensorSource, Weights};
 use lisa_metal::kernels::sparse::kernels as kda_kernels;
 use lisa_metal::{Array, Dtype, ops};
-
-#[cfg(test)]
-fn capture_decode_diagnostic(
-    prefix: &std::ffi::OsStr,
-    position: usize,
-    layer: usize,
-    name: &str,
-    array: &Array,
-) -> anyhow::Result<()> {
-    let values = array
-        .as_dtype(Dtype::Float32)?
-        .contiguous()?
-        .to_vec1::<f32>()?;
-    let bytes: Vec<u8> = values
-        .iter()
-        .flat_map(|value| value.to_le_bytes())
-        .collect();
-    let prefix = std::path::PathBuf::from(prefix).display().to_string();
-    std::fs::write(
-        format!("{prefix}.kda-pos-{position:05}-L{layer:02}-{name}.f32"),
-        bytes,
-    )?;
-    Ok(())
-}
 
 pub struct Kda {
     pub(super) q_w: Projection, // Plain model weight in source dtype, row-major [out, in]
@@ -67,88 +41,10 @@ pub struct Kda {
     pub(super) norm_eps: f32,
 }
 
+pub use crate::bindings::glm53_math::gated_rms_norm;
 use crate::bindings::glm53_math::l2norm_last;
-#[cfg(test)]
-use crate::bindings::glm53_math::linear_projection;
-pub use crate::bindings::glm53_math::{gated_rms_norm, rms_norm_last};
 
 impl Kda {
-    pub fn load<S: TensorSource>(
-        w: &mut Weights,
-        prefix: &str,
-        heads: usize,
-        head_dim: usize,
-        conv_k_sz: usize,
-        lower_bound: f32,
-        norm_eps: f32,
-    ) -> anyhow::Result<Self> {
-        let take = |w: &mut Weights, name: &str| -> anyhow::Result<Array> {
-            w.remove(name)
-                .ok_or_else(|| anyhow::anyhow!("glm53 kda: {name} missing"))
-        };
-        let p = |suffix: &str| format!("{prefix}.{suffix}");
-        // Keep plain projection weights in their source dtype. Decode and
-        // small prefill use ds4's BF16/F32 GEMV path; larger prefill uses its
-        // F16-staged, F32-accumulating tiled GEMM path.
-        let q_w = take(w, &p("q_proj.weight"))?;
-        let k_w = take(w, &p("k_proj.weight"))?;
-        let v_w = take(w, &p("v_proj.weight"))?;
-        let f_a_w = take(w, &p("f_a_proj.weight"))?;
-        let f_b_w = take(w, &p("f_b_proj.weight"))?;
-        let g_a_w = take(w, &p("g_a_proj.weight"))?;
-        let g_b_w = take(w, &p("g_b_proj.weight"))?;
-        let b_w = take(w, &p("b_proj.weight"))?;
-        // Depthwise conv weights [C, 1, K] -> [C, K].
-        let flat_taps = |a: Array| -> anyhow::Result<Array> {
-            let c = a.shape()[0] as usize;
-            let k = a.shape()[2] as usize;
-            Ok(a.reshape(&[(c as i32) as i32, (k as i32) as i32])?)
-        };
-        let conv_q = flat_taps(take(w, &p("q_conv1d.weight"))?)?.as_dtype(Dtype::Float32)?;
-        let conv_k = flat_taps(take(w, &p("k_conv1d.weight"))?)?.as_dtype(Dtype::Float32)?;
-        let conv_v = flat_taps(take(w, &p("v_conv1d.weight"))?)?.as_dtype(Dtype::Float32)?;
-        let dt_bias = take(w, &p("dt_bias"))?.as_dtype(Dtype::Float32)?;
-        let a_log = take(w, &p("A_log"))?.as_dtype(Dtype::Float32)?;
-        let o_norm_w = take(w, &p("o_norm.weight"))?.as_dtype(Dtype::Float32)?;
-        let o_proj = take(w, &p("o_proj.weight"))?;
-        Ok(Self {
-            q_w: q_w.into(),
-            k_w: k_w.into(),
-            v_w: v_w.into(),
-            o_proj: o_proj.into(),
-            f_a_w: f_a_w.into(),
-            f_b_w: f_b_w.into(),
-            g_a_w: g_a_w.into(),
-            g_b_w: g_b_w.into(),
-            b_w: b_w.into(),
-            conv_q,
-            conv_k,
-            conv_v,
-            dt_bias,
-            a_log,
-            o_norm_w,
-            heads,
-            head_dim,
-            conv_k_sz,
-            lower_bound,
-            norm_eps,
-        })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn ds4_decode_weights_for_capture(
-        &self,
-    ) -> anyhow::Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> {
-        Ok((
-            self.conv_q.to_vec1::<f32>()?,
-            self.conv_k.to_vec1::<f32>()?,
-            self.conv_v.to_vec1::<f32>()?,
-            self.a_log.to_vec1::<f32>()?,
-            self.dt_bias.to_vec1::<f32>()?,
-            self.o_norm_w.to_vec1::<f32>()?,
-        ))
-    }
-
     fn linear(&self, x: &Array, weight: &Projection) -> anyhow::Result<Array> {
         crate::bindings::glm53_kda_projection::linear(weight, x)
     }
@@ -176,7 +72,7 @@ impl Kda {
     /// Decode a cohort whose KDA recurrent states belong to separate
     /// sessions. The projections and output projection run over the complete
     /// row batch, while the fused recurrence kernel advances each row against
-    /// its own convolution and SSM state, matching ds4's native batch path.
+    /// its own convolution and SSM state, matching the reference's native batch path.
     pub fn forward_ragged(
         &self,
         x: &Array,
@@ -245,19 +141,7 @@ impl Kda {
         self.forward_with_mode(x, conv_state, ssm_state, cap, layer, false, None)
     }
 
-    pub fn forward_at_position(
-        &self,
-        x: &Array,
-        conv_state: &mut Option<Array>,
-        ssm_state: &mut Option<Array>,
-        cap: Option<&capture::Capture>,
-        layer: usize,
-        position: usize,
-    ) -> anyhow::Result<Array> {
-        self.forward_with_mode(x, conv_state, ssm_state, cap, layer, false, Some(position))
-    }
-
-    /// Forward a prompt chunk using DS4's prefill path, including a one-token
+    /// Forward a prompt chunk using the reference's prefill path, including a one-token
     /// continuation chunk after the 2048-token prefill boundary.
     pub fn forward_prefill(
         &self,
@@ -281,95 +165,34 @@ impl Kda {
         _position: Option<usize>,
     ) -> anyhow::Result<Array> {
         let (b, t, _h) = (x.dim(0) as usize, x.dim(1) as usize, x.dim(2) as usize);
-        #[cfg(test)]
-        let decode_diagnostic = if layer == 1 && b == 1 && (t == 1 || t == 2) && !prefill_mode {
-            _position.and_then(|position| {
-                let requested = std::env::var("LISA_GLM53_KDA_DIAG_CAPTURE_POSITIONS").ok()?;
-                let selected = requested
-                    .split(',')
-                    .filter_map(|item| item.trim().parse::<usize>().ok())
-                    .any(|item| item == position);
-                if selected {
-                    Some((
-                        std::env::var_os("LISA_GLM53_KDA_DIAG_CAPTURE_PREFIX")?,
-                        position,
-                    ))
-                } else {
-                    None
-                }
-            })
-        } else {
-            None
-        };
         let heads = self.heads;
         let d = self.head_dim;
         let qkv = heads * d;
         let conv_dim = qkv * 3;
-        let force_naive = std::env::var_os("LISA_GLM53_NAIVE").is_some();
-        // DS4 keeps prompt chunks on its prefill graph, including a one-token
+        // The reference keeps prompt chunks on its prefill graph, including a one-token
         // tail chunk after the 2048-token boundary. Generation forwards with
         // prior recurrent state use the fused decode path.
         let has_prior_recurrent_state = ssm_state.is_some();
-        let capture_ds4_prefill =
-            t > 1 && std::env::var_os("LISA_GLM53_KDA_PREFILL_DS4_CAPTURE").is_some();
 
         // 1. Input projections (six linears on the same input).
-        if !capture_ds4_prefill
-            || std::env::var_os("LISA_GLM53_KDA_CAPTURE_PREFILL_INPUT").is_some()
-        {
-            if let Some(c) = cap.filter(|capture| capture.wants(layer)) {
-                c.store(&format!("L{layer}.kda_input"), x);
-            }
+        if let Some(c) = cap.filter(|capture| capture.wants(layer)) {
+            c.store(&format!("L{layer}.kda_input"), x);
         }
         let _trace_projections =
             lisa_metal::trace::span_detail("glm53.kda.input_projections", layer as u64);
         let (qo, ko, vo, fa, ga, bo) = self.input_projections(x)?;
         let (gate_raw, output_gate) = self.gate_projections(&fa, &ga)?;
-        #[cfg(test)]
-        if let Some((prefix, position)) = decode_diagnostic.as_ref() {
-            for (name, array) in [
-                ("input", x),
-                ("q_proj", &qo),
-                ("k_proj", &ko),
-                ("v_proj", &vo),
-                ("fa_proj", &fa),
-                ("ga_proj", &ga),
-                ("beta_proj", &bo),
-                ("raw_gate", &gate_raw),
-                ("output_gate", &output_gate),
-            ] {
-                capture_decode_diagnostic(prefix, *position, layer, name, array)?;
-            }
-        }
         // `gate_raw` is f_b(f_a(x)); `output_gate` is g_b(g_a(x)).
         drop(_trace_projections);
         if let Some(c) = cap.filter(|capture| capture.wants(layer)) {
             c.store(&format!("L{layer}.kda_q_proj"), &qo);
             c.store(&format!("L{layer}.kda_k_proj"), &ko);
             c.store(&format!("L{layer}.kda_v_proj"), &vo);
-            if !capture_ds4_prefill {
-                c.store(&format!("L{layer}.kda_fa_proj"), &fa);
-                c.store(&format!("L{layer}.kda_ga_proj"), &ga);
-            }
+            c.store(&format!("L{layer}.kda_fa_proj"), &fa);
+            c.store(&format!("L{layer}.kda_ga_proj"), &ga);
             c.store(&format!("L{layer}.kda_beta_logits"), &bo);
             c.store(&format!("L{layer}.kda_gate_raw"), &gate_raw);
             c.store(&format!("L{layer}.kda_gb_proj"), &output_gate);
-            let capture_projection_weights =
-                std::env::var("LISA_GLM53_KDA_CAPTURE_PROJECTION_WEIGHTS")
-                    .ok()
-                    .is_some_and(|value| {
-                        value == "all" || value.parse::<usize>().ok() == Some(layer)
-                    });
-            if capture_projection_weights {
-                c.store(&format!("L{layer}.kda_q_proj_weight"), &self.q_w);
-                c.store(&format!("L{layer}.kda_k_proj_weight"), &self.k_w);
-                c.store(&format!("L{layer}.kda_v_proj_weight"), &self.v_w);
-                c.store(&format!("L{layer}.kda_fa_proj_weight"), &self.f_a_w);
-                c.store(&format!("L{layer}.kda_ga_proj_weight"), &self.g_a_w);
-                c.store(&format!("L{layer}.kda_beta_proj_weight"), &self.b_w);
-                c.store(&format!("L{layer}.kda_gate_proj_weight"), &self.f_b_w);
-                c.store(&format!("L{layer}.kda_gb_proj_weight"), &self.g_b_w);
-            }
         }
         let stream = lisa_metal::Stream::thread_local_or_default();
         let state = match ssm_state {
@@ -379,12 +202,12 @@ impl Kda {
                 &Array::from_f32_as(0.0, Dtype::Float32),
             )?,
         };
-        // 2. Fused path (B = 1): ds4 prepare kernel (conv + silu + l2norm +
+        // 2. Fused path (B = 1): the reference prepare kernel (conv + silu + l2norm +
         // compute_g_safe) -> recurrence kernel -> gated-output kernel.
         // prepare/output kernels are unit-tested at real geometry
         // (kda_prepare_matches_reference, kda_prepare_two_calls).
-        if b > 1 && t == 1 && !force_naive && !prefill_mode {
-            // ds4's native batch path shares the row projections across the
+        if b > 1 && t == 1 && !prefill_mode {
+            // The reference's native batch path shares the row projections across the
             // cohort, then dispatches its one-token decode kernel on each
             // row's independent convolution and recurrent state. Keep these
             // calls row-local: the fused decode's reduction schedule is the
@@ -406,12 +229,9 @@ impl Kda {
                     &Array::from_f32_as(0.0, Dtype::Float32),
                 )?,
             };
-            let state4 = if state.rank() == 5 {
-                state.reshape(&[b as i32, heads as i32, d as i32, d as i32])?
-            } else {
-                state.reshape(&[b as i32, heads as i32, d as i32, d as i32])?
-            }
-            .contiguous()?;
+            let state4 = state
+                .reshape(&[b as i32, heads as i32, d as i32, d as i32])?
+                .contiguous()?;
             if let Some(c) = cap.filter(|capture| capture.wants(layer)) {
                 c.store(&format!("L{layer}.kda_initial_conv"), &conv_in);
                 c.store(&format!("L{layer}.kda_initial_ssm"), &state4);
@@ -510,14 +330,14 @@ impl Kda {
             }
             return Ok(projected);
         }
-        if b == 1 && !force_naive {
+        if b == 1 {
             // The kernel binds raw GPU buffers — materialise the lazy casts
             // first (from_slice is eager; as_dtype/mk outputs are not).
             let qo_f = qo.as_dtype(Dtype::Float32)?.contiguous()?;
             let ko_f = ko.as_dtype(Dtype::Float32)?.contiguous()?;
             let vo_f = vo.as_dtype(Dtype::Float32)?.contiguous()?;
             let gate_f = gate_raw.as_dtype(Dtype::Float32)?.contiguous()?;
-            // ds4-style: ops dispatch eagerly into the current command buffer
+            // The reference-style: ops dispatch eagerly into the current command buffer
             // (Serial order) — no sync needed before binding raw buffers.
             let conv_in = match conv_state {
                 Some(a) => {
@@ -535,11 +355,6 @@ impl Kda {
                 state.clone()
             };
             let state_pn = state4.contiguous()?;
-            #[cfg(test)]
-            if let Some((prefix, position)) = decode_diagnostic.as_ref() {
-                capture_decode_diagnostic(prefix, *position, layer, "conv_in", &conv_in)?;
-                capture_decode_diagnostic(prefix, *position, layer, "state_in", &state_pn)?;
-            }
             if let Some(c) = cap.filter(|capture| capture.wants(layer)) {
                 c.store(&format!("L{layer}.kda_initial_conv"), &conv_in);
                 c.store(&format!("L{layer}.kda_initial_ssm"), &state_pn);
@@ -597,45 +412,24 @@ impl Kda {
                     )
                 };
                 if let Some((out, new_conv, new_state)) = decoded {
-                    #[cfg(test)]
-                    if let Some((prefix, position)) = decode_diagnostic.as_ref() {
-                        capture_decode_diagnostic(prefix, *position, layer, "decode_out", &out)?;
-                        capture_decode_diagnostic(prefix, *position, layer, "conv_out", &new_conv)?;
-                        capture_decode_diagnostic(
-                            prefix,
-                            *position,
-                            layer,
-                            "state_out",
-                            &new_state,
-                        )?;
-                    }
                     *conv_state = Some(new_conv.reshape(&[1, 3, conv_dim as i32])?);
                     *ssm_state = Some(new_state.reshape(&[1, heads as i32, d as i32, d as i32])?);
-                    if let Some(c) = cap {
-                        if c.wants(layer) {
-                            c.store(&format!("L{layer}.kda_decode_out"), &out);
-                            c.store(&format!("L{layer}.kda_decode_conv_state"), &new_conv);
-                            c.store(&format!("L{layer}.kda_decode_state"), &new_state);
-                        }
+                    if let Some(c) = cap
+                        && c.wants(layer)
+                    {
+                        c.store(&format!("L{layer}.kda_decode_out"), &out);
+                        c.store(&format!("L{layer}.kda_decode_conv_state"), &new_conv);
+                        c.store(&format!("L{layer}.kda_decode_state"), &new_state);
                     }
                     let out = out.reshape(&[1, 1, qkv as i32])?;
                     let _trace =
                         lisa_metal::trace::span_detail("glm53.kda.output_projection", layer as u64);
                     let projected = self.linear(&out, &self.o_proj)?;
-                    #[cfg(test)]
-                    if let Some((prefix, position)) = decode_diagnostic.as_ref() {
-                        capture_decode_diagnostic(prefix, *position, layer, "o_proj", &projected)?;
-                    }
                     return Ok(projected);
                 }
                 anyhow::bail!(
-                    "glm53 kda: ds4-parity fused decode kernel declined at layer {layer}; set LISA_GLM53_NAIVE=1 only to diagnose the slow reference path"
+                    "glm53 kda: ds4-parity fused decode kernel declined at layer {layer}"
                 );
-            }
-            if std::env::var_os("LISA_GLM53_DEBUG").is_some() && layer == 0 {
-                let qv = qo_f.to_vec1::<f32>().unwrap_or_default();
-                let nrm: f32 = qv.iter().map(|v| v * v).sum::<f32>().sqrt();
-                eprintln!("[kda-debug] pre: q len {} norm {:.4}", qv.len(), nrm);
             }
             if let Some((qf, kf, vf, g, new_conv)) = kda_kernels::kda_prepare(
                 &qo_f,
@@ -665,103 +459,26 @@ impl Kda {
                 for o in [&qf, &kf, &vf, &g, &new_conv] {
                     let _ = o.eval_enqueue();
                 }
-                #[cfg(test)]
-                if let Some((prefix, position)) = decode_diagnostic.as_ref() {
-                    capture_decode_diagnostic(prefix, *position, layer, "q_conv", &qf)?;
-                    capture_decode_diagnostic(prefix, *position, layer, "k_conv", &kf)?;
-                    capture_decode_diagnostic(prefix, *position, layer, "v_conv", &vf)?;
-                    capture_decode_diagnostic(prefix, *position, layer, "g", &g)?;
-                    capture_decode_diagnostic(prefix, *position, layer, "conv_out", &new_conv)?;
-                }
                 *conv_state = Some(
                     new_conv
                         .reshape(&[1i32, (self.conv_k_sz - 1) as i32, (conv_dim) as i32])?
                         .as_dtype(Dtype::Float32)?,
                 );
-                if layer == 0
-                    && let Some(path) = std::env::var_os("LISA_GLM53_DUMP")
+                if let Some(c) = cap
+                    && c.wants(layer)
                 {
-                    use std::io::Write;
-                    let path = std::path::Path::new(&path);
-                    let mut f = std::fs::File::create(path)?;
-                    for arr in [&qo_f, &ko_f, &vo_f, &gate_f] {
-                        let v = arr.to_vec1::<f32>()?;
-                        f.write_all(&(v.len() as u32).to_le_bytes())?;
-                        f.write_all(&v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())?;
-                    }
-                    for arr in [
-                        &self.conv_q,
-                        &self.conv_k,
-                        &self.conv_v,
-                        &self.a_log,
-                        &self.dt_bias,
-                    ] {
-                        let cf = arr.as_dtype(Dtype::Float32)?;
-                        let v = cf.to_vec1::<f32>()?;
-                        f.write_all(&(v.len() as u32).to_le_bytes())?;
-                        f.write_all(&v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())?;
-                    }
-                    let v = conv_in.to_vec1::<f32>()?;
-                    f.write_all(&(v.len() as u32).to_le_bytes())?;
-                    f.write_all(&v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())?;
-                    eprintln!("[kda-dump] wrote {}", path.display());
-                }
-                if std::env::var_os("LISA_GLM53_DEBUG").is_some() && layer == 0 {
-                    let qpre = qo_f.to_vec1::<f32>().unwrap_or_default();
-                    eprintln!("[kda-debug] q_in[0..6] = {:?}", &qpre[..6.min(qpre.len())]);
-                    let cin = conv_in.to_vec1::<f32>().unwrap_or_default();
-                    eprintln!("[kda-debug] conv_in[0..6] = {:?}", &cin[..6.min(cin.len())]);
-                    let taps = self
-                        .conv_q
-                        .as_dtype(Dtype::Float32)
-                        .unwrap()
-                        .to_vec1::<f32>()
-                        .unwrap_or_default();
-                    eprintln!(
-                        "[kda-debug] conv_q taps[0..8] = {:?}",
-                        &taps[..8.min(taps.len())]
-                    );
-                    let alog = self
-                        .a_log
-                        .as_dtype(Dtype::Float32)
-                        .unwrap()
-                        .to_vec1::<f32>()
-                        .unwrap_or_default();
-                    eprintln!("[kda-debug] a_log[0..4] = {:?}", &alog[..4.min(alog.len())]);
-                    let qv = qf.to_vec1::<f32>().unwrap_or_default();
-                    let nz = qv.iter().filter(|v| v.abs() > 1e-9).count();
-                    let nrm: f32 = qv.iter().map(|v| v * v).sum::<f32>().sqrt();
-                    eprintln!(
-                        "[kda-debug] post-prepare: q len {} norm {:.4} nonzero {}",
-                        qv.len(),
-                        nrm,
-                        nz
-                    );
-                    let gv = g.to_vec1::<f32>().unwrap_or_default();
-                    let gn: f32 = gv.iter().map(|v| v * v).sum::<f32>().sqrt();
-                    eprintln!(
-                        "[kda-debug] post-prepare: g len {} norm {:.4}",
-                        gv.len(),
-                        gn
-                    );
-                }
-                if let Some(c) = cap {
-                    if c.wants(layer) {
-                        if !capture_ds4_prefill {
-                            c.store(&format!("L{layer}.kda_qc"), &qf);
-                            c.store(&format!("L{layer}.kda_kc"), &kf);
-                            c.store(&format!("L{layer}.kda_vc"), &vf);
-                            c.store(&format!("L{layer}.kda_g"), &g);
-                            let beta = bo.as_dtype(Dtype::Float32)?.sigmoid()?.reshape(&[
-                                b as i32,
-                                t as i32,
-                                heads as i32,
-                                1,
-                            ])?;
-                            c.store(&format!("L{layer}.kda_beta"), &beta);
-                        }
-                        c.store(&format!("L{layer}.kda_conv_state"), &new_conv);
-                    }
+                    c.store(&format!("L{layer}.kda_qc"), &qf);
+                    c.store(&format!("L{layer}.kda_kc"), &kf);
+                    c.store(&format!("L{layer}.kda_vc"), &vf);
+                    c.store(&format!("L{layer}.kda_g"), &g);
+                    let beta = bo.as_dtype(Dtype::Float32)?.sigmoid()?.reshape(&[
+                        b as i32,
+                        t as i32,
+                        heads as i32,
+                        1,
+                    ])?;
+                    c.store(&format!("L{layer}.kda_beta"), &beta);
+                    c.store(&format!("L{layer}.kda_conv_state"), &new_conv);
                 }
                 // The cache may hold a rank-5 [B,1,H,Dk,Dv] state (written by
                 // the naive loop) or a rank-4 [B,H,Dk,Dv] one — normalize.
@@ -783,20 +500,13 @@ impl Kda {
                     false,
                     &stream,
                 ) {
-                    #[cfg(test)]
-                    if let Some((prefix, position)) = decode_diagnostic.as_ref() {
-                        capture_decode_diagnostic(prefix, *position, layer, "recurrence_y", &y_k)?;
-                        capture_decode_diagnostic(prefix, *position, layer, "state_out", &state_k)?;
-                    }
-                    if let Some(c) = cap {
-                        if c.wants(layer) {
-                            let _ = y_k.eval_enqueue();
-                            let _ = state_k.eval_enqueue();
-                            if !capture_ds4_prefill {
-                                c.store(&format!("L{layer}.fused_y"), &y_k);
-                            }
-                            c.store(&format!("L{layer}.fused_state"), &state_k);
-                        }
+                    if let Some(c) = cap
+                        && c.wants(layer)
+                    {
+                        let _ = y_k.eval_enqueue();
+                        let _ = state_k.eval_enqueue();
+                        c.store(&format!("L{layer}.fused_y"), &y_k);
+                        c.store(&format!("L{layer}.fused_state"), &state_k);
                     }
                     // Kernel outputs wrap real GPU buffers — no sync needed.
                     *ssm_state = Some(state_k.contiguous()?);
@@ -811,57 +521,40 @@ impl Kda {
                         self.norm_eps,
                         &stream,
                     ) {
-                        #[cfg(test)]
-                        if let Some((prefix, position)) = decode_diagnostic.as_ref() {
-                            capture_decode_diagnostic(
-                                prefix,
-                                *position,
-                                layer,
-                                "decode_out",
-                                &outn,
-                            )?;
-                        }
                         if let Some(c) = cap.filter(|capture| capture.wants(layer)) {
                             c.store(&format!("L{layer}.kda_outnorm"), &outn);
                         }
-                        if t == 1 {
-                            if let Some(c) = cap {
-                                if c.wants(layer) {
-                                    let _ = outn.eval_enqueue();
-                                    let _ = y_k.eval_enqueue();
-                                    c.store(&format!("L{layer}.dec_outnorm"), &outn);
-                                    c.store(
-                                        &format!(
-                                            "L{layer}.dec_y_s{}",
-                                            crate::bindings::glm53_affine_tower::INC_STEP
-                                                .load(std::sync::atomic::Ordering::Relaxed)
-                                        ),
-                                        &y_k,
-                                    );
-                                }
-                            }
+                        if t == 1
+                            && let Some(c) = cap
+                            && c.wants(layer)
+                        {
+                            let _ = outn.eval_enqueue();
+                            let _ = y_k.eval_enqueue();
+                            c.store(&format!("L{layer}.dec_outnorm"), &outn);
+                            c.store(
+                                &format!(
+                                    "L{layer}.dec_y_s{}",
+                                    crate::bindings::glm53_affine_tower::INC_STEP
+                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                ),
+                                &y_k,
+                            );
                         }
                         let out = outn.reshape(&[(b) as i32, (t) as i32, (qkv) as i32])?;
                         let projected = self.linear(&out, &self.o_proj)?;
-                        #[cfg(test)]
-                        if let Some((prefix, position)) = decode_diagnostic.as_ref() {
-                            capture_decode_diagnostic(
-                                prefix, *position, layer, "o_proj", &projected,
-                            )?;
-                        }
                         return Ok(projected);
                     }
                 }
             }
         }
 
-        if b == 1 && !force_naive {
+        if b == 1 {
             anyhow::bail!(
-                "glm53 kda: fused GPU prepare/recurrence/output path declined at layer {layer}; set LISA_GLM53_NAIVE=1 only to diagnose the slow reference path"
+                "glm53 kda: fused GPU prepare/recurrence/output path declined at layer {layer}"
             );
         }
 
-        // The fused recurrence consumes raw beta logits and computes DS4's
+        // The fused recurrence consumes raw beta logits and computes the reference's
         // sigmoid expression in-kernel. Only the diagnostic fallback needs a
         // materialized beta tensor.
         let beta = bo.as_dtype(Dtype::Float32)?.sigmoid()?.reshape(&[
@@ -887,7 +580,7 @@ impl Kda {
             )?,
         };
         // Only the naive convolution fallback needs a joined Q/K/V tensor.
-        // The ds4-shaped Metal prepare/decode kernels bind the three rows
+        // The reference-shaped Metal prepare/decode kernels bind the three rows
         // separately; building this concat before those fast paths returned
         // added three GPU copy dispatches per KDA layer on ordinary decode.
         let mixed = concat(vec![qo, ko, vo], 2)?; // [B,T,3*qkv]
@@ -952,11 +645,11 @@ impl Kda {
             .sigmoid()?
             .multiply(&fscalar(&fgdt, self.lower_bound)?)?
             .exp()?;
-        if let Some(c) = cap {
-            if c.wants(layer) {
-                c.store(&format!("L{layer}.kda_g"), &g);
-                c.store(&format!("L{layer}.kda_beta"), &beta);
-            }
+        if let Some(c) = cap
+            && c.wants(layer)
+        {
+            c.store(&format!("L{layer}.kda_g"), &g);
+            c.store(&format!("L{layer}.kda_beta"), &beta);
         }
 
         // 5. Delta-rule recurrence (per token), F32 state [B,Hh,Dk,Dv].
@@ -975,26 +668,25 @@ impl Kda {
             )?,
         };
         let mut outs: Vec<Array> = Vec::with_capacity(t);
-        if t == 1 {
-            if let Some(c) = cap {
-                if c.wants(layer) {
-                    let _ = qf.eval_enqueue();
-                    let _ = g.eval_enqueue();
-                    let _ = state.eval_enqueue();
-                    let step = crate::bindings::glm53_affine_tower::INC_STEP
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    c.store(&format!("L{layer}.dec_q_s{step}"), &qf);
-                    c.store(&format!("L{layer}.dec_g_s{step}"), &g);
-                    c.store(&format!("L{layer}.dec_state_in_s{step}"), &state);
-                    if layer == 0 {
-                        let wv = window.to_vec1::<f32>().unwrap_or_default();
-                        eprintln!(
-                            "[dec-conv] naive window[0..16] = {:?}",
-                            &wv[..16.min(wv.len())]
-                        );
-                        c.store(&format!("L{layer}.dec_conv_s{step}"), &window);
-                    }
-                }
+        if t == 1
+            && let Some(c) = cap
+            && c.wants(layer)
+        {
+            let _ = qf.eval_enqueue();
+            let _ = g.eval_enqueue();
+            let _ = state.eval_enqueue();
+            let step = crate::bindings::glm53_affine_tower::INC_STEP
+                .load(std::sync::atomic::Ordering::Relaxed);
+            c.store(&format!("L{layer}.dec_q_s{step}"), &qf);
+            c.store(&format!("L{layer}.dec_g_s{step}"), &g);
+            c.store(&format!("L{layer}.dec_state_in_s{step}"), &state);
+            if layer == 0 {
+                let wv = window.to_vec1::<f32>().unwrap_or_default();
+                eprintln!(
+                    "[dec-conv] naive window[0..16] = {:?}",
+                    &wv[..16.min(wv.len())]
+                );
+                c.store(&format!("L{layer}.dec_conv_s{step}"), &window);
             }
         }
         for ti in 0..t {
@@ -1037,31 +729,31 @@ impl Kda {
             let qt2 = q_t.reshape(&[bh, d as i32, 1])?; // [B*Hh, Dk, 1]
             let out_t = st_t2.matmul(&qt2)?; // [B*Hh, Dv, 1]
             let out_r = out_t.reshape(&[(b) as i32, 1, (heads) as i32, (d) as i32])?;
-            if let Some(c) = cap {
-                if c.wants(layer) && ti < 2 {
-                    c.store(&format!("L{layer}.kda_tok{ti}"), &out_r);
-                    if ti == 0 {
-                        c.store(&format!("L{layer}.kda_state_t0"), &state);
-                    }
+            if let Some(c) = cap
+                && c.wants(layer)
+                && ti < 2
+            {
+                c.store(&format!("L{layer}.kda_tok{ti}"), &out_r);
+                if ti == 0 {
+                    c.store(&format!("L{layer}.kda_state_t0"), &state);
                 }
             }
             outs.push(out_r);
         }
-        if t == 1 {
-            if let Some(c) = cap {
-                if c.wants(layer) {
-                    let last = outs.last().unwrap();
-                    let _ = last.eval_enqueue();
-                    c.store(
-                        &format!(
-                            "L{layer}.dec_y_s{}",
-                            crate::bindings::glm53_affine_tower::INC_STEP
-                                .load(std::sync::atomic::Ordering::Relaxed)
-                        ),
-                        last,
-                    );
-                }
-            }
+        if t == 1
+            && let Some(c) = cap
+            && c.wants(layer)
+        {
+            let last = outs.last().unwrap();
+            let _ = last.eval_enqueue();
+            c.store(
+                &format!(
+                    "L{layer}.dec_y_s{}",
+                    crate::bindings::glm53_affine_tower::INC_STEP
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                ),
+                last,
+            );
         }
         let out = concat(outs, 1)?; // [B,T,Hh,D]
         *ssm_state = Some(state.transpose_axes(&[0, 1, 2, 4, 3])?.reshape(&[
@@ -1070,10 +762,10 @@ impl Kda {
             d as i32,
             d as i32,
         ])?);
-        if let Some(c) = cap {
-            if c.wants(layer) {
-                c.store(&format!("L{layer}.kda_out_prenorm"), &out);
-            }
+        if let Some(c) = cap
+            && c.wants(layer)
+        {
+            c.store(&format!("L{layer}.kda_out_prenorm"), &out);
         }
 
         // 6. Gated output norm + o_proj.
@@ -1081,40 +773,8 @@ impl Kda {
         let gate = gate.reshape(&[(b) as i32, (t) as i32, (heads) as i32, (d) as i32])?;
         let out = gated_rms_norm(&out, &self.o_norm_w, &gate, self.norm_eps)?;
         let out = out.reshape(&[(b) as i32, (t) as i32, (qkv) as i32])?;
-        Ok(self.linear(&out, &self.o_proj)?)
+        self.linear(&out, &self.o_proj)
     }
 }
 
-impl Kda {
-    pub(crate) fn load_gguf(
-        w: &crate::core::gguf_resident::ResidentWeights,
-        layer: usize,
-    ) -> anyhow::Result<Self> {
-        use crate::bindings::glm53_projection::plain;
-        let p = |name: &str| format!("blk.{layer}.{name}.weight");
-        let projection = |name: &str| Projection::load(w, &p(name));
-        let f = |name: &str| plain(w, &p(name));
-        Ok(Self {
-            q_w: projection("kda_q")?,
-            k_w: projection("kda_k")?,
-            v_w: projection("kda_v")?,
-            o_proj: projection("kda_output")?,
-            f_a_w: projection("kda_f_a")?,
-            f_b_w: projection("kda_f_b")?,
-            g_a_w: projection("kda_g_a")?,
-            g_b_w: projection("kda_g_b")?,
-            b_w: projection("kda_beta")?,
-            conv_q: f("kda_q_conv")?.reshape(&[8192, 4])?,
-            conv_k: f("kda_k_conv")?.reshape(&[8192, 4])?,
-            conv_v: f("kda_v_conv")?.reshape(&[8192, 4])?,
-            dt_bias: f("kda_dt_bias")?,
-            a_log: f("kda_a_log")?,
-            o_norm_w: f("kda_o_norm")?,
-            heads: 64,
-            head_dim: 128,
-            conv_k_sz: 4,
-            lower_bound: -5.0,
-            norm_eps: 1e-5,
-        })
-    }
-}
+impl Kda {}

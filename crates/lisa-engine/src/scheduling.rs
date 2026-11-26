@@ -10,15 +10,14 @@
 //! that arrives while others are decoding is admitted mid-wave instead of
 //! waiting for the whole wave to drain. A long admission prefill is chunked and
 //! yields decode ticks between chunks (`ContinuousBatch::admit_chunked`), the
-//! prefill/decode interleave; `LISA_NO_INTERLEAVE=1`
-//! restores the blocking admit.
+//! prefill/decode interleave.
 
 use std::collections::{HashSet, VecDeque};
 use std::time::Instant;
 
 use crate::batching::{BatchRuntime, ContinuousBatch, MAX_PAD_WASTE, PREFILL_CHUNK};
 use crate::conversation::Conversation;
-use crate::speculative_runtime::{SpeculativeRuntime, SpeculativeSampler};
+use crate::speculation::runtime::{SpeculativeRuntime, SpeculativeSampler};
 
 pub trait ScheduleRuntime:
     SpeculativeRuntime + BatchRuntime<Sampler = <Self as SpeculativeRuntime>::Sampler>
@@ -128,7 +127,7 @@ fn run_speculative<R: ScheduleRuntime>(
             on_token(id, t)
         };
         let mtp_sampler = if !tower.has_target_mtp()
-            && req.sampler.is_greedy()
+            && req.sampler.can_use_raw_argmax()
             && !req.sampler.exact_sampling()
         {
             None
@@ -153,7 +152,7 @@ fn run_speculative<R: ScheduleRuntime>(
 }
 
 /// Interleave independent GLM target-MTP sessions at a verified round
-/// boundary. DS4's server submits one speculative cycle per active session;
+/// boundary. The reference's server submits one speculative cycle per active session;
 /// its current GLM batch implementation then evaluates those cycles through
 /// the serialized fallback. A resumable cycle retains the sampled carry and
 /// pending proposal while every other live stream advances.
@@ -255,8 +254,7 @@ fn run_batch<R: ScheduleRuntime>(
     let mut out: Vec<Vec<u32>> = Vec::new();
     let mut batch = ContinuousBatch::empty(cap_hint);
     let mut active: Vec<Active<Sampling<R>>> = Vec::new();
-    let interleave =
-        std::env::var("LISA_NO_INTERLEAVE").is_err() && !tower.batch_decode_equal_length_only();
+    let interleave = !tower.batch_decode_equal_length_only();
     // One-shot `[batched] decode engaged` marker: output equality alone cannot
     // tell a batched run from N serial ones.
     static DECODE_ENGAGED: std::sync::atomic::AtomicBool =
@@ -300,10 +298,10 @@ fn run_batch<R: ScheduleRuntime>(
     loop {
         // Admit from the queue (then from the live source) while there is room.
         // A request the pad-waste cap rejects is deferred (pushed back) and
-        // retried after the next decode round — specs/13 §3b.
+        // retried after the next decode round.
         let mut deferred: Vec<Request<Sampling<R>>> = Vec::new();
         while batch.len() < max_batch {
-            let Some(req) = queue.pop_front().or_else(|| next()) else {
+            let Some(req) = queue.pop_front().or_else(&mut *next) else {
                 break;
             };
             if tower.batch_decode_equal_length_only()

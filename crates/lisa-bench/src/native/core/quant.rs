@@ -6,13 +6,12 @@
 //! checkpoint config (2/4/8) and passed to `set_quant`.
 
 use lisa_metal::{Array, Dtype, ops};
-use std::cell::Cell;
 
 use crate::core::loader::{Shard, array_from_bytes};
 
 pub const GROUP_SIZE: i32 = 32;
 pub const BITS: i32 = 4;
-pub use lisa_engine::bindings::glm53_policy::*;
+pub use lisa_engine::bindings::glm53::policy::*;
 pub use lisa_engine::weights::affine::detect_group_size;
 pub type QuantizedLinear = lisa_engine::weights::affine::QuantizedLinear<Array>;
 pub type QuantizedEmbedding = lisa_engine::weights::affine::QuantizedEmbedding<Array>;
@@ -44,7 +43,7 @@ impl QuantizedLinearExecution for QuantizedLinear {
         out.reshape(&[&shape[..shape.len() - 1], &[self.dims_out() as i32]].concat())
     }
 
-    /// GLM affine projection using DS4's native tiny-row/matrix crossover.
+    /// GLM affine projection using the reference's native tiny-row/matrix crossover.
     /// The independent native fixtures and same-weight full-model captures
     /// recorded under resident-port-20261102 establish this arithmetic law.
     fn forward_glm53_prefill(&self, x: &Array) -> lisa_metal::error::Result<Array> {

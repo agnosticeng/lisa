@@ -55,7 +55,7 @@ impl Plan {
             vec![output as i32, (input / 64) as i32],
             D::BF16,
         );
-        let kernel = if output % 32 == 0 || output == 16 {
+        let kernel = if output.is_multiple_of(32) || output == 16 {
             Kernel::Affine4WideLinear
         } else {
             Kernel::AffineLinear {
@@ -83,30 +83,9 @@ impl Plan {
             weights: self.weights,
         }
     }
-    fn rotary(&mut self, x: Value, r: &Rope, d: usize, heads: usize) -> Value {
-        let count = (d as f32 * r.partial_rotary_factor) as usize / 2;
-        // Build frequencies on the device using the reference's F32 power operation.
-        let exps = (0..d / 2)
-            .map(|j| -(j as f32) * 2.0 / d as f32)
-            .collect::<Vec<_>>();
-        let exps = self.b.constant_f32(&exps, &[(d / 2) as i32]);
-        let base = self
-            .b
-            .constant_f32(&vec![r.rope_theta; d / 2], &[(d / 2) as i32]);
-        let f = self.binary(Binary::Power, base, exps);
-        let mask = (0..d / 2)
-            .map(|j| if j < count { 1.0 } else { 0.0 })
-            .collect::<Vec<_>>();
-        let mask = self.b.constant_f32(&mask, &[(d / 2) as i32]);
-        let f = self.binary(Binary::Multiply, f, mask);
-        let f = self.op(T::Broadcast(vec![self.rows, (d / 2) as i32]), &[f]);
-        let pos = self.op(T::Broadcast(vec![self.rows, (d / 2) as i32]), &[I(3)]);
-        let a = self.binary(Binary::Multiply, pos, f);
-        let a = self.cat(a, a, -1);
-        let c = self.op(T::Unary(Unary::Cos), &[a]);
-        let c = self.op(T::Cast(D::BF16), &[c]);
-        let s = self.op(T::Unary(Unary::Sin), &[a]);
-        let s = self.op(T::Cast(D::BF16), &[s]);
+    fn rotary(&mut self, x: Value, d: usize, heads: usize) -> Value {
+        let c = I(3);
+        let s = I(4);
         let c = self.op(
             T::Broadcast(vec![1, heads as i32, self.rows, d as i32]),
             &[c],
@@ -124,7 +103,44 @@ impl Plan {
         self.binary(Binary::Add, a, b)
     }
 }
-/// Inputs: hidden, convolution history or keys, values, absolute positions [S,1], attention mask.
+/// Fixed F32 frequencies, evaluated on the device with the original power and multiply.
+pub fn rotary_frequencies(r: &Rope, d: usize) -> Graph {
+    let mut p = Plan::new(0, 1);
+    let count = (d as f32 * r.partial_rotary_factor) as usize / 2;
+    // Build frequencies on the device using the reference's F32 power operation.
+    let exps = (0..d / 2)
+        .map(|j| -(j as f32) * 2.0 / d as f32)
+        .collect::<Vec<_>>();
+    let exps = p.b.constant_f32(&exps, &[(d / 2) as i32]);
+    let base =
+        p.b.constant_f32(&vec![r.rope_theta; d / 2], &[(d / 2) as i32]);
+    let f = p.binary(Binary::Power, base, exps);
+    let mask = (0..d / 2)
+        .map(|j| if j < count { 1.0 } else { 0.0 })
+        .collect::<Vec<_>>();
+    let mask = p.b.constant_f32(&mask, &[(d / 2) as i32]);
+    let f = p.binary(Binary::Multiply, f, mask);
+    p.finish(vec![f]).graph
+}
+
+/// BF16 cosine/sine shared by every attention layer with the same RoPE law.
+/// Input: absolute F32 positions `[S,1]`. Weight: original device-computed frequencies.
+pub fn rotary_factors(rows: usize, d: usize) -> Graph {
+    let mut p = Plan::new(1, rows as i32);
+    let f = p.op(T::Broadcast(vec![p.rows, (d / 2) as i32]), &[W(0)]);
+    let pos = p.op(T::Broadcast(vec![p.rows, (d / 2) as i32]), &[I(0)]);
+    let a = p.binary(Binary::Multiply, pos, f);
+    let a = p.cat(a, a, -1);
+    let c = p.op(T::Unary(Unary::Cos), &[a]);
+    let c = p.op(T::Cast(D::BF16), &[c]);
+    let s = p.op(T::Unary(Unary::Sin), &[a]);
+    let s = p.op(T::Cast(D::BF16), &[s]);
+    let mut graph = p.finish(vec![c, s]).graph;
+    graph.weights = 1;
+    graph
+}
+
+/// Inputs: hidden, convolution history or keys, values, BF16 cosine/sine, attention mask.
 /// Outputs: hidden and immutable replacement state (one convolution tensor or K,V).
 pub fn layer(c: &Config, kind: Layer, rows: usize, history: usize, cursor: usize) -> Definition {
     let h = c.hidden_size;
@@ -132,7 +148,7 @@ pub fn layer(c: &Config, kind: Layer, rows: usize, history: usize, cursor: usize
     let d = c.head_dim;
     let nh = c.num_attention_heads;
     let nk = c.num_key_value_heads;
-    let mut p = Plan::new(5, s);
+    let mut p = Plan::new(6, s);
     let x = p.norm(I(0), "operator_norm", h, c.norm_eps);
     let (mixed, states) = if kind == Layer::Conv {
         let bcx = p.linear(x, "conv.in_proj", h, 3 * h);
@@ -175,12 +191,12 @@ pub fn layer(c: &Config, kind: Layer, rows: usize, history: usize, cursor: usize
         let q = p.op(T::Reshape(vec![1, s, nh as i32, d as i32]), &[q]);
         let q = p.norm(q, "self_attn.q_norm", d, c.norm_eps);
         let q = p.op(T::Transpose(vec![0, 2, 1, 3]), &[q]);
-        let q = p.rotary(q, c.rope(kind), d, nh);
+        let q = p.rotary(q, d, nh);
         let k = p.linear(x, "self_attn.k_proj", h, nk * d);
         let k = p.op(T::Reshape(vec![1, s, nk as i32, d as i32]), &[k]);
         let k = p.norm(k, "self_attn.k_norm", d, c.norm_eps);
         let k = p.op(T::Transpose(vec![0, 2, 1, 3]), &[k]);
-        let k = p.rotary(k, c.rope(kind), d, nk);
+        let k = p.rotary(k, d, nk);
         let v = p.linear(x, "self_attn.v_proj", h, nk * d);
         let v = p.op(T::Reshape(vec![1, s, nk as i32, d as i32]), &[v]);
         let v = p.op(T::Transpose(vec![0, 2, 1, 3]), &[v]);
@@ -233,7 +249,7 @@ pub fn layer(c: &Config, kind: Layer, rows: usize, history: usize, cursor: usize
             AttentionMask::Tensor
         };
         let args = if mask == AttentionMask::Tensor {
-            let m = p.op(T::Cast(D::BF16), &[I(4)]);
+            let m = p.op(T::Cast(D::BF16), &[I(5)]);
             vec![q, k, v, m]
         } else {
             vec![q, k, v]

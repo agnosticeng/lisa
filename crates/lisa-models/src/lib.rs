@@ -5,6 +5,7 @@ pub mod deepseek41;
 pub mod dense;
 pub mod glm53;
 pub mod graph;
+pub mod inkling2;
 pub mod laya;
 pub mod normalization;
 pub mod position;
@@ -72,10 +73,10 @@ impl Plan {
                     "invalid arguments or forward reference at plan call {i}"
                 ));
             }
-            if let Kernel::AffineLinear { group_size, bits } = call.kernel {
-                if group_size <= 0 || !matches!(bits, 2 | 4 | 8) {
-                    return Err(format!("unsupported affine geometry at plan call {i}"));
-                }
+            if let Kernel::AffineLinear { group_size, bits } = call.kernel
+                && (group_size <= 0 || !matches!(bits, 2 | 4 | 8))
+            {
+                return Err(format!("unsupported affine geometry at plan call {i}"));
             }
         }
         if !valid(self.output, self.calls.len()) {
@@ -93,10 +94,44 @@ pub struct DimensionGuard {
     pub equals: i32,
 }
 
+/// Model-supplied alternatives may restrict the complete input shape as well
+/// as one dimension. Exact-rank ranges prevent a decode optimization from
+/// accidentally selecting a batched or flattened prefill input.
+#[derive(Clone, Debug)]
+pub enum ShapeGuard {
+    Dimension(DimensionGuard),
+    ExactRank(Vec<std::ops::RangeInclusive<i32>>),
+    Any(Vec<ShapeGuard>),
+}
+impl ShapeGuard {
+    pub fn valid(&self) -> bool {
+        match self {
+            Self::Dimension(g) => g.axis < g.min_rank,
+            Self::ExactRank(ranges) => {
+                !ranges.is_empty() && ranges.iter().all(|r| *r.start() > 0 && !r.is_empty())
+            }
+            Self::Any(guards) => !guards.is_empty() && guards.iter().all(Self::valid),
+        }
+    }
+    pub fn matches(&self, shape: &[i32]) -> bool {
+        match self {
+            Self::Dimension(g) => shape.len() >= g.min_rank && shape.get(g.axis) == Some(&g.equals),
+            Self::ExactRank(ranges) => {
+                shape.len() == ranges.len()
+                    && shape
+                        .iter()
+                        .zip(ranges)
+                        .all(|(dim, range)| range.contains(dim))
+            }
+            Self::Any(guards) => guards.iter().any(|g| g.matches(shape)),
+        }
+    }
+}
+
 pub struct Alternatives {
     pub primary: Plan,
     /// Optional optimized plan; a declined kernel restarts the primary plan.
-    pub guarded: Option<(DimensionGuard, Plan)>,
+    pub guarded: Option<(ShapeGuard, Plan)>,
 }
 
 pub mod program;

@@ -1,5 +1,4 @@
 #![cfg(test)]
-#![allow(dead_code, unused_imports)]
 use lisa_metal::{Array, Dtype};
 pub mod dit2;
 pub mod dit3;
@@ -14,7 +13,7 @@ pub(crate) fn layer_norm(x: &Array) -> anyhow::Result<Array> {
     let inv = xc
         .multiply(&xc)?
         .mean_axis(-1, true)?
-        .add(&Array::from_f32(1e-6))?
+        .add(Array::from_f32(1e-6))?
         .rsqrt()?;
     Ok(xc.multiply(&inv)?.as_dtype(Dtype::Bfloat16)?)
 }

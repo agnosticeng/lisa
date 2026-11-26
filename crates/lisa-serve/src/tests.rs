@@ -471,121 +471,6 @@ fn glm_tool_prompt_matches_ds4_multiple_and_deferred_tools() {
 }
 
 #[test]
-#[ignore]
-fn render_mimo_tools_and_parts() {
-    let dir = match lisa_engine::checkpoint::resolve_model_dir(
-        "agnosticeng/MiMo-V2.6-Distill-Qwen-9B-4bit",
-    ) {
-        Ok(d) => d,
-        Err(_) => return,
-    };
-    let src = match std::fs::read_to_string(dir.join("chat_template.jinja")) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    // Exercise the branches our text-only ChatMessage wrapper never feeds:
-    // tools, tool_calls, tool results, and multimodal content parts.
-    let t = hf_chat_template::ChatTemplate::from_str(&src).expect("template parse");
-    let mut input = hf_chat_template::RenderInput {
-        add_generation_prompt: true,
-        ..Default::default()
-    };
-    input.tools.push(json!({
-        "type": "function",
-        "function": { "name": "get_weather", "parameters": { "type": "object" } }
-    }));
-    input
-        .messages
-        .push(hf_chat_template::Message::user("weather in Paris?"));
-    let mut call = hf_chat_template::Message::assistant("");
-    call.tool_calls.push(json!({
-        "function": { "name": "get_weather", "arguments": { "city": "Paris" } }
-    }));
-    input.messages.push(call);
-    input
-        .messages
-        .push(hf_chat_template::Message::tool("sunny, 21C"));
-    let mut img = hf_chat_template::Message::user("");
-    img.content = Some(hf_chat_template::Content::Parts(vec![
-        json!({"type": "image"}),
-        json!({"type": "text", "text": "describe"}),
-    ]));
-    input.messages.push(img);
-    input.extra.insert("enable_thinking".into(), json!(false));
-    let out = t.render(&input).expect("render");
-    eprintln!("---RENDER---\n{out}\n---END---");
-}
-
-#[test]
-#[ignore]
-fn render_mimo_template() {
-    let dir = match lisa_engine::checkpoint::resolve_model_dir(
-        "agnosticeng/MiMo-V2.6-Distill-Qwen-9B-4bit",
-    ) {
-        Ok(d) => d,
-        Err(_) => return,
-    };
-    let src = match std::fs::read_to_string(dir.join("chat_template.jinja")) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    let t = ChatTemplate::new(&src).expect("template parse");
-    let msgs = vec![ChatMessage {
-        role: "user".into(),
-        content: "Name three colors.".into(),
-        reasoning_content: None,
-        tool_calls: Vec::new(),
-        tool_call_id: None,
-        parts: None,
-    }];
-    let out = t.render(&msgs, true, &[], true).expect("render");
-    eprintln!("---RENDER---\n{out}\n---END---");
-}
-
-#[test]
-#[ignore]
-fn render_real_template() {
-    let dir =
-        match lisa_engine::checkpoint::resolve_model_dir("agnosticeng/Qwen3.8-Flash-Next-4bit") {
-            Ok(d) => d,
-            Err(_) => return,
-        };
-    let src = match std::fs::read_to_string(dir.join("chat_template.jinja")) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    let t = ChatTemplate::new(&src).expect("template parse");
-    let msgs = vec![
-        ChatMessage {
-            role: "user".into(),
-            content: "Name three colors.".into(),
-            reasoning_content: None,
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-            parts: None,
-        },
-        ChatMessage {
-            role: "assistant".into(),
-            content: "Red, green, blue.".into(),
-            reasoning_content: Some("Thinking about colors.".into()),
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-            parts: None,
-        },
-        ChatMessage {
-            role: "user".into(),
-            content: "Which is warmest?".into(),
-            reasoning_content: None,
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-            parts: None,
-        },
-    ];
-    let out = t.render(&msgs, true, &[], true).expect("render");
-    eprintln!("---RENDER---\n{out}\n---END---");
-}
-
-#[test]
 fn session_reuse_compares_tool_messages_and_render_options() {
     let message = ChatMessage {
         role: "assistant".into(),
@@ -597,11 +482,23 @@ fn session_reuse_compares_tool_messages_and_render_options() {
     };
     let mut edited = message.clone();
     edited.tool_calls[0]["function"]["arguments"] = json!("b");
-    assert_eq!(super::structural_prefix(&[message.clone()], &[edited]), 0);
+    assert_eq!(
+        super::structural_prefix(std::slice::from_ref(&message), &[edited]),
+        0
+    );
     let mut edited = message.clone();
     edited.tool_call_id = Some("different-call".into());
-    assert_eq!(super::structural_prefix(&[message.clone()], &[edited]), 0);
-    assert_eq!(super::structural_prefix(&[message.clone()], &[message]), 1);
+    assert_eq!(
+        super::structural_prefix(std::slice::from_ref(&message), &[edited]),
+        0
+    );
+    assert_eq!(
+        super::structural_prefix(
+            std::slice::from_ref(&message),
+            std::slice::from_ref(&message)
+        ),
+        1
+    );
     let tools = vec![json!({"type":"function","function":{"name":"lookup"}})];
     assert!(super::session_render_options_match(
         &tools, true, &tools, true
@@ -618,7 +515,7 @@ fn session_reuse_compares_tool_messages_and_render_options() {
 }
 
 #[test]
-fn http_preserves_explicit_dspine_depth_and_auto_policy() {
+fn http_preserves_explicit_depth_and_auto_policy() {
     use lisa_engine::speculation::MtpDepth;
     for depth in [0, 2, 6, 7, 15, 16] {
         // Preserve the request, including an invalid depth: the engine validates

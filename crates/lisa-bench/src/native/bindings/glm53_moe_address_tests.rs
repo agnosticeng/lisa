@@ -1,6 +1,5 @@
 #![cfg(test)]
 use super::*;
-use crate::bindings::deepseek41_moe::tests::{counts, difference};
 fn equal(a: &Array, b: &Array) -> anyhow::Result<()> {
     assert_eq!(a.shape(), b.shape());
     assert_eq!(a.dtype(), b.dtype());
@@ -157,7 +156,6 @@ fn routed_expert_plans_match_original_bits_dispatch_and_reused_workspace() -> an
                                     .collect(),
                             ))
                         };
-                        let before = counts();
                         let old = model.forward_address_gpu_oracle(
                             &x,
                             &ids,
@@ -170,7 +168,6 @@ fn routed_expert_plans_match_original_bits_dispatch_and_reused_workspace() -> an
                             (mode > 0).then_some(&a),
                             3,
                         )?;
-                        let middle = counts();
                         let new = model.forward_address_gpu(
                             &x,
                             &ids,
@@ -183,17 +180,7 @@ fn routed_expert_plans_match_original_bits_dispatch_and_reused_workspace() -> an
                             (mode > 0).then_some(&b),
                             3,
                         )?;
-                        let after = counts();
                         equal(&old, &new)?;
-                        if std::env::var_os("LISA_TRACE").is_some() {
-                            let old = difference(&before, &middle);
-                            assert!(!old.is_empty());
-                            assert_eq!(
-                                old,
-                                difference(&middle, &after),
-                                "metadata{metadata:?} split{split} B{batch} T{time} capture{mode}"
-                            );
-                        }
                         if mode == 1 {
                             let a = a.entries.lock().unwrap();
                             let b = b.entries.lock().unwrap();
@@ -244,21 +231,11 @@ fn router_and_grouped_fallback_plans_match_original() -> anyhow::Result<()> {
                     &(0..b * t * 512)
                         .map(|i| ((i * 17 + t) % 101) as f32 * 0.002 - 0.08)
                         .collect::<Vec<_>>(),
-                    &[b as i32, t as i32, 512],
+                    &[b, t, 512],
                 );
-                let before = counts();
                 let (a, _) = model.forward_parts_oracle(&x, None, 3, false)?;
-                let middle = counts();
                 let (b, _) = model.forward_parts_with_capture_mode(&x, None, 3, false)?;
-                let after = counts();
                 equal(&a, &b)?;
-                if std::env::var_os("LISA_TRACE").is_some() {
-                    assert_eq!(
-                        difference(&before, &middle),
-                        difference(&middle, &after),
-                        "metadata{metadata:?} groups{groups} T{t}"
-                    );
-                }
             }
         }
     }

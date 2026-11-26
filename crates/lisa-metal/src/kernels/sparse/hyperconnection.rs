@@ -1,13 +1,15 @@
-//! Hyperconnection operations with the pinned DS4 arithmetic.
+//! Hyperconnection operations with the pinned reference arithmetic.
+use super::linear::bf16_projection_nsg;
 use super::*;
 
-
-pub(super) const HC_SPLIT_SOURCE: &crate::shader_pack::Source = crate::kernel_source!("glm53/hc_split.metal");
+pub(super) const HC_SPLIT_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("hyper/hc_split.metal");
 pub(super) const HC_SPLIT_NORM4_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/hc_split_norm4.metal");
+    crate::kernel_source!("hyper/hc_split_norm4.metal");
 pub(super) const HC_EXPAND_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/hc_expand.metal");
-pub(super) const HC_WSUM_SOURCE: &crate::shader_pack::Source = crate::kernel_source!("glm53/hc_wsum.metal");
+    crate::kernel_source!("hyper/hc_expand.metal");
+pub(super) const HC_WSUM_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("hyper/hc_wsum.metal");
 
 pub(super) fn hc_wsum_kernel() -> &'static Option<MetalKernel> {
     static K: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
@@ -28,7 +30,7 @@ pub(super) fn hc_wsum_kernel() -> &'static Option<MetalKernel> {
     })
 }
 
-/// Fused mHC collapse (ds4 weighted_sum port): residual `[B,T,4,H]` f32,
+/// Fused mHC collapse (the reference weighted_sum port): residual `[B,T,4,H]` f32,
 /// pre `[B,T,4]` f32 -> x `[B,T,H]` f32. One dispatch replaces the narrow/add
 /// op chain.
 pub fn hc_weighted_sum(residual: &Array, pre: &Array, stream: &Stream) -> Option<Array> {
@@ -38,8 +40,8 @@ pub fn hc_weighted_sum(residual: &Array, pre: &Array, stream: &Stream) -> Option
     let t = sh[1];
     let h = *sh.last().unwrap();
     let n_rows = b * t;
-    let nr = Array::from_int(n_rows as i32);
-    let h_a = Array::from_int(h as i32);
+    let nr = Array::from_int(n_rows);
+    let h_a = Array::from_int(h);
     for a in [residual, pre] {
         if let Err(e) = a.eval_enqueue() {
             eprintln!("[hc-wsum-decline] {e}");
@@ -52,21 +54,14 @@ pub fn hc_weighted_sum(residual: &Array, pre: &Array, stream: &Stream) -> Option
         dtype: Dtype::Float32,
     }];
     let all: Vec<&Array> = inputs.iter().map(|a| &**a).collect();
-    let out = match kernel.apply(
-        &all,
-        &[],
-        ((n_rows * h) as i32, 1, 1),
-        (1, 1, 1),
-        &outputs,
-        stream,
-    ) {
+    let out = match kernel.apply(&all, &[], ((n_rows * h), 1, 1), (1, 1, 1), &outputs, stream) {
         Ok(o) => o,
         Err(e) => {
             eprintln!("[hc-wsum-decline] {e}");
             return None;
         }
     };
-    Some(out.into_iter().next()?)
+    out.into_iter().next()
 }
 
 pub(super) fn hc_split_kernel() -> &'static Option<MetalKernel> {
@@ -192,10 +187,10 @@ pub fn hc_split_sinkhorn(
             return None;
         }
     };
-    Some(out.into_iter().next()?)
+    out.into_iter().next()
 }
 
-/// ds4's HC=4 fused coefficient split, stream collapse, and RMSNorm path.
+/// The reference's HC=4 fused coefficient split, stream collapse, and RMSNorm path.
 /// `mixes=[B*T,24]`, `x=[B,T,4,4096]`; returns `(split, post, comb, collapsed, normed)`.
 pub fn hc_split_weighted_sum_norm4(
     mixes: &Array,
@@ -250,7 +245,7 @@ pub fn hc_split_weighted_sum_norm4(
             // width by four and rounds the lane count up to a power of two.
             // For GLM's hidden=4096 specialization this is 1024 threads. The
             // reduction grouping is numerically observable, so do not tune
-            // this launch width independently of the DS4 reference.
+            // this launch width independently of the reference.
             (n_rows.checked_mul(1024)?, 1, 1),
             (1024, 1, 1),
             &[
@@ -324,7 +319,7 @@ pub fn hc_expand4(
     let out = match kernel.apply_with_inline_inputs(
         &inputs,
         &[],
-        ((n_rows * h) as i32, 1, 1),
+        ((n_rows * h), 1, 1),
         (1, 1, 1),
         &outputs,
         stream,
@@ -335,10 +330,10 @@ pub fn hc_expand4(
             return None;
         }
     };
-    Some(out.into_iter().next()?)
+    out.into_iter().next()
 }
 pub(super) const SHARED_Q8_SWIGLU_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/shared_q8_swiglu_ds4.metal");
+    crate::kernel_source!("moe/shared_q8_swiglu_ds4.metal");
 
 pub(super) fn shared_q8_swiglu_ds4_kernel() -> &'static Option<MetalKernel> {
     static K: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
@@ -369,7 +364,7 @@ pub(super) fn shared_q8_swiglu_ds4_kernel() -> &'static Option<MetalKernel> {
     })
 }
 
-/// DS4's one-row Q8 shared-expert gate/up and SwiGLU schedule, reading MLX's
+/// The reference's one-row Q8 shared-expert gate/up and SwiGLU schedule, reading MLX's
 /// affine-Q8 weight representation directly. This is the decode/prefill M=1
 /// path; multirow inputs use the stock affine-QMM implementation.
 pub fn shared_q8_swiglu_ds4(
@@ -390,7 +385,7 @@ pub fn shared_q8_swiglu_ds4(
         || out_dim > (i32::MAX as usize) / 2
         || x.shape() != [in_dim as i32]
         || x.dtype() != Dtype::Float32
-        || in_dim % 64 != 0
+        || !in_dim.is_multiple_of(64)
         || group_size != 64
     {
         return None;
@@ -437,7 +432,7 @@ pub fn shared_q8_swiglu_ds4(
         .apply_with_inline_inputs(
             &inputs,
             &[],
-            ((((out_dim + 1) / 2) * 32) as i32, 4, 1),
+            ((out_dim.div_ceil(2) * 32) as i32, 4, 1),
             (32, 4, 1),
             &outputs,
             stream,
@@ -447,9 +442,9 @@ pub fn shared_q8_swiglu_ds4(
     Some((it.next()?, it.next()?, it.next()?))
 }
 pub(super) const HC_MIX_RMS_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/hc_mix_rms.metal");
+    crate::kernel_source!("hyper/hc_mix_rms.metal");
 pub(super) const HC_MIX_RMS_BF16_GEMV_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/hc_mix_rms_bf16_gemv.metal");
+    crate::kernel_source!("hyper/hc_mix_rms_bf16_gemv.metal");
 
 pub(super) fn hc_mix_rms_kernel() -> &'static Option<MetalKernel> {
     static K: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
@@ -470,16 +465,16 @@ pub(super) fn hc_mix_rms_kernel() -> &'static Option<MetalKernel> {
     })
 }
 
-/// Plain F32 RMSNorm for the flattened mHC stream, using ds4's float4 and
+/// Plain F32 RMSNorm for the flattened mHC stream, using the reference's float4 and
 /// threadgroup reduction order instead of a generic square/reduce/scale graph.
-pub fn glm53_hc_mix_rms(input: &Array, eps: f32, stream: &Stream) -> Option<Array> {
+pub fn hc_mix_rms(input: &Array, eps: f32, stream: &Stream) -> Option<Array> {
     let kernel = hc_mix_rms_kernel().as_ref()?;
     if input.dtype() != Dtype::Float32 || input.rank() != 2 {
         return None;
     }
     let n = input.dim(1) as usize;
     let rows = input.dim(0) as usize;
-    if n == 0 || n % 4 != 0 || rows == 0 {
+    if n == 0 || !n.is_multiple_of(4) || rows == 0 {
         return None;
     }
     input.eval_enqueue().ok()?;
@@ -488,7 +483,7 @@ pub fn glm53_hc_mix_rms(input: &Array, eps: f32, stream: &Stream) -> Option<Arra
     let eps_a = Array::from_f32_as(eps, Dtype::Float32);
     let inputs: [&Array; 4] = [&n_a, &rows_a, &eps_a, input];
     let output = [OutputArg {
-        shape: input.shape().iter().map(|&d| d as i32).collect(),
+        shape: input.shape().to_vec(),
         dtype: Dtype::Float32,
     }];
     let all: Vec<&Array> = inputs.iter().map(|a| &**a).collect();
@@ -536,9 +531,9 @@ pub(super) fn hc_mix_rms_bf16_gemv_kernel() -> &'static Option<MetalKernel> {
 }
 
 /// Fused mHC input RMSNorm and BF16 projection for the 24-by-16384 decode and
-/// short-verify shapes. The RMS tree and each output's DS4 lane-FMA/SIMD-sum
-/// order match the separate `glm53_hc_mix_rms` + `glm53_bf16_gemv` chain.
-pub fn glm53_hc_mix_rms_bf16_gemv(
+/// short-verify shapes. The RMS tree and each output's reference lane-FMA/SIMD-sum
+/// order match the separate `hc_mix_rms` + `bf16_gemv` chain.
+pub fn hc_mix_rms_bf16_gemv(
     weights: &Array,
     input: &Array,
     eps: f32,

@@ -1,6 +1,5 @@
 #![cfg(test)]
-#![allow(dead_code)]
-//! Bind original GGUF payloads to native DS4/GGML Metal dispatches.
+//! Bind original GGUF payloads to native reference/GGML Metal dispatches.
 //! No affine conversion, CPU expert selection or whole-matrix dequantization.
 
 use crate::core::gguf_resident::PackedTensor;
@@ -34,7 +33,7 @@ pub fn linear(weight: &PackedTensor, input: &Array, round: bool, stream: &Stream
     linear_rows(weight, 0, weight.info.dimensions[1], input, round, stream)
 }
 
-/// Original DS4 paired query/KV gate. Other formats retain their independent
+/// Original reference paired query/KV gate. Other formats retain their independent
 /// projections, including the same BF16 output boundary.
 pub fn query_kv_pair(
     query: &PackedTensor,
@@ -60,7 +59,7 @@ pub fn query_kv_pair(
     ))
 }
 
-/// DS4's eight O_A groups. Q5_K uses the original GGML group strides in one
+/// The reference's eight O_A groups. Q5_K uses the original GGML group strides in one
 /// launch; formats with a different reduction retain their scalar dispatch.
 pub fn attention_output_groups(
     weight: &PackedTensor,

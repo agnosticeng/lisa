@@ -436,7 +436,7 @@ template <typename T, int GS, int BITS, int MROWS, int BN, int K_PARTS, int PPT,
 // their msg arm): 2 <= MROWS <= 7, N >= 100000, K % 64 == 0, N % BN == 0,
 // 4-bit only. BN per their vqmmMsgBn: 4 through M=6, 2 at M=7 ("14
 // accumulators — under the 24 ceiling"). NOTE the ledger lesson from our
-// splitk port (specs/15 §2): their BN=4 stack-spilled on OUR Metal compiler
+// splitk port: their BN=4 stack-spilled on OUR Metal compiler
 // at M=5 in the splitk tile — the msg tile carries no threadgroup partials
 // array, so BN=4 is kept per their design but the isolated bench must
 // confirm no spill before in-situ adoption.

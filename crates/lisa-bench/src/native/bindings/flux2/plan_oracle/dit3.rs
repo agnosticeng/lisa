@@ -41,7 +41,7 @@ fn rotations(ids: &[[f32; 4]]) -> (Array, Array) {
 }
 fn modulate(x: &Array, m: &Modulation) -> anyhow::Result<Array> {
     Ok(layer_norm(x)?
-        .multiply(&m[1].add(&Array::from_f32_as(1.0, Dtype::Bfloat16))?)?
+        .multiply(&m[1].add(Array::from_f32_as(1.0, Dtype::Bfloat16))?)?
         .add(&m[0])?)
 }
 impl Dit {
@@ -118,7 +118,7 @@ impl Dit {
             .reshape(x.shape())?;
         let ff = w.lin(&format!("{prefix}.mlp_in"), &n)?;
         let half = ff.dim(-1) / 2;
-        let ff = silu(&slice(&ff, 0, half))?.multiply(&slice(&ff, half, 2 * half))?;
+        let ff = silu(&slice(&ff, 0, half))?.multiply(slice(&ff, half, 2 * half))?;
         let out = w
             .lin(&format!("{prefix}.attn_out"), &attn)?
             .add(&w.lin(&format!("{prefix}.mlp_out"), &ff)?)?;
@@ -189,9 +189,9 @@ impl Dit {
         let out = w.lin("final_layer.image.adaLN_modulation.1", &silu(&vi)?)?;
         let x = layer_norm(&x.index((.., 0..ni, ..)))?
             .multiply(
-                &slice(&out, HIDDEN, 2 * HIDDEN).add(&Array::from_f32_as(1.0, Dtype::Bfloat16))?,
+                &slice(&out, HIDDEN, 2 * HIDDEN).add(Array::from_f32_as(1.0, Dtype::Bfloat16))?,
             )?
-            .add(&slice(&out, 0, HIDDEN))?;
+            .add(slice(&out, 0, HIDDEN))?;
         w.lin("final_layer.image.linear", &x)
     }
 }

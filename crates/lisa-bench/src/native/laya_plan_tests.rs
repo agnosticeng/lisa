@@ -97,7 +97,6 @@ fn fixture() -> (LayaConfig, BTreeMap<String, (Vec<f32>, Vec<i32>)>) {
 
 use lisa_metal::{Array, device::MetalDevice};
 #[test]
-#[cfg(feature = "metal")]
 fn complete_metal_plans_preserve_original_f32_bits() {
     let (cfg, weights) = fixture();
     let prepare = |plan: lisa_models::laya::plan::Plan| {

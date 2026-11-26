@@ -1,6 +1,5 @@
 #![cfg(test)]
-#![allow(dead_code)]
-//! mHC hyper-connections for `glm5_next`, following ds4's F32 inference graph.
+//! mHC hyper-connections for `glm5_next`, following the reference's F32 inference graph.
 //!
 //! The residual stream is
 //! `[B, T, C, H]` with `C = hc_mult = 4`. Per half (attn / ffn), a
@@ -17,9 +16,7 @@
 //! new_c = post[c] * y + sum_p comb[p, c] * state_p # expand    [B, T, C, H]
 //! ```
 
-use crate::core::loader::TensorSource;
-
-use lisa_metal::{Array, Dtype, ops};
+use lisa_metal::{Array, Dtype};
 
 pub struct Hc {
     fn_w: Array,          // [24, C*H] source dtype; BF16 decode uses ds4 row GEMV
@@ -37,17 +34,6 @@ pub fn fscalar(a: &Array, v: f32) -> lisa_metal::error::Result<Array> {
     Ok(Array::from_f32_as(v, a.dtype()))
 }
 
-/// Concatenate owned arrays along `axis` (the wrapper op borrows).
-pub fn concat(arrays: Vec<Array>, axis: i32) -> lisa_metal::error::Result<Array> {
-    let refs: Vec<&Array> = arrays.iter().collect();
-    ops::concatenate(&refs, axis)
-}
-
-/// Concatenate borrowed arrays along `axis`.
-pub fn concat_refs(arrays: &[&Array], axis: i32) -> lisa_metal::error::Result<Array> {
-    ops::concatenate(arrays, axis)
-}
-
 /// Narrow view `axis` in `[start, start+len)` (a view, via the inner array).
 pub fn narrow(
     a: &Array,
@@ -58,65 +44,7 @@ pub fn narrow(
     Ok(Array::new(a.t.narrow(axis, start, len)?))
 }
 
-/// Batched-safe matmul: flatten all leading dims to rows, contract, reshape
-/// back (mlx-c matmul is only exact on 2-D here, same as quantized_matmul).
-pub fn mm(a: &Array, w: &Array) -> lisa_metal::error::Result<Array> {
-    let sh = a.shape();
-    let rank = a.rank();
-    let rows: i32 = sh[..rank - 1].iter().product::<i32>().max(1);
-    let k = sh[rank - 1];
-    let flat = a.reshape(&[rows, k])?;
-    let out = flat.matmul(w)?;
-    Ok(out.reshape(&[&sh[..rank - 1], &[w.shape()[1]]].concat())?)
-}
-
-/// Sum over `axis` keeping a size-1 dim.
-pub fn keep_sum(a: &Array, axis: i32) -> lisa_metal::error::Result<Array> {
-    a.sum_axis(axis, true)
-}
-
-/// Mean over `axis` keeping a size-1 dim.
-pub fn keep_mean(a: &Array, axis: i32) -> lisa_metal::error::Result<Array> {
-    a.mean_axis(axis, true)
-}
-
 impl Hc {
-    /// `prefix` = `model.layers.N.hc_attn` or `...hc_ffn` (bare tensors:
-    /// `{prefix}_fn`, `{prefix}_base`, `{prefix}_scale`).
-    pub fn load<S: TensorSource>(
-        src: &mut S,
-        prefix: &str,
-        hc_mult: usize,
-        hidden: usize,
-        hc_eps: f32,
-        sinkhorn_iters: usize,
-        rms_eps: f32,
-    ) -> anyhow::Result<Self> {
-        let fn_w = src.get(&format!("{prefix}_fn"))?;
-        let base = src
-            .get(&format!("{prefix}_base"))?
-            .as_dtype(Dtype::Float32)?;
-        let scale = src
-            .get(&format!("{prefix}_scale"))?
-            .as_dtype(Dtype::Float32)?;
-        debug_assert_eq!(fn_w.shape()[0], 24);
-        debug_assert_eq!(fn_w.shape()[1], (hc_mult * hidden) as i32);
-        let s0 = narrow(&scale, 0, 0, 1)?.item_cast::<f32>();
-        let s1 = narrow(&scale, 0, 1, 1)?.item_cast::<f32>();
-        let s2 = narrow(&scale, 0, 2, 1)?.item_cast::<f32>();
-        Ok(Self {
-            fn_w,
-            base,
-            scale,
-            scale_vals: [s0, s1, s2],
-            hc_mult,
-            hidden,
-            eps: hc_eps,
-            sinkhorn_iters,
-            rms_eps,
-        })
-    }
-
     fn mix_rows(&self, state: &Array) -> anyhow::Result<(usize, usize, usize, usize, Array)> {
         let (b, t, c, h) = (
             state.dim(0) as usize,
@@ -135,7 +63,7 @@ impl Hc {
         let stream = lisa_metal::Stream::thread_local_or_default();
         if rows > 0
             && rows <= 8
-            && let Some(mixes) = lisa_metal::kernels::sparse::kernels::glm53_hc_mix_rms_bf16_gemv(
+            && let Some(mixes) = lisa_metal::kernels::sparse::kernels::hc_mix_rms_bf16_gemv(
                 &self.fn_w,
                 &flat,
                 self.rms_eps,
@@ -144,18 +72,17 @@ impl Hc {
         {
             return Ok((b, t, c, h, mixes));
         }
-        let normed =
-            lisa_metal::kernels::sparse::kernels::glm53_hc_mix_rms(&flat, self.rms_eps, &stream)
-                .ok_or_else(|| anyhow::anyhow!("GLM mHC input RMSNorm Metal kernel failed"))?;
+        let normed = lisa_metal::kernels::sparse::kernels::hc_mix_rms(&flat, self.rms_eps, &stream)
+            .ok_or_else(|| anyhow::anyhow!("GLM mHC input RMSNorm Metal kernel failed"))?;
         if rows > 0 && rows <= 8 && self.fn_w.dtype() == Dtype::Bfloat16 {
             let mixes =
-                lisa_metal::kernels::sparse::kernels::glm53_bf16_gemv(&self.fn_w, &normed, &stream)
+                lisa_metal::kernels::sparse::kernels::bf16_gemv(&self.fn_w, &normed, &stream)
                     .ok_or_else(|| anyhow::anyhow!("GLM mHC BF16 GEMV failed for {rows} rows"))?;
             return Ok((b, t, c, h, mixes));
         }
         if rows > 8 && self.fn_w.dtype() == Dtype::Bfloat16 {
             let mixes =
-                lisa_metal::kernels::sparse::kernels::glm53_bf16_gemm(&self.fn_w, &normed, &stream)
+                lisa_metal::kernels::sparse::kernels::bf16_gemm(&self.fn_w, &normed, &stream)
                     .ok_or_else(|| anyhow::anyhow!("GLM mHC BF16 GEMM failed for {rows} rows"))?;
             return Ok((b, t, c, h, mixes));
         }
@@ -167,22 +94,8 @@ impl Hc {
         Ok((b, t, c, h, mixes))
     }
 
-    /// Fused ds4 HC=4 split, collapse, and module-input RMSNorm. The GLM
-    /// architecture requires this Metal path; unsupported other shapes use
-    /// the separate operation path.
-    pub fn split_normed(
-        &self,
-        state: &Array,
-        norm_weight: &Array,
-        norm_eps: f32,
-    ) -> anyhow::Result<Option<(Array, Array, Array, Array)>> {
-        Ok(self
-            .split_normed_with_mixes(state, norm_weight, norm_eps)?
-            .map(|(collapsed, normed, post, comb, _mixes, _split)| (collapsed, normed, post, comb)))
-    }
-
     /// The capture variant also returns the 24-wide mHC projection so parity
-    /// traces can compare DS4's split/Sinkhorn from the exact same activation.
+    /// traces can compare the reference's split/Sinkhorn from the exact same activation.
     pub fn split_normed_with_mixes(
         &self,
         state: &Array,
@@ -216,21 +129,12 @@ impl Hc {
     /// comb [B,T,C,C] f32)`.
     pub fn split(&self, state: &Array) -> anyhow::Result<(Array, Array, Array)> {
         let (b, t, c, h, mixes) = self.mix_rows(state)?;
-        let dbg = std::env::var("LISA_GLM53_DEBUG").is_ok();
         macro_rules! dstep {
             ($n:expr, $e:expr) => {{
                 let r: lisa_metal::error::Result<Array> = (|| Ok($e))();
                 match r {
-                    Ok(a) => {
-                        if dbg {
-                            eprintln!("[dbg-mhc] {} {:?}", $n, a.shape());
-                        }
-                        a
-                    }
-                    Err(e) => {
-                        eprintln!("[dbg-mhc] FAILED at {} : {}", $n, e);
-                        return Err(anyhow::anyhow!("{e}"));
-                    }
+                    Ok(a) => a,
+                    Err(e) => return Err(anyhow::anyhow!("{} failed: {e}", $n)),
                 }
             }};
         }
@@ -238,7 +142,7 @@ impl Hc {
         let (s0, s1, s2) = (self.scale_vals[0], self.scale_vals[1], self.scale_vals[2]);
         let n = b * t;
         let col = |a: &Array, lo: usize, len: usize| -> lisa_metal::error::Result<Array> {
-            narrow(&a, 1, lo, len)?.reshape(&[(n) as i32, (len) as i32])
+            narrow(a, 1, lo, len)?.reshape(&[(n) as i32, (len) as i32])
         };
 
         // The fused split/Sinkhorn kernel computes `pre`, `post`, and `comb`
@@ -397,16 +301,14 @@ impl Hc {
         // post * y, broadcast over C.
         let mut new = post
             .expand_dims(3)? // [B,T,C,1]
-            .multiply(&yf.expand_dims(2)?.broadcast_to(&[
-                (b) as i32,
-                (t) as i32,
-                (c) as i32,
-                (h) as i32,
-            ])?)?; // [B,T,C,H]
+            .multiply(
+                &yf.expand_dims(2)?
+                    .broadcast_to(&[(b), (t), (c) as i32, (h)])?,
+            )?; // [B,T,C,H]
         // sum_p comb[p, c] * residual[p] — p is the first comb axis. Slice
         // that source row and transpose it into the output-stream broadcast.
         for p in 0..c {
-            let coef = narrow(&comb, 2, p, 1)?.transpose_axes(&[0, 1, 3, 2])?;
+            let coef = narrow(comb, 2, p, 1)?.transpose_axes(&[0, 1, 3, 2])?;
             let res_p = narrow(&rf, 2, p, 1)?; // [B,T,1,H]
             new = new.add(&coef.multiply(&res_p)?)?; // [B,T,C,H]
         }

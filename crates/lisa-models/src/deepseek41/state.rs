@@ -60,11 +60,7 @@ impl Position {
             layer < LAYERS && position < MAX_CONTEXT && ratio <= 2,
             "invalid attention cache position"
         );
-        let compressed_rows = if ratio == 0 {
-            0
-        } else {
-            (position + 1) / ratio
-        };
+        let compressed_rows = (position + 1).checked_div(ratio).unwrap_or(0);
         let raw_count = (position + 1).min(RAW_ROWS) as u32;
         Ok(Self {
             owner: owner(layer),
@@ -86,64 +82,6 @@ impl Position {
                 }
             },
         })
-    }
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn ownership_and_selection_boundaries_preserve_scalar_schedule() -> anyhow::Result<()> {
-        for layer in 0..40 {
-            for ratio in [0, 1, 2] {
-                for p in [
-                    0,
-                    1,
-                    127,
-                    128,
-                    8190,
-                    8191,
-                    16382,
-                    16383,
-                    16384,
-                    32767,
-                    32768,
-                    MAX_CONTEXT - 1,
-                ] {
-                    let s = Position::new(layer, ratio, p)?;
-                    let n = if ratio == 0 { 0 } else { (p + 1) / ratio };
-                    assert_eq!(
-                        s.owner,
-                        if layer < 8 {
-                            0
-                        } else if layer < 14 {
-                            1
-                        } else if layer < 20 {
-                            2
-                        } else {
-                            3
-                        }
-                    );
-                    assert_eq!(s.compressed_rows, n);
-                    assert_eq!(s.raw_start, ((p + 1 - (p + 1).min(128)) % 128) as u32);
-                    assert_eq!(
-                        s.selection,
-                        if n == 0 {
-                            Selection::Empty
-                        } else if layer > 20 && n > 16384 {
-                            Selection::Candidates
-                        } else {
-                            Selection::Full {
-                                mirror: n >= 8192,
-                                publish: layer == 20 && n > 16384,
-                            }
-                        }
-                    );
-                }
-            }
-        }
-        assert!(Position::new(40, 1, 0).is_err());
-        assert!(Position::new(0, 1, MAX_CONTEXT).is_err());
-        Ok(())
     }
 }
 pub fn allocate(capacity: usize) -> anyhow::Result<crate::graph::Graph> {
@@ -194,4 +132,62 @@ pub fn allocate(capacity: usize) -> anyhow::Result<crate::graph::Graph> {
         }
     }
     Ok(b.finish(out))
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn ownership_and_selection_boundaries_preserve_scalar_schedule() -> anyhow::Result<()> {
+        for layer in 0..40 {
+            for ratio in [0, 1, 2] {
+                for p in [
+                    0,
+                    1,
+                    127,
+                    128,
+                    8190,
+                    8191,
+                    16382,
+                    16383,
+                    16384,
+                    32767,
+                    32768,
+                    MAX_CONTEXT - 1,
+                ] {
+                    let s = Position::new(layer, ratio, p)?;
+                    let n = (p + 1).checked_div(ratio).unwrap_or(0);
+                    assert_eq!(
+                        s.owner,
+                        if layer < 8 {
+                            0
+                        } else if layer < 14 {
+                            1
+                        } else if layer < 20 {
+                            2
+                        } else {
+                            3
+                        }
+                    );
+                    assert_eq!(s.compressed_rows, n);
+                    assert_eq!(s.raw_start, ((p + 1 - (p + 1).min(128)) % 128) as u32);
+                    assert_eq!(
+                        s.selection,
+                        if n == 0 {
+                            Selection::Empty
+                        } else if layer > 20 && n > 16384 {
+                            Selection::Candidates
+                        } else {
+                            Selection::Full {
+                                mirror: n >= 8192,
+                                publish: layer == 20 && n > 16384,
+                            }
+                        }
+                    );
+                }
+            }
+        }
+        assert!(Position::new(40, 1, 0).is_err());
+        assert!(Position::new(0, 1, MAX_CONTEXT).is_err());
+        Ok(())
+    }
 }

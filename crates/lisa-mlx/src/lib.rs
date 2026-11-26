@@ -6,7 +6,7 @@
 //! biases as separate named tensors; model schema adapters interpret them.
 
 use anyhow::{Context, bail, ensure};
-use memmap2::Mmap;
+use memmap2::{Mmap, MmapOptions};
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -50,6 +50,7 @@ pub struct TensorInfo {
 /// payloads alive after the shard handle is dropped.
 pub struct Shard {
     map: Arc<Mmap>,
+    file: std::fs::File,
     tensors: HashMap<String, TensorInfo>,
 }
 
@@ -57,6 +58,9 @@ impl Shard {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         let file = std::fs::File::open(path)
             .with_context(|| format!("opening shard {}", path.display()))?;
+        // SAFETY: read-only map kept alive by Arc owners; checkpoint shards must not
+        // be modified or truncated while mapped, and payload ranges are checked
+        // against map.len() below.
         let map = Arc::new(unsafe { Mmap::map(&file)? });
         let n = map.len();
         if n < 8 {
@@ -143,7 +147,33 @@ impl Shard {
                 },
             );
         }
-        Ok(Self { map, tensors })
+        Ok(Self { map, file, tensors })
+    }
+
+    /// Independently own an immutable range of the same opened shard. The
+    /// caller selects the range; this reader has no device or alignment policy.
+    /// Retaining this mapping never retains the whole-shard parser mapping.
+    /// The original file descriptor prevents path replacement from substituting
+    /// different bytes. As with the parser mapping, the opened file must remain
+    /// immutable; a changed length is rejected before mapping a new range.
+    pub fn map_range(&self, range: std::ops::Range<usize>) -> anyhow::Result<Arc<Mmap>> {
+        ensure!(
+            range.start < range.end && range.end <= self.map.len(),
+            "invalid independent shard mapping range"
+        );
+        ensure!(
+            self.file.metadata()?.len() == self.map.len() as u64,
+            "shard length changed after opening"
+        );
+        // SAFETY: the range lies within the original descriptor's unchanged length
+        // (checked above), the map is read-only, and the opened shard stays immutable.
+        let mapping = unsafe {
+            MmapOptions::new()
+                .offset(range.start as u64)
+                .len(range.end - range.start)
+                .map(&self.file)?
+        };
+        Ok(Arc::new(mapping))
     }
 
     /// Raw byte slice of one tensor.

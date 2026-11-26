@@ -10,11 +10,6 @@ default-run = "lisa-bench"
 name = "lisa-bench"
 path = "src/main.rs"
 
-[features]
-default = ["metal"]
-metal = []
-glm53-fixtures = ["lisa-engine/glm53-fixtures"]
-
 [dependencies]
 lisa-engine.workspace = true
 half.workspace = true
@@ -37,5 +32,7 @@ serde.workspace = true
 sha2.workspace = true
 tokenizers.workspace = true
 [dev-dependencies]
-lisa-engine = {workspace=true,features=["diagnostics"]}
 tempfile = "3"
+
+[lints]
+workspace = true

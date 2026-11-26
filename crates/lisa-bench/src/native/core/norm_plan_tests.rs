@@ -8,23 +8,22 @@ fn original_rms_row_exact(
     h: usize,
     force_ops: bool,
 ) -> lisa_metal::error::Result<Array> {
-    // ds4 parity: the fused single-kernel port (same pinned association as the
+    // The reference parity: the fused single-kernel port (same pinned association as the
     // op path below — 4 sequential squares per lane, simd_sum butterfly,
     // rsqrt(total/128 + eps), bf16 rounding BEFORE the weight multiply).
-    // LISA_GLM53_RMS_OPS=1 forces the op path for A/B comparison.
-    if !force_ops {
-        if let Some(fused) = lisa_metal::kernels::sparse::kernels::rms_row_fused(
+    if !force_ops
+        && let Some(fused) = lisa_metal::kernels::sparse::kernels::rms_row_fused(
             x,
             eps,
             h,
             &lisa_metal::Stream::thread_local_or_default(),
-        ) {
-            let flat = fused.reshape(&x.shape())?;
-            return match scale {
-                Some(w) => flat.multiply(w),
-                None => Ok(flat),
-            };
-        }
+        )
+    {
+        let flat = fused.reshape(x.shape())?;
+        return match scale {
+            Some(w) => flat.multiply(w),
+            None => Ok(flat),
+        };
     }
     use lisa_metal::ops::indexing::IndexOp;
     let w_full = x.dim(-1) as usize;
@@ -37,18 +36,10 @@ fn original_rms_row_exact(
         &grouped.as_dtype(Dtype::Float32)?,
         &grouped.as_dtype(Dtype::Float32)?,
     )?;
-    if std::env::var("E_SQ").is_ok() {
-        eprintln!("[flag E_SQ]");
-        let _ = lisa_metal::transforms::eval([&sq]);
-    }
     // per-lane sequential sum over the 4 elements -> [.., groups, slices, 32]
     let mut lane = sq.index((Ellipsis, 0..1)).contiguous().unwrap();
     for i in 1..4i32 {
-        lane = lane.add(&sq.index((Ellipsis, i..i + 1)).contiguous().unwrap())?;
-    }
-    if std::env::var("E_LANE").is_ok() {
-        eprintln!("[flag E_LANE]");
-        let _ = lisa_metal::transforms::eval([&lane]);
+        lane = lane.add(sq.index((Ellipsis, i..i + 1)).contiguous().unwrap())?;
     }
     let lane_v = lane.reshape(&[lead, &[groups as i32, slices, 32i32]].concat())?;
     // per-simdgroup xor-butterfly over the 32 lanes -> [.., groups, slices]
@@ -69,10 +60,6 @@ fn original_rms_row_exact(
     let zeros = lisa_metal::ops::zeros::<f32>(&zshape)
         .map_err(|e| lisa_metal::error::Exception::custom(e.to_string()))?;
     let padded = lisa_metal::ops::concatenate(&[&partials, &zeros], -1)?;
-    if std::env::var("E_PADDED").is_ok() {
-        eprintln!("[flag E_PADDED]");
-        let _ = lisa_metal::transforms::eval([&padded]);
-    }
     let mut v2 = padded;
     width = 32;
     while width >= 2 {
@@ -84,29 +71,17 @@ fn original_rms_row_exact(
     }
     // total: [lead..., groups] -> unsqueeze for broadcasting
     let total = v2.reshape(&[lead, &[groups as i32, 1i32, 1i32, 1i32]].concat())?;
-    if std::env::var("E_TOTAL").is_ok() {
-        eprintln!("[flag E_TOTAL]");
-        let _ = lisa_metal::transforms::eval([&total]);
-    }
     let scaled = total.clone() / (h as f32);
-    let biased = scaled.add(&Array::from_f32(eps))?;
+    let biased = scaled.add(Array::from_f32(eps))?;
     let inv = lisa_metal::ops::rsqrt(&biased)
         .map_err(|e| lisa_metal::error::Exception::custom(e.to_string()))?;
-    if std::env::var("E_INV").is_ok() {
-        eprintln!("[flag E_INV]");
-        let _ = lisa_metal::transforms::eval([&inv]);
-    }
     let normalized = (grouped.as_dtype(Dtype::Float32)? * &inv).as_dtype(Dtype::Bfloat16)?;
-    if std::env::var("E_NORMED").is_ok() {
-        eprintln!("[flag E_NORMED]");
-        let _ = lisa_metal::transforms::eval([&normalized]);
-    }
-    let flat = normalized.reshape(&x.shape())?;
-    let out = match scale {
+    let flat = normalized.reshape(x.shape())?;
+
+    match scale {
         Some(w) => flat.multiply(w),
         None => Ok(flat.clone()),
-    };
-    out
+    }
 }
 
 #[test]

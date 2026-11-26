@@ -1,8 +1,11 @@
 //! Checked storage views and byte-preserving copies; no model computation.
+#[cfg(test)]
 use anyhow::Result;
 #[cfg(test)]
 use anyhow::ensure;
+#[cfg(test)]
 use lisa_metal::Array;
+#[cfg(test)]
 /// Checked contiguous view; offsets are bytes at the outer Array boundary.
 pub(crate) fn view(x: &Array, first: usize, shape: &[i32]) -> Result<Array> {
     lisa_engine::storage::view(&crate::metal_context::device(), x, first, shape)

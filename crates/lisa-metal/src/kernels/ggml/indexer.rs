@@ -1,12 +1,12 @@
-//! DS4's scalar index scorer and block-sort/merge selection.
+//! The reference's scalar index scorer and block-sort/merge selection.
 
 use super::{f32_input, output};
 use crate::error::{Error, Result};
 use crate::runtime::Math;
 use crate::{Array, Dtype, Stream};
 
-const SOURCE: &crate::shader_pack::Source = crate::kernel_source!("deepseek41/indexer.metal");
-const SORT: &crate::shader_pack::Source = crate::kernel_source!("deepseek41/topk.metal");
+const SOURCE: &crate::shader_pack::Source = crate::kernel_source!("gguf_iq/indexer.metal");
+const SORT: &crate::shader_pack::Source = crate::kernel_source!("gguf_iq/topk.metal");
 
 pub fn index_scores(q: &Array, weights: &Array, keys: &Array, stream: &Stream) -> Result<Array> {
     f32_input(q, &[32, 128])?;
@@ -79,7 +79,7 @@ pub fn index_scores(q: &Array, weights: &Array, keys: &Array, stream: &Stream) -
     Ok(out)
 }
 
-/// FP4 E8M0 keys are already exactly representable in BF16. Preserve DS4's
+/// FP4 E8M0 keys are already exactly representable in BF16. Preserve the reference's
 /// truncating store instead of introducing a new rounded cache conversion.
 pub fn index_keys_bf16(keys: &Array, stream: &Stream) -> Result<Array> {
     if keys.rank() != 2 || keys.dim(0) < 1 || keys.dim(0) > 1048576 || keys.dim(1) != 128 {
@@ -195,7 +195,7 @@ struct MergeArgs {
     block_top_k: u32,
 }
 
-/// DS4's shape gates: descending block sort below 16384 columns, radix above.
+/// The reference's shape gates: descending block sort below 16384 columns, radix above.
 /// Radix uses score-descending/id-ascending ties; short rows retain the
 /// non-stable bitonic order. The fused final merge emulates the short ladder.
 pub fn index_topk(scores: &Array, top_k: i32, stream: &Stream) -> Result<Array> {
@@ -406,7 +406,7 @@ fn radix_topk(
         return Err(Error::msg("device cannot execute DS4 radix selection"));
     }
     // Independent scratch gives each queued call its own histogram lifetime.
-    // DS4's parity ping-pong is unnecessary until this scratch is reused.
+    // The reference's parity ping-pong is unnecessary until this scratch is reused.
     let hist = crate::ops::zeros::<u32>(&[rows, 4 * 2048])?;
     let state = output(stream, &[rows, 4], Dtype::Uint32)?;
     let counts = output(stream, &[rows, groups as i32, 2], Dtype::Uint32)?;
@@ -492,7 +492,9 @@ pub struct IndexCandidates {
 
 impl IndexCandidates {
     /// Read-only candidate storage for diagnostics and portable storage binding.
-    pub fn tensor(&self) -> &Array { &self.list }
+    pub fn tensor(&self) -> &Array {
+        &self.list
+    }
 }
 
 pub fn index_candidates(scores: &Array, stream: &Stream) -> Result<IndexCandidates> {

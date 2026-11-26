@@ -108,7 +108,7 @@ pub(crate) fn top32_indices_on(scores: &Array, stream: &Stream) -> Result<Array>
                 shape: vec![rows, scratch_width],
                 dtype: Dtype::Uint32,
             }],
-            &stream,
+            stream,
         )?
         .remove(0);
     while runs > 1 {
@@ -130,7 +130,7 @@ pub(crate) fn top32_indices_on(scores: &Array, stream: &Stream) -> Result<Array>
                 shape: vec![rows, out_runs * 32],
                 dtype: Dtype::Uint32,
             }],
-            &stream,
+            stream,
         )?;
         candidates = outputs.remove(0);
         runs = out_runs;

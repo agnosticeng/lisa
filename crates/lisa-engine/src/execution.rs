@@ -46,36 +46,6 @@ impl Default for Observer {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn prepared_state_is_owned_by_one_execution_context() {
-        let first = ExecutionContext::new(1);
-        let second = ExecutionContext::new(2);
-        let weak = first.with_slot(
-            "cache",
-            || Rc::new(RefCell::new(0)),
-            |slot| {
-                *slot.borrow_mut() = 42;
-                Rc::downgrade(slot)
-            },
-        );
-        second.with_slot(
-            "cache",
-            || Rc::new(RefCell::new(0)),
-            |slot| assert_eq!(*slot.borrow(), 0),
-        );
-        first.with_slot(
-            "cache",
-            || Rc::new(RefCell::new(0)),
-            |slot| assert_eq!(*slot.borrow(), 42),
-        );
-        drop(first);
-        assert!(weak.upgrade().is_none());
-    }
-}
-
 /// Explicit execution owner retained by a loaded model. No provider or active
 /// context is discovered or constructed implicitly by the engine.
 pub struct DeviceContext<D: 'static>(Rc<ExecutionContext<D>>);
@@ -115,5 +85,35 @@ impl<D: 'static> DeviceContext<D> {
         f: impl FnOnce(&T) -> R,
     ) -> R {
         self.0.with_slot(key, init, f)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn prepared_state_is_owned_by_one_execution_context() {
+        let first = ExecutionContext::new(1);
+        let second = ExecutionContext::new(2);
+        let weak = first.with_slot(
+            "cache",
+            || Rc::new(RefCell::new(0)),
+            |slot| {
+                *slot.borrow_mut() = 42;
+                Rc::downgrade(slot)
+            },
+        );
+        second.with_slot(
+            "cache",
+            || Rc::new(RefCell::new(0)),
+            |slot| assert_eq!(*slot.borrow(), 0),
+        );
+        first.with_slot(
+            "cache",
+            || Rc::new(RefCell::new(0)),
+            |slot| assert_eq!(*slot.borrow(), 42),
+        );
+        drop(first);
+        assert!(weak.upgrade().is_none());
     }
 }

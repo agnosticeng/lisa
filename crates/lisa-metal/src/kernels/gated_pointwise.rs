@@ -13,18 +13,18 @@ pub const EXACT_HEADER: &crate::shader_pack::Source =
 /// sigmoid rounds bf16 exactly as the separate kernel would have stored it,
 /// then the product rounds bf16.
 const SIGMOID_MUL_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("qwen35/sigmoid_mul.metal");
+    crate::kernel_source!("pointwise/sigmoid_mul.metal");
 
 /// `track_swiglu2_packed`: `mlx_silu(gu[i]) * gu[F + i]` over ONE packed
 /// `[B, 2F]` gate|up buffer (the merged gate|up qmv output). Bit-identical to
 /// `track_swiglu2` on the split arrays: same exact_header silu, and the second
 /// half of the packed qmv output IS the up projection, row-exact.
 const SWIGLU2_PACKED_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("qwen35/swiglu2_packed.metal");
+    crate::kernel_source!("pointwise/swiglu2_packed.metal");
 
 /// Source of `track_sigmoid_mul_tail` (see [`sigmoid_mul_tail`]).
 const SIGMOID_MUL_TAIL_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("qwen35/sigmoid_mul_tail.metal");
+    crate::kernel_source!("pointwise/sigmoid_mul_tail.metal");
 
 static SWIGLU2_PACKED: std::sync::OnceLock<crate::error::Result<MetalKernel>> =
     std::sync::OnceLock::new();
@@ -46,7 +46,7 @@ pub(crate) fn swiglu2_packed_kernel() -> crate::error::Result<&'static MetalKern
         .map_err(|e| crate::error::Error::msg(e.to_string()))
 }
 
-/// Run `track_swiglu2_packed`. `gu` `[B, 2F]` contiguous bf16 -> `[B, F]`.
+/// Run `track_swiglu2_packed`. `gu` `[..., 2F]` bf16 -> `[..., F]`.
 /// `None` when unavailable / odd width / non-bf16 — caller falls back to the
 /// split qmv + `track_swiglu2` chain.
 pub fn swiglu2_packed(gu: &Array, stream: &Stream) -> Option<Array> {
@@ -73,17 +73,19 @@ pub fn try_swiglu2_packed(gu: &Array, stream: &Stream) -> crate::error::Result<O
     let template = [
         TemplateArg::Dtype("InT", Dtype::Bfloat16),
         TemplateArg::Int("B", b),
-        TemplateArg::Int("F", f as i32),
+        TemplateArg::Int("F", f),
     ];
+    let mut shape = gu.shape().to_vec();
+    *shape.last_mut().unwrap() = f;
     let outs = [crate::ffi::OutputArg {
-        shape: vec![b, f as i32],
+        shape,
         dtype: Dtype::Bfloat16,
     }];
     Ok(kernel
         .apply(
             &inputs,
             &template,
-            (b * f as i32, 1, 1),
+            (b * f, 1, 1),
             (256, 1, 1),
             &outs,
             stream,
@@ -94,7 +96,7 @@ pub fn try_swiglu2_packed(gu: &Array, stream: &Stream) -> crate::error::Result<O
 
 static SIGMOID_MUL: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 
-/// `track_sigmoid_mul_tail` (specs/04): the attention tail in ONE launch over
+/// `track_sigmoid_mul_tail`: the attention tail in ONE launch over
 /// the UN-transposed sdpa output. `gate` is `[b, s, h, hd]`, `up` is the sdpa
 /// output `[b, h, s, hd]` (both read through their strides); the output is the
 /// contiguous merged `[b, s, h*hd]` the o_proj consumes. Removes the per-layer
@@ -218,12 +220,12 @@ pub fn sigmoid_mul(gate: &Array, up: &Array, stream: &Stream) -> Option<Array> {
 /// `RmsNorm::forward` → transpose → `rope_partial` chain (see shader header);
 /// pinned by `qk_norm_rope_matches_composed`.
 const QK_NORM_ROPE_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("qwen35/qk_norm_rope.metal");
+    crate::kernel_source!("rope/qk_norm_rope.metal");
 
 static QK_NORM_ROPE: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 
 const QK_NORM_ROPE_ROWS_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("qwen35/qk_norm_rope_rows.metal");
+    crate::kernel_source!("rope/qk_norm_rope_rows.metal");
 
 static QK_NORM_ROPE_ROWS: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 
@@ -338,7 +340,7 @@ pub fn qk_norm_rope_rows(
     stream: &Stream,
 ) -> Option<(Array, Array, Array)> {
     const HD: i32 = 256;
-    if s < 2 || s > 8 {
+    if !(2..=8).contains(&s) {
         return None;
     }
     for a in [qg, k, qw, kw, cos, sin] {
@@ -397,12 +399,12 @@ pub fn qk_norm_rope_rows(
 }
 
 /// `track_keyed_gumbel_sample`: full-vocab Gumbel-max draw in one launch
-/// (specs/08 §5). `L` is the flat f32 `[V]` logit row, `inv_temperature` a
+///. `L` is the flat f32 `[V]` logit row, `inv_temperature` a
 /// 0-dim f32 scalar, `seed_lo`/`seed_hi`/`pos_i` 0-dim i32 scalars holding
 /// the u64 seed (low, high) and the absolute position. Returns the `[1]`
 /// i32 token array — the caller reads back 4 bytes.
 const KEYED_SAMPLE_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("qwen35/keyed_sample.metal");
+    crate::kernel_source!("sampling/keyed_sample.metal");
 
 static KEYED_SAMPLE: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 
@@ -463,7 +465,7 @@ mod parity {
     use super::*;
     use crate::ops;
 
-    /// specs/13 re-audit pin: `track_swiglu2_packed` must be ROW-GENERIC.
+    /// Pin: `track_swiglu2_packed` must be ROW-GENERIC.
     /// The original body read `gu[i]`/`gu[F+i]` single-row style — correct at
     /// B == 1, but at B > 1 every row >= 1 mixed row 0's gate with row 1's up
     /// (batched decode slots >= 1 emitted token soup from decode step 1).
@@ -527,7 +529,7 @@ mod parity {
         }
     }
 
-    /// specs/04 pin: the attention-tail kernel over the UN-transposed sdpa
+    /// Pin: the attention-tail kernel over the UN-transposed sdpa
     /// output (`gate [b,s,h,hd]`, `up [b,h,s,hd]` -> merged `[b,s,h*hd]`)
     /// must be word-exact vs the transpose + `track_sigmoid_mul` chain it
     /// replaces. 65536 gate/up values per draw, plus specials.
@@ -557,8 +559,8 @@ mod parity {
             .as_dtype(Dtype::Bfloat16)
             .unwrap();
         let fused = sigmoid_mul_tail(&g, &u, b, s, h, hd, &stream).expect("kernel");
-        // Reference chain exactly as attention_tail built it before specs/04
-        // (transpose then MATERIALIZE — reshape copies — then sigmoid_mul).
+        // Reference chain: transpose, materialize (the reshape copies), then
+        // sigmoid_mul.
         let ut = u.transpose_axes(&[0, 2, 1, 3]).unwrap();
         let ut = ut.copied().unwrap();
         let reference = sigmoid_mul(&g, &ut, &stream).expect("kernel");
@@ -590,7 +592,7 @@ mod parity {
     }
 
     #[test]
-    // RESOLVED (specs/04 §6→§8, commit aaf9d6d): under --test-threads=16 +
+    // RESOLVED: under --test-threads=16 +
     // parallel GPU load this pin used to fail with BOTH sides reading
     // foreign/stale buffer values — a runtime readback race (lost wait +
     // fence-map UAF), not a numerics bug. The runtime synchronization fix
@@ -656,7 +658,7 @@ mod parity {
                     f[i],
                     c[i],
                     bf(bf(sig) as f64 * ai[i] as f64),
-                    bf(sig as f64 * ai[i] as f64),
+                    bf(sig * ai[i] as f64),
                 );
             }
         }
@@ -734,7 +736,7 @@ mod parity {
 
     #[test]
     fn qk_norm_rope_rows_matches_composed() {
-        // specs/24 pin: the S-row verify kernel vs the composed
+        // Pin: the S-row verify kernel vs the composed
         // rms -> transpose -> rope_partial chain, on the STOCK interleaved
         // q|gate source layout. 4 draws x (7 rows x 28 heads x 256) = 200k+
         // values, PLUS a full-scale sweep: 8 draws x s=7 x (24+4 heads)
@@ -760,7 +762,7 @@ mod parity {
         let kw = mk(&[hd], &mut rnd);
         let rope = |x: &Array, cos: &Array, sin: &Array| -> Array {
             let rotated = x.index((Ellipsis, 0..rd));
-            let half = (rd / 2) as i32;
+            let half = rd / 2;
             let x1 = rotated.index((Ellipsis, 0..half));
             let x2 = rotated.index((Ellipsis, half..rd));
             let neg_x2 = -x2;
@@ -768,7 +770,7 @@ mod parity {
             let out = rotated
                 .multiply(cos)
                 .unwrap()
-                .add(&swapped.multiply(sin).unwrap())
+                .add(swapped.multiply(sin).unwrap())
                 .unwrap();
             let rest = x.index((Ellipsis, rd..hd));
             ops::concatenate(&[&out, &rest], -1).unwrap()
@@ -891,7 +893,7 @@ mod parity {
         // core::norm::rope_partial, inlined for the test).
         let rope = |x: &Array| -> Array {
             let rotated = x.index((Ellipsis, 0..rd));
-            let half = (rd / 2) as i32;
+            let half = rd / 2;
             let x1 = rotated.index((Ellipsis, 0..half));
             let x2 = rotated.index((Ellipsis, half..rd));
             let neg_x2 = -x2;
@@ -899,7 +901,7 @@ mod parity {
             let out = rotated
                 .multiply(&cos)
                 .unwrap()
-                .add(&swapped.multiply(&sin).unwrap())
+                .add(swapped.multiply(&sin).unwrap())
                 .unwrap();
             let rest = x.index((Ellipsis, rd..hd));
             ops::concatenate(&[&out, &rest], -1).unwrap()

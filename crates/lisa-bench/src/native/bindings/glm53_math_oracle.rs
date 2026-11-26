@@ -1,5 +1,4 @@
 #![cfg(test)]
-#![allow(dead_code)]
 
 use lisa_metal::kernels::sparse::kernels as kda_kernels;
 use lisa_metal::{Array, Dtype};
@@ -10,18 +9,18 @@ pub fn l2norm_last(a: &Array, eps: f32) -> lisa_metal::error::Result<Array> {
 
 pub fn linear_projection(x: &Array, weight: &Array) -> anyhow::Result<Array> {
     let (b, t) = (x.dim(0) as usize, x.dim(1) as usize);
-    let n_rows = b.checked_mul(t).unwrap_or(usize::MAX);
+    let n_rows = b.saturating_mul(t);
     if n_rows <= 8 && n_rows > 0 && weight.dtype() == Dtype::Bfloat16 {
         let input = x.reshape(&[n_rows as i32, x.dim(2)])?;
         let stream = lisa_metal::Stream::thread_local_or_default();
-        let out = kda_kernels::glm53_bf16_gemv(weight, &input, &stream)
+        let out = kda_kernels::bf16_gemv(weight, &input, &stream)
             .ok_or_else(|| anyhow::anyhow!("GLM BF16 GEMV failed for a {n_rows}-row projection"))?;
         return Ok(out.reshape(&[b as i32, t as i32, weight.dim(0)])?);
     }
     if n_rows > 8 && weight.dtype() == Dtype::Bfloat16 {
         let input = x.reshape(&[n_rows as i32, x.dim(2)])?;
         let stream = lisa_metal::Stream::thread_local_or_default();
-        let out = kda_kernels::glm53_bf16_gemm(weight, &input, &stream)
+        let out = kda_kernels::bf16_gemm(weight, &input, &stream)
             .ok_or_else(|| anyhow::anyhow!("GLM BF16 GEMM failed for a {n_rows}-row projection"))?;
         return Ok(out.reshape(&[b as i32, t as i32, weight.dim(0)])?);
     }
@@ -62,5 +61,5 @@ pub fn mm(a: &Array, w: &Array) -> lisa_metal::error::Result<Array> {
     let k = sh[rank - 1];
     let flat = a.reshape(&[rows, k])?;
     let out = flat.matmul(w)?;
-    Ok(out.reshape(&[&sh[..rank - 1], &[w.shape()[1]]].concat())?)
+    out.reshape(&[&sh[..rank - 1], &[w.shape()[1]]].concat())
 }

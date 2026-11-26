@@ -38,7 +38,7 @@ pub fn set_per_buffer(n: usize) {
 pub fn clear_cache() {
     with_dev(|m| {
         let _ = m.synchronize();
-        m.pool.sweep();
+        m.pool.sweep_completed(m.commands.completed_watermark());
     });
 }
 
@@ -64,7 +64,7 @@ pub(crate) fn trim_cache_on(m: &crate::runtime::MetalRuntime) {
         CACHE_BASELINE.store(now, Ordering::Relaxed);
     } else if now > base.saturating_add(limit) {
         let _ = m.synchronize();
-        m.pool.sweep();
+        m.pool.sweep_completed(m.commands.completed_watermark());
     }
 }
 
@@ -88,15 +88,6 @@ pub fn reserve_model_memory(
         .reserve_model_memory(bytes, budget)
 }
 
-/// No high-water mark is tracked, so report the live allocation.
-pub fn peak_memory() -> Result<usize> {
-    active_memory()
-}
-
-pub fn cache_memory() -> Result<usize> {
-    Ok(0)
-}
-
 /// A caller-owned allowance for additional Metal allocations. Nested scopes
 /// may only lower the limit. The caller must serialize work on this runtime
 /// and drop nested scopes in reverse order. Kernel arithmetic/shapes are unchanged.
@@ -115,11 +106,20 @@ pub fn allocation_budget(additional_bytes: usize) -> Result<AllocationBudget> {
     // Retire old sessions before measuring a new allowance: otherwise unused
     // pages can consume most of the process limit before this scope begins.
     runtime.synchronize()?;
-    runtime.pool.sweep_completed(runtime.commands.completed_watermark());
-    let limit = runtime.allocated_bytes().saturating_add(additional_bytes).max(1);
+    runtime
+        .pool
+        .sweep_completed(runtime.commands.completed_watermark());
+    let limit = runtime
+        .allocated_bytes()
+        .saturating_add(additional_bytes)
+        .max(1);
     let previous = runtime.swap_allocation_limit(limit);
     if previous != 0 && previous < limit {
         runtime.swap_allocation_limit(previous);
     }
-    Ok(AllocationBudget { runtime, previous, _thread_bound: std::marker::PhantomData })
+    Ok(AllocationBudget {
+        runtime,
+        previous,
+        _thread_bound: std::marker::PhantomData,
+    })
 }

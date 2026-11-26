@@ -178,7 +178,7 @@ pub fn decode_message_images(body: &serde_json::Value) -> anyhow::Result<Vec<Rgb
 }
 
 /// Admission for a media operation before allocating its GPU intermediates.
-pub(super) fn admit_scratch<D: crate::bindings::BindingDevice + lisa_backend::ManagedDevice>(
+pub(crate) fn admit_scratch<D: crate::bindings::BindingDevice + lisa_backend::ManagedDevice>(
     context: &crate::execution::DeviceContext<D>,
     bytes: usize,
 ) -> anyhow::Result<()> {
@@ -228,3 +228,5 @@ mod tests {
         assert!(decode_message_images(&body).is_err());
     }
 }
+
+pub(crate) mod inkling2;

@@ -1,5 +1,5 @@
 //! Byte-level admission for live generation state, alongside the independent
-//! batch padding limit. The server enables this gate with `LISA_RAM_CAP_GB`.
+//! batch padding limit. The server enables this gate when an explicit RAM cap is set.
 //!
 //! The rule is refuse-don't-attempt: state beyond the budget is refused (a 503
 //! upstream), never allocated and hoped for.
@@ -15,7 +15,7 @@ impl MemoryBudget {
         Self { budget, used: 0 }
     }
 
-    /// Current platform admission budget, lowered by `LISA_RAM_CAP_GB`.
+    /// Current platform admission budget, lowered by an explicit RAM cap.
     pub fn from_host() -> Self {
         Self::new(crate::memory::ram_budget())
     }
@@ -87,7 +87,7 @@ mod tests {
         let mut b = MemoryBudget::new(32 << 20);
         let req = stream_bytes(64, 65536, 4096, 2); // 64 tok @ 64 KiB/tok ×2
         assert_eq!(req, 64 * 65536 * 2 + 4096);
-        assert_eq!(b.budget() >= b.used(), true); // invariant floor
+        assert!(b.budget() >= b.used()); // invariant floor
         assert!(b.try_admit(req));
         assert_eq!(b.used(), req);
         b.release(req);

@@ -78,13 +78,6 @@ pub(crate) fn tensor(kind: T, shape: &[i32], seed: u32) -> Result<PackedTensor> 
 pub(crate) fn counts() -> BTreeMap<String, u64> {
     // Label counts are published when command buffers complete. Reading them
     // before the fence can compare two empty/stale censuses and miss dispatches.
-    if std::env::var_os("LISA_TRACE").is_some() {
-        lisa_metal::Stream::thread_local_or_default()
-            .runtime()
-            .commands
-            .flush_and_wait()
-            .expect("complete the measured dispatch interval");
-    }
     lisa_metal::runtime_label_dispatches().into_iter().collect()
 }
 pub(crate) fn difference(

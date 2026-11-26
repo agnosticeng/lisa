@@ -1,7 +1,7 @@
 # Lisa for macOS, iPhone and iPad
 
 Current validation and the simulator bf16 compiler blocker are recorded in
-[the shared Apple app architecture](../../specs/desktop.md#shared-apple-app).
+[the Apple app spec](../../specs/apple-app.md).
 
 This Xcode project shares its SwiftUI views, application state and Rust engine
 between Apple Silicon macOS 15+ and iOS/iPadOS 18+. This is the sole app frontend.
@@ -78,8 +78,8 @@ sequentially. The example cap must be lower than physical RAM minus 8 GiB.
 ```sh
 xcrun simctl install "$SIMULATOR_ID" \
   target/apple-simulator/Build/Products/Debug-iphonesimulator/Lisa.app
-SIMCTL_CHILD_LISA_RAM_CAP_GB=4 xcrun simctl launch --console-pty \
-  "$SIMULATOR_ID" org.lisa.app --lisa-integration-check
+xcrun simctl launch --console-pty \
+  "$SIMULATOR_ID" org.lisa.app --lisa-integration-check --ram-cap-gb 4
 ```
 
 Inspect `Documents/integration-check.json` inside the data directory returned by:
@@ -90,15 +90,15 @@ xcrun simctl get_app_container "$SIMULATOR_ID" org.lisa.app data
 
 A passed simulator check does not certify physical-device GPU support, speed,
 thermal behavior, app memory limits, background transitions or microphone access.
-The old `--lisa-simulator-check` argument retains its `simulator-check.json`
-output name for existing scripts.
+The `--lisa-simulator-check` argument writes `simulator-check.json`.
 For an independent float32/bf16 compiler diagnostic, launch any Debug
 build with `--lisa-metal-probe` and inspect `Documents/metal-probe.json`.
 
 The simulator uses host RAM and does not supply an iOS per-app memory limit.
 Real devices query `os_proc_available_memory()` on every admission and retain
 512 MiB of headroom from the smaller of that allowance and physical RAM. A zero
-allowance refuses loading. `LISA_RAM_CAP_GB` can only lower the result. This
+allowance refuses loading. The `--ram-cap-gb` launch argument can only lower
+the result. This
 permits small models on 8 GiB iPhones while keeping the Mac's 8 GiB reserve.
 Model size is an initial admission estimate; long contexts and image workloads
 can still exhaust memory. On a memory warning, Lisa cancels work and unloads the
@@ -122,10 +122,9 @@ downloads, image attachments and generation, a WebKit browser, on-device speech
 input, spoken replies and the local API server. Platform wrappers are limited
 to WebKit hosting, image display, audio sessions and app lifecycle.
 
-Chats retain the existing JSON format under Application Support/Lisa/chats.
-The Mac app shares the existing unsandboxed chat/model locations. iOS stores
-models under `Library/Application Support/Lisa/models` in its application
-container, excluded from iCloud backups. The application configures that cache
+Chats use the shared JSON format in the app data directory. The Mac app uses
+unsandboxed chat/model locations; iOS stores models in its application container,
+excluded from iCloud backups. The application configures that cache
 explicitly before workers start; desktop environment defaults are not writable
 model locations on iOS. Download failures are shown in the UI and device console.
 This does not synchronize data between
@@ -134,7 +133,7 @@ background requests cancellation and releases GPU state and the local server.
 Model reload and saved-history replay happen on return to the foreground.
 Transient inactivity alone does not release the model.
 
-Custom mathematical typesetting and the former slash-command picker are not
+Custom mathematical typesetting and a slash-command picker are not
 implemented in the SwiftUI interface. Voice, browser interstitials, image generation and API serving require
 separate device-level acceptance checks before claiming complete desktop parity.
 
@@ -159,8 +158,8 @@ result number; full mobile redirect URLs remain in the navigator. Direct search
 requests search Google and open the first result before inference. Failed
 retrieval cannot fall back to an answer from model memory. Web replies show source links and compact extracts from the pages actually read.
 Release listings render as film titles with source dates/genres; ratings, buttons
-and navigation are omitted. Other pages use short quoted excerpts. Model-written summaries are not used for those replies: the small
-default checkpoint was observed inventing titles even after reading sources.
+and navigation are omitted. Other pages use short quoted excerpts. Model-written summaries are not used for those replies, because small
+models can invent titles even after reading sources.
 Excerpts preserve the source wording; they do not certify that a page is current
 or that its claims are true.
 

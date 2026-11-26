@@ -71,6 +71,14 @@ pub struct Mlp {
     pub projections: [Projection; 3],
 }
 impl Mlp {
+    /// Coalesce the original scalar projections, keeping routing, activation
+    /// stores and expert summation in their serial arithmetic order.
+    pub fn prompt_graph(self, rows: usize) -> anyhow::Result<Graph> {
+        let graph = self.graph(&[1, 1, 4096], true)?;
+        let projections = crate::graph::sequence::single_row_projections(&graph);
+        crate::graph::sequence::expand(&graph, rows, &vec![vec![]; rows], &projections)
+            .map_err(anyhow::Error::msg)
+    }
     pub fn for_layer(layer: usize, projections: [Projection; 3]) -> Self {
         Self {
             sparse: layer >= 3,
@@ -156,18 +164,13 @@ impl Mlp {
             }),
             vec![Value::Weight(6), x, routing[0]],
         );
+        // Preserve the standalone activation's F32 store before route weighting.
         let y = b.one(
-            Kernel::SparseF32(S::ClampedSwiGlu {
+            Kernel::SparseF32(S::WeightedClampedSwiGlu {
                 limit: 10f32.to_bits(),
             }),
-            vec![gate, up],
+            vec![gate, up, routing[1]],
         );
-        let weights = b.one(Kernel::Tensor(T::Reshape(vec![1, 8, 1])), vec![routing[1]]);
-        let y = b.one(
-            Kernel::Tensor(T::Binary(Binary::Multiply)),
-            vec![y, weights],
-        );
-        let y = b.one(Kernel::Tensor(T::Contiguous), vec![y]);
         let experts = b.one(
             Kernel::PackedCompute(P::ExpertLinear { encoding: E::Q2K }),
             vec![Value::Weight(7), y, routing[0]],

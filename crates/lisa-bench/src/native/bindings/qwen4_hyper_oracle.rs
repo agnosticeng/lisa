@@ -74,7 +74,7 @@ impl GatedResidual {
         let prod = w4.multiply(&n4)?;
         let mut acc = prod.index((.., .., 0, ..)).contiguous().unwrap();
         for s in 1..self.hc_count {
-            acc = acc.add(&prod.index((.., .., s as i32, ..)))?;
+            acc = acc.add(prod.index((.., .., s as i32, ..)))?;
         }
         Ok(acc)
     }
@@ -123,38 +123,36 @@ impl GatedResidual {
                 s,
                 has_inject,
                 &stream,
-            ) {
-                if let Some((input, inject_w)) = {
-                    let packed = if s == 1 {
-                        self.decode_up.as_ref()
-                    } else {
-                        None
-                    };
-                    let (wu, su, bu) = match packed {
-                        Some(p) => (&p.weight, &p.scales, &p.biases),
-                        None => (
-                            &self.mix_up.weight,
-                            &self.mix_up.scales,
-                            &self.mix_up.biases,
-                        ),
-                    };
-                    lisa_metal::moe_decode::up_mix(
-                        &act,
-                        normed,
-                        wu,
-                        su,
-                        bu,
-                        &injw,
-                        h,
-                        hc,
-                        s,
-                        has_inject,
-                        packed.is_some(),
-                        &stream,
-                    )
-                } {
-                    return Ok((input.reshape(&[b, s, h])?, inject_w.reshape(&[b, s, hc])?));
-                }
+            ) && let Some((input, inject_w)) = {
+                let packed = if s == 1 {
+                    self.decode_up.as_ref()
+                } else {
+                    None
+                };
+                let (wu, su, bu) = match packed {
+                    Some(p) => (&p.weight, &p.scales, &p.biases),
+                    None => (
+                        &self.mix_up.weight,
+                        &self.mix_up.scales,
+                        &self.mix_up.biases,
+                    ),
+                };
+                lisa_metal::moe_decode::up_mix(
+                    &act,
+                    normed,
+                    wu,
+                    su,
+                    bu,
+                    &injw,
+                    h,
+                    hc,
+                    s,
+                    has_inject,
+                    packed.is_some(),
+                    &stream,
+                )
+            } {
+                return Ok((input.reshape(&[b, s, h])?, inject_w.reshape(&[b, s, hc])?));
             }
         }
         let inj = match &self.block_inject {

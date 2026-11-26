@@ -51,48 +51,36 @@ fn draft_selection_matches_original_shortlist_and_full_head() -> anyhow::Result<
     let coarse = projection(1025, 256, 2, 64);
     for bits in [2, 4, 8] {
         for use_coarse in [false, true] {
-            for confidence in [false, true] {
-                let target = projection(1025, 256, bits, 64);
-                let got = select(&hidden, &target, use_coarse.then_some(&coarse), confidence)?;
-                let (id, exact, candidates, logp) = if use_coarse {
-                    let scores = coarse.forward(&hidden)?;
-                    let ids = ops::top32_indices(&scores)?.reshape(&[32])?;
-                    let w = target.weight.take_axis(&ids, 0)?;
-                    let s = target.scales.take_axis(&ids, 0)?;
-                    let b = target.biases.take_axis(&ids, 0)?;
-                    let exact = ops::quantized_matmul(
-                        &hidden,
-                        &w,
-                        &s,
-                        Some(&b),
-                        true,
-                        target.group_size,
-                        target.bits,
-                    )?;
-                    let local = ops::indexing::argmax_axis(&exact, -1, None)?.reshape(&[1])?;
-                    let id = ids.take_axis(&local, 0)?.reshape(&[1, 1])?;
-                    let logp = exact.softmax_axis(-1)?.take_axis(&local, -1)?.log()?;
-                    (id, exact, Some(ids), confidence.then_some(logp))
-                } else {
-                    let scores = target.forward(&hidden)?;
-                    let id = ops::indexing::argmax_axis(&scores, -1, None)?.reshape(&[1, 1])?;
-                    let logp = if confidence {
-                        Some(scores.softmax_axis(-1)?.take_axis(&id, -1)?.log()?)
-                    } else {
-                        None
-                    };
-                    (id, scores, None, logp)
-                };
-                same(&got.token, &id);
-                same(&got.scores, &exact);
-                assert_eq!(got.candidates.is_some(), candidates.is_some());
-                assert_eq!(got.confidence.is_some(), logp.is_some());
-                if let Some(expected) = &candidates {
-                    same(got.candidates.as_ref().unwrap(), expected);
-                }
-                if let Some(expected) = &logp {
-                    same(got.confidence.as_ref().unwrap(), expected);
-                }
+            let target = projection(1025, 256, bits, 64);
+            let got = select(&hidden, &target, use_coarse.then_some(&coarse))?;
+            let (id, exact, candidates) = if use_coarse {
+                let scores = coarse.forward(&hidden)?;
+                let ids = ops::top32_indices(&scores)?.reshape(&[32])?;
+                let w = target.weight.take_axis(&ids, 0)?;
+                let s = target.scales.take_axis(&ids, 0)?;
+                let b = target.biases.take_axis(&ids, 0)?;
+                let exact = ops::quantized_matmul(
+                    &hidden,
+                    &w,
+                    &s,
+                    Some(&b),
+                    true,
+                    target.group_size,
+                    target.bits,
+                )?;
+                let local = ops::indexing::argmax_axis(&exact, -1, None)?.reshape(&[1])?;
+                let id = ids.take_axis(&local, 0)?.reshape(&[1, 1])?;
+                (id, exact, Some(ids))
+            } else {
+                let scores = target.forward(&hidden)?;
+                let id = ops::indexing::argmax_axis(&scores, -1, None)?.reshape(&[1, 1])?;
+                (id, scores, None)
+            };
+            same(&got.token, &id);
+            same(&got.scores, &exact);
+            assert_eq!(got.candidates.is_some(), candidates.is_some());
+            if let Some(expected) = &candidates {
+                same(got.candidates.as_ref().unwrap(), expected);
             }
         }
     }

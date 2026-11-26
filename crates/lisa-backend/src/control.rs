@@ -31,9 +31,30 @@ pub trait ManagedDevice: HostAccessDevice {
     type Scope;
     fn memory_usage(&self) -> anyhow::Result<MemoryUsage>;
     fn reserve_residency(&self, bytes: usize, budget: usize) -> anyhow::Result<Self::Reservation>;
+    /// Reduce an existing reservation after the caller has completed all users
+    /// and released the storage no longer covered by it. Never increase bytes
+    /// or change the reservation's budget. A zero-byte reservation must keep
+    /// private-allocation admission active until it is dropped. Providers that
+    /// do not support shrinking retain their original charge and return false.
+    fn shrink_residency(
+        &self,
+        _reservation: &mut Self::Reservation,
+        _bytes: usize,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
     /// End the current execution encoder without submitting or waiting.
     fn execution_boundary(&self);
     fn submit(&self, wait: bool) -> anyhow::Result<()>;
+    /// Commit queued work, then wait only for the submission marked by
+    /// `previous`. Returns this submission's mark, so a caller can keep one
+    /// batch executing while it encodes the next. Providers without marks
+    /// wait for everything.
+    fn submit_after(&self, previous: Option<u64>) -> anyhow::Result<u64> {
+        let _ = previous;
+        self.submit(true)?;
+        Ok(0)
+    }
     fn enter_scope(&self, scope: ExecutionScope) -> Self::Scope;
     fn trim_unused(&self);
     /// Complete queued work and release all unleased pooled allocations.

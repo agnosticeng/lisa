@@ -174,20 +174,19 @@ pub struct ModelConfig {
 fn merge(nested: &Option<RawText>, root: &RawText) -> RawText {
     // Field-wise merge; the nested text_config wins over the root.
     let mut v = serde_json::to_value(root).expect("root to value");
-    if let Some(t) = nested {
-        if let (Some(a), Ok(b)) = (v.as_object_mut(), serde_json::to_value(t).map_err(|_| ())) {
-            if let Some(b) = b.as_object() {
-                for (k, val) in b {
-                    a.insert(k.clone(), val.clone());
-                }
-            }
+    if let Some(t) = nested
+        && let (Some(a), Ok(b)) = (v.as_object_mut(), serde_json::to_value(t).map_err(|_| ()))
+        && let Some(b) = b.as_object()
+    {
+        for (k, val) in b {
+            a.insert(k.clone(), val.clone());
         }
     }
     serde_json::from_value(v).expect("merged config")
 }
 
 impl ModelConfig {
-    pub fn from_str(data: &str) -> anyhow::Result<Self> {
+    pub fn parse(data: &str) -> anyhow::Result<Self> {
         let raw: RawConfig = serde_json::from_str(data)?;
         let m = merge(&raw.text_config, &raw.root);
         let eos_token_ids: Vec<i64> = match &m.eos_token_id {

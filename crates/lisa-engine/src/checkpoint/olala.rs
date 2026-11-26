@@ -183,7 +183,7 @@ pub(crate) mod tests {
             formats.insert(
                 name,
                 Format {
-                    projection: crate::bindings::packed::projection(kind).unwrap(),
+                    projection: crate::weights::gguf::projection(kind).unwrap(),
                     dtype,
                     row_bytes: kind.row_bytes(shape[0]).unwrap() as i32,
                 },

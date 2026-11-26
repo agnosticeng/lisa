@@ -23,17 +23,6 @@ pub(super) fn compile_builtin(
     compile_builtin_bool_consts(device, source, name, &[])
 }
 
-/// Like [`compile_builtin`] with explicit math compile options (tail-ULP
-/// experiments only — the stock built-in class is `Math::SafeNoLang`).
-pub(super) fn compile_builtin_math(
-    device: &Device,
-    source: &str,
-    name: &str,
-    math: Math,
-) -> Result<ComputePipeline> {
-    device.compile_with(source, name, math)
-}
-
 /// Like [`compile_builtin`] but can specialise Metal bool function constants.
 pub(super) fn compile_builtin_bool_consts(
     device: &Device,
@@ -48,15 +37,47 @@ pub(super) fn compile_builtin_bool_consts(
     device.compile_with_constants(source, name, Math::SafeNoLang, &c)
 }
 
-/// Compile a library and fetch `name`, specialising bool/int function
-/// constants.
-pub(super) fn compile_builtin_typed_consts(
+/// [`compile_builtin`] with the source built only on a cache miss.
+pub(super) fn compile_builtin_lazy(
     device: &Device,
-    source: &str,
+    name: &str,
+    source: impl FnOnce() -> String,
+) -> Result<ComputePipeline> {
+    device.compile_lazy(name, Math::SafeNoLang, &[], source)
+}
+
+/// [`compile_builtin_bool_consts`] with the source built only on a cache miss.
+pub(super) fn compile_builtin_bool_consts_lazy(
+    device: &Device,
+    name: &str,
+    consts: &[(usize, bool)],
+    source: impl FnOnce() -> String,
+) -> Result<ComputePipeline> {
+    let c: Vec<(usize, ConstVal)> = consts
+        .iter()
+        .map(|(i, v)| (*i, ConstVal::Bool(*v)))
+        .collect();
+    device.compile_lazy(name, Math::SafeNoLang, &c, source)
+}
+
+/// Compile with typed function constants, building the source only on a cache miss.
+pub(super) fn compile_builtin_typed_consts_lazy(
+    device: &Device,
     name: &str,
     consts: &[(usize, ConstVal)],
+    source: impl FnOnce() -> String,
 ) -> Result<ComputePipeline> {
-    device.compile_with_constants(source, name, Math::SafeNoLang, consts)
+    device.compile_lazy(name, Math::SafeNoLang, consts, source)
+}
+
+/// Compile with explicit math options, building the source only on a cache miss.
+pub(super) fn compile_builtin_math_lazy(
+    device: &Device,
+    name: &str,
+    math: Math,
+    source: impl FnOnce() -> String,
+) -> Result<ComputePipeline> {
+    device.compile_lazy(name, math, &[], source)
 }
 
 /// MLX `backend/metal/utils.cpp:8` `type_to_name` — used in the kernel name.
@@ -111,7 +132,7 @@ pub(super) fn tg_from_row_size(row_size: usize) -> usize {
     } else if row_size <= 1024 {
         128
     } else {
-        ((row_size.div_ceil(4) + 31) / 32 * 32).min(1024)
+        (row_size.div_ceil(4).div_ceil(32) * 32).min(1024)
     }
 }
 

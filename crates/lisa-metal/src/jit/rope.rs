@@ -1,10 +1,9 @@
 use objc2_metal::MTLSize;
 
+use super::compile::compile_builtin_bool_consts_lazy;
 use crate::array::Array;
 
-use super::compile::{
-    builtin_template_def, compile_builtin_bool_consts, get_block_dims, type_string, type_to_name,
-};
+use super::compile::{builtin_template_def, get_block_dims, type_string, type_to_name};
 use super::{Device, Tensor};
 use super::{MLX_ROPE_SOURCE, MLX_UTILS_PREAMBLE};
 use crate::error::Result;
@@ -53,16 +52,16 @@ pub fn rope(
         "rope_single",
         &[in_t.to_string()],
     ));
-    let source = format!("{MLX_UTILS_PREAMBLE}{MLX_ROPE_SOURCE}{defs}");
-    let pipeline = compile_builtin_bool_consts(
+    let source = || format!("{MLX_UTILS_PREAMBLE}{MLX_ROPE_SOURCE}{defs}");
+    let pipeline = compile_builtin_bool_consts_lazy(
         device,
-        &source,
         &kernel_name,
         &[(1, forward), (2, traditional), (3, false)],
+        source,
     )?;
 
     let count = x.elem_count();
-    let obuf = mdev.buffer_for_full_gpu_write((count) as usize * (in_dt).size_of(), "rope_out")?;
+    let obuf = mdev.buffer_for_full_gpu_write((count) * (in_dt).size_of(), "rope_out")?;
     let out = Array::from_parts(mdev, obuf.clone(), &dims_v.clone(), in_dt);
 
     let in_strides = layout.stride().to_vec();

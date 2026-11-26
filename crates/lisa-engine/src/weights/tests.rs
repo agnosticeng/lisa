@@ -59,10 +59,11 @@ impl Device for HostViews {
         if !source.host_tensor().is_some_and(|h| h.validate()) {
             return Err(std::io::Error::other("invalid import"));
         }
-        if options.mode == ImportMode::Copy {
+        if matches!(options.mode, ImportMode::Copy | ImportMode::CopyCompact) {
             let host = source.host_tensor().unwrap();
             let owner = Arc::new(host.bytes.to_vec());
             let pointer = std::ptr::NonNull::new(owner.as_ptr() as *mut u8).unwrap();
+            // SAFETY: `owner` is an immutable Vec whose exact buffer is `pointer..len`.
             let storage = unsafe { HostStorage::new(pointer, owner.len(), owner) };
             self.0.fetch_add(1, Ordering::SeqCst);
             return Ok(Storage {
@@ -106,7 +107,7 @@ impl StorageDevice for HostViews {
     ) -> Result<Storage, Self::Error> {
         let size =
             tensor_bytes(shape, dtype).ok_or_else(|| std::io::Error::other("invalid shape"))?;
-        if offset % dtype.size_of() != 0
+        if !offset.is_multiple_of(dtype.size_of())
             || offset.checked_add(size).is_none_or(|n| n > t.bytes().len())
         {
             return Err(std::io::Error::other("view out of range"));
@@ -192,9 +193,88 @@ fn gguf_import_preserves_payloads_and_reserves_before_import() -> anyhow::Result
     )?;
     assert_eq!(uploaded.tensors["packed"].packed_bytes().bytes(), packed);
     assert_eq!(uploaded.tensors["plain"].plain_view()?.bytes(), plain);
+    let packed_pointer = uploaded.tensors["packed"].packed_bytes().bytes().as_ptr();
+    let plain_pointer = uploaded.tensors["plain"].plain_view()?.bytes().as_ptr();
+    let uploaded = uploaded.into_prepared()?;
+    assert_eq!(uploaded.tensors["packed"].packed_bytes().bytes(), packed);
+    assert_eq!(
+        uploaded.tensors["packed"].packed_bytes().bytes().as_ptr(),
+        packed_pointer
+    );
+    assert_eq!(
+        uploaded.tensors["plain"].plain_view()?.bytes().as_ptr(),
+        plain_pointer
+    );
+    assert_eq!(uploaded.tensors["plain"].layout.dtype, ScalarType::BF16);
+    assert_eq!(
+        uploaded.tensors["packed"].layout.projection,
+        lisa_models::packed::Projection::Q8
+    );
+
+    // A failed metadata adaptation must drain before releasing either the
+    // already converted views or the unconverted original allocations.
+    type Owner = dyn std::any::Any + Send + Sync;
+    struct Drain {
+        owners: Arc<std::sync::Mutex<Vec<std::sync::Weak<Owner>>>>,
+        count: Arc<AtomicUsize>,
+    }
+    impl Drop for Drain {
+        fn drop(&mut self) {
+            assert!(
+                self.owners
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|p| p.upgrade().is_some())
+            );
+            self.count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let owners = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let drains = Arc::new(AtomicUsize::new(0));
+    let mut invalid =
+        gguf::ResidentWeights::pull(device.clone(), &package, &["packed", "plain"], |_| {
+            Ok(Drain {
+                owners: owners.clone(),
+                count: drains.clone(),
+            })
+        })?;
+    for tensor in invalid.tensors.values() {
+        owners
+            .lock()
+            .unwrap()
+            .push(Arc::downgrade(&tensor.packed_bytes().owner.owner()));
+    }
+    invalid
+        .tensors
+        .get_mut("plain")
+        .unwrap()
+        .info
+        .dimensions
+        .clear();
     drop(package);
+    assert!(invalid.into_prepared().is_err());
+    assert_eq!(drains.load(Ordering::SeqCst), 1);
+    assert!(owners.lock().unwrap().iter().all(|p| p.upgrade().is_none()));
     assert!(weak.upgrade().is_some());
-    drop(store);
+    // Loading can erase GGUF metadata while preserving the exact imported
+    // tensor views and the original admission lease for tensor-only execution.
+    let (reservation, original) = store.into_parts();
+    let mut tensors = std::collections::BTreeMap::new();
+    tensors.insert(
+        "packed".to_owned(),
+        original["packed"].packed_bytes().clone(),
+    );
+    tensors.insert("plain".to_owned(), original["plain"].plain_view()?);
+    let prepared = source::PreparedTensors {
+        _reservation: reservation,
+        tensors,
+    };
+    drop(original);
+    assert!(weak.upgrade().is_some());
+    assert_eq!(prepared.tensors["packed"].bytes(), packed);
+    assert_eq!(prepared.tensors["plain"].bytes(), plain);
+    drop(prepared);
     assert!(weak.upgrade().is_none());
     assert_eq!(packed_view.bytes(), packed);
     assert_eq!(plain_view.bytes(), plain);
@@ -271,7 +351,7 @@ fn mapped_mlx_import_preserves_packed_bytes_and_outlives_reader() -> anyhow::Res
 }
 #[test]
 fn resident_index_checks_identity_and_ranges_with_non_metal_storage() -> anyhow::Result<()> {
-    use crate::core::weight_arena::{ArenaIndex, FileIdentity, ResidentWeights, TensorRecord};
+    use crate::weights::weight_arena::{ArenaIndex, FileIdentity, ResidentWeights, TensorRecord};
     use std::os::unix::fs::MetadataExt;
     let tmp = tempfile::tempdir()?;
     let root = tmp.path();

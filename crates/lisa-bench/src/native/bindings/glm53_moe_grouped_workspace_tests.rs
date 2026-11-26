@@ -66,7 +66,7 @@ fn dispatch_chain(
     let device = input.t.device();
     let (route_ids, counts, work_count, work_items) = routes;
     let project = |is_up, output| {
-        jit::glm53_moe_q2_mm_grouped_ds4_prefill_with_output(
+        jit::moe_q2_mm_grouped_ds4_prefill_with_output(
             device,
             &address_table.t,
             &input.t,
@@ -95,7 +95,7 @@ fn dispatch_chain(
         true,
         workspace.and_then(|views| views.up.as_ref().map(|v| &v.t)),
     );
-    let act = jit::glm53_moe_grouped_swiglu_weight_prefill_with_output(
+    let act = jit::moe_grouped_swiglu_weight_prefill_with_output(
         device,
         &gate,
         &up,
@@ -106,7 +106,7 @@ fn dispatch_chain(
         workspace.map(|views| &views.act.t),
     )
     .unwrap();
-    let down = jit::glm53_moe_q2_down_grouped_ds4_prefill_with_output(
+    let down = jit::moe_q2_down_grouped_ds4_prefill_with_output(
         device,
         &address_table.t,
         &act,
@@ -254,8 +254,8 @@ fn grouped_moe_workspace_reuses_all_stages_exactly_without_intermediate_waits() 
         }
         let mut first_bits = None;
         for (iteration, (fresh, reused)) in captures.iter().enumerate() {
-            let fresh_bits = fresh.each_ref().map(|output| output_bits(output));
-            let reused_bits = reused.each_ref().map(|output| output_bits(output));
+            let fresh_bits = fresh.each_ref().map(output_bits);
+            let reused_bits = reused.each_ref().map(output_bits);
             assert_eq!(
                 fresh_bits, reused_bits,
                 "{metadata:?} iteration {iteration}: gate/up/activation/down/sum bits differ"

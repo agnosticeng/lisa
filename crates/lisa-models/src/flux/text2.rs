@@ -94,7 +94,7 @@ pub fn program(schema: &Schema, geometry: Geometry, real: usize) -> anyhow::Resu
     for i in 0..depth {
         let p = format!("layers.{i}");
         let norm = |x: &Array, key: &str| -> anyhow::Result<Array> {
-            Ok(x.rms(&w.get(&format!("{p}.{key}.weight"))?, 1e-6)?)
+            x.rms(&w.get(&format!("{p}.{key}.weight"))?, 1e-6)
         };
         let n = norm(&x, "input_layernorm")?;
         let q = norm(

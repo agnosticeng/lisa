@@ -46,18 +46,18 @@ impl LayaConfig {
         agent: &serde_json::Value,
         tcfg: Option<&serde_json::Value>,
     ) -> anyhow::Result<Self> {
-        let model_type = str_of(&enc, "model_type").unwrap_or_default();
+        let model_type = str_of(enc, "model_type").unwrap_or_default();
         anyhow::ensure!(
             model_type == "modernbert",
             "unsupported Laya encoder model_type {model_type:?} (want modernbert)"
         );
-        if let Some(act) = str_of(&enc, "hidden_activation") {
+        if let Some(act) = str_of(enc, "hidden_activation") {
             anyhow::ensure!(act == "gelu", "unsupported hidden_activation {act:?}");
         }
 
-        let hidden_size = int_of(&enc, "hidden_size").context("hidden_size")?;
-        let num_heads = int_of(&enc, "num_attention_heads").context("num_attention_heads")?;
-        let num_layers = int_of(&enc, "num_hidden_layers").context("num_hidden_layers")?;
+        let hidden_size = int_of(enc, "hidden_size").context("hidden_size")?;
+        let num_heads = int_of(enc, "num_attention_heads").context("num_attention_heads")?;
+        let num_layers = int_of(enc, "num_hidden_layers").context("num_hidden_layers")?;
         anyhow::ensure!(
             num_heads > 0 && hidden_size % num_heads == 0,
             "hidden_size % heads"
@@ -66,7 +66,7 @@ impl LayaConfig {
         anyhow::ensure!(head_dim % 2 == 0, "head_dim must be even for RoPE");
 
         // Layer attention pattern: `layer_types` if present, else every Nth full.
-        let every_n = int_of(&enc, "global_attn_every_n_layers").unwrap_or(3);
+        let every_n = int_of(enc, "global_attn_every_n_layers").unwrap_or(3);
         anyhow::ensure!(every_n > 0, "global_attn_every_n_layers is 0");
         let mut layer_global = vec![false; num_layers];
         for (i, g) in layer_global.iter_mut().enumerate() {
@@ -84,8 +84,8 @@ impl LayaConfig {
         }
 
         let (mut theta_global, mut theta_local) = (
-            f32_of(&enc, "global_rope_theta").unwrap_or(160_000.0),
-            f32_of(&enc, "local_rope_theta").unwrap_or(10_000.0),
+            f32_of(enc, "global_rope_theta").unwrap_or(160_000.0),
+            f32_of(enc, "local_rope_theta").unwrap_or(10_000.0),
         );
         if let Some(rp) = enc.get("rope_parameters") {
             if let Some(v) = rp
@@ -104,9 +104,9 @@ impl LayaConfig {
 
         // Special tokens: ids from the encoder config, `mask_token` text from the
         // tokenizer config (the id is looked up from the tokenizer at run time).
-        let cls_id = int_of(&enc, "cls_token_id").unwrap_or(0) as u32;
-        let sep_id = int_of(&enc, "sep_token_id").unwrap_or(0) as u32;
-        let pad_id = int_of(&enc, "pad_token_id").unwrap_or(0) as u32;
+        let cls_id = int_of(enc, "cls_token_id").unwrap_or(0) as u32;
+        let sep_id = int_of(enc, "sep_token_id").unwrap_or(0) as u32;
+        let pad_id = int_of(enc, "pad_token_id").unwrap_or(0) as u32;
         let mask_token = tcfg
             .as_ref()
             .and_then(|t| t.get("mask_token"))
@@ -114,10 +114,10 @@ impl LayaConfig {
             .unwrap_or_else(|| "[MASK]".to_string());
 
         // --- agent ---
-        let head_layers = int_of(&agent, "head_layers").unwrap_or(2);
-        let max_len = int_of(&agent, "max_len").unwrap_or(512);
-        let head_max_len = int_of(&agent, "head_max_len").unwrap_or(192);
-        let max_pos = int_of(&enc, "max_position_embeddings").unwrap_or(8192);
+        let head_layers = int_of(agent, "head_layers").unwrap_or(2);
+        let max_len = int_of(agent, "max_len").unwrap_or(512);
+        let head_max_len = int_of(agent, "head_max_len").unwrap_or(192);
+        let max_pos = int_of(enc, "max_position_embeddings").unwrap_or(8192);
         anyhow::ensure!(
             4 < head_max_len && head_max_len < max_len && max_len <= max_pos,
             "want 4 < head_max_len ({head_max_len}) < max_len ({max_len}) <= max_position_embeddings ({max_pos})"
@@ -151,16 +151,16 @@ impl LayaConfig {
         }
 
         Ok(Self {
-            vocab_size: int_of(&enc, "vocab_size").unwrap_or(0),
+            vocab_size: int_of(enc, "vocab_size").unwrap_or(0),
             hidden_size,
-            intermediate_size: int_of(&enc, "intermediate_size").unwrap_or(0),
+            intermediate_size: int_of(enc, "intermediate_size").unwrap_or(0),
             num_layers,
             num_heads,
             head_dim,
-            norm_eps: f32_of(&enc, "norm_eps")
-                .or_else(|| f32_of(&enc, "layer_norm_eps"))
+            norm_eps: f32_of(enc, "norm_eps")
+                .or_else(|| f32_of(enc, "layer_norm_eps"))
                 .unwrap_or(1e-5),
-            local_attention: int_of(&enc, "local_attention").unwrap_or(128),
+            local_attention: int_of(enc, "local_attention").unwrap_or(128),
             layer_global,
             rope_theta_global: theta_global,
             rope_theta_local: theta_local,
@@ -212,7 +212,7 @@ impl LayaConfig {
 pub fn clamp_temperature(name: &str, t: &mut f32) {
     const TEMP_MIN: f32 = 0.5;
     const TEMP_MAX: f32 = 5.0;
-    if !(*t > 0.0) || !t.is_finite() {
+    if *t <= 0.0 || !t.is_finite() {
         *t = 1.0;
         return;
     }

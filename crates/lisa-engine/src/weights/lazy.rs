@@ -19,7 +19,7 @@ pub struct LazyTensorStore<D: StorageDevice> {
     dir: PathBuf,
     tensors: HashMap<String, (String, String)>,
     shards: Mutex<HashMap<String, Arc<Shard<D>>>>,
-    resident: Option<crate::core::weight_arena::ResidentWeights<D>>,
+    resident: Option<crate::weights::weight_arena::ResidentWeights<D>>,
 }
 
 impl<D: StorageDevice + Clone + Sync> LazyTensorStore<D>
@@ -92,7 +92,7 @@ where
             .map(PathBuf::from)
             .collect::<std::collections::HashSet<_>>();
         source_files.insert(PathBuf::from("model.safetensors.index.json"));
-        let resident = crate::core::weight_arena::ResidentWeights::open_with_policy(
+        let resident = crate::weights::weight_arena::ResidentWeights::open_with_policy(
             store.device.clone(),
             dir,
             index,

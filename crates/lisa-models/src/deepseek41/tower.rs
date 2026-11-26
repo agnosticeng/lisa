@@ -90,50 +90,6 @@ pub fn reshape(shape: Vec<i32>) -> Graph {
     let x = b.one(K::Tensor(T::Reshape(shape)), vec![V::Input(0)]);
     b.finish(vec![x])
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn layer_major_schedule_retains_causal_rows_and_submission_cadence() -> anyhow::Result<()> {
-        for rows in [1, 3, 8] {
-            let p = schedule(40, rows, true)?;
-            let layers = p.iter().filter(|s| matches!(s, Step::Layer(_))).count();
-            assert_eq!(layers, 40);
-            assert_eq!(
-                p.iter().filter(|s| matches!(s, Step::Attention(_))).count(),
-                40 * rows
-            );
-            assert_eq!(
-                p.iter()
-                    .filter(|s| matches!(s, Step::Submit { wait: true }))
-                    .count(),
-                if rows == 1 { 0 } else { 40 }
-            );
-            assert_eq!(
-                p.iter()
-                    .filter(|s| matches!(s, Step::Submit { wait: false }))
-                    .count(),
-                if rows == 1 { 20 } else { 0 }
-            );
-            assert_eq!(
-                p.last(),
-                Some(&Step::Head {
-                    row: rows - 1,
-                    logits: true
-                })
-            );
-            let mut layer = 0;
-            for s in p {
-                match s {
-                    Step::Layer(i) => layer = i,
-                    Step::EngramProject(table) => assert_eq!(engram::LAYERS[table], layer),
-                    _ => {}
-                }
-            }
-        }
-        Ok(())
-    }
-}
 pub fn concatenate_output(count: usize, width: i32) -> Graph {
     let mut b = Builder::new(count, 0, 0);
     let x = if count == 1 {
@@ -239,3 +195,47 @@ pub const OUTPUT: &str = "output.weight";
 pub const EMBEDDING: &str = "token_embd.weight";
 pub const ATTENTION_HC: &str = "attn";
 pub const FFN_HC: &str = "ffn";
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn layer_major_schedule_retains_causal_rows_and_submission_cadence() -> anyhow::Result<()> {
+        for rows in [1, 3, 8] {
+            let p = schedule(40, rows, true)?;
+            let layers = p.iter().filter(|s| matches!(s, Step::Layer(_))).count();
+            assert_eq!(layers, 40);
+            assert_eq!(
+                p.iter().filter(|s| matches!(s, Step::Attention(_))).count(),
+                40 * rows
+            );
+            assert_eq!(
+                p.iter()
+                    .filter(|s| matches!(s, Step::Submit { wait: true }))
+                    .count(),
+                if rows == 1 { 0 } else { 40 }
+            );
+            assert_eq!(
+                p.iter()
+                    .filter(|s| matches!(s, Step::Submit { wait: false }))
+                    .count(),
+                if rows == 1 { 20 } else { 0 }
+            );
+            assert_eq!(
+                p.last(),
+                Some(&Step::Head {
+                    row: rows - 1,
+                    logits: true
+                })
+            );
+            let mut layer = 0;
+            for s in p {
+                match s {
+                    Step::Layer(i) => layer = i,
+                    Step::EngramProject(table) => assert_eq!(engram::LAYERS[table], layer),
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    }
+}

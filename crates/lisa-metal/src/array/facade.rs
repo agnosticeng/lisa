@@ -74,6 +74,8 @@ impl Array {
         let out = Self::zeros(&self.rt, &[rows, cols], self.dtype)?;
         self.rt.commands.flush_and_wait()?;
         let esz = self.dtype.size_of();
+        // SAFETY: after `flush_and_wait` both buffers are idle; `x` is contiguous [m, k] and `out`
+        // is [rows, cols] with m <= rows and k <= cols, so every row copy is in bounds.
         unsafe {
             let src = x.buf.contents().add(x.layout.offset * esz);
             let dst = out.buf.contents();

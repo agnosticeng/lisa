@@ -1,14 +1,13 @@
 //! Application construction and native oracles for portable attention bindings.
 use crate::core::{
-    cache::FullAttentionCache, graph::PreparedGraph, loader::TensorSource, norm::RmsNorm,
-    quant::QuantizedLinear,
+    cache::FullAttentionCache, loader::TensorSource, norm::RmsNorm, quant::QuantizedLinear,
 };
 use lisa_metal::{Array, device::MetalDevice};
 pub struct Qwen35Attention(
-    pub lisa_engine::bindings::qwen35_attention::Qwen35Attention<MetalDevice>,
+    pub lisa_engine::bindings::qwen35::attention::Qwen35Attention<MetalDevice>,
 );
 impl std::ops::Deref for Qwen35Attention {
-    type Target = lisa_engine::bindings::qwen35_attention::Qwen35Attention<MetalDevice>;
+    type Target = lisa_engine::bindings::qwen35::attention::Qwen35Attention<MetalDevice>;
     fn deref(&self) -> &Self::Target {
         &self.0
     }
@@ -26,7 +25,7 @@ impl Qwen35Attention {
         bits: i32,
     ) -> anyhow::Result<Self> {
         Ok(Self(
-            lisa_engine::bindings::qwen35_attention::Qwen35Attention::load(
+            lisa_engine::bindings::qwen35::attention::Qwen35Attention::load(
                 crate::metal_context::execution_context(),
                 src,
                 prefix,
@@ -47,7 +46,7 @@ fn join_qkv(
     k: &mut QuantizedLinear,
     v: &mut QuantizedLinear,
 ) -> anyhow::Result<Option<QuantizedLinear>> {
-    lisa_engine::bindings::qwen35_attention::join_qkv(
+    lisa_engine::bindings::qwen35::attention::join_qkv(
         &crate::metal_context::execution_context(),
         q,
         k,

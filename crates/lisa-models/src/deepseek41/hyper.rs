@@ -1,4 +1,4 @@
-//! Four-stream DS4 residual computation, with original rounding boundaries.
+//! Four-stream the reference residual computation, with original rounding boundaries.
 use super::projection::Matrix;
 use crate::graph::{Builder, Graph, Value as V};
 use lisa_backend::{Kernel as K, PackedCompute as P, TensorOperation as T};

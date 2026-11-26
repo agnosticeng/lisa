@@ -1,6 +1,6 @@
 //! Engine-owned preparation and execution over a model-unaware device endpoint.
 use lisa_backend::Device;
-use lisa_models::{Alternatives, DimensionGuard, Plan, Value};
+use lisa_models::{Alternatives, Plan, ShapeGuard, Value};
 
 struct PreparedBranch<D: Device> {
     plan: Plan,
@@ -10,7 +10,7 @@ pub struct PreparedPlan<D: Device> {
     device: D,
     stream: D::Stream,
     primary: PreparedBranch<D>,
-    guarded: Option<(DimensionGuard, PreparedBranch<D>)>,
+    guarded: Option<(ShapeGuard, PreparedBranch<D>)>,
     weights: Vec<D::Tensor>,
 }
 impl<D: Device> PreparedPlan<D>
@@ -23,10 +23,7 @@ where
             .validate(weights.len())
             .map_err(anyhow::Error::msg)?;
         if let Some((guard, plan)) = &plans.guarded {
-            anyhow::ensure!(
-                guard.axis < guard.min_rank,
-                "plan shape guard axis exceeds minimum rank"
-            );
+            anyhow::ensure!(guard.valid(), "invalid model-plan shape guard");
             plan.validate(weights.len()).map_err(anyhow::Error::msg)?;
         }
         let prepare = |plan: Plan| -> anyhow::Result<Option<PreparedBranch<D>>> {
@@ -61,10 +58,10 @@ where
     pub fn run(&self, input: &D::Tensor) -> anyhow::Result<D::Tensor> {
         if let Some((guard, branch)) = &self.guarded {
             let shape = self.device.shape(input);
-            if shape.len() >= guard.min_rank && shape[guard.axis] == guard.equals {
-                if let Some(output) = self.execute(branch, input)? {
-                    return Ok(output);
-                }
+            if guard.matches(shape)
+                && let Some(output) = self.execute(branch, input)?
+            {
+                return Ok(output);
             }
         }
         self.execute(&self.primary, input)?

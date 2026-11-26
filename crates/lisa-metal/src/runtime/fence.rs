@@ -15,6 +15,8 @@ pub struct Fence {
     raw: Retained<ProtocolObject<dyn MTLFence>>,
 }
 
+// SAFETY: an MTLFence handle is immutable after creation and only encoded under the
+// `Commands` lock; retain/release of Metal objects is thread-safe.
 unsafe impl Send for Fence {}
 unsafe impl Sync for Fence {}
 

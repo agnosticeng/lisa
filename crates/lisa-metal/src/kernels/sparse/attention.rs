@@ -1,26 +1,28 @@
-//! Attention operations with the pinned DS4 arithmetic.
+//! Attention operations with the pinned reference arithmetic.
+use super::indexing::{indexer_topk_merge_kernel, indexer_topk_sort_kernel};
+use super::moe::moe_gather_header;
 use super::*;
 
 pub(super) const DSA_INDEXED_LORA_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/dsa_indexed_lora.metal");
+    crate::kernel_source!("sparse_attention/dsa_indexed_lora.metal");
 pub(super) const DSA_INDEXED_LORA_NATIVE_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/dsa_indexed_lora_native.metal");
+    crate::kernel_source!("sparse_attention/dsa_indexed_lora_native.metal");
 pub(super) const DSA_INDEXED_DECODE_FUSED_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/dsa_indexed_decode_fused.metal");
+    crate::kernel_source!("sparse_attention/dsa_indexed_decode_fused.metal");
 pub(super) const DSA_INDEXED_DECODE_NATIVE_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/dsa_indexed_decode_native.metal");
+    crate::kernel_source!("sparse_attention/dsa_indexed_decode_native.metal");
 pub(super) const DSA_VALUE_PROJECT_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/dsa_value_project.metal");
+    crate::kernel_source!("sparse_attention/dsa_value_project.metal");
 pub(super) const DSA_QK_LOWRANK_NATIVE_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/dsa_qk_lowrank_native.metal");
+    crate::kernel_source!("sparse_attention/dsa_qk_lowrank_native.metal");
 pub(super) const DSA_VALUE_PROJECT_NATIVE_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/dsa_value_project_native.metal");
+    crate::kernel_source!("sparse_attention/dsa_value_project_native.metal");
 pub(super) const DSA_VALUE_PROJECT_NATIVE_MMA_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/dsa_value_project_native_mma.metal");
+    crate::kernel_source!("sparse_attention/dsa_value_project_native_mma.metal");
 pub(super) const DSA_O_PROJECT_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/dsa_o_project.metal");
+    crate::kernel_source!("sparse_attention/dsa_o_project.metal");
 
-/// Select rowwise descending top-k pool ids with ds4's block-sort plus merge
+/// Select rowwise descending top-k pool ids with the reference's block-sort plus merge
 /// algorithm. `scores` is contiguous F32 `[rows, pools]`; output is I32
 /// `[rows, top_k]`. This avoids globally sorting the full sparse-attention
 /// history for every query row.
@@ -28,7 +30,7 @@ pub fn dsa_indexer_topk(scores: &Array, top_k: usize, stream: &Stream) -> Option
     dsa_indexer_topk_with_shuffle(scores, top_k, false, stream)
 }
 
-/// DS4's blockwise indexer top-k with SIMD shuffle stages for the sub-32
+/// The reference's blockwise indexer top-k with SIMD shuffle stages for the sub-32
 /// bitonic network. The comparator and tie order are the same as the shared
 /// threadgroup-memory implementation.
 pub fn dsa_indexer_topk_shuffle(scores: &Array, top_k: usize, stream: &Stream) -> Option<Array> {
@@ -50,7 +52,7 @@ pub(super) fn dsa_indexer_topk_with_shuffle(
         return None;
     }
 
-    // The reference DS4 Metal path uses a 1024-entry block on Apple Silicon.
+    // The reference the reference Metal path uses a 1024-entry block on Apple Silicon.
     // Round up to the next power of two for shorter score rows.
     let mut nth = 1usize;
     while nth < n_comp && nth < 1024 {
@@ -102,7 +104,7 @@ pub(super) fn dsa_indexer_topk_with_shuffle(
         let n_merges = work_width.div_ceil(2 * run_len);
         let final_merge = n_merges == 1;
         let out_width = if final_merge { top_k } else { work_width };
-        let merge_threads = run_len.min(512).max(1);
+        let merge_threads = run_len.clamp(1, 512);
         let merge_inputs = [
             KernelInput::I32(n_comp as i32),
             KernelInput::I32(n_rows as i32),
@@ -133,9 +135,9 @@ pub(super) fn dsa_indexer_topk_with_shuffle(
     Some(partial)
 }
 pub(super) const DSA_QKV_NORM_ROWS_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/dsa_qkv_rms_norm_rows.metal");
+    crate::kernel_source!("sparse_attention/dsa_qkv_rms_norm_rows.metal");
 pub(super) const DSA_QKV_PROJECT_PAIR_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/dsa_qkv_project_pair.metal");
+    crate::kernel_source!("sparse_attention/dsa_qkv_project_pair.metal");
 
 pub(super) fn dsa_qkv_norm_rows_kernel() -> &'static Option<MetalKernel> {
     static K: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
@@ -164,10 +166,10 @@ pub(super) fn dsa_qkv_norm_rows_kernel() -> &'static Option<MetalKernel> {
     })
 }
 
-/// DS4's fused DSA q/kv normalization, retaining its q-sized threadgroup for
-/// both branches. The GLM q-rank has 384 float4 lanes; DS4 uses those lanes
+/// The reference's fused DSA q/kv normalization, retaining its q-sized threadgroup for
+/// both branches. The GLM q-rank has 384 float4 lanes; the reference uses those lanes
 /// when reducing the shorter 512-value KV row as well.
-pub fn glm53_dsa_qkv_rms_norm_rows(
+pub fn dsa_qkv_rms_norm_rows(
     q_input: &Array,
     q_weight: &Array,
     kv_input: &Array,
@@ -275,9 +277,9 @@ pub(super) fn dsa_qkv_project_pair_kernel() -> &'static Option<MetalKernel> {
 
 /// Pair GLM DSA `q_a` and `kv_a` affine projections in one dispatch. The
 /// query-rank branch keeps MLX qmv_fast arithmetic. For one row, `kv_a` uses
-/// DS4's F32 affine matvec order; for 2..8 rows it uses DS4's small-batch row
+/// the reference's F32 affine matvec order; for 2..8 rows it uses the reference's small-batch row
 /// grouping and shuffle reduction.
-pub fn glm53_dsa_qkv_project_pair(
+pub fn dsa_qkv_project_pair(
     q_weights: &Array,
     q_scales: &Array,
     q_biases: &Array,
@@ -395,11 +397,11 @@ pub fn glm53_dsa_qkv_project_pair(
 }
 
 pub(super) const DSA_SCORES_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/dsa_scores.metal");
+    crate::kernel_source!("sparse_attention/dsa_scores.metal");
 pub(super) const DSA_WV_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/dsa_wv.metal");
+    crate::kernel_source!("sparse_attention/dsa_wv.metal");
 pub(super) const DSA_QK_LOWRANK_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/dsa_qk_lowrank.metal");
+    crate::kernel_source!("sparse_attention/dsa_qk_lowrank.metal");
 
 pub(super) fn dsa_scores_kernel() -> &'static Option<MetalKernel> {
     static K: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
@@ -496,7 +498,7 @@ pub fn dsa_decode_scores(
             return None;
         }
     };
-    Some(out.into_iter().next()?)
+    out.into_iter().next()
 }
 
 /// Fused DSA decode attention, stage 2: scores `[B*heads,tc]` and
@@ -545,7 +547,7 @@ pub fn dsa_decode_weighted_v(scores: &Array, v: &Array, stream: &Stream) -> Opti
             return None;
         }
     };
-    Some(out.into_iter().next()?)
+    out.into_iter().next()
 }
 
 pub(super) fn dsa_qk_lowrank_native_kernel() -> &'static Option<MetalKernel> {
@@ -577,7 +579,7 @@ pub(super) fn dsa_qk_lowrank_native_kernel() -> &'static Option<MetalKernel> {
     })
 }
 
-/// QK projection with the native DS4 schedule available under its diagnostic
+/// QK projection with the native reference schedule available under its diagnostic
 /// scope. Queries are `[B,H,T,256]`, output is `[B,T,H,512]`.
 pub fn dsa_qk_lowrank_project(
     q: &Array,
@@ -730,7 +732,7 @@ pub(super) fn dsa_indexed_lora_kernel() -> &'static Option<MetalKernel> {
     })
 }
 
-// Keep the complete DS4 ABI: runtime dimensions and no-RoPE branches are
+// Keep the complete reference ABI: runtime dimensions and no-RoPE branches are
 // part of the compiled arithmetic, even for GLM-5.3's fixed geometry.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -758,7 +760,7 @@ pub(super) struct Ds4IndexedLoraArgs {
     head_base: u32,
 }
 
-/// DS4's split serial attention fallback for a private MTP window beyond
+/// The reference's split serial attention fallback for a private MTP window beyond
 /// the fused kernel's 2051-row limit. Eight SIMD groups stage 16 F16 rows at
 /// a time; scratch remains 16 KiB independent of the selected-window length.
 pub fn dsa_indexed_lora_wide_native(
@@ -838,7 +840,7 @@ pub fn dsa_indexed_lora_wide_native(
         let encoder = guard.encoder();
         encoder.set_pipeline(&pipeline);
         encoder.set_bytes(0, &args);
-        // No RoPE rows exist for GLM-5.3. Preserve DS4's argument binding;
+        // No RoPE rows exist for GLM-5.3. Preserve the reference's argument binding;
         // qk_rope=0 prevents the aliased placeholder at slot 4 from being read.
         for (index, tensor) in [
             (1, q),
@@ -857,7 +859,7 @@ pub fn dsa_indexed_lora_wide_native(
         encoder.set_output(6, Some(&output_buffer), 0);
         encoder.set_threadgroup_memory_length(0, 16 * 512 * std::mem::size_of::<u16>());
         encoder.dispatch_groups((8, 1, 1), (32, 8, 1));
-        // DS4 keeps this dispatch and its following value projection in the
+        // The reference keeps this dispatch and its following value projection in the
         // active serial encoder. Do not commit, wait, or close the encoder.
     }
     Some(output)
@@ -968,7 +970,7 @@ pub fn dsa_indexed_decode_fused_capture_kernel() -> &'static Option<MetalKernel>
     })
 }
 
-/// DS4's serial indexed-decode schedule for GLM-5.3: one threadgroup per
+/// The reference's serial indexed-decode schedule for GLM-5.3: one threadgroup per
 /// attention head fuses indexed softmax, latent reduction, and MLX-affine
 /// value projection. `None` leaves callers free to use the general path.
 #[allow(clippy::too_many_arguments)]
@@ -1217,7 +1219,7 @@ pub fn dsa_value_project_rows(
         return None;
     }
     let rows = lora.dim(0) as usize;
-    if rows == 0 || rows % n_heads != 0 {
+    if rows == 0 || !rows.is_multiple_of(n_heads) {
         return None;
     }
     let rows_i32 = i32::try_from(rows).ok()?;
@@ -1306,7 +1308,7 @@ pub(super) fn dsa_o_project_kernel() -> &'static Option<MetalKernel> {
     })
 }
 
-/// GLM DSA output projection using DS4's raw MLX-affine F32 matvec schedule.
+/// GLM DSA output projection using the reference's raw MLX-affine F32 matvec schedule.
 pub fn dsa_o_project(
     input: &Array,
     weight: &Array,
@@ -1317,7 +1319,7 @@ pub fn dsa_o_project(
 ) -> Option<Array> {
     const IN: usize = 16_384;
     const OUT: usize = 4_096;
-    if group_size == 0 || IN % group_size != 0 || i32::try_from(group_size).is_err() {
+    if group_size == 0 || !IN.is_multiple_of(group_size) || i32::try_from(group_size).is_err() {
         return None;
     }
     if input.rank() != 2
@@ -1445,7 +1447,7 @@ pub fn dsa_indexed_lora_short(
         Ok(mut out) => out.pop(),
         Err(err) => {
             eprintln!("[dsa-indexed-lora-dispatch] {err}");
-            return None;
+            None
         }
     }
 }

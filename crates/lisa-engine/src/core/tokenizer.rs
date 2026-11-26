@@ -5,8 +5,8 @@ use tokenizers::Tokenizer as HfTokenizer;
 pub struct Tokenizer {
     pub inner: HfTokenizer,
     pub im_end_ids: Vec<u32>,
-    lfm3: bool,
-    native: Option<crate::core::gguf_tokenizer::Tokenizer>,
+    pub(crate) lfm3: bool,
+    pub(crate) native: Option<crate::core::native_tokenizer::Tokenizer>,
 }
 
 /// Incremental decoding with the same text as `Tokenizer::decode` at every
@@ -139,79 +139,6 @@ impl Tokenizer {
     pub fn is_lfm3(&self) -> bool {
         self.lfm3
     }
-    pub fn load(dir: &std::path::Path) -> anyhow::Result<Self> {
-        if dir.is_file() {
-            let header = lisa_gguf::Header::open(dir)?;
-            if matches!(header.architecture()?, "qwen35" | "olala") {
-                let inner = if header.architecture()? == "olala" { crate::checkpoint::qwen35_tokenizer::from_qwen2_header(&header)? } else { crate::checkpoint::qwen35_tokenizer::from_header(&header)? };
-                let im_end_ids = ["<|im_end|>", "<|endoftext|>"]
-                    .iter()
-                    .filter_map(|t| inner.token_to_id(t))
-                    .collect();
-                return Ok(Self {
-                    inner,
-                    im_end_ids,
-                    native: None,
-                    lfm3: false,
-                });
-            }
-            anyhow::ensure!(
-                matches!(header.architecture()?, "deepseek41" | "glm5-next"),
-                "unsupported GGUF tokenizer architecture"
-            );
-            let native = crate::core::gguf_tokenizer::Tokenizer::from_header(&header)?;
-            let im_end_ids = if header.architecture()? == "glm5-next" {
-                crate::checkpoint::glm53::config(&header)?
-                    .eos_token_ids
-                    .into_iter()
-                    .map(|id| id as u32)
-                    .collect()
-            } else {
-                vec![native.eos]
-            };
-            return Ok(Self {
-                inner: native.decoder_view()?,
-                im_end_ids,
-                native: Some(native),
-                lfm3: false,
-            });
-        }
-        Self::load_file(&dir.join("tokenizer.json"))
-    }
-
-    /// Load a `tokenizer.json` from an explicit path (some checkpoints keep it
-    /// in a `tokenizer/` subdirectory).
-    pub fn load_file(path: &std::path::Path) -> anyhow::Result<Self> {
-        let is_glm53 = match path.parent() {
-            Some(dir) => is_glm53_model_dir(dir)?,
-            None => false,
-        };
-        let inner = if is_glm53 {
-            load_glm53_tokenizer(path)?
-        } else {
-            HfTokenizer::from_file(path).map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?
-        };
-        // <|im_end|> and <|endoftext|>
-        let mut im_end_ids = Vec::new();
-        for token in ["<|im_end|>", "<|endoftext|>"] {
-            if let Some(id) = inner.token_to_id(token) {
-                im_end_ids.push(id);
-            }
-        }
-        let lfm3 = path
-            .parent()
-            .and_then(|dir| std::fs::read(dir.join("config.json")).ok())
-            .map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes))
-            .transpose()?
-            .is_some_and(|config| config["model_type"] == "lfm3");
-        Ok(Self {
-            inner,
-            im_end_ids,
-            native: None,
-            lfm3,
-        })
-    }
-
     pub fn encode(&self, text: &str, add_bos: bool) -> anyhow::Result<Vec<u32>> {
         if let Some(native) = &self.native {
             let mut ids = native.encode_rendered(text)?;
@@ -226,10 +153,8 @@ impl Tokenizer {
             .map_err(|e| anyhow::anyhow!("encode: {e}"))?
             .get_ids()
             .to_vec();
-        if add_bos {
-            if let Some(bos) = self.inner.token_to_id("<|im_start|>") {
-                ids.insert(0, bos);
-            }
+        if add_bos && let Some(bos) = self.inner.token_to_id("<|im_start|>") {
+            ids.insert(0, bos);
         }
         Ok(ids)
     }
@@ -350,45 +275,6 @@ impl Tokenizer {
     }
 }
 
-/// Embedded GGUF templates and directory checkpoints use one discovery path.
-pub fn load_chat_template(model: &std::path::Path) -> anyhow::Result<Option<String>> {
-    if model.is_file() {
-        let header = lisa_gguf::Header::open(model)?;
-        return Ok(header
-            .metadata
-            .get("tokenizer.chat_template")
-            .and_then(lisa_gguf::Value::as_str)
-            .map(str::to_owned));
-    }
-    match std::fs::read_to_string(model.join("chat_template.jinja")) {
-        Ok(template) => {
-            // Standalone templates still obtain their special tokens from tokenizer_config.json.
-            let config_path = model.join("tokenizer_config.json");
-            let config: serde_json::Value = if config_path.is_file() {
-                serde_json::from_slice(&std::fs::read(config_path)?)?
-            } else {
-                serde_json::Value::Null
-            };
-            let mut source = String::new();
-            for name in ["bos_token", "eos_token", "pad_token"] {
-                let token = config[name]
-                    .as_str()
-                    .or_else(|| config[name]["content"].as_str());
-                if let Some(token) = token {
-                    source.push_str(&format!(
-                        "{{%- set {name} = {} -%}}",
-                        serde_json::to_string(token)?
-                    ));
-                }
-            }
-            source.push_str(&template);
-            Ok(Some(source))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
-    }
-}
-
 impl Tokenizer {
     /// Native no-thinking turn for a persistent chat. Generation stops before
     /// EOS, so subsequent turns close the previous assistant and omit BOS.
@@ -409,7 +295,7 @@ impl Tokenizer {
         };
         if native.is_glm4() {
             let rendered = if first {
-                glm_generation_prompt(prompt, system, GlmReasoning::Disabled)
+                glm_generation_prompt(prompt, system, ReasoningEffort::Disabled)
             } else {
                 format!("<|user|>{prompt}<|assistant|><think></think>")
             };
@@ -422,7 +308,7 @@ impl Tokenizer {
         Ok(Some(ids))
     }
 
-    /// Preserve each DS4 family's raw-text control-marker rules.
+    /// Preserve each the reference family's raw-text control-marker rules.
     pub fn encode_plain(&self, text: &str) -> anyhow::Result<Vec<u32>> {
         if let Some(native) = &self.native {
             if native.is_glm4() {
@@ -445,45 +331,6 @@ impl Tokenizer {
             .ok_or_else(|| anyhow::anyhow!("model has no native GGUF tokenizer"))?
             .chat(system, prompt, effort)
     }
-}
-
-fn is_glm53_model_dir(dir: &std::path::Path) -> anyhow::Result<bool> {
-    let config_path = dir.join("config.json");
-    if !config_path.is_file() {
-        return Ok(false);
-    }
-    let config: serde_json::Value = serde_json::from_slice(&std::fs::read(&config_path)?)?;
-    let model_type = config.get("model_type").and_then(serde_json::Value::as_str);
-    let text_model_type = config
-        .pointer("/text_config/model_type")
-        .and_then(serde_json::Value::as_str);
-    Ok(matches!(model_type, Some("glm5_next" | "glm5_next_text"))
-        || text_model_type == Some("glm5_next_text"))
-}
-
-fn load_glm53_tokenizer(path: &std::path::Path) -> anyhow::Result<HfTokenizer> {
-    let bytes = std::fs::read(path)?;
-    load_glm53_tokenizer_bytes(&bytes)
-}
-
-fn load_glm53_tokenizer_bytes(bytes: &[u8]) -> anyhow::Result<HfTokenizer> {
-    let mut document: serde_json::Value = serde_json::from_slice(bytes)?;
-    let model = document
-        .get_mut("model")
-        .and_then(serde_json::Value::as_object_mut)
-        .ok_or_else(|| anyhow::anyhow!("GLM-5.3 tokenizer model is missing"))?;
-    anyhow::ensure!(
-        model.get("type").and_then(serde_json::Value::as_str) == Some("BPE"),
-        "GLM-5.3 DS4 parity requires a BPE tokenizer"
-    );
-
-    // The MLX tokenizer JSON sets ignore_merges=true, allowing a whole vocab
-    // entry to bypass BPE merge ranks. DS4's GGUF tokenizer always applies its
-    // merge table. Force the same semantics while keeping the MLX vocab and
-    // pre-tokenizer, so raw text maps to the same token IDs as DS4.
-    model.insert("ignore_merges".to_string(), serde_json::Value::Bool(false));
-    let bytes = serde_json::to_vec(&document)?;
-    HfTokenizer::from_bytes(bytes).map_err(|e| anyhow::anyhow!("GLM-5.3 tokenizer: {e}"))
 }
 
 /// A minimal ChatML applier matching the checkpoint's chat template for
@@ -529,15 +376,6 @@ pub fn generation_prompt(messages: &[(String, String)]) -> String {
     out
 }
 
-/// Non-thinking generation prompt: a pre-closed `<think>` block, matching the
-/// template's `enable_thinking=false`, so the model answers directly with no
-/// visible reasoning. Used by the UI.
-pub fn generation_prompt_no_think(messages: &[(String, String)]) -> String {
-    let mut out = apply_chat_template(messages);
-    out.push_str("assistant\n<think>\n\n</think>\n\n");
-    out
-}
-
 /// Build a Qwen ChatML prompt using the real special tokens. With
 /// `think == false` the think block is pre-closed so the model answers directly.
 pub fn chat_prompt_special(text: &str, think: bool) -> String {
@@ -562,21 +400,25 @@ pub fn chat_prompt_special_with_system(text: &str, system: Option<&str>, think: 
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GlmReasoning {
+pub enum ReasoningEffort {
     High,
     Max,
     Disabled,
 }
 
-/// GLM-5.3 generation prompt, matching ds4's text-only chat prefix. The
+/// GLM-5.3 generation prompt, matching the reference's text-only chat prefix. The
 /// control markers must be encoded as their special-token ids; rendering
 /// lookalike separators as ordinary text changes the model input.
-pub fn glm_generation_prompt(text: &str, system: Option<&str>, reasoning: GlmReasoning) -> String {
+pub fn glm_generation_prompt(
+    text: &str,
+    system: Option<&str>,
+    reasoning: ReasoningEffort,
+) -> String {
     let mut out = String::from("[gMASK]<sop>");
     let effort = match reasoning {
-        GlmReasoning::High => Some("Reasoning Effort: High"),
-        GlmReasoning::Max => Some("Reasoning Effort: Max"),
-        GlmReasoning::Disabled => None,
+        ReasoningEffort::High => Some("Reasoning Effort: High"),
+        ReasoningEffort::Max => Some("Reasoning Effort: Max"),
+        ReasoningEffort::Disabled => None,
     };
     if let Some(effort) = effort {
         out.push_str("<|system|>");
@@ -589,7 +431,7 @@ pub fn glm_generation_prompt(text: &str, system: Option<&str>, reasoning: GlmRea
     out.push_str("<|user|>");
     out.push_str(text);
     out.push_str("<|assistant|><think>");
-    if reasoning == GlmReasoning::Disabled {
+    if reasoning == ReasoningEffort::Disabled {
         out.push_str("</think>");
     }
     out
@@ -611,39 +453,29 @@ pub fn chat_turn_suffix(msg: &str, first: bool) -> String {
     out
 }
 
-/// Like [`chat_turn_suffix`], but using the real ChatML special tokens and a
-/// pre-closed think block when `think == false`, matching
-/// [`chat_prompt_special_with_system`]. Used for multi-turn sessions so each
-/// turn continues the committed conversation.
-///
-/// `assistant_im_end` distinguishes templates that close an assistant turn with
-/// `` (e.g. MiMo) from Qwen's, which relies on a plain newline.
-pub fn chat_turn_suffix_special(
-    msg: &str,
-    first: bool,
-    think: bool,
-    assistant_im_end: bool,
-) -> String {
-    let start = concat!("<|", "im_start", "|>");
-    let end = concat!("<|", "im_end", "|>");
-    let tail = if think {
-        " thinking\n"
-    } else {
-        " thinking\n\n response\n\n"
-    };
-    let lead = if first {
-        String::new()
-    } else if assistant_im_end {
-        format!("{end}\n")
-    } else {
-        "\n".to_string()
-    };
-    format!("{lead}{start}user\n{msg}{end}\n{start}assistant\n{tail}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_inkling_sampling_terminator_is_loaded_from_tokenizer() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let source = serde_json::json!({
+            "version":"1.0", "truncation":null, "padding":null,
+            "added_tokens":[], "normalizer":null, "pre_tokenizer":null,
+            "post_processor":null, "decoder":null,
+            "model":{"type":"WordLevel", "vocab":{
+                "unknown":0, "<|content_model_end_sampling|>":1, "word":2
+            }, "unk_token":"unknown"}
+        });
+        std::fs::write(
+            dir.path().join("tokenizer.json"),
+            serde_json::to_vec(&source)?,
+        )?;
+        let tokenizer = crate::checkpoint::tokenizer::load(dir.path())?;
+        assert_eq!(tokenizer.im_end_ids, vec![1]);
+        Ok(())
+    }
 
     #[test]
     fn incremental_byte_level_matches_full_decode_at_every_token() -> anyhow::Result<()> {
@@ -745,7 +577,7 @@ mod tests {
         }"#;
         let source_tokenizer = HfTokenizer::from_bytes(source)
             .map_err(|e| anyhow::anyhow!("source tokenizer: {e}"))?;
-        let ds4_tokenizer = load_glm53_tokenizer_bytes(source)?;
+        let ds4_tokenizer = crate::checkpoint::tokenizer::load_glm53_tokenizer_bytes(source)?;
         let source_ids = source_tokenizer
             .encode("ab", false)
             .map_err(|e| anyhow::anyhow!("source encode: {e}"))?;
@@ -758,118 +590,22 @@ mod tests {
     }
 
     #[test]
-    fn glm53_real_tokenizer_matches_ds4_natural_prompt_fixture() -> anyhow::Result<()> {
-        let Some(model_dir) = std::env::var_os("LISA_GLM53_MODEL") else {
-            eprintln!("LISA_GLM53_MODEL=<snapshot> to check real GLM tokenizer parity");
-            return Ok(());
-        };
-        let tokenizer = Tokenizer::load(std::path::Path::new(&model_dir))?;
-        assert_eq!(tokenizer.encode(" attenzione", false)?, [1619, 16581, 6339]);
-
-        let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src/core/fixtures/glm53-tokenizer");
-        let read_u32 = |name: &str| -> anyhow::Result<Vec<u32>> {
-            let bytes = std::fs::read(fixture_dir.join(name))?;
-            anyhow::ensure!(bytes.len() % 4 == 0, "{name} is not a u32 array");
-            Ok(bytes
-                .chunks_exact(4)
-                .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("four bytes")))
-                .collect())
-        };
-        let mlx_ids = read_u32("prompt-row-1.u32")?;
-        let ds4_ids = read_u32("prompt-row-1.ds4.u32")?;
-        let text = tokenizer.decode(&mlx_ids)?;
-        let actual = tokenizer.encode(&text, false)?;
-        assert_eq!(actual.len(), 8_195);
-        assert_eq!(actual, ds4_ids);
-
-        let cases_path = fixture_dir.join("tokenizer-ds4-merge-cases-20261101.json");
-        let fixture: serde_json::Value = serde_json::from_slice(&std::fs::read(cases_path)?)?;
-        assert_eq!(
-            fixture["ds4_revision"],
-            "c97964b8aa77034a8e17afb10ca7a686c40ab511"
-        );
-        let cases = fixture["cases"]
-            .as_array()
-            .ok_or_else(|| anyhow::anyhow!("DS4 tokenizer cases are missing"))?;
-        assert_eq!(cases.len(), 12);
-        for (index, case) in cases.iter().enumerate() {
-            let text = case["text"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("tokenizer case {index} has no text"))?;
-            let expected = case["ids"]
-                .as_array()
-                .ok_or_else(|| anyhow::anyhow!("tokenizer case {index} has no ids"))?
-                .iter()
-                .map(|id| {
-                    id.as_u64()
-                        .and_then(|id| u32::try_from(id).ok())
-                        .ok_or_else(|| anyhow::anyhow!("tokenizer case {index} has an invalid id"))
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            assert_eq!(
-                tokenizer.encode(text, false)?,
-                expected,
-                "tokenizer case {index}"
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
     fn glm_generation_prompt_matches_ds4_wire_format() {
         assert_eq!(
             glm_generation_prompt(
                 "Hello",
                 Some("You are a helpful assistant"),
-                GlmReasoning::High,
+                ReasoningEffort::High,
             ),
             "[gMASK]<sop><|system|>Reasoning Effort: High<|system|>You are a helpful assistant<|user|>Hello<|assistant|><think>"
         );
         assert_eq!(
-            glm_generation_prompt("Hello", None, GlmReasoning::Max),
+            glm_generation_prompt("Hello", None, ReasoningEffort::Max),
             "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Hello<|assistant|><think>"
         );
         assert_eq!(
-            glm_generation_prompt("Hello", None, GlmReasoning::Disabled),
+            glm_generation_prompt("Hello", None, ReasoningEffort::Disabled),
             "[gMASK]<sop><|user|>Hello<|assistant|><think></think>"
         );
-    }
-
-    #[test]
-    fn glm_generation_prompt_encodes_ds4_special_token_ids() -> anyhow::Result<()> {
-        let Some(model_dir) = std::env::var_os("LISA_GLM53_MODEL") else {
-            eprintln!("[glm53-prompt] skipping: LISA_GLM53_MODEL is unset");
-            return Ok(());
-        };
-        let tokenizer = Tokenizer::load(std::path::Path::new(&model_dir))?;
-        let special = |text: &str| {
-            tokenizer
-                .inner
-                .token_to_id(text)
-                .ok_or_else(|| anyhow::anyhow!("GLM tokenizer is missing {text}"))
-        };
-        let mut expected = vec![
-            special("[gMASK]")?,
-            special("<sop>")?,
-            special("<|system|>")?,
-        ];
-        expected.extend(tokenizer.encode("Reasoning Effort: High", false)?);
-        expected.push(special("<|system|>")?);
-        expected.extend(tokenizer.encode("You are a helpful assistant", false)?);
-        expected.push(special("<|user|>")?);
-        expected.extend(tokenizer.encode("Hello", false)?);
-        expected.push(special("<|assistant|>")?);
-        expected.push(special("<think>")?);
-
-        assert_eq!(
-            tokenizer.encode_special(&glm_generation_prompt(
-                "Hello",
-                Some("You are a helpful assistant"),
-                GlmReasoning::High,
-            ))?,
-            expected
-        );
-        Ok(())
     }
 }

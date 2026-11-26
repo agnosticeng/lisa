@@ -2,11 +2,11 @@
 pub use lisa_engine::cache::NativeState;
 use lisa_metal::Array;
 pub type NativeCache = lisa_engine::cache::NativeCache<Array>;
-pub type IndexerTape = lisa_engine::indexer_cache::IndexerTape<lisa_metal::device::MetalDevice>;
-pub type TapeSnapshot = lisa_engine::indexer_cache::TapeSnapshot<Array>;
+pub type IndexerTape = lisa_engine::cache::indexer::IndexerTape<lisa_metal::device::MetalDevice>;
+pub type TapeSnapshot = lisa_engine::cache::indexer::TapeSnapshot<Array>;
 pub type FullAttentionCache =
-    lisa_engine::attention_cache::FullAttentionCache<lisa_metal::device::MetalDevice>;
-pub type GdnCache = lisa_engine::recurrent_cache::GdnCache<Array>;
+    lisa_engine::cache::attention::FullAttentionCache<lisa_metal::device::MetalDevice>;
+pub type GdnCache = lisa_engine::cache::recurrent::GdnCache<Array>;
 pub type LayerCache = lisa_engine::cache::LayerCache<lisa_metal::device::MetalDevice>;
 pub type LayerState = lisa_engine::cache::LayerState<Array>;
 pub type LayerRollbackState = lisa_engine::cache::LayerRollbackState<Array>;
@@ -16,6 +16,62 @@ use lisa_engine::cache::FullPrefixState;
 use lisa_metal::{Dtype, ops, ops::indexing::IndexOp};
 #[cfg(test)]
 mod cache_state_tests {
+    #[test]
+    fn full_attention_ple_rollback_retains_only_accepted_inputs() -> anyhow::Result<()> {
+        let context = crate::metal_context::execution_context();
+        for batch in [1, 2] {
+            for history in [3, 9] {
+                for advance in [1, 2, 7] {
+                    let rows = history + advance;
+                    let data: Vec<f32> = (0..batch * rows * 4).map(|i| i as f32).collect();
+                    let full = Array::from_slice(&data, &[batch as i32, rows as i32, 4]);
+                    for keep in 0..=advance {
+                        let mut full_cache = FullAttentionCache::new(context.clone(), 1, 4);
+                        full_cache.offset = 20 + advance;
+                        full_cache.capture_ple_full = Some(full.clone());
+                        full_cache.ple_conv =
+                            Some(full.index((.., advance as i32.., ..)).contiguous()?);
+                        let mut cache = LayerCache::Full(full_cache);
+                        cache.rollback_verified(&context, advance, keep, true)?;
+                        let LayerCache::Full(cache) = cache else {
+                            unreachable!()
+                        };
+                        assert_eq!(cache.offset, 20 + keep);
+                        let expected: Vec<f32> = (0..batch)
+                            .flat_map(|b| {
+                                data[(b * rows + keep) * 4..(b * rows + keep + history) * 4]
+                                    .iter()
+                                    .copied()
+                            })
+                            .collect();
+                        assert_eq!(cache.ple_conv.unwrap().to_vec1::<f32>()?, expected);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn full_attention_ple_rollback_rejects_missing_capture_before_mutation() {
+        let context = crate::metal_context::execution_context();
+        let mut full = FullAttentionCache::new(context.clone(), 1, 4);
+        full.offset = 23;
+        full.ple_conv = Some(Array::from_slice(&[9f32], &[1, 1, 1]));
+        let mut cache = LayerCache::Full(full);
+        for captured in [false, true] {
+            assert!(cache.rollback_verified(&context, 3, 1, captured).is_err());
+            let LayerCache::Full(full) = &cache else {
+                unreachable!()
+            };
+            assert_eq!(full.offset, 23);
+            assert_eq!(
+                full.ple_conv.as_ref().unwrap().to_vec1::<f32>().unwrap(),
+                [9.]
+            );
+        }
+    }
+
     #[test]
     fn failed_delta_rollback_keeps_all_committed_handles() {
         let mut c = GdnCache::new();
@@ -35,61 +91,6 @@ mod cache_state_tests {
     }
 
     use super::*;
-
-    #[test]
-    fn dspine_replay_commits_conv_and_survives_snapshot_restore() -> lisa_metal::error::Result<()> {
-        let stream = lisa_metal::Stream::thread_local_or_default();
-        let (t, hk, hv) = (16, 16, 48);
-        let values = |shape: &[i32], dtype| {
-            let n: i32 = shape.iter().product();
-            let v: Vec<f32> = (0..n)
-                .map(|i| (((i * 17 + 5) % 67) as f32 - 33.0) / 257.0)
-                .collect();
-            Array::from_slice(&v, shape).as_dtype(dtype)
-        };
-        let q = values(&[1, t, hk, 128], Dtype::Bfloat16)?;
-        let v = values(&[1, t, hv, 128], Dtype::Bfloat16)?;
-        let gate = values(&[1, t, hv], Dtype::Float32)?.add(&Array::from_f32(0.7))?;
-        // A preceding one-row capture leaves a three-dimensional live SSM.
-        let initial = values(&[hv, 128, 128], Dtype::Float32)?;
-        let (_, snapshots) =
-            lisa_metal::kernels::gdn_two_row(&q, &q, &v, &gate, &gate, &initial, true, &stream)
-                .unwrap();
-        let (_, _, replay) = crate::core::recurrent::capture(&q, &q, &v, &gate, &gate, &initial)
-            .unwrap()
-            .unwrap();
-        let conv = values(&[1, t + 3, 8], Dtype::Bfloat16)?;
-        let mut cache = GdnCache::new();
-        cache.capture_replay = Some(replay);
-        cache.capture_conv_input = Some(conv.clone());
-        for n in 1..=t {
-            cache.rollback_to(&crate::metal_context::execution_context(), n as usize, 4)?;
-            assert_eq!(
-                cache.ssm.as_ref().unwrap().to_vec1::<u32>()?,
-                snapshots
-                    .index((n - 1, .., .., ..))
-                    .contiguous()?
-                    .to_vec1::<u32>()?
-            );
-            assert_eq!(
-                cache.conv.as_ref().unwrap().to_vec1::<u16>()?,
-                conv.index((.., n..n + 3, ..))
-                    .contiguous()?
-                    .to_vec1::<u16>()?
-            );
-        }
-        cache.rollback_to(&crate::metal_context::execution_context(), 3, 4)?;
-        let saved = cache.snapshot_state();
-        cache.rollback_to(&crate::metal_context::execution_context(), 12, 4)?;
-        cache.restore_state(&saved);
-        assert!(cache.capture_replay.is_none());
-        assert!(cache.capture_conv_input.is_none());
-        let expected = saved.1.unwrap().to_vec1::<u32>()?;
-        assert_eq!(cache.ssm.as_ref().unwrap().to_vec1::<u32>()?, expected);
-        cache.rollback_to(&crate::metal_context::execution_context(), 8, 4)?; // Restoring a snapshot invalidates the old transaction.
-        assert_eq!(cache.ssm.as_ref().unwrap().to_vec1::<u32>()?, expected);
-        Ok(())
-    }
 
     #[test]
     fn indexer_tape_append_fields_matches_packed_append() -> lisa_metal::error::Result<()> {
@@ -128,56 +129,6 @@ mod cache_state_tests {
             &[half::f16::from_f32(9.75), half::f16::from_f32(2.5)]
         );
         assert_eq!(tape.compact_total(), 12);
-        Ok(())
-    }
-
-    #[cfg(feature = "glm53-fixtures")]
-    #[test]
-    fn glm_compact_cache_matches_ds4_metal_positional_f16_writes() -> lisa_metal::error::Result<()>
-    {
-        const ROWS: usize = 8;
-        const DIM: usize = 512;
-        const START: usize = 254;
-        const REPLACED_ROW: usize = 3;
-        let external_fixture: &[u8] =
-            &crate::bindings::glm53_test_fixtures::read("dsa_compact_cache_ds4_metal.bin");
-        assert_eq!(external_fixture.len(), ROWS * DIM * 2);
-
-        fn row_values(row_index: usize) -> Vec<f32> {
-            (0..DIM)
-                .map(|i| {
-                    let logical = row_index * DIM + i;
-                    let centered = ((logical * 73 + 29) % 2001) as i32 - 1000;
-                    centered as f32 / 997.0
-                })
-                .collect()
-        }
-
-        let mut tape = IndexerTape::new(crate::metal_context::execution_context());
-        for row in 0..ROWS {
-            tape.write_compact_f16_at(
-                &Array::from_slice(&row_values(row), &[1, 1, DIM as i32]),
-                START + row,
-            )?;
-        }
-        tape.write_compact_f16_at(
-            &Array::from_slice(&row_values(ROWS + REPLACED_ROW), &[1, 1, DIM as i32]),
-            START + REPLACED_ROW,
-        )?;
-
-        let rows = tape
-            .compact_slice(START, START + ROWS)
-            .expect("DS4 comparison cache rows");
-        rows.eval()?;
-        let actual = rows
-            .reshape(&[(ROWS * DIM) as i32])?
-            .to_vec1::<half::f16>()?;
-        let actual_bits: Vec<u16> = actual.iter().map(|value| value.to_bits()).collect();
-        let expected_bits: Vec<u16> = external_fixture
-            .chunks_exact(2)
-            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
-            .collect();
-        assert_eq!(actual_bits, expected_bits);
         Ok(())
     }
 
@@ -407,166 +358,6 @@ mod cache_state_tests {
         assert_eq!(restored.indexer_tape.total, 596);
         assert_eq!(restored.indexer_tape.pooled_upto, 149);
         assert_eq!(restored.indexer_tape.raw_start(), 568);
-        Ok(())
-    }
-
-    #[cfg(feature = "glm53-fixtures")]
-    #[test]
-    fn glm_indexer_pool_rollback_and_replay_match_ds4_incremental_cache() -> anyhow::Result<()> {
-        if !lisa_metal::device::metal_available() {
-            eprintln!("[glm-indexer-pool-replay] skipping: no Metal device available");
-            return Ok(());
-        }
-        const POOLS: usize = 2;
-        const POOL_SIZE: usize = 4;
-        const DIM: usize = 128;
-        const ROW_VALUES: usize = POOLS * POOL_SIZE * DIM;
-        const ROW_BYTES: usize = ROW_VALUES * std::mem::size_of::<f32>();
-        const NORM_BYTES: usize = DIM * std::mem::size_of::<f32>();
-        const APE_BYTES: usize = POOL_SIZE * DIM * std::mem::size_of::<u16>();
-        const POOL_BYTES: usize = POOLS * DIM * std::mem::size_of::<u16>();
-        let external_fixture: &[u8] =
-            &crate::bindings::glm53_test_fixtures::read("indexer_pool_lifecycle_ds4.bin");
-        assert_eq!(
-            external_fixture.len(),
-            ROW_BYTES + NORM_BYTES + ROW_BYTES + NORM_BYTES + APE_BYTES + POOL_BYTES
-        );
-
-        let decode_f32 = |bytes: &[u8]| {
-            bytes
-                .chunks_exact(std::mem::size_of::<f32>())
-                .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("F32 fixture word")))
-                .collect::<Vec<_>>()
-        };
-        let decode_bf16 = |bytes: &[u8]| {
-            bytes
-                .chunks_exact(std::mem::size_of::<u16>())
-                .map(|chunk| half::bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])))
-                .collect::<Vec<_>>()
-        };
-        let expected: Vec<half::f16> = external_fixture[external_fixture.len() - POOL_BYTES..]
-            .chunks_exact(std::mem::size_of::<u16>())
-            .map(|chunk| half::f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])))
-            .collect();
-        let raw = decode_f32(&external_fixture[..ROW_BYTES]);
-        let norm_weight = decode_f32(&external_fixture[ROW_BYTES..ROW_BYTES + NORM_BYTES]);
-        let gate_start = ROW_BYTES + NORM_BYTES;
-        let gate = decode_f32(&external_fixture[gate_start..gate_start + ROW_BYTES]);
-        let bias_start = gate_start + ROW_BYTES;
-        let norm_bias = decode_f32(&external_fixture[bias_start..bias_start + NORM_BYTES]);
-        let ape_start = bias_start + NORM_BYTES;
-        let ape = decode_bf16(&external_fixture[ape_start..ape_start + APE_BYTES]);
-
-        let append_rows = |tape: &mut IndexerTape,
-                           start: usize,
-                           count: usize,
-                           raw_rows: &[f32],
-                           gate_rows: &[f32]|
-         -> anyhow::Result<()> {
-            let start_at = start * DIM;
-            let end_at = (start + count) * DIM;
-            let raw =
-                Array::from_slice(&raw_rows[start_at..end_at], &[1, count as i32, DIM as i32]);
-            let gate =
-                Array::from_slice(&gate_rows[start_at..end_at], &[1, count as i32, DIM as i32]);
-            tape.append_fields(&raw, &gate, POOL_SIZE)?;
-            Ok(())
-        };
-        let pool_rows = |raw_rows: &[f32], gate_rows: &[f32]| -> anyhow::Result<Array> {
-            let raw = Array::from_slice(raw_rows, &[1, 1, POOL_SIZE as i32, DIM as i32]);
-            let gate = Array::from_slice(gate_rows, &[1, 1, POOL_SIZE as i32, DIM as i32]);
-            let norm_weight = Array::from_slice(&norm_weight, &[DIM as i32]);
-            let norm_bias = Array::from_slice(&norm_bias, &[DIM as i32]);
-            let ape = Array::from_slice(&ape, &[POOL_SIZE as i32, DIM as i32]);
-            lisa_metal::kernels::sparse::kernels::indexer_pool_fused(
-                &raw,
-                &gate,
-                &ape,
-                &norm_weight,
-                &norm_bias,
-                1e-6,
-                &lisa_metal::Stream::thread_local_or_default(),
-            )
-            .ok_or_else(|| anyhow::anyhow!("DS4-shaped DSA pool kernel declined"))
-        };
-
-        let mut tape = IndexerTape::new(crate::metal_context::execution_context());
-        for (start, count) in [(0, 1), (1, 2), (3, 1)] {
-            append_rows(&mut tape, start, count, &raw, &gate)?;
-        }
-        let first_pool = pool_rows(&raw[..POOL_SIZE * DIM], &gate[..POOL_SIZE * DIM])?;
-        tape.push_pooled_f16(&first_pool)?;
-        let checkpoint = tape.snapshot();
-
-        let mut speculative_raw = vec![0.0f32; POOL_SIZE * DIM];
-        let mut speculative_gate = vec![0.0f32; POOL_SIZE * DIM];
-        for row in 0..POOL_SIZE {
-            for channel in 0..DIM {
-                let index = row * DIM + channel;
-                let source = ((row + 1) % POOL_SIZE) * DIM + channel;
-                speculative_raw[index] = raw[source] * -0.5 + (row + 2) as f32 * 0.0625;
-                speculative_gate[index] = gate[source] * 0.25 + (row + 1) as f32 * 0.125;
-            }
-        }
-        let mut speculative_full_raw = vec![0.0f32; ROW_VALUES];
-        let mut speculative_full_gate = vec![0.0f32; ROW_VALUES];
-        speculative_full_raw[POOL_SIZE * DIM..].copy_from_slice(&speculative_raw);
-        speculative_full_gate[POOL_SIZE * DIM..].copy_from_slice(&speculative_gate);
-        append_rows(
-            &mut tape,
-            4,
-            2,
-            &speculative_full_raw,
-            &speculative_full_gate,
-        )?;
-        append_rows(
-            &mut tape,
-            6,
-            2,
-            &speculative_full_raw,
-            &speculative_full_gate,
-        )?;
-        let speculative_pool = pool_rows(&speculative_raw, &speculative_gate)?;
-        let speculative_bits: Vec<u16> = speculative_pool
-            .to_vec1::<half::f16>()?
-            .iter()
-            .map(|value| value.to_bits())
-            .collect();
-        tape.push_pooled_f16(&speculative_pool)?;
-        tape.trim(4);
-        assert_eq!(tape.total, 4);
-        assert_eq!(tape.pooled_upto, 1);
-
-        for (start, count) in [(4, 1), (5, 2), (7, 1)] {
-            append_rows(&mut tape, start, count, &raw, &gate)?;
-        }
-        let replayed_pool = pool_rows(&raw[POOL_SIZE * DIM..], &gate[POOL_SIZE * DIM..])?;
-        tape.push_pooled_f16(&replayed_pool)?;
-        let actual: Vec<u16> = tape
-            .pooled_view()
-            .expect("replayed pooled cache")
-            .to_vec1::<half::f16>()?
-            .iter()
-            .map(|value| value.to_bits())
-            .collect();
-        let expected_bits: Vec<u16> = expected.iter().map(|value| value.to_bits()).collect();
-        anyhow::ensure!(
-            actual == expected_bits,
-            "LISA pooled cache after rollback/replay differs from DS4 incremental Metal"
-        );
-        anyhow::ensure!(
-            speculative_bits != expected_bits[DIM..],
-            "speculative pool fixture unexpectedly equals the replacement replay"
-        );
-        anyhow::ensure!(
-            tape.total == 8 && tape.pooled_upto == 2 && tape.raw_start() == 0,
-            "unexpected live DSA tape state after replay"
-        );
-        anyhow::ensure!(checkpoint.total == 4 && checkpoint.pooled_upto == 1);
-        eprintln!(
-            "[glm-indexer-pool-replay] all {} F16 cache values match DS4 after speculative completion, rollback, and replacement replay",
-            actual.len()
-        );
         Ok(())
     }
 

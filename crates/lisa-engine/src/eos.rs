@@ -51,6 +51,11 @@ pub fn set_eos_ids_for_model<R: crate::language::LanguageRuntime>(
     set_eos_ids(all);
 }
 
+/// The current stop tokens.
+pub fn eos_ids() -> Vec<u32> {
+    EOS_IDS.read().unwrap().clone()
+}
+
 pub fn is_eos(id: u32) -> bool {
     EOS_IDS.read().unwrap().contains(&id)
 }

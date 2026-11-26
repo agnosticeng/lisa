@@ -16,7 +16,7 @@ fn compose(parts: &[&str]) -> String {
 
 // --- track_moe_route_1 -----------------------------------------------------
 
-const ROUTE_SOURCE: &crate::shader_pack::Source = crate::kernel_source!("qwen4/route.metal");
+const ROUTE_SOURCE: &crate::shader_pack::Source = crate::kernel_source!("moe/route.metal");
 
 static ROUTE: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 static ROUTE_WIDE: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
@@ -106,7 +106,7 @@ pub fn route(
 // --- track_moe_gate_up_reuse_2row ------------------------------------------
 
 const GATE_UP_REUSE_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("qwen4/gate_up_reuse.metal");
+    crate::kernel_source!("moe/gate_up_reuse.metal");
 
 static GATE_UP_REUSE: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 
@@ -186,7 +186,7 @@ pub fn gate_up_act(
 // --- track_moe_down_combine_1 ----------------------------------------------
 
 const DOWN_COMBINE_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("qwen4/down_combine.metal");
+    crate::kernel_source!("moe/down_combine.metal");
 
 static DOWN_COMBINE: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 
@@ -281,7 +281,7 @@ pub fn down_combine(
 // --- track_moe_gate_up_act (wide, S in 2..=8) ------------------------------
 
 const GATE_UP_ACT_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("qwen4/gate_up_act.metal");
+    crate::kernel_source!("moe/gate_up_act.metal");
 
 static GATE_UP_ACT: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 
@@ -446,12 +446,12 @@ pub fn down_combine_wide(
 // --- mixer: track_mixer_down_inject + track_mixer_up_mix (S <= 8) -----------
 
 const DOWN_INJECT_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("qwen4/down_inject.metal");
+    crate::kernel_source!("hyper/down_inject.metal");
 const DOWN_INJECT_1_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("qwen4/down_inject_1.metal");
+    crate::kernel_source!("hyper/down_inject_1.metal");
 
-const UP_MIX_SOURCE: &crate::shader_pack::Source = crate::kernel_source!("qwen4/up_mix.metal");
-const UP_MIX_1_SOURCE: &crate::shader_pack::Source = crate::kernel_source!("qwen4/up_mix_1.metal");
+const UP_MIX_SOURCE: &crate::shader_pack::Source = crate::kernel_source!("hyper/up_mix.metal");
+const UP_MIX_1_SOURCE: &crate::shader_pack::Source = crate::kernel_source!("hyper/up_mix_1.metal");
 
 const BF16_SIGMOID_SOURCE: &crate::shader_pack::Source =
     crate::kernel_source!("common/elementwise/bf16_sigmoid.metal");
@@ -572,8 +572,9 @@ pub fn down_inject(
     stream: &Stream,
 ) -> Option<(Array, Array, Array)> {
     // OPT-SPLITK: one-row windows split the K walk across SIMD groups.
-    if s == 1 && MIXER_SPLIT_K > 0 {
-        if let Some(o) = split_k_mixer(
+    if s == 1
+        && MIXER_SPLIT_K > 0
+        && let Some(o) = split_k_mixer(
             normed,
             wd,
             sd,
@@ -586,9 +587,9 @@ pub fn down_inject(
             has_inject,
             MIXER_SPLIT_K,
             stream,
-        ) {
-            return Some(o);
-        }
+        )
+    {
+        return Some(o);
     }
     let kernel = down_inject_kernel(s == 1).as_ref()?;
     let rps = if s == 1 { 1 } else { 4 };
@@ -702,10 +703,10 @@ pub fn up_mix(
 // --- track_split_k_mixer: S=1 mixer down+inject split across SIMD groups ----
 
 const SPLIT_K_HELPER: &crate::shader_pack::Source =
-    crate::kernel_source!("qwen4/split_k_mixer_helper.metal");
+    crate::kernel_source!("hyper/split_k_mixer_helper.metal");
 
 const SPLIT_K_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("qwen4/split_k_mixer.metal");
+    crate::kernel_source!("hyper/split_k_mixer.metal");
 
 static SPLIT_K: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 

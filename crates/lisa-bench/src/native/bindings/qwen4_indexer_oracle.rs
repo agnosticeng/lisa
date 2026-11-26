@@ -11,8 +11,6 @@ use crate::core::cache::IndexerTape;
 use crate::core::norm::{RmsNorm, Rotary, rope_partial};
 use crate::core::quant::QuantizedLinear;
 
-/// The indexer key tape: EXACT storage (no reserve), one row per token.
-
 /// QSA indexer for one full-attention layer.
 pub struct QsaIndexer {
     pub index_qk_proj: QuantizedLinear,

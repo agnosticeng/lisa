@@ -9,23 +9,61 @@ const RAM_RESERVE_GIB: usize = 8;
 #[cfg(any(test, all(target_os = "ios", not(target_abi = "sim"))))]
 const IOS_RESERVE_BYTES: usize = 512 << 20;
 
-/// Minimum live headroom kept outside a model's working set.
-pub fn ram_reserve_bytes() -> usize {
-    #[cfg(all(target_os = "ios", not(target_abi = "sim")))]
-    {
-        IOS_RESERVE_BYTES
-    }
-    #[cfg(not(all(target_os = "ios", not(target_abi = "sim"))))]
-    {
-        RAM_RESERVE_GIB << 30
+static RAM_CAP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Cap the RAM budget at `gib` GiB for this process. The application sets it
+/// once from `--ram-cap-gb`; it can only lower the detected budget, and it
+/// also arms HTTP request admission.
+pub fn set_ram_cap_gib(gib: usize) {
+    RAM_CAP.store(
+        gib.saturating_mul(1 << 30),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// Storage format of attention key/value caches.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KvFormat {
+    /// 8-bit keys and values where the model implements them, else its own
+    /// format.
+    #[default]
+    Auto,
+    /// Each model's own key/value format (F16 or wider).
+    Native,
+    /// 8-bit keys and values with one F32 scale per token and head. Halves
+    /// cache memory and is a separate numerical law; models without it
+    /// refuse to load.
+    Int8,
+}
+
+static KV_FORMAT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Select the key/value cache format for models loaded after this call. The
+/// application sets it once from `--kv-format`.
+pub fn set_kv_format(format: KvFormat) {
+    KV_FORMAT.store(format as u8, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The key/value cache format the application selected.
+pub fn kv_format() -> KvFormat {
+    match KV_FORMAT.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => KvFormat::Native,
+        2 => KvFormat::Int8,
+        _ => KvFormat::Auto,
     }
 }
 
-/// `LISA_RAM_CAP_GB` parsed to bytes, if set to a positive integer.
-fn env_cap_bytes() -> Option<usize> {
-    let v = std::env::var("LISA_RAM_CAP_GB").ok()?;
-    let g: usize = v.trim().parse().ok()?;
-    (g > 0).then(|| g.checked_mul(1usize << 30)).flatten()
+/// Whether a model that implements 8-bit keys and values uses them.
+pub fn kv_int8() -> bool {
+    kv_format() != KvFormat::Native
+}
+
+/// The explicit RAM cap in bytes, if the application set one.
+pub fn ram_cap() -> Option<usize> {
+    match RAM_CAP.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        bytes => Some(bytes),
+    }
 }
 
 /// Total physical RAM in bytes (`sysctl hw.memsize`), cached; 0 if unavailable.
@@ -34,7 +72,8 @@ pub fn physical_ram() -> usize {
     {
         let mut bytes = 0u64;
         let mut size = std::mem::size_of_val(&bytes);
-        // sysctl writes only the supplied scalar-sized output on Apple hosts.
+        // SAFETY: the name is a NUL-terminated literal and `size` is the byte size of
+        // `bytes`, so sysctl writes at most that scalar output.
         let result = unsafe {
             libc::sysctlbyname(
                 c"hw.memsize".as_ptr(),
@@ -52,7 +91,9 @@ pub fn physical_ram() -> usize {
     }
     #[cfg(target_os = "linux")]
     {
+        // SAFETY: sysconf takes no pointers and only reads a system constant.
         let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
+        // SAFETY: sysconf takes no pointers and only reads a system constant.
         let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         return usize::try_from(pages)
             .ok()
@@ -80,21 +121,17 @@ pub fn physical_ram() -> usize {
 ///
 /// Mac/Simulator: physical RAM minus 8 GiB. Physical iOS devices: the smaller
 /// of physical RAM and the current additional per-app allowance, minus 512 MiB.
-/// `LISA_RAM_CAP_GB` can only lower either budget. The iOS allowance is read on
+/// An explicit cap ([`set_ram_cap_gib`]) can only lower either budget. The iOS allowance is read on
 /// every call, never cached; this is a conservative budget for new admissions,
 /// not a measurement of total memory owned by an already loaded model.
 pub fn ram_budget() -> usize {
     #[cfg(all(target_os = "ios", not(target_abi = "sim")))]
     {
-        ios_admission_budget(
-            physical_ram(),
-            available_ram().unwrap_or(0),
-            env_cap_bytes(),
-        )
+        ios_admission_budget(physical_ram(), available_ram().unwrap_or(0), ram_cap())
     }
     #[cfg(not(all(target_os = "ios", not(target_abi = "sim"))))]
     {
-        admission_budget(physical_ram(), env_cap_bytes())
+        admission_budget(physical_ram(), ram_cap())
     }
 }
 
@@ -180,9 +217,11 @@ pub fn available_ram() -> Option<usize> {
     }
     #[cfg(all(target_os = "ios", not(target_abi = "sim")))]
     {
+        // SAFETY: matches libSystem's `size_t os_proc_available_memory(void)`.
         unsafe extern "C" {
             fn os_proc_available_memory() -> usize;
         }
+        // SAFETY: the call takes no arguments and only reads the jetsam allowance.
         Some(unsafe { os_proc_available_memory() })
     }
     // Simulator processes have no iOS jetsam limit; the API returns zero there.

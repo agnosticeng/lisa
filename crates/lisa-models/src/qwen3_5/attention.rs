@@ -17,9 +17,11 @@ pub struct Plan {
     pub epsilon: u32,
     pub scale: u32,
     pub gated: bool,
+    /// Captured verification under the serial numerical law. Ordinary prefill
+    /// and explicitly selected wide verification keep their existing kernels.
+    pub serial_causal: bool,
     pub quant: [(i32, i32); 4],
     pub joined: bool,
-    pub retiled: bool,
     pub cache: Option<Append>,
     pub mask_length: Option<i32>,
     pub next_positions: Option<Vec<usize>>,
@@ -52,7 +54,7 @@ fn project(g: &mut Builder, x: Value, slot: usize, quant: (i32, i32)) -> Value {
 }
 impl Plan {
     /// Weights: Q,K,V,O triples; Q/K norm; optional joined triple; optional
-    /// retiled triple. Inputs: activation, cosine, sine, optional old K/V, mask.
+    /// Inputs: activation, cosine, sine, optional old K/V, mask.
     /// Outputs: activation, followed by cache storage K/V when requested.
     pub fn graph(&self) -> Result<Graph, String> {
         let (b, s, h, kh, d) = (
@@ -69,6 +71,9 @@ impl Plan {
         {
             return Err("invalid dense attention geometry".into());
         }
+        if self.serial_causal && self.mask_length.is_some() {
+            return Err("serial causal attention does not accept a separate mask".into());
+        }
         let has_old = self
             .cache
             .as_ref()
@@ -82,14 +87,13 @@ impl Plan {
         let mask_slot = 3 + if has_old { 2 } else { 0 };
         let mut g = Builder::new(
             mask_slot + usize::from(self.mask_length.is_some()),
-            14 + 3 * usize::from(self.joined) + 3 * usize::from(self.retiled),
+            14 + 3 * usize::from(self.joined),
             0,
         );
         let x = Value::Input(0);
         let cos = Value::Input(1);
         let sin = Value::Input(2);
-        let merged = self.gated && self.retiled && s == 1;
-        let joined = if !merged && b == 1 && s <= 8 && self.joined {
+        let joined = if b == 1 && s <= 8 && self.joined {
             Some(project(&mut g, x, 14, self.quant[0]))
         } else {
             None
@@ -98,28 +102,18 @@ impl Plan {
         let kn = kh * d;
         let mut q = None;
         let mut gate = None;
-        let mut raw = None;
-        if merged {
-            let y = project(&mut g, x, 14 + 3 * usize::from(self.joined), self.quant[0]);
-            let y = reshape(&mut g, y, &[b, 2 * h * d]);
-            let z = slice(&mut g, y, 1, 0, h * d);
-            q = Some(reshape(&mut g, z, &[b, s, h, d]));
-            let z = slice(&mut g, y, 1, h * d, 2 * h * d);
-            gate = Some(reshape(&mut g, z, &[b, s, h, d]));
-        } else {
-            let y = match joined {
-                Some(v) => slice(&mut g, v, 2, 0, qn),
-                None => project(&mut g, x, 0, self.quant[0]),
-            };
-            let y = op(&mut g, T::SplitLastAxis(vec![h, 2, d]), y);
-            raw = Some(y);
-            if s == 1 {
-                let z = op(&mut g, T::Select { axis: 3, index: 0 }, y);
-                q = Some(op(&mut g, T::Contiguous, z));
-                if self.gated {
-                    let z = op(&mut g, T::Select { axis: 3, index: 1 }, y);
-                    gate = Some(op(&mut g, T::Contiguous, z));
-                }
+        let y = match joined {
+            Some(v) => slice(&mut g, v, 2, 0, qn),
+            None => project(&mut g, x, 0, self.quant[0]),
+        };
+        let y = op(&mut g, T::SplitLastAxis(vec![h, 2, d]), y);
+        let raw = y;
+        if s == 1 {
+            let z = op(&mut g, T::Select { axis: 3, index: 0 }, y);
+            q = Some(op(&mut g, T::Contiguous, z));
+            if self.gated {
+                let z = op(&mut g, T::Select { axis: 3, index: 1 }, y);
+                gate = Some(op(&mut g, T::Contiguous, z));
             }
         }
         let k = match joined {
@@ -136,8 +130,7 @@ impl Plan {
             .mask_length
             .map(|len| reshape(&mut g, Value::Input(mask_slot), &[b, 1, 1, s, len]));
         let fused = b == 1 && d == 256 && self.rotary == 64 && self.frequencies_bf16;
-        let fused_rows =
-            fused && (2..=8).contains(&s) && self.gated && mask.is_none() && raw.is_some();
+        let fused_rows = fused && (2..=8).contains(&s) && self.gated && mask.is_none();
         let (q, k) = if fused && s == 1 || fused_rows {
             let (query, key) = if fused_rows {
                 if let Some(all) = joined {
@@ -147,10 +140,7 @@ impl Plan {
                         slice(&mut g, all, 1, qn, qn + kn),
                     )
                 } else {
-                    (
-                        reshape(&mut g, raw.unwrap(), &[s, qn]),
-                        reshape(&mut g, k, &[s, kn]),
-                    )
+                    (reshape(&mut g, raw, &[s, qn]), reshape(&mut g, k, &[s, kn]))
                 }
             } else {
                 (q.unwrap(), k)
@@ -171,7 +161,7 @@ impl Plan {
             (out[0], out[1])
         } else {
             if q.is_none() {
-                let y = reshape(&mut g, raw.unwrap(), &[b, s, h, 2, d]);
+                let y = reshape(&mut g, raw, &[b, s, h, 2, d]);
                 let z = op(&mut g, T::Select { axis: 3, index: 0 }, y);
                 q = Some(op(&mut g, T::Contiguous, z));
                 if self.gated {
@@ -285,17 +275,19 @@ impl Plan {
             if let Some(mask) = mask {
                 inputs.push(mask);
             }
-            g.one(
-                Kernel::Tensor(T::Attention {
+            let attention = if self.serial_causal {
+                T::AttentionSerialCausal { scale: self.scale }
+            } else {
+                T::Attention {
                     scale: self.scale,
                     mask: if mask.is_some() {
                         AttentionMask::Tensor
                     } else {
                         AttentionMask::Causal
                     },
-                }),
-                inputs,
-            )
+                }
+            };
+            g.one(Kernel::Tensor(attention), inputs)
         };
         if fused_rows {
             gate = Some(reshape(&mut g, gate.unwrap(), &[b, s, h, d]));
@@ -318,7 +310,12 @@ impl Plan {
         let out = project(&mut g, out, 9, self.quant[3]);
         let mut outputs = vec![out];
         outputs.extend(storage);
-        Ok(g.finish(outputs))
+        let graph = g.finish(outputs);
+        Ok(if self.serial_causal {
+            graph.with_serial_affine(true)
+        } else {
+            graph
+        })
     }
 }
 
@@ -358,21 +355,77 @@ pub fn join_projection(
     }
     Some(g.finish(outputs))
 }
-pub fn retile_projection(heads: i32, width: i32) -> Graph {
-    let mut g = Builder::new(3, 0, 0);
-    let indices = (0..2)
-        .flat_map(|part| {
-            (0..heads).flat_map(move |h| (0..width).map(move |j| h * 2 * width + part * width + j))
-        })
-        .collect::<Vec<_>>();
-    let indices = g.constant_i32(&indices, &[heads * 2 * width]);
-    let outputs = (0..3)
-        .map(|i| {
-            g.one(
-                Kernel::Tensor(T::Take { axis: 0 }),
-                vec![Value::Input(i), indices],
-            )
-        })
-        .collect::<Vec<_>>();
-    g.finish(outputs)
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+
+    #[test]
+    fn serial_capture_selects_serial_attention_and_projection_contracts() {
+        let mut plan = Plan {
+            batch: 1,
+            rows: 7,
+            heads: 24,
+            key_heads: 4,
+            width: 256,
+            rotary: 64,
+            frequencies_bf16: true,
+            epsilon: 1e-6f32.to_bits(),
+            scale: 0.0625f32.to_bits(),
+            gated: true,
+            serial_causal: false,
+            quant: [(64, 4); 4],
+            joined: true,
+            cache: None,
+            mask_length: None,
+            next_positions: None,
+        };
+        for (batch, rows) in [(1, 1), (1, 7), (1, 16), (2, 1)] {
+            plan.batch = batch;
+            plan.rows = rows;
+            plan.serial_causal = false;
+            let ordinary = plan.graph().unwrap();
+            plan.serial_causal = true;
+            let captured = plan.graph().unwrap();
+            ordinary.validate().unwrap();
+            captured.validate().unwrap();
+            assert_eq!(ordinary.calls.len(), captured.calls.len());
+            let mut differences = 0;
+            let mut projections = 0;
+            for (ordinary, captured) in ordinary.calls.iter().zip(&captured.calls) {
+                assert_eq!(ordinary.inputs, captured.inputs);
+                if ordinary.kernel != captured.kernel {
+                    if let Kernel::AffineLinear { group_size, bits } = ordinary.kernel {
+                        assert_eq!(
+                            captured.kernel,
+                            Kernel::AffineSerialLinear {
+                                group_size,
+                                bits,
+                                allow_verify_splitk: true,
+                            }
+                        );
+                        projections += 1;
+                        continue;
+                    }
+                    assert_eq!(
+                        ordinary.kernel,
+                        Kernel::Tensor(T::Attention {
+                            scale: plan.scale,
+                            mask: AttentionMask::Causal,
+                        })
+                    );
+                    assert_eq!(
+                        captured.kernel,
+                        Kernel::Tensor(T::AttentionSerialCausal { scale: plan.scale })
+                    );
+                    differences += 1;
+                }
+            }
+            assert_eq!(differences, 1);
+            assert!(projections >= 2);
+            assert_eq!(ordinary.outputs, captured.outputs);
+        }
+        plan.mask_length = Some(7);
+        assert!(plan.graph().is_err());
+    }
 }

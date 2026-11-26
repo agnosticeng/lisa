@@ -1,11 +1,7 @@
 //! Native conformance fixtures for the portable qwen encoder.
 pub type Encoder = lisa_engine::vision::qwen::Encoder<lisa_metal::device::MetalDevice>;
 #[cfg(test)]
-use crate::core::program;
-#[cfg(test)]
 use lisa_metal::Array;
-#[cfg(test)]
-use lisa_models::vision::qwen as definition;
 pub use lisa_models::vision::qwen::Config;
 #[cfg(test)]
 use serde_json::Value;

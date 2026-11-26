@@ -1,8 +1,9 @@
 //! Native conformance tests for portable DeepSeek session storage.
-pub use lisa_engine::bindings::deepseek41_state::MAX_CONTEXT;
-pub type State = lisa_engine::bindings::deepseek41_state::State<lisa_metal::device::MetalDevice>;
+pub use lisa_engine::bindings::deepseek41::state::MAX_CONTEXT;
+pub type State = lisa_engine::bindings::deepseek41::state::State<lisa_metal::device::MetalDevice>;
 #[cfg(test)]
 pub(crate) use crate::core::storage::store_row;
+#[cfg(test)]
 pub(crate) use crate::core::storage::view;
 #[cfg(test)]
 use {

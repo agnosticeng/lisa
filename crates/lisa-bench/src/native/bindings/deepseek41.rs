@@ -1,8 +1,8 @@
-//! Native GGUF adapters for the pinned DS4 DeepSeek V4.1 execution port.
+//! Native GGUF adapters for the pinned reference DeepSeek V4.1 execution port.
 //!
 //! The text graph is integrated with `LanguageModel`, CLI, HTTP and UI.
 //! Short stage captures and logits through an 8199-token prompt match the
-//! pinned same-weight DS4 adapter on the measured workloads.
+//! pinned same-weight reference adapter on the measured workloads.
 //! Wide GEMM prefill and broader context/performance certification remain
 //! open; see specs/models/deepseek41.md for the acceptance boundary.
 
@@ -23,6 +23,6 @@ pub use crate::bindings::deepseek41_weights as weights;
 #[path = "deepseek41_kernel_tests.rs"]
 mod kernel_tests;
 
-pub use lisa_engine::bindings::deepseek41_tower::DS4_REVISION;
+pub use lisa_engine::bindings::deepseek41::tower::DS4_REVISION;
 
 pub use crate::checkpoint::catalog::deepseek41::{GGUF_ENTRY, REPO};

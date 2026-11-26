@@ -1,4 +1,4 @@
-//! The draft-ranking oracle (specs/08 tree drafting).
+//! The draft-ranking oracle.
 //!
 //! The MTP draft head proposes exactly ONE token per step and verify rejects
 //! the round at the first mismatch, so a step where the head ranked the true
@@ -59,8 +59,8 @@ pub fn last() -> Option<DraftScores> {
 /// 1-based rank of `token` in a recorded candidate set.
 ///
 /// `proposal` is the token the head actually proposed (its argmax): a score
-/// tie with the argmax loses, so a tied-but-not-proposed token ranks 2, never
-/// 1. `None` means the token is outside the head's candidate set entirely (a
+/// tie with the argmax loses, so a tied-but-not-proposed token ranks 2, never 1.
+/// `None` means the token is outside the head's candidate set entirely (a
 /// coarse shortlist miss) — unreachable for the top-`K` readouts only when
 /// `K` covers the vocab.
 pub fn rank(rec: &DraftScores, token: u32, proposal: u32) -> Option<usize> {
@@ -102,7 +102,7 @@ pub struct RoundSample {
 
 const KS: [usize; 3] = [2, 4, 8];
 
-/// End-of-run oracle summary (specs/08): where the target's true token sat
+/// End-of-run oracle summary: where the target's true token sat
 /// in the draft head's own ranking on the rounds the linear chain rejected,
 /// and what a top-`K` branching draft would have accepted instead.
 ///
@@ -264,6 +264,23 @@ pub fn log_summary(samples: &[RoundSample], accept_hist: &[usize]) {
     }
 }
 
+/// Capture logical tensor values without assuming a provider or storage layout.
+pub fn push_arrays<T: lisa_backend::TensorAccess>(
+    ids: Option<&T>,
+    scores: &T,
+) -> anyhow::Result<()> {
+    if !enabled() {
+        return Ok(());
+    }
+    let scores = scores.read_f32()?;
+    let candidates = match ids {
+        Some(ids) => ids.read_ids()?,
+        None => (0..scores.len() as u32).collect(),
+    };
+    push(candidates, scores);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,21 +310,4 @@ mod tests {
         assert_eq!(rank(&r, 7, 7), Some(1));
         assert_eq!(rank(&r, 9, 7), Some(2));
     }
-}
-
-/// Capture logical tensor values without assuming a provider or storage layout.
-pub fn push_arrays<T: lisa_backend::TensorAccess>(
-    ids: Option<&T>,
-    scores: &T,
-) -> anyhow::Result<()> {
-    if !enabled() {
-        return Ok(());
-    }
-    let scores = scores.read_f32()?;
-    let candidates = match ids {
-        Some(ids) => ids.read_ids()?,
-        None => (0..scores.len() as u32).collect(),
-    };
-    push(candidates, scores);
-    Ok(())
 }

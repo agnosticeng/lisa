@@ -88,7 +88,7 @@ pub struct Qwen35Config {
 }
 
 impl Qwen35Config {
-    pub fn from_str(data: &str) -> anyhow::Result<Self> {
+    pub fn parse(data: &str) -> anyhow::Result<Self> {
         let raw: RawConfig = serde_json::from_str(data)?;
         let t = raw.text_config.clone().unwrap_or_default();
         let root = &raw.root;
@@ -113,9 +113,7 @@ impl Qwen35Config {
                     })
                     .collect()
             });
-        let eos = match g(|x| x.eos_token_id.clone().map(|_| 0)) {
-            _ => t.eos_token_id.clone().or_else(|| root.eos_token_id.clone()),
-        };
+        let eos = t.eos_token_id.clone().or_else(|| root.eos_token_id.clone());
         let eos_token_id = match eos {
             Some(serde_json::Value::Number(n)) => n.as_i64().unwrap_or(248046),
             Some(serde_json::Value::Array(a)) => {

@@ -7,6 +7,109 @@ use lisa_gguf::{Package, TensorInfo};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+pub use super::prepared::PreparedLayout;
+
+pub fn projection(kind: lisa_gguf::TensorType) -> Result<lisa_models::packed::Projection> {
+    use lisa_backend::PackedEncoding as E;
+    use lisa_gguf::TensorType as T;
+    use lisa_models::packed::Projection as P;
+    Ok(match kind {
+        T::F32 | T::F16 | T::BF16 => P::Plain,
+        T::Q8_0 => P::Q8,
+        T::IQ2_XXS => P::Block(E::Iq2Xxs),
+        T::IQ2_XS => P::Block(E::Iq2Xs),
+        T::IQ1_M => P::Block(E::Iq1M),
+        T::Q5_K => P::Block(E::Q5K),
+        T::Q6_K => P::Block(E::Q6K),
+        T::Q2_K => P::Block(E::Q2K),
+        T::Q4_K => P::Block(E::Q4K),
+        T::NVFP4 => P::Block(E::Nvfp4),
+        _ => anyhow::bail!("unsupported packed compute encoding {kind:?}"),
+    })
+}
+
+pub fn prepared_layout(info: &TensorInfo) -> Result<PreparedLayout> {
+    ensure!(
+        !info.dimensions.is_empty() && info.dimensions.iter().all(|&n| n > 0),
+        "invalid packed tensor dimensions"
+    );
+    let logical_shape = info
+        .dimensions
+        .iter()
+        .rev()
+        .map(|&n| i32::try_from(n))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let row_bytes = i32::try_from(info.row_bytes()?)?;
+    let dtype = match info.kind {
+        lisa_gguf::TensorType::F32 => Dtype::F32,
+        lisa_gguf::TensorType::F16 => Dtype::F16,
+        lisa_gguf::TensorType::BF16 => Dtype::BF16,
+        _ => Dtype::U8,
+    };
+    let storage_shape = if dtype == Dtype::U8 {
+        let mut bytes = logical_shape[..logical_shape.len() - 1].to_vec();
+        bytes.push(row_bytes);
+        bytes
+    } else {
+        // Plain compute views are typed elements; row_bytes still describes
+        // their original byte span. Only packed U8 views use byte dimensions.
+        logical_shape.clone()
+    };
+    Ok(PreparedLayout {
+        projection: projection(info.kind)?,
+        dtype,
+        logical_shape,
+        storage_shape,
+        row_bytes,
+    })
+}
+
+/// Original row decoder retained behind a tensor-producing loading adapter.
+/// Its arithmetic and import policy are unchanged from the legacy F32 path.
+pub struct RowEmbedding<D: StorageDevice> {
+    device: D,
+    source: lisa_gguf::Tensor,
+    width: usize,
+    row_bytes: usize,
+}
+impl<D: StorageDevice> RowEmbedding<D> {
+    pub fn new(device: D, source: lisa_gguf::Tensor) -> Result<Self> {
+        ensure!(
+            source.info.dimensions.len() == 2,
+            "embedding must be a matrix"
+        );
+        let width = usize::try_from(source.info.dimensions[0])?;
+        let row_bytes = usize::try_from(source.info.row_bytes()?)?;
+        Ok(Self {
+            device,
+            source,
+            width,
+            row_bytes,
+        })
+    }
+}
+impl<D: StorageDevice + Send + Sync> super::source::EmbeddingRows<D::Tensor> for RowEmbedding<D> {
+    fn row(&self, token: u32) -> Result<D::Tensor> {
+        let mut bytes = vec![0; self.row_bytes];
+        self.source.read_rows(&[u64::from(token)], &mut bytes)?;
+        let mut values = vec![0.; self.width];
+        lisa_gguf::quant::decode(self.source.info.kind, &bytes, &mut values)?;
+        let bytes = values
+            .iter()
+            .flat_map(|v| v.to_ne_bytes())
+            .collect::<Vec<_>>();
+        Ok(self.device.pull(
+            lisa_backend::HostTensor {
+                bytes: &bytes,
+                shape: &[1, i32::try_from(self.width)?],
+                dtype: Dtype::F32,
+            }
+            .into(),
+            Default::default(),
+        )?)
+    }
+}
+
 #[derive(Clone)]
 pub struct PackedTensor<D: StorageDevice> {
     pub(crate) device: D,
@@ -17,8 +120,20 @@ pub struct PackedTensor<D: StorageDevice> {
 }
 
 impl<D: StorageDevice> PackedTensor<D> {
+    /// Adapt file metadata once, retaining the exact imported payload.
+    pub fn into_prepared(self) -> Result<super::prepared::PreparedTensor<D::Tensor>> {
+        let layout = self.prepared_layout()?;
+        let plain = if layout.projection == lisa_models::packed::Projection::Plain {
+            Some(self.plain_view()?)
+        } else {
+            None
+        };
+        super::prepared::PreparedTensor::new(layout, self.bytes, plain)
+    }
+    pub fn prepared_layout(&self) -> Result<PreparedLayout> {
+        prepared_layout(&self.info)
+    }
     /// Construct an already imported packed tensor for device conformance tests.
-    #[cfg(any(test, feature = "diagnostics"))]
     pub fn from_parts_for_test(device: D, bytes: D::Tensor, info: TensorInfo) -> Self {
         Self {
             device,
@@ -62,6 +177,40 @@ pub struct ResidentWeights<D: StorageDevice, L> {
 }
 
 impl<D: StorageDevice + Clone, L> ResidentWeights<D, L> {
+    /// Remove all file-reader metadata before handing weights to execution.
+    pub fn into_prepared(self) -> Result<super::prepared::PreparedWeights<D::Tensor, L>>
+    where
+        D::Tensor: Clone,
+    {
+        let mut prepared = super::prepared::PreparedWeights {
+            reservation: self._reservation,
+            tensors: BTreeMap::new(),
+            mapped_bytes: self.mapped_bytes,
+            residency: self.residency,
+        };
+        // Borrow the original owners until every fallible view is prepared.
+        // On error this local drops first, draining the reservation before
+        // either its new views or the original bank's buffers are released.
+        for (name, tensor) in &self.tensors {
+            let layout = tensor.prepared_layout()?;
+            let plain = if layout.projection == lisa_models::packed::Projection::Plain {
+                Some(tensor.plain_view()?)
+            } else {
+                None
+            };
+            prepared.tensors.insert(
+                name.clone(),
+                super::prepared::PreparedTensor::new(layout, tensor.bytes.clone(), plain)?,
+            );
+        }
+        Ok(prepared)
+    }
+    /// Transfer the unchanged residency lease and original views to a loading
+    /// adapter that materializes its container-independent tensor bank.
+    pub(crate) fn into_parts(self) -> (L, BTreeMap<String, PackedTensor<D>>) {
+        (self._reservation, self.tensors)
+    }
+
     /// `names` is explicit: the graph must exclude disk-only tables. Budgeting
     /// happens before the first mmap or GPU view, including page padding.
     /// Runtime allocations are charged separately by the same buffer pool.
@@ -117,7 +266,9 @@ impl<D: StorageDevice + Clone, L> ResidentWeights<D, L> {
                 std::ptr::NonNull::new(mapping.as_ptr() as *mut u8).context("null GGUF mapping")?;
             let length = mapping.len();
             let owner: Arc<dyn std::any::Any + Send + Sync> = mapping;
-            // The GGUF adapter supplies bytes and a retained mapping only.
+            // SAFETY: `owner` is the exact read-only page-rounded GGUF mapping, whose
+            // last page is partly file-backed and so readable; checkpoint files stay
+            // immutable while mapped, and the device retains `owner` through last use.
             let storage = unsafe { lisa_backend::HostStorage::new(pointer, length, owner) };
             let mut shape: Vec<i32> = tensor.info.dimensions[1..]
                 .iter()
@@ -170,4 +321,56 @@ pub fn load_resident<D: lisa_backend::ManagedDevice + Clone>(
         );
         device.reserve_residency(mapped_bytes, budget)
     })
+}
+
+#[cfg(test)]
+mod prepared_tests {
+    use super::*;
+    #[test]
+    fn prepared_packed_layout_retains_original_encoding_and_byte_geometry() -> Result<()> {
+        use lisa_backend::PackedEncoding as E;
+        use lisa_gguf::TensorType as T;
+        use lisa_models::packed::Projection as P;
+        for (kind, width, bytes, projection) in [
+            (T::Q5_K, 2304, 1584, P::Block(E::Q5K)),
+            (T::Q8_0, 2304, 2448, P::Q8),
+            (T::NVFP4, 2304, 1296, P::Block(E::Nvfp4)),
+        ] {
+            let info = TensorInfo {
+                name: "expert".into(),
+                dimensions: vec![width, 2304, 128],
+                kind,
+                offset: 4096,
+                bytes: bytes * 2304 * 128,
+            };
+            let layout = prepared_layout(&info)?;
+            assert_eq!(layout.projection, projection);
+            assert_eq!(layout.dtype, Dtype::U8);
+            assert_eq!(layout.logical_shape, [128, 2304, 2304]);
+            assert_eq!(layout.storage_shape, [128, 2304, bytes as i32]);
+            assert_eq!(layout.row_bytes, bytes as i32);
+            assert_eq!(info.kind, kind);
+            assert_eq!(info.offset, 4096);
+        }
+        for (kind, dtype, element_bytes) in [
+            (T::F32, Dtype::F32, 4),
+            (T::F16, Dtype::F16, 2),
+            (T::BF16, Dtype::BF16, 2),
+        ] {
+            let info = TensorInfo {
+                name: "plain".into(),
+                dimensions: vec![32, 3],
+                kind,
+                offset: 4096,
+                bytes: 32 * 3 * element_bytes,
+            };
+            let layout = prepared_layout(&info)?;
+            assert_eq!(layout.projection, P::Plain);
+            assert_eq!(layout.dtype, dtype);
+            assert_eq!(layout.storage_shape, [3, 32]);
+            assert_eq!(layout.logical_shape, layout.storage_shape);
+            assert_eq!(layout.row_bytes as u64, 32 * element_bytes);
+        }
+        Ok(())
+    }
 }

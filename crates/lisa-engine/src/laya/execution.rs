@@ -2,9 +2,7 @@
 use super::Laya;
 use crate::core::graph::PreparedGraph;
 use anyhow::{Context, Result, ensure};
-use lisa_backend::{
-    HostTensor, ImportOptions, Kernel, ReadbackDevice, ScalarType, TensorOperation,
-};
+use lisa_backend::{HostTensor, ImportOptions, ReadbackDevice, ScalarType};
 use lisa_models::laya::plan::{self, Arithmetic, Plan};
 use std::cell::RefCell;
 
@@ -26,15 +24,24 @@ pub(super) struct Bound<D: ReadbackDevice> {
     device: D,
     arithmetic: Arithmetic,
     plans: RefCell<Plans<D>>,
+    weights: RefCell<Box<dyn crate::weights::source::TensorSource<D::Tensor>>>,
+    question_types: i32,
 }
 impl<D: ReadbackDevice + Clone> Bound<D>
 where
     D::Tensor: Clone,
 {
-    pub fn new(device: D, arithmetic: Arithmetic) -> Self {
+    pub fn new(
+        device: D,
+        arithmetic: Arithmetic,
+        weights: Box<dyn crate::weights::source::TensorSource<D::Tensor>>,
+        question_types: i32,
+    ) -> Self {
         Self {
             device,
             arithmetic,
+            weights: RefCell::new(weights),
+            question_types,
             plans: RefCell::new(Plans {
                 encoder: None,
                 scorer: None,
@@ -54,69 +61,11 @@ where
             ImportOptions::default(),
         )?)
     }
-    fn prepare(&self, model: &Laya, plan: Plan) -> Result<PreparedGraph<D>> {
+    fn prepare(&self, plan: Plan) -> Result<PreparedGraph<D>> {
         let weights = plan
             .weights
             .iter()
-            .map(|name| {
-                let (bytes, dtype, shape) = model
-                    .weights()
-                    .tensor_bytes(name)
-                    .with_context(|| format!("laya: missing weight {name}"))?;
-                let dtype = crate::weights::mlx::scalar_type(dtype);
-                if self.arithmetic == Arithmetic::HostF32 {
-                    let data = match dtype {
-                        ScalarType::F32 => bytes.to_vec(),
-                        ScalarType::F16 => bytes
-                            .chunks_exact(2)
-                            .flat_map(|b| {
-                                half::f16::from_le_bytes(b.try_into().unwrap())
-                                    .to_f32()
-                                    .to_le_bytes()
-                            })
-                            .collect(),
-                        ScalarType::BF16 => bytes
-                            .chunks_exact(2)
-                            .flat_map(|b| {
-                                half::bf16::from_le_bytes(b.try_into().unwrap())
-                                    .to_f32()
-                                    .to_le_bytes()
-                            })
-                            .collect(),
-                        _ => anyhow::bail!("unsupported Laya weight dtype"),
-                    };
-                    return Ok(self.device.pull(
-                        HostTensor {
-                            bytes: &data,
-                            shape,
-                            dtype: ScalarType::F32,
-                        }
-                        .into(),
-                        ImportOptions::default(),
-                    )?);
-                }
-                let input = self.device.pull(
-                    HostTensor {
-                        bytes,
-                        shape,
-                        dtype,
-                    }
-                    .into(),
-                    ImportOptions::default(),
-                )?;
-                if dtype == ScalarType::F32 {
-                    return Ok(input);
-                }
-                let cast = self
-                    .device
-                    .prepare(Kernel::Tensor(TensorOperation::Cast(ScalarType::F32)))?
-                    .context("device does not support the required weight cast")?;
-                let result = self
-                    .device
-                    .dispatch(&cast, &[&input], &self.device.stream())?
-                    .context("device rejected the required weight cast")?;
-                result.output.into_one().map_err(anyhow::Error::msg)
-            })
+            .map(|name| self.weights.borrow_mut().get(name))
             .collect::<Result<Vec<_>>>()?;
         PreparedGraph::new(self.device.clone(), plan.graph, weights)
     }
@@ -145,12 +94,8 @@ where
             !markers.is_empty() && markers.iter().all(|&p| p >= 0 && (p as usize) < ids.len()),
             "invalid Laya marker positions"
         );
-        let (_, _, shape) = model
-            .weights()
-            .tensor_bytes("type_emb.weight")
-            .context("missing type embedding")?;
         ensure!(
-            shape.len() == 2 && qtype >= 0 && qtype < shape[0],
+            qtype >= 0 && qtype < self.question_types,
             "invalid Laya question type"
         );
         let sequence = i32::try_from(ids.len())?;
@@ -162,10 +107,11 @@ where
         if cache.encoder.as_ref().is_none_or(|(n, _)| *n != ids.len()) {
             cache.encoder = Some((
                 ids.len(),
-                self.prepare(
-                    model,
-                    plan::encoder_with(model.config(), sequence, self.arithmetic),
-                )?,
+                self.prepare(plan::encoder_with(
+                    model.config(),
+                    sequence,
+                    self.arithmetic,
+                ))?,
             ));
         }
         let hidden = cache
@@ -186,15 +132,12 @@ where
             cache.scorer = Some((
                 ids.len(),
                 markers.len(),
-                self.prepare(
-                    model,
-                    plan::scorer_with(
-                        model.config(),
-                        sequence,
-                        i32::try_from(markers.len())?,
-                        self.arithmetic,
-                    ),
-                )?,
+                self.prepare(plan::scorer_with(
+                    model.config(),
+                    sequence,
+                    i32::try_from(markers.len())?,
+                    self.arithmetic,
+                ))?,
             ));
         }
         let mut output = cache
@@ -225,7 +168,7 @@ where
             ImportOptions::default(),
         )?;
         if cache.action.is_none() {
-            cache.action = Some(self.prepare(model, plan::action_with(self.arithmetic))?);
+            cache.action = Some(self.prepare(plan::action_with(self.arithmetic))?);
         }
         let action = cache
             .action

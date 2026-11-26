@@ -53,6 +53,54 @@ pub struct ResourcesHandle {
     value: Box<Object>,
 }
 
+trait ErasedProgram: Send + Sync {
+    fn set_scheduling(&mut self, scheduling: ProgramScheduling) -> bool;
+    fn replay(&self, inputs: &[&TensorHandle]) -> anyhow::Result<Option<Vec<Arc<Object>>>>;
+}
+struct TypedProgram<T> {
+    program: Box<dyn RecordedProgram<T>>,
+}
+impl<T: Any + Send + Sync> ErasedProgram for TypedProgram<T> {
+    fn set_scheduling(&mut self, scheduling: ProgramScheduling) -> bool {
+        self.program.set_scheduling(scheduling)
+    }
+    fn replay(&self, inputs: &[&TensorHandle]) -> anyhow::Result<Option<Vec<Arc<Object>>>> {
+        let inputs = inputs
+            .iter()
+            .map(|t| {
+                t.value
+                    .downcast_ref::<T>()
+                    .expect("checked recorded-program tensor owner")
+            })
+            .collect::<smallvec::SmallVec<[&T; 16]>>();
+        Ok(self.program.replay(&inputs)?.map(|outputs| {
+            outputs
+                .into_iter()
+                .map(|t| Arc::new(t) as Arc<Object>)
+                .collect()
+        }))
+    }
+}
+struct ProgramHandle {
+    owner: DeviceHandle,
+    value: Box<dyn ErasedProgram>,
+}
+impl RecordedProgram<TensorHandle> for ProgramHandle {
+    fn set_scheduling(&mut self, scheduling: ProgramScheduling) -> bool {
+        self.value.set_scheduling(scheduling)
+    }
+    fn replay(&self, inputs: &[&TensorHandle]) -> anyhow::Result<Option<Vec<TensorHandle>>> {
+        for tensor in inputs {
+            self.owner.check(&tensor.owner)?;
+        }
+        Ok(self
+            .value
+            .replay(inputs)?
+            .map(|outputs| outputs.into_iter().map(|t| self.owner.tensor(t)).collect()))
+    }
+}
+type ErasedCapture = (Vec<Arc<Object>>, Option<Box<dyn ErasedProgram>>);
+
 trait Operations: Send + Sync {
     fn same_storage(&self, a: &Object, b: &Object) -> bool;
     fn capabilities(&self) -> &[KernelCapability];
@@ -67,6 +115,12 @@ trait Operations: Send + Sync {
         inputs: &[&TensorHandle],
         stream: &Object,
     ) -> Result<Option<(Outputs<Arc<Object>>, Box<Object>)>>;
+    fn capture_program(
+        &self,
+        inputs: &[&TensorHandle],
+        stream: &Object,
+        encode: &mut dyn FnMut() -> anyhow::Result<Vec<TensorHandle>>,
+    ) -> anyhow::Result<ErasedCapture>;
     fn resources(&self, slots: &[&TensorHandle]) -> Result<Box<Object>>;
     fn dispatch_indirect(
         &self,
@@ -86,6 +140,7 @@ trait Operations: Send + Sync {
     ) -> Result<Arc<Object>>;
     fn read_bytes(&self, tensor: &Object) -> Result<Vec<u8>>;
     fn copy_tensor(&self, tensor: &Object) -> Result<Arc<Object>>;
+    fn read_i32_through(&self, tensor: &Object) -> Result<Vec<i32>>;
     fn read_f32_through(&self, tensor: &Object) -> Result<Vec<f32>>;
     fn layout(&self, tensor: &Object) -> TensorLayout;
     fn evaluate(&self, tensor: &Object, wait: bool) -> Result<()>;
@@ -103,7 +158,7 @@ fn needs_resources(kind: KernelKind) -> bool {
 impl<D> Operations for Typed<D>
 where
     D: HostAccessDevice + Send + Sync + 'static,
-    D::Tensor: Send + Sync + 'static,
+    D::Tensor: Clone + Send + Sync + 'static,
     D::KernelHandle: Send + Sync + 'static,
     D::Stream: Send + Sync + 'static,
     D::Completion: Send + Sync + 'static,
@@ -175,6 +230,44 @@ where
                 Box::new(out.completion) as Box<Object>,
             )
         }))
+    }
+    fn capture_program(
+        &self,
+        inputs: &[&TensorHandle],
+        stream: &Object,
+        encode: &mut dyn FnMut() -> anyhow::Result<Vec<TensorHandle>>,
+    ) -> anyhow::Result<ErasedCapture> {
+        let inputs = inputs
+            .iter()
+            .map(|t| {
+                t.value
+                    .downcast_ref::<D::Tensor>()
+                    .expect("checked tensor owner")
+            })
+            .collect::<smallvec::SmallVec<[&D::Tensor; 16]>>();
+        let (outputs, program) = self.0.capture_program(
+            &inputs,
+            stream.downcast_ref().expect("checked stream owner"),
+            &mut || {
+                Ok(encode()?
+                    .iter()
+                    .map(|tensor| {
+                        tensor
+                            .value
+                            .downcast_ref::<D::Tensor>()
+                            .expect("checked capture-output owner")
+                            .clone()
+                    })
+                    .collect())
+            },
+        )?;
+        Ok((
+            outputs
+                .into_iter()
+                .map(|tensor| Arc::new(tensor) as Arc<Object>)
+                .collect(),
+            program.map(|program| Box::new(TypedProgram { program }) as Box<dyn ErasedProgram>),
+        ))
     }
     fn resources(&self, slots: &[&TensorHandle]) -> Result<Box<Object>> {
         let bridge = self
@@ -256,6 +349,11 @@ where
             .read_bytes(tensor.downcast_ref().expect("checked tensor owner"))
             .map_err(error)
     }
+    fn read_i32_through(&self, tensor: &Object) -> Result<Vec<i32>> {
+        self.0
+            .read_i32_through(tensor.downcast_ref().expect("checked tensor owner"))
+            .map_err(error)
+    }
     fn read_f32_through(&self, tensor: &Object) -> Result<Vec<f32>> {
         self.0
             .read_f32_through(tensor.downcast_ref().expect("checked tensor owner"))
@@ -275,7 +373,7 @@ impl DeviceHandle {
     pub fn new<D>(device: D) -> Self
     where
         D: HostAccessDevice + Send + Sync + 'static,
-        D::Tensor: Send + Sync + 'static,
+        D::Tensor: Clone + Send + Sync + 'static,
         D::KernelHandle: Send + Sync + 'static,
         D::Stream: Send + Sync + 'static,
         D::Completion: Send + Sync + 'static,
@@ -299,7 +397,7 @@ impl DeviceHandle {
     pub fn with_indirect<D>(device: D) -> Self
     where
         D: HostAccessDevice + IndirectDevice + Send + Sync + 'static,
-        D::Tensor: Send + Sync + 'static,
+        D::Tensor: Clone + Send + Sync + 'static,
         D::KernelHandle: Send + Sync + 'static,
         D::Stream: Send + Sync + 'static,
         D::Completion: Send + Sync + 'static,
@@ -429,6 +527,35 @@ impl Device for DeviceHandle {
                 },
             }))
     }
+    fn capture_program(
+        &self,
+        inputs: &[&TensorHandle],
+        stream: &StreamHandle,
+        encode: &mut dyn FnMut() -> anyhow::Result<Vec<TensorHandle>>,
+    ) -> anyhow::Result<ProgramCapture<TensorHandle>> {
+        self.check(&stream.owner)?;
+        for tensor in inputs {
+            self.check(&tensor.owner)?;
+        }
+        let (outputs, program) =
+            self.0
+                .capture_program(inputs, stream.value.as_ref(), &mut || {
+                    let outputs = encode()?;
+                    for tensor in &outputs {
+                        self.check(&tensor.owner)?;
+                    }
+                    Ok(outputs)
+                })?;
+        Ok((
+            outputs.into_iter().map(|t| self.tensor(t)).collect(),
+            program.map(|value| {
+                Box::new(ProgramHandle {
+                    owner: self.clone(),
+                    value,
+                }) as Box<dyn RecordedProgram<TensorHandle>>
+            }),
+        ))
+    }
     fn wait(&self, completion: &CompletionHandle) -> Result<()> {
         self.check(&completion.owner)?;
         self.0.wait(completion.value.as_ref())
@@ -459,8 +586,10 @@ impl ReadbackDevice for DeviceHandle {
         }
         Ok(self
             .read_bytes(tensor)?
-            .chunks_exact(4)
-            .map(|b| f32::from_ne_bytes(b.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_ne_bytes(*b))
             .collect())
     }
 }
@@ -520,6 +649,10 @@ impl HostAccessDevice for DeviceHandle {
     fn read_bytes(&self, tensor: &TensorHandle) -> anyhow::Result<Vec<u8>> {
         Ok(DeviceHandle::read_bytes(self, tensor)?)
     }
+    fn read_i32_through(&self, tensor: &TensorHandle) -> anyhow::Result<Vec<i32>> {
+        self.check(&tensor.owner)?;
+        Ok(self.0.read_i32_through(tensor.value.as_ref())?)
+    }
     fn read_f32_through(&self, tensor: &TensorHandle) -> anyhow::Result<Vec<f32>> {
         self.check(&tensor.owner)?;
         Ok(self.0.read_f32_through(tensor.value.as_ref())?)
@@ -529,5 +662,259 @@ impl HostAccessDevice for DeviceHandle {
     }
     fn evaluate(&self, tensor: &TensorHandle, wait: bool) -> anyhow::Result<()> {
         Ok(DeviceHandle::evaluate(self, tensor, wait)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone)]
+    struct Tensor {
+        bytes: Arc<Vec<u8>>,
+        shape: Vec<i32>,
+        dtype: ScalarType,
+    }
+    struct Provider {
+        record: bool,
+        replays: Arc<AtomicUsize>,
+    }
+    struct IdentityProgram(Arc<AtomicUsize>);
+    impl RecordedProgram<Tensor> for IdentityProgram {
+        fn set_scheduling(&mut self, _: ProgramScheduling) -> bool {
+            true
+        }
+        fn replay(&self, inputs: &[&Tensor]) -> anyhow::Result<Option<Vec<Tensor>>> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            if inputs.len() != 1 || inputs[0].shape != [1] {
+                return Ok(None);
+            }
+            Ok(Some(vec![inputs[0].clone()]))
+        }
+    }
+    impl Device for Provider {
+        type Tensor = Tensor;
+        type KernelHandle = ();
+        type Stream = ();
+        type Completion = ();
+        type Error = DeviceError;
+        fn capabilities(&self) -> &[KernelCapability] {
+            &[]
+        }
+        fn pull(&self, source: TensorSource<'_>, _: ImportOptions) -> Result<Tensor> {
+            let source = source.host_tensor().unwrap();
+            Ok(Tensor {
+                bytes: Arc::new(source.bytes.to_vec()),
+                shape: source.shape.to_vec(),
+                dtype: source.dtype,
+            })
+        }
+        fn shape<'a>(&self, tensor: &'a Tensor) -> &'a [i32] {
+            &tensor.shape
+        }
+        fn dtype(&self, tensor: &Tensor) -> Option<ScalarType> {
+            Some(tensor.dtype)
+        }
+        fn stream(&self) {}
+        fn prepare(&self, _: Kernel) -> Result<Option<()>> {
+            Ok(None)
+        }
+        fn dispatch(
+            &self,
+            _: &(),
+            _: &[&Tensor],
+            _: &(),
+        ) -> Result<Option<Dispatch<Outputs<Tensor>, ()>>> {
+            Ok(None)
+        }
+        fn wait(&self, _: &()) -> Result<()> {
+            Ok(())
+        }
+        fn capture_program(
+            &self,
+            _: &[&Tensor],
+            _: &(),
+            encode: &mut dyn FnMut() -> anyhow::Result<Vec<Tensor>>,
+        ) -> anyhow::Result<ProgramCapture<Tensor>> {
+            Ok((
+                encode()?,
+                self.record.then(|| {
+                    Box::new(IdentityProgram(self.replays.clone()))
+                        as Box<dyn RecordedProgram<Tensor>>
+                }),
+            ))
+        }
+    }
+    impl StorageDevice for Provider {
+        fn max_allocation_bytes(&self) -> usize {
+            usize::MAX
+        }
+        fn byte_view(&self, _: &Tensor, _: usize, _: &[i32], _: ScalarType) -> Result<Tensor> {
+            Err(DeviceError::msg("unused test operation"))
+        }
+    }
+    impl HostAccessDevice for Provider {
+        fn same_storage(&self, a: &Tensor, b: &Tensor) -> bool {
+            Arc::ptr_eq(&a.bytes, &b.bytes)
+        }
+        fn read_bytes(&self, tensor: &Tensor) -> anyhow::Result<Vec<u8>> {
+            Ok(tensor.bytes.as_ref().clone())
+        }
+        fn read_i32_through(&self, tensor: &Tensor) -> anyhow::Result<Vec<i32>> {
+            anyhow::ensure!(tensor.dtype == ScalarType::I32, "expected I32 test storage");
+            self.replays.fetch_add(1, Ordering::Relaxed);
+            Ok(tensor
+                .bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| i32::from_ne_bytes(*b))
+                .collect())
+        }
+        fn layout(&self, _: &Tensor) -> TensorLayout {
+            TensorLayout {
+                strides: vec![1],
+                offset: 0,
+            }
+        }
+        fn evaluate(&self, _: &Tensor, _: bool) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+    fn new_device(record: bool) -> (DeviceHandle, Arc<AtomicUsize>) {
+        let replays = Arc::new(AtomicUsize::new(0));
+        (
+            DeviceHandle::new(Provider {
+                record,
+                replays: replays.clone(),
+            }),
+            replays,
+        )
+    }
+    fn tensor(device: &DeviceHandle, values: &[u8]) -> TensorHandle {
+        device
+            .pull(
+                HostTensor {
+                    bytes: values,
+                    shape: &[values.len() as i32],
+                    dtype: ScalarType::U8,
+                }
+                .into(),
+                ImportOptions::default(),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn recorded_program_scheduling_hint_reaches_erased_provider() -> anyhow::Result<()> {
+        let (device, _) = new_device(true);
+        let a = tensor(&device, &[7]);
+        let stream = device.stream();
+        let (_, program) = device.capture_program(&[&a], &stream, &mut || Ok(vec![a.clone()]))?;
+        let mut program = program.unwrap();
+        assert!(program.set_scheduling(ProgramScheduling::DependencyParallel));
+        assert!(program.set_scheduling(ProgramScheduling::Ordered));
+        Ok(())
+    }
+
+    #[test]
+    fn recorded_program_preserves_owner_storage_and_declines_shapes() -> anyhow::Result<()> {
+        let (device, calls) = new_device(true);
+        let owner = Arc::downgrade(&device.0);
+        let a = tensor(&device, &[7]);
+        let stream = device.stream();
+        let (out, program) = device.capture_program(&[&a], &stream, &mut || Ok(vec![a.clone()]))?;
+        assert!(device.same_storage(&a, &out[0]));
+        let program = program.unwrap();
+        let b = tensor(&device, &[9]);
+        let replay = program.replay(&[&b])?.unwrap();
+        assert!(device.same_storage(&b, &replay[0]));
+        assert_eq!(device.read_bytes(&replay[0])?, vec![9]);
+        let wide = tensor(&device, &[1, 2]);
+        assert!(program.replay(&[&wide])?.is_none());
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        drop((a, b, wide, out, replay, stream, device));
+        assert!(owner.upgrade().is_some(), "program must retain its device");
+        drop(program);
+        assert!(owner.upgrade().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn capture_and_replay_reject_foreign_owners_before_provider_calls() -> anyhow::Result<()> {
+        let (device, calls) = new_device(true);
+        let (other, _) = new_device(false);
+        let a = tensor(&device, &[7]);
+        let foreign = tensor(&other, &[8]);
+        let stream = device.stream();
+        let mut encoded = 0;
+        let mut encode = || {
+            encoded += 1;
+            Ok(vec![a.clone()])
+        };
+        assert!(
+            device
+                .capture_program(&[&foreign], &stream, &mut encode)
+                .is_err()
+        );
+        assert!(
+            device
+                .capture_program(&[&a], &other.stream(), &mut encode)
+                .is_err()
+        );
+        assert_eq!(encoded, 0);
+        assert!(
+            device
+                .capture_program(&[&a], &stream, &mut || Ok(vec![foreign.clone()]))
+                .is_err()
+        );
+        let (_, program) = device.capture_program(&[&a], &stream, &mut || Ok(vec![a.clone()]))?;
+        assert!(program.unwrap().replay(&[&foreign]).is_err());
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn declined_capture_preserves_outputs_and_errors() -> anyhow::Result<()> {
+        let (device, _) = new_device(false);
+        let a = tensor(&device, &[7]);
+        let stream = device.stream();
+        let (out, program) = device.capture_program(&[&a], &stream, &mut || Ok(vec![a.clone()]))?;
+        assert!(program.is_none());
+        assert!(device.same_storage(&a, &out[0]));
+        let failed = device.capture_program(&[&a], &stream, &mut || {
+            anyhow::bail!("capture encoding failed")
+        });
+        assert_eq!(failed.err().unwrap().to_string(), "capture encoding failed");
+        Ok(())
+    }
+    #[test]
+    fn integer_partial_readback_preserves_provider_fence_and_owner_check() -> anyhow::Result<()> {
+        let (device, calls) = new_device(false);
+        let (other, _) = new_device(false);
+        let bytes = 42i32.to_ne_bytes();
+        let token = device.pull(
+            HostTensor {
+                bytes: &bytes,
+                shape: &[1, 1],
+                dtype: ScalarType::I32,
+            }
+            .into(),
+            ImportOptions::default(),
+        )?;
+        assert_eq!(HostAccessDevice::read_i32_through(&device, &token)?, [42]);
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "erasure fell back to a full byte read instead of the provider fence"
+        );
+        assert!(HostAccessDevice::read_i32_through(&other, &token).is_err());
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "foreign read reached the original provider"
+        );
+        Ok(())
     }
 }

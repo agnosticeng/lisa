@@ -51,13 +51,13 @@ pub struct Args {
     /// Comma-separated stage-name substrings; empty records every selected stage.
     #[arg(long, value_delimiter = ',', requires = "capture_logits")]
     capture_keys: Vec<String>,
-    /// Explicitly select the native DS4 Q8 schedule, also used by default.
+    /// Explicitly select the native reference Q8 schedule, also used by default.
     #[arg(long, default_value_t = false)]
     matrix_prefill: bool,
-    /// Explicitly select native DS4 attention, also used by default.
+    /// Explicitly select native reference attention, also used by default.
     #[arg(long, default_value_t = false)]
     native_dsa: bool,
-    /// Explicitly select native DS4 fused Q8 gate/up/SwiGLU, also used by default.
+    /// Explicitly select native reference fused Q8 gate/up/SwiGLU, also used by default.
     #[arg(long, default_value_t = false)]
     native_q8_gate_up: bool,
 }
@@ -104,14 +104,14 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         _ => anyhow::bail!("provide exactly one of --prompt or --prompt-file"),
     };
     let tokenization_started = Instant::now();
-    let tokenizer = tokenizer::Tokenizer::load(&args.model)?;
+    let tokenizer = lisa_engine::checkpoint::tokenizer::load(&args.model)?;
     let rendered_prompt = if args.raw {
         prompt.clone()
     } else {
         tokenizer::glm_generation_prompt(
             &prompt,
             Some("You are a helpful assistant"),
-            tokenizer::GlmReasoning::High,
+            tokenizer::ReasoningEffort::High,
         )
     };
     let input_ids = if args.raw {
@@ -172,7 +172,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         "checkpoint has no target MTP head"
     );
     generate::set_eos_ids_for_model(tokenizer.im_end_ids.clone(), tower.as_ref());
-    let mut sampler = sampler::Sampler(lisa_engine::sampling::Sampler {
+    let mut sampler = sampler::Sampler::new(lisa_engine::sampling::Sampler {
         temperature: args.temperature,
         seed: args.seed,
         ..Default::default()
@@ -191,13 +191,12 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             &input_ids,
             args.max_tokens,
             &mut sampler,
-            0,
             &mut on_token,
         )?;
         (ids, Some(stats))
     } else {
         let mut session = session::Session::new(tower.as_mut());
-        let stochastic = (!sampler.greedy()).then_some(&mut sampler);
+        let stochastic = (!sampler.can_use_raw_argmax()).then_some(&mut sampler);
         let ids = session.generate_mtp_depth(
             tower.as_mut(),
             &input_ids,
@@ -241,7 +240,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         "matrix_prefill_explicit": args.matrix_prefill,
         "dsa_schedule": if lisa_bench::bindings::glm53_attention_mode::glm53_dsa_native_enabled() { "native_ds4" } else { "legacy_affine" },
         "native_dsa_explicit": args.native_dsa,
-        "q8_gate_up_schedule": if model_type == "glm5-next" { "gguf_separate" } else if lisa_bench::bindings::glm53_affine_moe::native_gate_up_enabled() && std::env::var("LISA_GLM53_Q8_GATE_UP").as_deref() != Ok("separate") { "native_ds4_fused" } else { "separate" },
+        "q8_gate_up_schedule": if model_type == "glm5-next" { "gguf_separate" } else if lisa_bench::bindings::glm53_affine_moe::native_gate_up_enabled() { "native_ds4_fused" } else { "separate" },
         "native_q8_gate_up_explicit": args.native_q8_gate_up,
         "timing_valid_for_performance": args.capture_logits.is_none(),
         "sampling": {"seed": args.seed, "temperature": args.temperature,

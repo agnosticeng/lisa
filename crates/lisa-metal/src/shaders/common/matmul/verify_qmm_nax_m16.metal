@@ -1,7 +1,7 @@
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 using namespace metal;
 using namespace mpp::tensor_ops;
-// The NAX m16 verify tile (specs/08 item 2): the dedicated M 8..=16 lane for
+// The NAX m16 verify tile: the dedicated M 8..=16 lane for
 // M5-class matrix units. Port of the reference's `_build_kernel_m16_nax_ktmpl`
 // body VERBATIM (single-brace form), with the MLX fast-kernel scaffolding
 // replaced by lisa's explicit [[kernel]] signature — the tensor extents,

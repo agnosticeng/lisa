@@ -1,5 +1,5 @@
 //! Application construction of the portable language execution adapter.
-pub type MetalLanguageRuntime = lisa_engine::language_runtime::Runtime<
+pub type MetalLanguageRuntime = lisa_engine::language::runtime::Runtime<
     lisa_metal::device::MetalDevice,
     crate::core::sampler::Sampler,
 >;

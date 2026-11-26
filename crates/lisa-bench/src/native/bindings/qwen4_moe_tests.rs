@@ -114,3 +114,90 @@ fn expert_plans_preserve_decode_gather_indirect_and_batch_bits() -> anyhow::Resu
     }
     Ok(())
 }
+
+#[test]
+fn captured_expert_plan_matches_independent_serial_rows() -> anyhow::Result<()> {
+    use lisa_metal::ops::indexing::IndexOp;
+    let (h, n) = (2560, 640);
+    for experts in [512, 32] {
+        // The smaller expert bank exercises the generic single-row fallback.
+        let mut src = source(experts, h, n)?;
+        let model = SparseMoeBlock::load_on(
+            crate::metal_context::execution_context(),
+            &mut src,
+            "block",
+            10,
+        )?;
+        drop(src);
+        for (batch, rows) in [(1, 1), (1, 2), (1, 7), (1, 8), (1, 9), (2, 1), (2, 7)] {
+            // Retain a nonzero storage offset and padded row strides.
+            let backing = Array::from_slice(
+                &(0..batch * rows * (h + 32))
+                    .map(|i| half::bf16::from_f32(((i * 13 % 251) as f32 - 125.) / 311.))
+                    .collect::<Vec<_>>(),
+                &[batch, rows, h + 32],
+            );
+            let x = backing.index((.., .., 8..8 + h));
+            let captured = model
+                .forward_captured(&x)
+                .with_context(|| format!("captured E={experts} B={batch} S={rows}"))?
+                .to_vec1::<u16>()?;
+            let mut expected = Vec::with_capacity((batch * rows * h) as usize);
+            for b in 0..batch {
+                for row in 0..rows {
+                    let single = x.index((b..b + 1, row..row + 1, ..)).contiguous()?;
+                    expected.extend(
+                        model
+                            .forward(&single)
+                            .with_context(|| {
+                                format!("serial E={experts} B={batch} S={rows} row={b}/{row}")
+                            })?
+                            .to_vec1::<u16>()?,
+                    );
+                }
+            }
+            assert_eq!(
+                captured, expected,
+                "experts={experts} batch={batch} rows={rows}"
+            );
+            // Exercise both cached graph identities at the same shape.
+            let ordinary = model
+                .forward(&x)
+                .with_context(|| format!("ordinary padded E={experts} B={batch} S={rows}"))?
+                .to_vec1::<u16>()?;
+            let ordinary_dense = model
+                .forward(&x.contiguous()?)
+                .with_context(|| format!("ordinary dense E={experts} B={batch} S={rows}"))?
+                .to_vec1::<u16>()?;
+            assert_eq!(
+                ordinary, ordinary_dense,
+                "ordinary input layout E={experts} B={batch} S={rows}"
+            );
+            let different = ordinary
+                .iter()
+                .zip(&expected)
+                .filter(|(a, b)| a != b)
+                .count();
+            let maximum = ordinary
+                .iter()
+                .zip(&expected)
+                .map(|(&a, &b)| {
+                    (half::bf16::from_bits(a).to_f32() - half::bf16::from_bits(b).to_f32()).abs()
+                })
+                .fold(0.0f32, f32::max);
+            eprintln!(
+                "expert serial differential E={experts} B={batch} S={rows}: ordinary={different}/{} max_abs={maximum} captured=0",
+                expected.len(),
+            );
+            assert_eq!(
+                model
+                    .forward_captured(&x)
+                    .with_context(|| format!("cached captured E={experts} B={batch} S={rows}"))?
+                    .to_vec1::<u16>()?,
+                expected,
+                "captured graph after ordinary execution: experts={experts} B={batch} S={rows}"
+            );
+        }
+    }
+    Ok(())
+}

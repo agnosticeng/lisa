@@ -1,15 +1,10 @@
 #![cfg(test)]
-#![allow(dead_code)]
-//! DS4's scalar V4.1 attention graph with original GGUF projections.
+//! The reference's scalar V4.1 attention graph with original GGUF projections.
 
-use crate::bindings::deepseek41::{
-    config::Config,
-    state::{State, store_row, view},
-};
-#[path = "deepseek41_projection_oracle.rs"]
-mod projection;
+use crate::bindings::deepseek41::state::{State, store_row, view};
+use crate::bindings::deepseek41_projection_oracle as projection;
 use crate::core::capture::Capture;
-use crate::core::gguf_resident::{PackedTensor, ResidentWeights};
+use crate::core::gguf_resident::PackedTensor;
 use anyhow::{Context, Result};
 use lisa_metal::kernels::ggml::{self as gpu, ActivationFormat};
 use lisa_metal::{Array, Stream};
@@ -59,55 +54,6 @@ pub struct Attention {
 }
 
 impl Attention {
-    pub fn load(weights: &ResidentWeights, layer: usize, config: &Config) -> Result<Self> {
-        let get = |suffix: &str| {
-            weights
-                .tensors
-                .get(&format!("blk.{layer}.{suffix}"))
-                .cloned()
-                .with_context(|| format!("missing DeepSeek attention tensor {suffix}"))
-        };
-        let plain = |suffix: &str| projection::plain_view(&get(suffix)?);
-        let ratio = config.compress_ratios[layer] as usize;
-        let compressor = if config.kv_sources.contains(&(layer as u32)) {
-            Some(Compressor {
-                kv: get("attn_compressor_kv.weight")?,
-                gate: if ratio == 2 {
-                    Some(get("attn_compressor_gate.weight")?)
-                } else {
-                    None
-                },
-                norm: plain("attn_compressor_norm.weight")?,
-                index_k: get("indexer.attn_k.weight")?,
-                index_norm: plain("indexer.k_norm.weight")?,
-            })
-        } else {
-            None
-        };
-        let indexer = if config.index_sources.contains(&(layer as u32)) {
-            Some(Indexer {
-                q: get("indexer.attn_q_b.weight")?,
-                weights: get("indexer.proj.weight")?,
-            })
-        } else {
-            None
-        };
-        Ok(Self {
-            layer,
-            ratio,
-            q_a: get("attn_q_a.weight")?,
-            q_norm: plain("attn_q_a_norm.weight")?,
-            kv: get("attn_kv.weight")?,
-            kv_norm: plain("attn_kv_a_norm.weight")?,
-            q_b: get("attn_q_b.weight")?,
-            o_a: get("attn_output_a.weight")?,
-            o_b: get("attn_output_b.weight")?,
-            sinks: plain("attn_sinks.weight")?,
-            compressor,
-            indexer,
-        })
-    }
-
     /// Row-independent projections retain the original matvec reductions.
     /// The causal cache/index/attention work runs in position order afterward.
     pub(super) fn project(&self, norm: &Array, stream: &Stream) -> Result<Projections> {
@@ -233,47 +179,47 @@ impl Attention {
                 }
             }
         }
-        if let Some(indexer) = &self.indexer {
-            if n_comp > 0 {
-                let mut query =
-                    projection::linear(&indexer.q, &qr, true, stream)?.reshape(&[32, 128])?;
-                gpu::index_query_rope_quantize(&mut query, rope, stream)?;
-                record("index_query", &query);
-                let weights =
-                    projection::linear(&indexer.weights, norm, true, stream)?.reshape(&[32])?;
-                let cache = &state.owners[owner];
-                let picked = if self.layer > 20 && n_comp > 16384 {
-                    let keys = view(&cache.index, 0, &[n_comp as i32, 128])?;
-                    gpu::index_candidates_select(
-                        &query,
-                        &weights,
-                        &keys,
-                        candidates
+        if let Some(indexer) = &self.indexer
+            && n_comp > 0
+        {
+            let mut query =
+                projection::linear(&indexer.q, &qr, true, stream)?.reshape(&[32, 128])?;
+            gpu::index_query_rope_quantize(&mut query, rope, stream)?;
+            record("index_query", &query);
+            let weights =
+                projection::linear(&indexer.weights, norm, true, stream)?.reshape(&[32])?;
+            let cache = &state.owners[owner];
+            let picked = if self.layer > 20 && n_comp > 16384 {
+                let keys = view(&cache.index, 0, &[n_comp as i32, 128])?;
+                gpu::index_candidates_select(
+                    &query,
+                    &weights,
+                    &keys,
+                    candidates
+                        .as_ref()
+                        .context("DeepSeek candidate list was not published")?,
+                    stream,
+                )?
+            } else {
+                let keys = if n_comp >= 8192 {
+                    view(
+                        cache
+                            .index_bf16
                             .as_ref()
-                            .context("DeepSeek candidate list was not published")?,
-                        stream,
+                            .context("missing DeepSeek BF16 key mirror")?,
+                        0,
+                        &[n_comp as i32, 128],
                     )?
                 } else {
-                    let keys = if n_comp >= 8192 {
-                        view(
-                            cache
-                                .index_bf16
-                                .as_ref()
-                                .context("missing DeepSeek BF16 key mirror")?,
-                            0,
-                            &[n_comp as i32, 128],
-                        )?
-                    } else {
-                        view(&cache.index, 0, &[n_comp as i32, 128])?
-                    };
-                    let scores = gpu::index_scores(&query, &weights, &keys, stream)?;
-                    if self.layer == 20 && n_comp > 16384 {
-                        *candidates = Some(gpu::index_candidates(&scores, stream)?);
-                    }
-                    gpu::index_topk(&scores, n_comp.min(512) as i32, stream)?
+                    view(&cache.index, 0, &[n_comp as i32, 128])?
                 };
-                *selected = Some(picked.reshape(&[n_comp.min(512) as i32])?);
-            }
+                let scores = gpu::index_scores(&query, &weights, &keys, stream)?;
+                if self.layer == 20 && n_comp > 16384 {
+                    *candidates = Some(gpu::index_candidates(&scores, stream)?);
+                }
+                gpu::index_topk(&scores, n_comp.min(512) as i32, stream)?
+            };
+            *selected = Some(picked.reshape(&[n_comp.min(512) as i32])?);
         }
         let raw_count = (pos + 1).min(128) as u32;
         let comp = if n_comp > 0 {

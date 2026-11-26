@@ -3,67 +3,37 @@ pub use super::glm53_dense_mlp::{
 };
 #[cfg(test)]
 use super::glm53_oracle_helpers::narrow;
-use crate::core::{
-    capture::Capture,
-    loader::{LazyTensorStore, TensorSource, Weights},
-    quant::QuantizedLinear,
-};
+#[cfg(test)]
+use crate::core::{capture::Capture, quant::QuantizedLinear};
+#[cfg(test)]
 use lisa_backend::ResourceDevice;
-pub use lisa_engine::bindings::glm53_policy::{Glm53Q8GateUpNativeScope, native_gate_up_enabled};
-use lisa_metal::{Array, Dtype, ops};
-use std::{
-    collections::{HashMap, HashSet},
-    sync::{
-        Arc, Mutex, Weak,
-        atomic::{AtomicUsize, Ordering},
-    },
-    time::Instant,
-};
-pub type MoE = lisa_engine::bindings::glm53_affine_moe::MoE<lisa_metal::device::MetalDevice>;
+pub use lisa_engine::bindings::glm53::policy::{Glm53Q8GateUpNativeScope, native_gate_up_enabled};
+#[cfg(test)]
+use lisa_metal::{Array, Dtype};
+#[cfg(test)]
+use std::sync::{Arc, atomic::AtomicUsize};
+pub type MoE = lisa_engine::bindings::glm53::affine::moe::MoE<lisa_metal::device::MetalDevice>;
 pub type ExpertParameters =
-    lisa_engine::bindings::glm53_affine_moe::ExpertParameters<lisa_metal::device::MetalDevice>;
+    lisa_engine::bindings::glm53::affine::moe::ExpertParameters<lisa_metal::device::MetalDevice>;
 pub type CachedExpert =
-    lisa_engine::bindings::glm53_affine_moe::CachedExpert<lisa_metal::device::MetalDevice>;
+    lisa_engine::bindings::glm53::affine::moe::CachedExpert<lisa_metal::device::MetalDevice>;
 pub type ExpertCacheState =
-    lisa_engine::bindings::glm53_affine_moe::ExpertCacheState<lisa_metal::device::MetalDevice>;
+    lisa_engine::bindings::glm53::affine::moe::ExpertCacheState<lisa_metal::device::MetalDevice>;
 pub type ExpertPools =
-    lisa_engine::bindings::glm53_affine_moe::ExpertPools<lisa_metal::device::MetalDevice>;
+    lisa_engine::bindings::glm53::affine::moe::ExpertPools<lisa_metal::device::MetalDevice>;
 pub type ExpertStageMessage =
-    lisa_engine::bindings::glm53_affine_moe::ExpertStageMessage<lisa_metal::device::MetalDevice>;
+    lisa_engine::bindings::glm53::affine::moe::ExpertStageMessage<lisa_metal::device::MetalDevice>;
 pub type GroupedMoeWorkspace =
-    lisa_engine::bindings::glm53_affine_moe::GroupedMoeWorkspace<lisa_metal::device::MetalDevice>;
+    lisa_engine::bindings::glm53::affine::moe::GroupedMoeWorkspace<lisa_metal::device::MetalDevice>;
 pub type GroupedMoeBuffers =
-    lisa_engine::bindings::glm53_affine_moe::GroupedMoeBuffers<lisa_metal::device::MetalDevice>;
+    lisa_engine::bindings::glm53::affine::moe::GroupedMoeBuffers<lisa_metal::device::MetalDevice>;
 pub type GroupedMoeViews =
-    lisa_engine::bindings::glm53_affine_moe::GroupedMoeViews<lisa_metal::device::MetalDevice>;
+    lisa_engine::bindings::glm53::affine::moe::GroupedMoeViews<lisa_metal::device::MetalDevice>;
+#[cfg(test)]
 fn selected_prefetch_bytes(expert_ids: &[usize], expert_cache_bytes: &[usize]) -> Option<usize> {
     expert_ids.iter().try_fold(0usize, |total, &expert_id| {
         total.checked_add(*expert_cache_bytes.get(expert_id)?)
     })
-}
-
-#[cfg(test)]
-fn encode_f32(values: &[f32]) -> Vec<u8> {
-    values
-        .iter()
-        .flat_map(|value| value.to_le_bytes())
-        .collect()
-}
-
-#[cfg(all(test, feature = "glm53-fixtures"))]
-fn encode_i32(values: &[i32]) -> Vec<u8> {
-    values
-        .iter()
-        .flat_map(|value| value.to_le_bytes())
-        .collect()
-}
-
-#[cfg(all(test, feature = "glm53-fixtures"))]
-fn encode_u32(values: &[u32]) -> Vec<u8> {
-    values
-        .iter()
-        .flat_map(|value| value.to_le_bytes())
-        .collect()
 }
 
 #[cfg(test)]

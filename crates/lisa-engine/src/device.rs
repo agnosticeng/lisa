@@ -7,7 +7,7 @@ pub struct DeviceRequest {
 impl std::str::FromStr for DeviceRequest {
     type Err = anyhow::Error;
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let (provider, index) = value.split_once(':').map_or((value, "0"), |v| v);
+        let (provider, index) = value.split_once(':').unwrap_or((value, "0"));
         anyhow::ensure!(
             !provider.is_empty()
                 && provider

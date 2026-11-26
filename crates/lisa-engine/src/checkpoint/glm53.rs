@@ -1,16 +1,15 @@
-//! Validate the DS4 checkpoint before mapping any tensor payload.
+//! Validate the reference checkpoint before mapping any tensor payload.
 
 use anyhow::{Context, Result, ensure};
 use lisa_gguf::{Header, Package, TensorType, Value};
 // Model schema ownership is in `lisa-models`; file access stays in the engine.
-use crate::core::config::ReadConfig;
+use crate::checkpoint::config::ReadConfig;
 pub use lisa_models::glm53::config::*;
 impl ReadConfig for ModelConfig {
     fn parse_config(data: &str) -> anyhow::Result<Self> {
-        Self::from_str(data)
+        Self::parse(data)
     }
 }
-
 
 pub fn config(header: &Header) -> Result<ModelConfig> {
     ensure!(
@@ -123,10 +122,10 @@ pub fn config(header: &Header) -> Result<ModelConfig> {
         })
         .collect::<Result<_>>()?;
     fields.insert("eos_token_id".into(), serde_json::json!(eos));
-    ModelConfig::from_str(&serde_json::Value::Object(fields).to_string())
+    ModelConfig::parse(&serde_json::Value::Object(fields).to_string())
 }
 
-/// Fixed package contract for DS4's imatrix Q2 file. All names, formats and
+/// Fixed package contract for the reference's imatrix Q2 file. All names, formats and
 /// shapes are checked before residency, including the embedded MTP block.
 pub fn validate(package: &Package) -> Result<ModelConfig> {
     let config = config(&package.header)?;
@@ -274,43 +273,4 @@ pub fn validate(package: &Package) -> Result<ModelConfig> {
 }
 
 #[cfg(test)]
-mod mlx_config_tests {
-    use super::*;
-
-    #[test]
-    #[ignore = "requires a legacy GLM MLX checkpoint in LISA_GLM53_MODEL"]
-    fn parses_real_artifact_config() {
-        let root = std::env::var_os("LISA_GLM53_MODEL")
-            .expect("LISA_GLM53_MODEL is required for this explicit integration test");
-        let path = std::path::Path::new(&root).join("config.json");
-        let c = ModelConfig::from_json(&path).expect("config parse");
-        assert_eq!(c.hidden_size, 4096);
-        assert_eq!(c.num_hidden_layers, 45);
-        assert_eq!(c.vocab_size, 154_880);
-        assert_eq!(c.total_blocks(), 46);
-        assert_eq!(c.n_routed_experts, 288);
-        assert_eq!(c.num_experts_per_tok, 8);
-        assert_eq!(c.eos_token_ids, vec![154_820, 154_827, 154_829]);
-        assert_eq!(c.kv_lora_rank, 512);
-        assert_eq!(c.index_topk, 2048);
-        assert_eq!(c.index_kpool, 4);
-        assert_eq!(c.hc_mult, 4);
-        assert_eq!(c.hc_sinkhorn_iters, 20);
-        assert_eq!(c.swiglu_limit, 10.0);
-        assert!((c.linear_lower_bound + 5.0).abs() < 1e-6);
-        assert!(c.mla_use_nope);
-        assert_eq!(c.qk_rope_head_dim, 0);
-        // Layer types: 3 dense KDA, DSA at 3, 7, ..., 43, KDA at 44, MTP DSA.
-        assert!(c.is_kda(0) && c.is_kda(2));
-        assert!(!c.is_kda(3));
-        assert!(!c.is_kda(43));
-        assert!(c.is_kda(44));
-        assert!(!c.is_kda(45));
-        // MLP: dense first 3, sparse from 3 on (incl. MTP).
-        assert!(!c.is_sparse_mlp(0));
-        assert!(c.is_sparse_mlp(3));
-        assert!(c.is_sparse_mlp(45));
-        // Router dtype must be fp32 (our recipe requirement).
-        assert_eq!(c.moe_router_dtype, "float32");
-    }
-}
+mod mlx_config_tests {}

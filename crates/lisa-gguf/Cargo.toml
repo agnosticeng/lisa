@@ -10,3 +10,6 @@ anyhow.workspace = true
 half.workspace = true
 libc.workspace = true
 memmap2.workspace = true
+
+[lints]
+workspace = true

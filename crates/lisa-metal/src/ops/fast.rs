@@ -72,7 +72,7 @@ pub fn layer_norm(x: &Array, weight: &Array, bias: &Array, eps: f32) -> Result<A
     )?))
 }
 
-/// Fused residual-add + RMSNorm (specs/08 §1): returns `(sum, normed)` where
+/// Fused residual-add + RMSNorm: returns `(sum, normed)` where
 /// `sum = bf16(x + r)` and `normed = rms_norm(sum, weight, eps)` — one
 /// dispatch, bit-identical to the composed pair.
 pub fn fused_add_rms_norm(
@@ -119,10 +119,49 @@ pub fn rope(
     )?))
 }
 
+/// Tensor-offset variant of `rope`, retaining the same kernel, scalar offset
+/// specialization and arithmetic. The immutable offset allocation is caller-owned.
+pub fn rope_at(
+    x: &Array,
+    dimensions: i32,
+    traditional: bool,
+    base: f32,
+    scale: f32,
+    offset: &Array,
+) -> Result<Array> {
+    if x.ndim() < 2 || dimensions <= 0 || dimensions % 2 != 0 || dimensions > x.dim(-1) {
+        crate::bail!("rope: dimensions must be positive, even and no larger than the head width");
+    }
+    if offset.dtype() != Dtype::Int32
+        || offset.shape() != [1]
+        || !std::sync::Arc::ptr_eq(x.t.runtime(), offset.t.runtime())
+    {
+        crate::bail!("rope: tensor offset must be I32[1] on the activation device");
+    }
+    if dimensions < x.dim(-1) {
+        use super::indexing::{Ellipsis, IndexOp};
+        let prefix = x.index((Ellipsis, 0..dimensions)).contiguous()?;
+        let rotated = rope_at(&prefix, dimensions, traditional, base, scale, offset)?;
+        let tail = x.index((Ellipsis, dimensions..));
+        return Array::concatenate(&[&rotated, &tail], -1);
+    }
+    Ok(Array::new(jit::rope(
+        x.t.device(),
+        &x.t,
+        dimensions,
+        traditional,
+        base,
+        scale,
+        &offset.t,
+        true,
+    )?))
+}
+
 #[cfg(test)]
 mod offset_tests {
     use super::*;
     use crate::ops::{Dtype, indexing::IndexOp};
+    use lisa_backend::TensorAccess;
 
     fn bits(array: &Array) -> Result<Vec<u32>> {
         Ok(array
@@ -132,6 +171,63 @@ mod offset_tests {
             .into_iter()
             .map(f32::to_bits)
             .collect())
+    }
+
+    #[test]
+    fn tensor_offset_rotary_preserves_host_offset_arithmetic_and_views() -> anyhow::Result<()> {
+        use lisa_backend::{Device, Kernel, TensorOperation};
+        let device = crate::device::MetalDevice::system_default();
+        let stream = device.stream();
+        for dtype in [Dtype::Bfloat16, Dtype::Float16, Dtype::Float32] {
+            for (heads, rows) in [(8, 1), (24, 8), (8, 7), (8, 1023)] {
+                let shape = [2, heads, rows, 128];
+                let values = (0..shape.iter().product::<i32>())
+                    .map(|i| ((i * 17 % 257) as f32 - 128.) / 31.)
+                    .collect::<Vec<_>>();
+                // Preserve a nonzero byte origin on contiguous activations.
+                let x = Array::from_slice(&values, &shape)
+                    .as_dtype(dtype)?
+                    .slice(0, 1, Some(2))?;
+                for dimensions in [64, 128] {
+                    let operation = Kernel::Tensor(TensorOperation::RotaryAt {
+                        dimensions,
+                        base: 1e6f32.to_bits(),
+                    });
+                    let handle = device
+                        .prepare(operation)?
+                        .ok_or_else(|| anyhow::anyhow!("missing tensor-offset rotary"))?;
+                    for offset in [0, 1020, 1024, 131071] {
+                        let positions =
+                            Array::from_slice(&[-7, offset, 99], &[3]).slice(0, 1, Some(2))?;
+                        let expected = rope(&x, dimensions, false, Some(1e6), 1., offset, None)?;
+                        let actual = device
+                            .dispatch(&handle, &[&x, &positions], &stream)?
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("tensor-offset rotary declined valid inputs")
+                            })?
+                            .output
+                            .into_one()
+                            .map_err(anyhow::Error::msg)?;
+                        assert_eq!(
+                            bits(&actual)?,
+                            bits(&expected)?,
+                            "{dtype:?}, heads={heads}, rows={rows}, dims={dimensions}, offset={offset}"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn tensor_offset_rotary_rejects_non_scalar_offset_without_encoding() -> Result<()> {
+        let x = Array::from_slice(&[1f32; 128], &[1, 1, 128]);
+        let wrong_dtype = Array::from_slice(&[0f32], &[1]);
+        let wrong_extent = Array::from_slice(&[0i32, 1], &[2]);
+        assert!(rope_at(&x, 128, false, 1e6, 1., &wrong_dtype).is_err());
+        assert!(rope_at(&x, 128, false, 1e6, 1., &wrong_extent).is_err());
+        Ok(())
     }
 
     #[test]

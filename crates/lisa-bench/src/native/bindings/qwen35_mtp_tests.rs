@@ -50,7 +50,7 @@ impl MtpReference for MtpHead {
         let (cos, sin) = self.rope.cos_sin(&self.context, &pos)?;
         let cos = cos.expand_dims(1)?;
         let sin = sin.expand_dims(1)?;
-        // Same hoist as tower.forward_inner (specs/16): bf16 cast once.
+        // Same hoist as tower.forward_inner: bf16 cast once.
         let cos_bf = cos.as_dtype(lisa_metal::Dtype::Bfloat16)?;
         let sin_bf = sin.as_dtype(lisa_metal::Dtype::Bfloat16)?;
         let cache = self.caches.first_mut();
@@ -104,7 +104,7 @@ fn weights(
     lisa_models::qwen3_5::config::Qwen35Config,
     QuantizedEmbedding,
 ) {
-    let mut config = lisa_models::qwen3_5::config::Qwen35Config::from_str("{}").unwrap();
+    let mut config = lisa_models::qwen3_5::config::Qwen35Config::parse("{}").unwrap();
     config.hidden_size = 256;
     config.intermediate_size = 512;
     config.num_attention_heads = 2;

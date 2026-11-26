@@ -221,7 +221,7 @@ impl Build {
     }
 }
 
-/// Input: token IDs. Output: final normalized encoder states [S,H].
+/// Input: token IDs. Output: final normalized encoder states `[S,H]`.
 pub fn encoder(cfg: &LayaConfig, sequence: i32) -> Plan {
     encoder_with(cfg, sequence, Arithmetic::Native)
 }
@@ -272,8 +272,8 @@ pub fn encoder_with(cfg: &LayaConfig, sequence: i32, arithmetic: Arithmetic) -> 
     p.finish(vec![out])
 }
 
-/// Inputs: encoder states, question-type index [1], marker positions [K].
-/// Outputs: marker logits [K], probabilities [K], first decision hidden row.
+/// Inputs: encoder states, question-type index `[1]`, marker positions `[K]`.
+/// Outputs: marker logits `[K]`, probabilities `[K]`, first decision hidden row.
 pub fn scorer(cfg: &LayaConfig, sequence: i32, markers: i32) -> Plan {
     scorer_with(cfg, sequence, markers, Arithmetic::Native)
 }
@@ -344,7 +344,7 @@ pub fn scorer_with(cfg: &LayaConfig, sequence: i32, markers: i32, arithmetic: Ar
     p.finish(vec![logits, probs, h0])
 }
 
-/// Inputs: first hidden row [1,H], calibrated host features [1,4].
+/// Inputs: first hidden row `[1,H]`, calibrated host features `[1,4]`.
 pub fn action() -> Plan {
     action_with(Arithmetic::Native)
 }

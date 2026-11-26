@@ -7,18 +7,18 @@ use super::compile::{type_string, type_to_name};
 use super::{DType, Device, Tensor};
 use super::{NAX_GEMM_HEADER, NAX_QUANT_HEADER};
 
-const GLM53_AFFINE_Q8_PREFILL_DS4_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("common/matmul/glm53_affine_q8_prefill_ds4.metal");
-const GLM53_AFFINE_Q2_MPP_DS4_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("common/matmul/glm53_affine_q2_mpp_ds4.metal");
-const GLM53_MOE_Q2_PAIR_GROUPED_DS4_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("common/matmul/glm53_moe_q2_pair_grouped_ds4.metal");
-const GLM53_MOE_Q2_MM_GROUPED_DS4_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("common/matmul/glm53_moe_q2_mm_grouped_ds4.metal");
-const GLM53_MOE_GROUPED_SWIGLU_WEIGHT_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("common/elementwise/glm53_moe_grouped_swiglu_weight.metal");
-const GLM53_MOE_Q2_DOWN_GROUPED_DS4_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("common/matmul/glm53_moe_q2_down_grouped_ds4.metal");
+const AFFINE_Q8_PREFILL_DS4_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("common/matmul/affine_q8_prefill_ds4.metal");
+const AFFINE_Q2_MPP_DS4_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("common/matmul/affine_q2_mpp_ds4.metal");
+const MOE_Q2_PAIR_GROUPED_DS4_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("common/matmul/moe_q2_pair_grouped_ds4.metal");
+const MOE_Q2_MM_GROUPED_DS4_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("common/matmul/moe_q2_mm_grouped_ds4.metal");
+const MOE_GROUPED_SWIGLU_WEIGHT_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("pointwise/grouped_swiglu_weight.metal");
+const MOE_Q2_DOWN_GROUPED_DS4_SOURCE: &crate::shader_pack::Source =
+    crate::kernel_source!("common/matmul/moe_q2_down_grouped_ds4.metal");
 use crate::error::Result;
 
 /// MLX `steel_matmul_regular_axpby_nax` (`matmul.cpp:178`), no batch, no
@@ -91,9 +91,9 @@ pub fn matmul_nax(
         if transpose_a { 't' } else { 'n' },
         if transpose_b { 't' } else { 'n' },
     );
-    let align_m = m % bm == 0;
+    let align_m = m.is_multiple_of(bm);
     let align_n = n % bn == 0;
-    let align_k = k % bk == 0;
+    let align_k = k.is_multiple_of(bk);
     let pipeline = compile_nax_jit(
         device,
         &matmul_nax_source(
@@ -119,9 +119,8 @@ pub fn matmul_nax(
         ],
     )?;
     let count = m * n;
-    let obuf =
-        mdev.buffer_for_full_gpu_write((count) as usize * (a.dtype()).size_of(), "gemm_out")?;
-    let out = Array::from_parts(mdev, obuf.clone(), &vec![m, n], a.dtype());
+    let obuf = mdev.buffer_for_full_gpu_write((count) * (a.dtype()).size_of(), "gemm_out")?;
+    let out = Array::from_parts(mdev, obuf.clone(), &[m, n], a.dtype());
 
     let tn = n.div_ceil(bn);
     let tm = m.div_ceil(bm);
@@ -189,6 +188,20 @@ pub(super) fn compile_nax_jit(
     compile_nax_jit_with_math(device, source, name, consts, crate::runtime::Math::Safe)
 }
 
+/// [`compile_nax_jit`] with the source built only on a cache miss.
+pub(super) fn compile_nax_jit_lazy(
+    device: &Device,
+    name: &str,
+    consts: &[(usize, bool)],
+    source: impl FnOnce() -> String,
+) -> Result<ComputePipeline> {
+    let consts: Vec<(usize, ConstVal)> = consts
+        .iter()
+        .map(|&(i, v)| (i, ConstVal::Bool(v)))
+        .collect();
+    device.compile_lazy(name, crate::runtime::Math::Safe, &consts, source)
+}
+
 fn compile_nax_jit_with_math(
     device: &Device,
     source: &str,
@@ -245,9 +258,9 @@ pub fn gather_qmm_rhs_nax(
     let e = w.elem_count() / w.dims()[w.rank() - 1] / w.dims()[w.rank() - 2];
     let bm = if m / e < 64 { 32usize } else { 64usize };
     let (bn, bk, wm, wn) = (64usize, 64usize, 2usize, 2usize);
-    let align_m = m % bm == 0;
-    let align_n = n % bn == 0;
-    let align_k = k % bk == 0;
+    let align_m = m.is_multiple_of(bm);
+    let align_n = n.is_multiple_of(bn);
+    let align_k = k.is_multiple_of(bk);
 
     let ty = type_to_name(x.dtype())?;
     let kname = format!(
@@ -260,10 +273,8 @@ pub fn gather_qmm_rhs_nax(
         &[(200, align_m), (201, align_n), (202, align_k)],
     )?;
 
-    let obuf = mdev.buffer_for_full_gpu_write(
-        (total) as usize * (x.dtype()).size_of(),
-        "gather_qmm_rhs_nax_out",
-    )?;
+    let obuf =
+        mdev.buffer_for_full_gpu_write((total) * (x.dtype()).size_of(), "gather_qmm_rhs_nax_out")?;
     let out = Array::from_parts(mdev, obuf.clone(), &out_dims, x.dtype());
 
     let guard = mdev.commands.encoder()?;
@@ -369,9 +380,8 @@ pub fn qmm_nax(
     )?;
 
     let count = m * n;
-    let obuf =
-        mdev.buffer_for_full_gpu_write((count) as usize * (x.dtype()).size_of(), "qmm_nax_out")?;
-    let out = Array::from_parts(mdev, obuf.clone(), &vec![m, n], x.dtype());
+    let obuf = mdev.buffer_for_full_gpu_write((count) * (x.dtype()).size_of(), "qmm_nax_out")?;
+    let out = Array::from_parts(mdev, obuf.clone(), &[m, n], x.dtype());
 
     let guard = mdev.commands.encoder()?;
     let enc = guard.encoder();
@@ -405,20 +415,8 @@ pub fn qmm_nax(
     Ok(out)
 }
 
-/// Kept for the existing prefill comparison harness. The candidate now uses
-/// DS4's full crossover, including generic SIMD-matrix tails and BF16 metadata.
-pub fn glm53_affine_q8_mpp_prefill(
-    device: &Device,
-    x: &Tensor,
-    w: &Tensor,
-    scales: &Tensor,
-    biases: &Tensor,
-) -> Result<Tensor> {
-    glm53_affine_q8_prefill(device, x, w, scales, biases)
-}
-
 #[repr(C)]
-struct Glm53Q8MmArgs {
+struct Q8MmArgs {
     ne00: i32,
     ne02: i32,
     nb01: u64,
@@ -437,13 +435,13 @@ struct Glm53Q8MmArgs {
     padding1: u32,
 }
 
-const _: [(); 88] = [(); std::mem::size_of::<Glm53Q8MmArgs>()];
+const _: [(); 88] = [(); std::mem::size_of::<Q8MmArgs>()];
 
-/// Candidate port of DS4's Q8 matrix schedule with original MLX affine storage.
+/// Candidate port of the reference's Q8 matrix schedule with original MLX affine storage.
 /// Rows 17+ use the 64x32 generic kernel, except aligned MPP rows on capable
 /// devices. Unaligned batches of 192+ split into an MPP prefix and generic tail.
-/// The caller keeps rows <=16 on DS4's existing affine matvec path.
-pub fn glm53_affine_q8_prefill(
+/// The caller keeps rows <=16 on the reference's existing affine matvec path.
+pub fn affine_q8_prefill(
     device: &Device,
     x: &Tensor,
     w: &Tensor,
@@ -463,16 +461,14 @@ pub fn glm53_affine_q8_prefill(
         || k % 64 != 0
         || [m, k, n].into_iter().any(|dim| dim > i32::MAX as usize)
     {
-        crate::bail!(
-            "glm53_affine_q8_prefill: unsupported geometry or dtype (M={m}, K={k}, N={n})"
-        );
+        crate::bail!("affine_q8_prefill: unsupported geometry or dtype (M={m}, K={k}, N={n})");
     }
     if scales.dims2() != (n, k / 64) || biases.dims2() != (n, k / 64) {
-        crate::bail!("glm53_affine_q8_prefill: affine arrays must have shape [N, K/64]");
+        crate::bail!("affine_q8_prefill: affine arrays must have shape [N, K/64]");
     }
     for tensor in [x, w, scales, biases] {
         if !tensor.buffer_and_layout().1.is_contiguous() {
-            crate::bail!("glm53_affine_q8_prefill: non-contiguous input");
+            crate::bail!("affine_q8_prefill: non-contiguous input");
         }
     }
     let mpp_rows = if device.nax() && n % 64 == 0 && (m % 32 == 0 || m >= 192) {
@@ -492,11 +488,11 @@ pub fn glm53_affine_q8_prefill(
         static MPP_SOURCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
         MPP_SOURCE
             .get_or_init(|| {
-                format!("#define DS4_METAL_HAS_TENSOR 1\n{GLM53_AFFINE_Q8_PREFILL_DS4_SOURCE}")
+                format!("#define DS4_METAL_HAS_TENSOR 1\n{AFFINE_Q8_PREFILL_DS4_SOURCE}")
             })
             .as_str()
     } else {
-        GLM53_AFFINE_Q8_PREFILL_DS4_SOURCE
+        AFFINE_Q8_PREFILL_DS4_SOURCE
     };
     let output_bytes = m
         .checked_mul(n)
@@ -529,7 +525,7 @@ pub fn glm53_affine_q8_prefill(
             &[(0, false), (1, !mpp && boundary)],
             crate::runtime::Math::CompilerDefault,
         )?;
-        let args = Glm53Q8MmArgs {
+        let args = Q8MmArgs {
             ne00: k as i32,
             ne02: 1,
             nb01: k as u64,
@@ -587,12 +583,12 @@ pub fn glm53_affine_q8_prefill(
     Ok(output)
 }
 
-/// DS4-style MPP prefill tile for MLX affine-Q2 weights. The caller supplies
+/// reference-style MPP prefill tile for MLX affine-Q2 weights. The caller supplies
 /// one contiguous expert matrix: weights `[N,K/4]`, scales/biases `[N,K/128]`,
 /// and activations `[M,K]`. Each dequantized weight is rounded to half before
-/// matrix accumulation, matching the weight staging class used by DS4's
+/// matrix accumulation, matching the weight staging class used by the reference's
 /// grouped routed-expert kernels.
-pub fn glm53_affine_q2_mpp_prefill(
+pub fn affine_q2_mpp_prefill(
     device: &Device,
     x: &Tensor,
     w: &Tensor,
@@ -604,7 +600,7 @@ pub fn glm53_affine_q2_mpp_prefill(
     let metadata_ty = match scales.dtype() {
         DType::F32 => "f32",
         DType::BF16 => "bf16",
-        other => crate::bail!("glm53_affine_q2_mpp_prefill: unsupported metadata type {other:?}"),
+        other => crate::bail!("affine_q2_mpp_prefill: unsupported metadata type {other:?}"),
     };
     if x.dtype() != DType::F32
         || biases.dtype() != scales.dtype()
@@ -616,21 +612,21 @@ pub fn glm53_affine_q2_mpp_prefill(
         || n % 64 != 0
     {
         crate::bail!(
-            "glm53_affine_q2_mpp_prefill: unsupported shape/dtype (M={m}, K={k}, N={n}, packedK={packed_k}, metadata={:?})",
+            "affine_q2_mpp_prefill: unsupported shape/dtype (M={m}, K={k}, N={n}, packedK={packed_k}, metadata={:?})",
             scales.dtype()
         );
     }
     if scales.dims2() != (n, k / 128) || biases.dims2() != (n, k / 128) {
-        crate::bail!("glm53_affine_q2_mpp_prefill: affine arrays must have shape [N, K/128]");
+        crate::bail!("affine_q2_mpp_prefill: affine arrays must have shape [N, K/128]");
     }
     for tensor in [x, w, scales, biases] {
         if !tensor.buffer_and_layout().1.is_contiguous() {
-            crate::bail!("glm53_affine_q2_mpp_prefill: non-contiguous input");
+            crate::bail!("affine_q2_mpp_prefill: non-contiguous input");
         }
     }
 
     let name = format!("glm53_affine_q2_mpp_ds4_{metadata_ty}_nr1_32_nr0_64_nk32");
-    let source = format!("{NAX_QUANT_HEADER}\n{GLM53_AFFINE_Q2_MPP_DS4_SOURCE}");
+    let source = format!("{NAX_QUANT_HEADER}\n{AFFINE_Q2_MPP_DS4_SOURCE}");
     let pipeline = compile_nax_jit(device, &source, &name, &[])?;
     let output_buffer =
         device.buffer_for_full_gpu_write(m * n * std::mem::size_of::<f32>(), &name)?;
@@ -670,7 +666,7 @@ pub fn glm53_affine_q2_mpp_prefill(
 /// The caller must keep its workspace lease through the last consumer encode.
 /// Each returned tensor gets a fresh host cache; a workspace view must never
 /// escape as a persistent result or diagnostic capture.
-fn glm53_grouped_output(
+fn grouped_output(
     device: &Device,
     reuse: Option<&Tensor>,
     shape: &[usize],
@@ -700,12 +696,12 @@ fn glm53_grouped_output(
     }
 }
 
-/// DS4-style expert-major affine-Q2 gate/up simdgroup prefill. `route_ids`,
+/// reference-style expert-major affine-Q2 gate/up simdgroup prefill. `route_ids`,
 /// counts, work count, and work items come from the GLM expert-route map. The
 /// address table contains nine GPU addresses per expert; `keepalive` retains
 /// indirect buffers when no model-wide residency set is attached.
 #[allow(clippy::too_many_arguments)]
-pub fn glm53_moe_q2_pair_grouped_ds4_prefill(
+pub fn moe_q2_pair_grouped_ds4_prefill(
     device: &Device,
     address_table: &Tensor,
     x: &Tensor,
@@ -723,7 +719,7 @@ pub fn glm53_moe_q2_pair_grouped_ds4_prefill(
     mid_dim: usize,
     limit: f32,
 ) -> Result<Tensor> {
-    glm53_moe_q2_pair_grouped_ds4_prefill_with_output(
+    moe_q2_pair_grouped_ds4_prefill_with_output(
         device,
         address_table,
         x,
@@ -746,7 +742,7 @@ pub fn glm53_moe_q2_pair_grouped_ds4_prefill(
 
 /// Reuse a model-owned full-write output; its lease must cover every consumer.
 #[allow(clippy::too_many_arguments)]
-pub fn glm53_moe_q2_pair_grouped_ds4_prefill_with_output(
+pub fn moe_q2_pair_grouped_ds4_prefill_with_output(
     device: &Device,
     address_table: &Tensor,
     x: &Tensor,
@@ -769,20 +765,18 @@ pub fn glm53_moe_q2_pair_grouped_ds4_prefill_with_output(
         DType::F32 => "f32",
         DType::BF16 => "bf16",
         other => {
-            crate::bail!(
-                "glm53_moe_q2_pair_grouped_ds4_prefill: unsupported metadata dtype {other:?}"
-            )
+            crate::bail!("moe_q2_pair_grouped_ds4_prefill: unsupported metadata dtype {other:?}")
         }
     };
     if address_table.rank() != 1
         || address_table.dtype() != DType::I64
-        || address_table.dim(0) != n_experts.checked_mul(9).unwrap_or(usize::MAX)
+        || address_table.dim(0) != n_experts.saturating_mul(9)
         || x.rank() != 2
         || x.dtype() != DType::F32
         || x.dim(0) != n_tokens
         || route_ids.rank() != 1
         || route_ids.dtype() != DType::I32
-        || route_ids.dim(0) != n_experts.checked_mul(n_tokens).unwrap_or(usize::MAX)
+        || route_ids.dim(0) != n_experts.saturating_mul(n_tokens)
         || counts.rank() != 1
         || counts.dtype() != DType::I32
         || counts.dim(0) != n_experts
@@ -797,47 +791,45 @@ pub fn glm53_moe_q2_pair_grouped_ds4_prefill_with_output(
         || top_k == 0
         || n_experts == 0
         || mid_dim == 0
-        || mid_dim % 64 != 0
+        || !mid_dim.is_multiple_of(64)
         || n_tokens > i32::MAX as usize
         || top_k > i32::MAX as usize
         || n_experts > i32::MAX as usize
         || mid_dim > i32::MAX as usize
         || x.dim(1) == 0
-        || x.dim(1) % 128 != 0
+        || !x.dim(1).is_multiple_of(128)
         || x.dim(1) > i32::MAX as usize
         || [n_tokens, top_k, n_experts, mid_dim, x.dim(1)]
             .into_iter()
             .any(|dim| dim > i32::MAX as usize)
     {
-        crate::bail!("glm53_moe_q2_pair_grouped_ds4_prefill: unsupported route/weight shape");
+        crate::bail!("moe_q2_pair_grouped_ds4_prefill: unsupported route/weight shape");
     }
     let n_slots = route_weights.dim(0);
     let in_dim = x.dim(1);
-    if n_slots != n_tokens.checked_mul(top_k).unwrap_or(usize::MAX) {
-        crate::bail!(
-            "glm53_moe_q2_pair_grouped_ds4_prefill: route weights do not match [tokens, top_k]"
-        );
+    if n_slots != n_tokens.saturating_mul(top_k) {
+        crate::bail!("moe_q2_pair_grouped_ds4_prefill: route weights do not match [tokens, top_k]");
     }
-    let max_work_items = (n_slots / 32 + usize::from(n_slots % 32 != 0))
+    let max_work_items = (n_slots / 32 + usize::from(!n_slots.is_multiple_of(32)))
         .checked_add(n_experts)
         .ok_or_else(|| {
-            crate::error::Error::msg("glm53_moe_q2_pair_grouped_ds4_prefill: work size overflow")
+            crate::error::Error::msg("moe_q2_pair_grouped_ds4_prefill: work size overflow")
         })?;
     if work_items.dim(0) < max_work_items.saturating_mul(2) {
-        crate::bail!("glm53_moe_q2_pair_grouped_ds4_prefill: route work buffer is too small");
+        crate::bail!("moe_q2_pair_grouped_ds4_prefill: route work buffer is too small");
     }
     let output_elems = n_slots.checked_mul(mid_dim).ok_or_else(|| {
-        crate::error::Error::msg("glm53_moe_q2_pair_grouped_ds4_prefill: output size overflow")
+        crate::error::Error::msg("moe_q2_pair_grouped_ds4_prefill: output size overflow")
     })?;
     let output_bytes = output_elems
         .checked_mul(std::mem::size_of::<half::f16>())
         .ok_or_else(|| {
-            crate::error::Error::msg("glm53_moe_q2_pair_grouped_ds4_prefill: output byte overflow")
+            crate::error::Error::msg("moe_q2_pair_grouped_ds4_prefill: output byte overflow")
         })?;
     let name = format!("glm53_moe_q2_pair_grouped_ds4_{metadata_ty}_nr1_32_nr0_64_nk32");
-    let source = format!("{NAX_QUANT_HEADER}\n{GLM53_MOE_Q2_PAIR_GROUPED_DS4_SOURCE}");
+    let source = format!("{NAX_QUANT_HEADER}\n{MOE_Q2_PAIR_GROUPED_DS4_SOURCE}");
     let pipeline = compile_nax_jit(device, &source, &name, &[])?;
-    let output = glm53_grouped_output(
+    let output = grouped_output(
         device,
         reuse_output,
         &[n_slots, mid_dim],
@@ -909,11 +901,11 @@ pub fn glm53_moe_q2_pair_grouped_ds4_prefill_with_output(
     Ok(output)
 }
 
-/// DS4's split expert-major affine-Q2 gate or up projection. The caller
+/// The reference's split expert-major affine-Q2 gate or up projection. The caller
 /// dispatches both projections independently, then applies the separate
-/// route-weighted F16 SwiGLU stage used by DS4's grouped MoE path.
+/// route-weighted F16 SwiGLU stage used by the reference's grouped MoE path.
 #[allow(clippy::too_many_arguments)]
-pub fn glm53_moe_q2_mm_grouped_ds4_prefill(
+pub fn moe_q2_mm_grouped_ds4_prefill(
     device: &Device,
     address_table: &Tensor,
     x: &Tensor,
@@ -931,7 +923,7 @@ pub fn glm53_moe_q2_mm_grouped_ds4_prefill(
     is_up: bool,
     vector_load: bool,
 ) -> Result<Tensor> {
-    glm53_moe_q2_mm_grouped_ds4_prefill_with_output(
+    moe_q2_mm_grouped_ds4_prefill_with_output(
         device,
         address_table,
         x,
@@ -954,7 +946,7 @@ pub fn glm53_moe_q2_mm_grouped_ds4_prefill(
 
 /// Reuse a model-owned full-write output; its lease must cover every consumer.
 #[allow(clippy::too_many_arguments)]
-pub fn glm53_moe_q2_mm_grouped_ds4_prefill_with_output(
+pub fn moe_q2_mm_grouped_ds4_prefill_with_output(
     device: &Device,
     address_table: &Tensor,
     x: &Tensor,
@@ -977,20 +969,18 @@ pub fn glm53_moe_q2_mm_grouped_ds4_prefill_with_output(
         DType::F32 => "f32",
         DType::BF16 => "bf16",
         other => {
-            crate::bail!(
-                "glm53_moe_q2_mm_grouped_ds4_prefill: unsupported metadata dtype {other:?}"
-            )
+            crate::bail!("moe_q2_mm_grouped_ds4_prefill: unsupported metadata dtype {other:?}")
         }
     };
     if address_table.rank() != 1
         || address_table.dtype() != DType::I64
-        || address_table.dim(0) != n_experts.checked_mul(9).unwrap_or(usize::MAX)
+        || address_table.dim(0) != n_experts.saturating_mul(9)
         || x.rank() != 2
         || x.dtype() != DType::F32
         || x.dim(0) != n_tokens
         || route_ids.rank() != 1
         || route_ids.dtype() != DType::I32
-        || route_ids.dim(0) != n_experts.checked_mul(n_tokens).unwrap_or(usize::MAX)
+        || route_ids.dim(0) != n_experts.saturating_mul(n_tokens)
         || counts.rank() != 1
         || counts.dtype() != DType::I32
         || counts.dim(0) != n_experts
@@ -1003,43 +993,43 @@ pub fn glm53_moe_q2_mm_grouped_ds4_prefill_with_output(
         || top_k == 0
         || n_experts == 0
         || out_dim == 0
-        || out_dim % 64 != 0
+        || !out_dim.is_multiple_of(64)
         || n_tokens > i32::MAX as usize
         || top_k > i32::MAX as usize
         || n_experts > i32::MAX as usize
         || out_dim > i32::MAX as usize
         || x.dim(1) == 0
-        || x.dim(1) % 128 != 0
+        || !x.dim(1).is_multiple_of(128)
         || x.dim(1) > i32::MAX as usize
     {
-        crate::bail!("glm53_moe_q2_mm_grouped_ds4_prefill: unsupported route/weight shape");
+        crate::bail!("moe_q2_mm_grouped_ds4_prefill: unsupported route/weight shape");
     }
-    let n_slots = n_tokens.checked_mul(top_k).unwrap_or(usize::MAX);
+    let n_slots = n_tokens.saturating_mul(top_k);
     let in_dim = x.dim(1);
-    let max_work_items = (n_slots / 32 + usize::from(n_slots % 32 != 0))
+    let max_work_items = (n_slots / 32 + usize::from(!n_slots.is_multiple_of(32)))
         .checked_add(n_experts)
         .ok_or_else(|| {
-            crate::error::Error::msg("glm53_moe_q2_mm_grouped_ds4_prefill: work size overflow")
+            crate::error::Error::msg("moe_q2_mm_grouped_ds4_prefill: work size overflow")
         })?;
     if work_items.dim(0) < max_work_items.saturating_mul(2) {
-        crate::bail!("glm53_moe_q2_mm_grouped_ds4_prefill: route work buffer is too small");
+        crate::bail!("moe_q2_mm_grouped_ds4_prefill: route work buffer is too small");
     }
     let output_elems = n_slots.checked_mul(out_dim).ok_or_else(|| {
-        crate::error::Error::msg("glm53_moe_q2_mm_grouped_ds4_prefill: output size overflow")
+        crate::error::Error::msg("moe_q2_mm_grouped_ds4_prefill: output size overflow")
     })?;
     let output_bytes = output_elems
         .checked_mul(std::mem::size_of::<f32>())
         .ok_or_else(|| {
-            crate::error::Error::msg("glm53_moe_q2_mm_grouped_ds4_prefill: output byte overflow")
+            crate::error::Error::msg("moe_q2_mm_grouped_ds4_prefill: output byte overflow")
         })?;
     let direction = if is_up { "up" } else { "gate" };
     let load_variant = if vector_load { "" } else { "_scalar" };
     let name = format!(
         "glm53_moe_q2_mm_grouped_ds4_{metadata_ty}_{direction}{load_variant}_nr1_32_nr0_64_nk32"
     );
-    let source = format!("{NAX_QUANT_HEADER}\n{GLM53_MOE_Q2_MM_GROUPED_DS4_SOURCE}");
+    let source = format!("{NAX_QUANT_HEADER}\n{MOE_Q2_MM_GROUPED_DS4_SOURCE}");
     let pipeline = compile_nax_jit(device, &source, &name, &[])?;
-    let output = glm53_grouped_output(
+    let output = grouped_output(
         device,
         reuse_output,
         &[n_slots, out_dim],
@@ -1094,9 +1084,9 @@ pub fn glm53_moe_q2_mm_grouped_ds4_prefill_with_output(
     Ok(output)
 }
 
-/// Apply DS4's separate clamped, route-weighted SwiGLU and store the compact
+/// Apply the reference's separate clamped, route-weighted SwiGLU and store the compact
 /// F16 intermediate consumed by grouped down projection.
-pub fn glm53_moe_grouped_swiglu_weight_prefill(
+pub fn moe_grouped_swiglu_weight_prefill(
     device: &Device,
     gate: &Tensor,
     up: &Tensor,
@@ -1105,9 +1095,9 @@ pub fn glm53_moe_grouped_swiglu_weight_prefill(
     width: usize,
     limit: f32,
 ) -> Result<Tensor> {
-    // DS4 compiles its monolithic Metal library with Metal's default math
+    // The reference compiles its monolithic Metal library with Metal's default math
     // settings. Match that mode for its weighted SwiGLU schedule.
-    glm53_moe_grouped_swiglu_weight_prefill_with_math(
+    moe_grouped_swiglu_weight_prefill_with_math(
         device,
         gate,
         up,
@@ -1119,7 +1109,7 @@ pub fn glm53_moe_grouped_swiglu_weight_prefill(
     )
 }
 
-fn glm53_moe_grouped_swiglu_weight_prefill_with_math(
+fn moe_grouped_swiglu_weight_prefill_with_math(
     device: &Device,
     gate: &Tensor,
     up: &Tensor,
@@ -1129,7 +1119,7 @@ fn glm53_moe_grouped_swiglu_weight_prefill_with_math(
     limit: f32,
     math: crate::runtime::Math,
 ) -> Result<Tensor> {
-    glm53_moe_grouped_swiglu_weight_prefill_impl(
+    moe_grouped_swiglu_weight_prefill_impl(
         device,
         gate,
         up,
@@ -1142,9 +1132,9 @@ fn glm53_moe_grouped_swiglu_weight_prefill_with_math(
     )
 }
 
-/// Reuse the model-owned F16 activation output without changing DS4 math.
+/// Reuse the model-owned F16 activation output without changing the reference math.
 #[allow(clippy::too_many_arguments)]
-pub fn glm53_moe_grouped_swiglu_weight_prefill_with_output(
+pub fn moe_grouped_swiglu_weight_prefill_with_output(
     device: &Device,
     gate: &Tensor,
     up: &Tensor,
@@ -1154,7 +1144,7 @@ pub fn glm53_moe_grouped_swiglu_weight_prefill_with_output(
     limit: f32,
     reuse_output: Option<&Tensor>,
 ) -> Result<Tensor> {
-    glm53_moe_grouped_swiglu_weight_prefill_impl(
+    moe_grouped_swiglu_weight_prefill_impl(
         device,
         gate,
         up,
@@ -1168,7 +1158,7 @@ pub fn glm53_moe_grouped_swiglu_weight_prefill_with_output(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn glm53_moe_grouped_swiglu_weight_prefill_impl(
+fn moe_grouped_swiglu_weight_prefill_impl(
     device: &Device,
     gate: &Tensor,
     up: &Tensor,
@@ -1193,14 +1183,14 @@ fn glm53_moe_grouped_swiglu_weight_prefill_impl(
         || n_slots > i32::MAX as usize
         || width > i32::MAX as usize
     {
-        crate::bail!("glm53_moe_grouped_swiglu_weight_prefill: unsupported activation shape");
+        crate::bail!("moe_grouped_swiglu_weight_prefill: unsupported activation shape");
     }
     for tensor in [gate, up, route_weights] {
         if !tensor.buffer_and_layout().1.is_contiguous() {
-            crate::bail!("glm53_moe_grouped_swiglu_weight_prefill: non-contiguous input");
+            crate::bail!("moe_grouped_swiglu_weight_prefill: non-contiguous input");
         }
     }
-    let source = format!("{NAX_QUANT_HEADER}\n{GLM53_MOE_GROUPED_SWIGLU_WEIGHT_SOURCE}");
+    let source = format!("{NAX_QUANT_HEADER}\n{MOE_GROUPED_SWIGLU_WEIGHT_SOURCE}");
     let pipeline = compile_nax_jit_with_math(
         device,
         &source,
@@ -1209,16 +1199,14 @@ fn glm53_moe_grouped_swiglu_weight_prefill_impl(
         math,
     )?;
     let output_elems = n_slots.checked_mul(width).ok_or_else(|| {
-        crate::error::Error::msg("glm53_moe_grouped_swiglu_weight_prefill: output size overflow")
+        crate::error::Error::msg("moe_grouped_swiglu_weight_prefill: output size overflow")
     })?;
     let output_bytes = output_elems
         .checked_mul(std::mem::size_of::<half::f16>())
         .ok_or_else(|| {
-            crate::error::Error::msg(
-                "glm53_moe_grouped_swiglu_weight_prefill: output byte overflow",
-            )
+            crate::error::Error::msg("moe_grouped_swiglu_weight_prefill: output byte overflow")
         })?;
-    let output = glm53_grouped_output(
+    let output = grouped_output(
         device,
         reuse_output,
         &[n_slots, width],
@@ -1260,10 +1248,10 @@ fn glm53_moe_grouped_swiglu_weight_prefill_impl(
     Ok(output)
 }
 
-/// DS4-style expert-major affine-Q2 down projection over F16 SwiGLU rows.
+/// reference-style expert-major affine-Q2 down projection over F16 SwiGLU rows.
 /// Route-map tensors use the same expert-major layout as the gate/up kernel.
 #[allow(clippy::too_many_arguments)]
-pub fn glm53_moe_q2_down_grouped_ds4_prefill(
+pub fn moe_q2_down_grouped_ds4_prefill(
     device: &Device,
     address_table: &Tensor,
     x: &Tensor,
@@ -1281,7 +1269,7 @@ pub fn glm53_moe_q2_down_grouped_ds4_prefill(
     vector_load: bool,
     output_tile: usize,
 ) -> Result<Tensor> {
-    glm53_moe_q2_down_grouped_ds4_prefill_with_output(
+    moe_q2_down_grouped_ds4_prefill_with_output(
         device,
         address_table,
         x,
@@ -1304,7 +1292,7 @@ pub fn glm53_moe_q2_down_grouped_ds4_prefill(
 
 /// Reuse a model-owned full-write output; its lease must cover every consumer.
 #[allow(clippy::too_many_arguments)]
-pub fn glm53_moe_q2_down_grouped_ds4_prefill_with_output(
+pub fn moe_q2_down_grouped_ds4_prefill_with_output(
     device: &Device,
     address_table: &Tensor,
     x: &Tensor,
@@ -1327,20 +1315,18 @@ pub fn glm53_moe_q2_down_grouped_ds4_prefill_with_output(
         DType::F32 => "f32",
         DType::BF16 => "bf16",
         other => {
-            crate::bail!(
-                "glm53_moe_q2_down_grouped_ds4_prefill: unsupported metadata dtype {other:?}"
-            )
+            crate::bail!("moe_q2_down_grouped_ds4_prefill: unsupported metadata dtype {other:?}")
         }
     };
     if address_table.rank() != 1
         || address_table.dtype() != DType::I64
-        || address_table.dim(0) != n_experts.checked_mul(9).unwrap_or(usize::MAX)
+        || address_table.dim(0) != n_experts.saturating_mul(9)
         || x.rank() != 2
         || x.dtype() != DType::F16
-        || x.dim(0) != n_tokens.checked_mul(top_k).unwrap_or(usize::MAX)
+        || x.dim(0) != n_tokens.saturating_mul(top_k)
         || route_ids.rank() != 1
         || route_ids.dtype() != DType::I32
-        || route_ids.dim(0) != n_experts.checked_mul(n_tokens).unwrap_or(usize::MAX)
+        || route_ids.dim(0) != n_experts.saturating_mul(n_tokens)
         || counts.rank() != 1
         || counts.dtype() != DType::I32
         || counts.dim(0) != n_experts
@@ -1354,40 +1340,40 @@ pub fn glm53_moe_q2_down_grouped_ds4_prefill_with_output(
         || n_experts == 0
         || out_dim == 0
         || !matches!(output_tile, 64 | 128)
-        || out_dim % output_tile != 0
+        || !out_dim.is_multiple_of(output_tile)
         || x.dim(1) == 0
-        || x.dim(1) % 128 != 0
+        || !x.dim(1).is_multiple_of(128)
         || [n_tokens, top_k, n_experts, out_dim, x.dim(1)]
             .into_iter()
             .any(|dim| dim > i32::MAX as usize)
     {
-        crate::bail!("glm53_moe_q2_down_grouped_ds4_prefill: unsupported route/weight shape");
+        crate::bail!("moe_q2_down_grouped_ds4_prefill: unsupported route/weight shape");
     }
-    let n_slots = n_tokens.checked_mul(top_k).unwrap_or(usize::MAX);
+    let n_slots = n_tokens.saturating_mul(top_k);
     let in_dim = x.dim(1);
-    let max_work_items = (n_slots / 32 + usize::from(n_slots % 32 != 0))
+    let max_work_items = (n_slots / 32 + usize::from(!n_slots.is_multiple_of(32)))
         .checked_add(n_experts)
         .ok_or_else(|| {
-            crate::error::Error::msg("glm53_moe_q2_down_grouped_ds4_prefill: work size overflow")
+            crate::error::Error::msg("moe_q2_down_grouped_ds4_prefill: work size overflow")
         })?;
     if work_items.dim(0) < max_work_items.saturating_mul(2) {
-        crate::bail!("glm53_moe_q2_down_grouped_ds4_prefill: route work buffer is too small");
+        crate::bail!("moe_q2_down_grouped_ds4_prefill: route work buffer is too small");
     }
     let output_elems = n_slots.checked_mul(out_dim).ok_or_else(|| {
-        crate::error::Error::msg("glm53_moe_q2_down_grouped_ds4_prefill: output size overflow")
+        crate::error::Error::msg("moe_q2_down_grouped_ds4_prefill: output size overflow")
     })?;
     let output_bytes = output_elems
         .checked_mul(std::mem::size_of::<f32>())
         .ok_or_else(|| {
-            crate::error::Error::msg("glm53_moe_q2_down_grouped_ds4_prefill: output byte overflow")
+            crate::error::Error::msg("moe_q2_down_grouped_ds4_prefill: output byte overflow")
         })?;
     let load_variant = if vector_load { "" } else { "_scalar" };
     let name = format!(
         "glm53_moe_q2_down_grouped_ds4_{metadata_ty}{load_variant}_nr1_32_nr0_{output_tile}_nk32"
     );
-    let source = format!("{NAX_QUANT_HEADER}\n{GLM53_MOE_Q2_DOWN_GROUPED_DS4_SOURCE}");
+    let source = format!("{NAX_QUANT_HEADER}\n{MOE_Q2_DOWN_GROUPED_DS4_SOURCE}");
     let pipeline = compile_nax_jit(device, &source, &name, &[])?;
-    let output = glm53_grouped_output(
+    let output = grouped_output(
         device,
         reuse_output,
         &[n_slots, out_dim],
@@ -1443,7 +1429,7 @@ pub fn glm53_moe_q2_down_grouped_ds4_prefill_with_output(
 }
 
 #[cfg(test)]
-mod glm53_moe_grouped_ds4_tests {
+mod moe_grouped_ds4_tests {
     use super::*;
     use crate::ops::Array as OpsArray;
 
@@ -1531,7 +1517,7 @@ mod glm53_moe_grouped_ds4_tests {
             .iter()
             .map(|array| &array.t)
             .collect::<Vec<_>>();
-        let actual = glm53_moe_q2_pair_grouped_ds4_prefill(
+        let actual = moe_q2_pair_grouped_ds4_prefill(
             x.t.device(),
             &address_table.t,
             &x.t,
@@ -1556,7 +1542,7 @@ mod glm53_moe_grouped_ds4_tests {
         .map(f32::from)
         .collect::<Vec<_>>();
 
-        let split_gate = glm53_moe_q2_mm_grouped_ds4_prefill(
+        let split_gate = moe_q2_mm_grouped_ds4_prefill(
             x.t.device(),
             &address_table.t,
             &x.t,
@@ -1575,7 +1561,7 @@ mod glm53_moe_grouped_ds4_tests {
             true,
         )
         .expect("split grouped Q2 gate matmul should compile and dispatch");
-        let split_up = glm53_moe_q2_mm_grouped_ds4_prefill(
+        let split_up = moe_q2_mm_grouped_ds4_prefill(
             x.t.device(),
             &address_table.t,
             &x.t,
@@ -1594,7 +1580,7 @@ mod glm53_moe_grouped_ds4_tests {
             true,
         )
         .expect("split grouped Q2 up matmul should compile and dispatch");
-        let split_pair = glm53_moe_grouped_swiglu_weight_prefill(
+        let split_pair = moe_grouped_swiglu_weight_prefill(
             x.t.device(),
             &split_gate,
             &split_up,
@@ -1624,7 +1610,7 @@ mod glm53_moe_grouped_ds4_tests {
             OpsArray::from_slice(&down_input_values, &[(TOKENS * TOP_K) as i32, IN as i32])
                 .as_dtype(crate::ops::Dtype::Float16)
                 .expect("convert down input to F16");
-        let actual_down = glm53_moe_q2_down_grouped_ds4_prefill(
+        let actual_down = moe_q2_down_grouped_ds4_prefill(
             down_input.t.device(),
             &address_table.t,
             &down_input.t,
@@ -1645,7 +1631,7 @@ mod glm53_moe_grouped_ds4_tests {
         .expect("grouped Q2 DS4 down kernel should compile and dispatch")
         .to_vec1::<f32>()
         .expect("read grouped Q2 DS4 down output");
-        let actual_down_wide = glm53_moe_q2_down_grouped_ds4_prefill(
+        let actual_down_wide = moe_q2_down_grouped_ds4_prefill(
             down_input.t.device(),
             &address_table.t,
             &down_input.t,
@@ -1762,385 +1748,5 @@ mod glm53_moe_grouped_ds4_tests {
             down_rel_l2 < 1.0e-5,
             "grouped Q2 DS4 down rel L2 error {down_rel_l2:e}"
         );
-    }
-
-    fn fixture_f32(path: &std::path::Path) -> Vec<f32> {
-        std::fs::read(path)
-            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
-            .chunks_exact(4)
-            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
-            .collect()
-    }
-
-    fn fixture_i32(path: &std::path::Path) -> Vec<i32> {
-        std::fs::read(path)
-            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
-            .chunks_exact(4)
-            .map(|bytes| i32::from_le_bytes(bytes.try_into().unwrap()))
-            .collect()
-    }
-
-    fn fixture_bf16(path: &std::path::Path) -> Vec<half::bf16> {
-        std::fs::read(path)
-            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
-            .chunks_exact(2)
-            .map(|bytes| half::bf16::from_bits(u16::from_le_bytes(bytes.try_into().unwrap())))
-            .collect()
-    }
-
-    fn fixture_error(actual: &[f32], expected: &[f32]) -> (f32, f64, usize) {
-        assert_eq!(actual.len(), expected.len());
-        let (max_abs, (error_sq, reference_sq, exact)) = actual.iter().zip(expected).fold(
-            (0.0f32, (0.0f64, 0.0f64, 0usize)),
-            |(max_abs, (error_sq, reference_sq, exact)), (&got, &want)| {
-                let delta = got - want;
-                (
-                    max_abs.max(delta.abs()),
-                    (
-                        error_sq + f64::from(delta) * f64::from(delta),
-                        reference_sq + f64::from(want) * f64::from(want),
-                        exact + usize::from(got.to_bits() == want.to_bits()),
-                    ),
-                )
-            },
-        );
-        (
-            max_abs,
-            (error_sq / reference_sq.max(f64::MIN_POSITIVE)).sqrt(),
-            exact,
-        )
-    }
-
-    #[test]
-    #[ignore = "requires the exported MLX Q2 fixture and corrected DS4 sidecars"]
-    fn grouped_q2_real_fixture_matches_ds4_production_simdgroup_oracle() {
-        if !crate::device::metal_available() {
-            eprintln!("[glm53-moe-q2-real] skipping: no Metal device available");
-            return;
-        }
-        const TOKENS: usize = 96;
-        const TOP_K: usize = 8;
-        const EXPERTS: usize = 288;
-        const HIDDEN: usize = 4096;
-        const INTER: usize = 2048;
-
-        let exports = std::path::PathBuf::from(
-            std::env::var("LISA_GLM53_Q2_EXPORT_ROOT").expect("set export root"),
-        );
-        let capture = std::path::PathBuf::from(
-            std::env::var("LISA_GLM53_Q2_CAPTURE_ROOT").expect("set capture root"),
-        );
-        let ds4_prefix = std::path::PathBuf::from(
-            std::env::var("LISA_GLM53_Q2_DS4_OUTPUT_PREFIX").expect("set DS4 output prefix"),
-        );
-
-        let input_values = fixture_f32(&capture.join("input.f32"));
-        let selected_values = fixture_i32(&capture.join("selected_all.i32"));
-        let route_weight_values = fixture_f32(&capture.join("route_weights_all.f32"));
-        assert_eq!(input_values.len(), TOKENS * HIDDEN);
-        assert_eq!(selected_values.len(), TOKENS * TOP_K);
-        assert_eq!(route_weight_values.len(), TOKENS * TOP_K);
-
-        let mut expert_arrays = Vec::<OpsArray>::new();
-        let mut address_values = vec![0i64; EXPERTS * 9];
-        for expert in 0..EXPERTS {
-            if !selected_values.contains(&(expert as i32)) {
-                continue;
-            }
-            for (projection, input_dim, output_dim) in [
-                ("gate_proj", HIDDEN, INTER),
-                ("up_proj", HIDDEN, INTER),
-                ("down_proj", INTER, HIDDEN),
-            ] {
-                let dir = exports.join(format!("expert_{expert}/{projection}"));
-                let packed = std::fs::read(dir.join("weight.u32"))
-                    .unwrap_or_else(|error| panic!("read {}: {error}", dir.display()));
-                let scales = fixture_bf16(&dir.join("scales.bf16"));
-                let biases = fixture_bf16(&dir.join("biases.bf16"));
-                let groups = input_dim / 128;
-                assert_eq!(packed.len(), output_dim * (input_dim / 4));
-                assert_eq!(scales.len(), output_dim * groups);
-                assert_eq!(biases.len(), output_dim * groups);
-
-                let weight =
-                    OpsArray::from_slice(&packed, &[(output_dim * (input_dim / 4)) as i32]);
-                let scale = OpsArray::from_slice(&scales, &[(output_dim as i32), groups as i32]);
-                let bias = OpsArray::from_slice(&biases, &[(output_dim as i32), groups as i32]);
-                let index = expert * 9
-                    + match projection {
-                        "gate_proj" => 0,
-                        "up_proj" => 3,
-                        "down_proj" => 6,
-                        _ => unreachable!(),
-                    };
-                address_values[index] = weight.gpu_address().expect("weight GPU address") as i64;
-                address_values[index + 1] = scale.gpu_address().expect("scale GPU address") as i64;
-                address_values[index + 2] = bias.gpu_address().expect("bias GPU address") as i64;
-                expert_arrays.extend([weight, scale, bias]);
-            }
-        }
-
-        let address_table = OpsArray::from_slice(&address_values, &[(EXPERTS * 9) as i32]);
-        let input = OpsArray::from_slice(&input_values, &[TOKENS as i32, HIDDEN as i32]);
-        let selected = OpsArray::from_slice(&selected_values, &[(TOKENS * TOP_K) as i32]);
-        let route_weights = OpsArray::from_slice(&route_weight_values, &[(TOKENS * TOP_K) as i32]);
-        let stream = crate::ops::Stream::thread_local_or_default();
-        let (route_ids, counts, work_count, work_items) =
-            crate::kernels::sparse::kernels::moe_expert_route_map(
-                &selected, TOKENS, TOP_K, EXPERTS, 32, &stream,
-            )
-            .expect("route-map dispatch");
-        let keepalive = expert_arrays
-            .iter()
-            .map(|array| &array.t)
-            .collect::<Vec<_>>();
-
-        let split_gate = glm53_moe_q2_mm_grouped_ds4_prefill(
-            input.t.device(),
-            &address_table.t,
-            &input.t,
-            &route_ids.t,
-            &counts.t,
-            &work_count.t,
-            &work_items.t,
-            &keepalive,
-            None,
-            DType::BF16,
-            TOKENS,
-            TOP_K,
-            EXPERTS,
-            INTER,
-            false,
-            true,
-        )
-        .expect("split grouped gate simdgroup dispatch");
-        let split_up = glm53_moe_q2_mm_grouped_ds4_prefill(
-            input.t.device(),
-            &address_table.t,
-            &input.t,
-            &route_ids.t,
-            &counts.t,
-            &work_count.t,
-            &work_items.t,
-            &keepalive,
-            None,
-            DType::BF16,
-            TOKENS,
-            TOP_K,
-            EXPERTS,
-            INTER,
-            true,
-            true,
-        )
-        .expect("split grouped up simdgroup dispatch");
-        let scalar_gate = glm53_moe_q2_mm_grouped_ds4_prefill(
-            input.t.device(),
-            &address_table.t,
-            &input.t,
-            &route_ids.t,
-            &counts.t,
-            &work_count.t,
-            &work_items.t,
-            &keepalive,
-            None,
-            DType::BF16,
-            TOKENS,
-            TOP_K,
-            EXPERTS,
-            INTER,
-            false,
-            false,
-        )
-        .expect("scalar grouped gate simdgroup dispatch");
-        let scalar_up = glm53_moe_q2_mm_grouped_ds4_prefill(
-            input.t.device(),
-            &address_table.t,
-            &input.t,
-            &route_ids.t,
-            &counts.t,
-            &work_count.t,
-            &work_items.t,
-            &keepalive,
-            None,
-            DType::BF16,
-            TOKENS,
-            TOP_K,
-            EXPERTS,
-            INTER,
-            true,
-            false,
-        )
-        .expect("scalar grouped up simdgroup dispatch");
-        let pair_f16 = OpsArray::new(
-            glm53_moe_grouped_swiglu_weight_prefill(
-                input.t.device(),
-                &split_gate,
-                &split_up,
-                &route_weights.t,
-                TOKENS * TOP_K,
-                INTER,
-                10.0,
-            )
-            .expect("split grouped SwiGLU dispatch"),
-        );
-        let scalar_pair_f16 = OpsArray::new(
-            glm53_moe_grouped_swiglu_weight_prefill(
-                input.t.device(),
-                &scalar_gate,
-                &scalar_up,
-                &route_weights.t,
-                TOKENS * TOP_K,
-                INTER,
-                10.0,
-            )
-            .expect("scalar split grouped SwiGLU dispatch"),
-        );
-        let down = glm53_moe_q2_down_grouped_ds4_prefill(
-            pair_f16.t.device(),
-            &address_table.t,
-            &pair_f16.t,
-            &route_ids.t,
-            &counts.t,
-            &work_count.t,
-            &work_items.t,
-            &keepalive,
-            None,
-            DType::BF16,
-            TOKENS,
-            TOP_K,
-            EXPERTS,
-            HIDDEN,
-            true,
-            64,
-        )
-        .expect("grouped down simdgroup dispatch");
-        let down_array = OpsArray::new(down);
-        let down_wide = glm53_moe_q2_down_grouped_ds4_prefill(
-            pair_f16.t.device(),
-            &address_table.t,
-            &pair_f16.t,
-            &route_ids.t,
-            &counts.t,
-            &work_count.t,
-            &work_items.t,
-            &keepalive,
-            None,
-            DType::BF16,
-            TOKENS,
-            TOP_K,
-            EXPERTS,
-            HIDDEN,
-            true,
-            128,
-        )
-        .expect("wide grouped down simdgroup dispatch");
-        let down_wide_array = OpsArray::new(down_wide);
-        let wide_values = down_wide_array
-            .to_vec1::<f32>()
-            .expect("read wide down F32");
-        let standard_values = down_array.to_vec1::<f32>().expect("read standard down F32");
-        let first_mismatch = wide_values
-            .iter()
-            .zip(&standard_values)
-            .position(|(a, b)| a.to_bits() != b.to_bits());
-        let max_delta = wide_values
-            .iter()
-            .zip(&standard_values)
-            .map(|(a, b)| (f64::from(*a) - f64::from(*b)).abs())
-            .fold(0.0, f64::max);
-        assert!(
-            first_mismatch.is_none(),
-            "128-row down tile differs from DS4 64-row tile: max_abs={max_delta}, first={first_mismatch:?}"
-        );
-        let scalar_down = glm53_moe_q2_down_grouped_ds4_prefill(
-            scalar_pair_f16.t.device(),
-            &address_table.t,
-            &scalar_pair_f16.t,
-            &route_ids.t,
-            &counts.t,
-            &work_count.t,
-            &work_items.t,
-            &keepalive,
-            None,
-            DType::BF16,
-            TOKENS,
-            TOP_K,
-            EXPERTS,
-            HIDDEN,
-            false,
-            64,
-        )
-        .expect("scalar grouped down simdgroup dispatch");
-        let scalar_down_array = OpsArray::new(scalar_down);
-        let sum = crate::kernels::sparse::kernels::moe_sum8(&down_array, TOKENS, HIDDEN, &stream)
-            .expect("ordered sum8 dispatch");
-
-        let actual_pair = pair_f16
-            .t
-            .to_vec::<half::f16>()
-            .expect("read pair F16")
-            .into_iter()
-            .map(f32::from)
-            .collect::<Vec<_>>();
-        let actual_down = down_array.to_vec1::<f32>().expect("read down F32");
-        let scalar_actual_pair = scalar_pair_f16
-            .t
-            .to_vec::<half::f16>()
-            .expect("read scalar pair F16")
-            .into_iter()
-            .map(f32::from)
-            .collect::<Vec<_>>();
-        let scalar_actual_down = scalar_down_array
-            .to_vec1::<f32>()
-            .expect("read scalar down F32");
-        assert!(
-            actual_pair
-                .iter()
-                .zip(&scalar_actual_pair)
-                .all(|(a, b)| a.to_bits() == b.to_bits()),
-            "vector and scalar grouped gate/up results differ"
-        );
-        assert!(
-            actual_down
-                .iter()
-                .zip(&scalar_actual_down)
-                .all(|(a, b)| a.to_bits() == b.to_bits()),
-            "vector and scalar grouped down results differ"
-        );
-        let actual_sum = sum.to_vec1::<f32>().expect("read sum F32");
-        let mut pair_path = ds4_prefix.as_os_str().to_os_string();
-        pair_path.push(".pair.f32");
-        let mut down_path = ds4_prefix.as_os_str().to_os_string();
-        down_path.push(".down.f32");
-        let expected_pair = fixture_f32(std::path::Path::new(&pair_path));
-        let expected_down = fixture_f32(std::path::Path::new(&down_path));
-        let expected_sum = fixture_f32(&ds4_prefix);
-        let pair_error = fixture_error(&actual_pair, &expected_pair);
-        let down_error = fixture_error(&actual_down, &expected_down);
-        let sum_error = fixture_error(&actual_sum, &expected_sum);
-        eprintln!(
-            "[glm53-moe-q2-real] pair max_abs={:e} rel_l2={:e} exact={}/{}",
-            pair_error.0,
-            pair_error.1,
-            pair_error.2,
-            actual_pair.len()
-        );
-        eprintln!(
-            "[glm53-moe-q2-real] down max_abs={:e} rel_l2={:e} exact={}/{}",
-            down_error.0,
-            down_error.1,
-            down_error.2,
-            actual_down.len()
-        );
-        eprintln!(
-            "[glm53-moe-q2-real] sum max_abs={:e} rel_l2={:e} exact={}/{}",
-            sum_error.0,
-            sum_error.1,
-            sum_error.2,
-            actual_sum.len()
-        );
-        assert!(pair_error.1 < 1.0e-5, "grouped pair relative L2 error");
-        assert!(down_error.1 < 1.0e-5, "grouped down relative L2 error");
-        assert!(sum_error.1 < 1.0e-5, "grouped sum relative L2 error");
     }
 }

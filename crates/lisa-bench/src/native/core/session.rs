@@ -13,7 +13,6 @@ pub use crate::conversation::{TargetMtpEosPolicy, TargetMtpSamplingMode};
 pub use crate::speculation::MtpDepth;
 #[cfg(test)]
 use crate::speculation::target_mtp_draw_reuses_argmax;
-pub type LayerSnapshot = lisa_engine::cache::SessionSnapshot<Array>;
 
 /// Verify that feeding a token sequence in chunks through one [`Session`] gives
 /// the same logits as feeding it in a single prefill with fresh caches.
@@ -484,7 +483,7 @@ mod target_mtp_tests {
                     &mut |_| Ok(TargetMtpSamplingMode::Greedy),
                 )?
             } else {
-                session.generate(&mut tower, &[1], 3, &mut sampler, 0, None, &mut |_| Ok(()))?
+                session.generate(&mut tower, &[1], 3, &mut sampler, None, &mut |_| Ok(()))?
             };
             assert_eq!(generated, vec![2, 3, 4]);
             assert_eq!(tower.prefill_calls, vec![vec![1]]);
@@ -588,7 +587,7 @@ mod target_mtp_tests {
                 (0.7, 1, 1.0, false),
                 (1e-6, 1, 1.0, false),
             ] {
-                let sampler = Sampler(lisa_engine::sampling::Sampler {
+                let sampler = Sampler::new(lisa_engine::sampling::Sampler {
                     temperature,
                     top_k,
                     repetition_penalty,
@@ -636,7 +635,7 @@ mod target_mtp_tests {
             assert_eq!(emitted, generated);
             assert_eq!(session.fed, vec![1, 2, 3, 4, 5]);
             ToyTargetMtp::assert_cache_matches_fed(&session)?;
-            assert_eq!(session.glm_mtp_cache_for_test().total, 0);
+            assert_eq!(session.target_mtp_cache_for_test().total, 0);
             assert_eq!(tower.mtp_calls.first(), Some(&(2, 1, 1, 3)));
             if bad_first_draft {
                 assert_eq!(tower.mtp_calls.get(1), Some(&(3, 2, 1, 4)));
@@ -671,7 +670,7 @@ mod target_mtp_tests {
                 id,
                 prompt: vec![1],
                 max_tokens: 8,
-                sampler: Sampler(lisa_engine::sampling::Sampler {
+                sampler: Sampler::new(lisa_engine::sampling::Sampler {
                     temperature: 0.8,
                     seed: 0x5eed + id as u64,
                     ..Default::default()
@@ -741,7 +740,7 @@ mod target_mtp_tests {
                         mtp_calls: Vec::new(),
                     };
                     let make_sampler = || {
-                        Sampler(lisa_engine::sampling::Sampler {
+                        Sampler::new(lisa_engine::sampling::Sampler {
                             temperature: if sampling == 0 { 0.0 } else { 0.8 },
                             seed: 0x5eed,
                             mtp_exact_sampling: sampling == 2,
@@ -816,21 +815,21 @@ mod target_mtp_tests {
                         chunked_tower.mtp_calls, full_tower.mtp_calls,
                         "yield must not re-seed or replay MTP"
                     );
-                    assert!(chunked_session.has_glm_mtp_pending_for_test() == false);
+                    assert!(!chunked_session.has_target_mtp_pending_for_test());
                     ToyTargetMtp::assert_cache_matches_fed(&full_session)?;
                     assert_eq!(
-                        chunked_session.glm_mtp_cache_for_test().compact_total(),
-                        full_session.glm_mtp_cache_for_test().compact_total()
+                        chunked_session.target_mtp_cache_for_test().compact_total(),
+                        full_session.target_mtp_cache_for_test().compact_total()
                     );
                     assert_eq!(
                         chunked_session
-                            .glm_mtp_cache_for_test()
+                            .target_mtp_cache_for_test()
                             .compact_live_for_test()
                             .unwrap()
                             .as_dtype(lisa_metal::Dtype::Float32)?
                             .to_vec1::<f32>()?,
                         full_session
-                            .glm_mtp_cache_for_test()
+                            .target_mtp_cache_for_test()
                             .compact_live_for_test()
                             .unwrap()
                             .as_dtype(lisa_metal::Dtype::Float32)?
@@ -864,7 +863,7 @@ mod target_mtp_tests {
                 context_limit,
                 mtp_calls: Vec::new(),
             };
-            let mut sampler = Sampler(lisa_engine::sampling::Sampler {
+            let mut sampler = Sampler::new(lisa_engine::sampling::Sampler {
                 temperature: 0.8,
                 seed: 0x5eed,
                 ..Default::default()
@@ -1009,7 +1008,7 @@ mod target_mtp_tests {
                     .contains("injected target-MTP verify failure after cache append")
             );
             assert_eq!(session.fed, vec![1, 2]);
-            assert!(session.has_glm_mtp_pending_for_test() == false);
+            assert!(!session.has_target_mtp_pending_for_test());
             ToyTargetMtp::assert_cache_matches_fed(&session)?;
         }
         Ok(())
@@ -1033,7 +1032,7 @@ mod target_mtp_tests {
         assert_eq!(first, vec![2, 3, 4]);
         assert_eq!(session.fed, vec![1, 2, 3, 4]);
 
-        // The final emitted token is already in the target cache, as in DS4.
+        // The final emitted token is already in the target cache, as in the reference.
         // The next request contributes a new suffix token and reuses the
         // private MTP tape across that prompt extension.
         let next = session.generate_mtp(&mut tower, &[5], 3, 2, &mut |_| Ok(()))?;
@@ -1051,7 +1050,7 @@ mod target_mtp_tests {
             "accepted rows must advance the retained MTP cache at absolute positions"
         );
         let compact = session
-            .glm_mtp_cache_for_test()
+            .target_mtp_cache_for_test()
             .compact_slice(0, 8)
             .expect("retained absolute-position MTP cache")
             .as_dtype(lisa_metal::Dtype::Float32)?
@@ -1077,24 +1076,24 @@ mod target_mtp_tests {
         session.enable_snapshots();
         let initial = Array::from_slice(&[3.0f32], &[1, 1, 1]);
         session
-            .glm_mtp_cache_mut_for_test()
+            .target_mtp_cache_mut_for_test()
             .write_compact_f16_at(&initial, 1)?;
-        *session.glm_mtp_min_position_for_test() = Some(1);
+        *session.target_mtp_min_position_for_test() = Some(1);
         session.fed = vec![10, 11];
         session.capture_snapshot(1, 0);
 
         let speculative = Array::from_slice(&[9.0f32], &[1, 1, 1]);
         session
-            .glm_mtp_cache_mut_for_test()
+            .target_mtp_cache_mut_for_test()
             .write_compact_f16_at(&speculative, 4)?;
-        *session.glm_mtp_min_position_for_test() = Some(4);
+        *session.target_mtp_min_position_for_test() = Some(4);
         session.fed.push(12);
         assert_eq!(session.restore_snapshot(&mut tower, 1), Some(2));
         assert_eq!(session.fed, vec![10, 11]);
-        assert_eq!(*session.glm_mtp_min_position_for_test(), Some(1));
+        assert_eq!(*session.target_mtp_min_position_for_test(), Some(1));
         assert_eq!(
             session
-                .glm_mtp_cache_for_test()
+                .target_mtp_cache_for_test()
                 .compact_slice(0, 2)
                 .expect("snapshot MTP rows")
                 .as_dtype(lisa_metal::Dtype::Float32)?
@@ -1103,7 +1102,7 @@ mod target_mtp_tests {
         );
         assert!(
             session
-                .glm_mtp_cache_for_test()
+                .target_mtp_cache_for_test()
                 .compact_slice(0, 5)
                 .is_none()
         );
@@ -1126,7 +1125,7 @@ mod target_mtp_tests {
                 context_limit: 128,
                 mtp_calls: Vec::new(),
             };
-            let mut sampler = crate::core::sampler::Sampler(lisa_engine::sampling::Sampler {
+            let mut sampler = crate::core::sampler::Sampler::new(lisa_engine::sampling::Sampler {
                 temperature: 0.8,
                 seed: 0x5eed,
                 mtp_exact_sampling: exact_sampling,
@@ -1178,7 +1177,7 @@ mod target_mtp_tests {
             context_limit: 128,
             mtp_calls: Vec::new(),
         };
-        let mut sampler = crate::core::sampler::Sampler(lisa_engine::sampling::Sampler {
+        let mut sampler = crate::core::sampler::Sampler::new(lisa_engine::sampling::Sampler {
             temperature: 0.8,
             seed: 0x5eed,
             mtp_exact_sampling: true,
@@ -1226,16 +1225,16 @@ mod target_mtp_tests {
         let first_logits = ToyTargetMtp::target_logits(2, true);
         let next_logits = ToyTargetMtp::target_logits(3, true);
         let seed = (0..256).find(|&seed| {
-            let mut sampler = crate::core::sampler::Sampler(lisa_engine::sampling::Sampler {
+            let mut sampler = crate::core::sampler::Sampler::new(lisa_engine::sampling::Sampler {
                 temperature: 0.8,
                 seed,
                 ..Default::default()
             });
             let first = sampler
-                .draw_ds4(&crate::metal_language::runtime(), &first_logits, &[1])
+                .draw_host(&crate::metal_language::runtime(), &first_logits, &[1])
                 .ok();
             let next = sampler
-                .draw_ds4(&crate::metal_language::runtime(), &next_logits, &[1, 2])
+                .draw_host(&crate::metal_language::runtime(), &next_logits, &[1, 2])
                 .ok();
             first == Some(2) && next.is_some_and(|token| token != 3)
         });
@@ -1253,7 +1252,7 @@ mod target_mtp_tests {
                 context_limit: 128,
                 mtp_calls: Vec::new(),
             };
-            let mut sampler = crate::core::sampler::Sampler(lisa_engine::sampling::Sampler {
+            let mut sampler = crate::core::sampler::Sampler::new(lisa_engine::sampling::Sampler {
                 temperature: 0.8,
                 seed,
                 mtp_exact_sampling: exact_sampling,
@@ -1332,7 +1331,7 @@ mod target_mtp_tests {
             };
             assert_eq!(
                 session
-                    .glm_mtp_cache_for_test()
+                    .target_mtp_cache_for_test()
                     .compact_slice(0, expected_compact.len())
                     .expect("MTP cache through generated target tokens")
                     .as_dtype(lisa_metal::Dtype::Float32)?
@@ -1361,7 +1360,7 @@ mod target_mtp_tests {
             (vec![30], false, false, vec![31], vec![30], 0),
             // EOS is the target token after the first output: MTP is not armed.
             (vec![29], false, false, vec![30, 31], vec![29, 30], 1),
-            // The draft predicts EOS and the target accepts it; DS4 commits
+            // The draft predicts EOS and the target accepts it; the reference commits
             // both verified rows, including the accepted EOS row.
             (
                 vec![28],
@@ -1414,7 +1413,7 @@ mod target_mtp_tests {
                 assert_eq!(generated, expected, "prompt {prompt:?}");
                 assert_eq!(session.fed, fed, "target-cache boundary for {prompt:?}");
                 assert_eq!(tower.mtp_calls.len(), mtp_calls, "MTP calls for {prompt:?}");
-                assert!(session.has_glm_mtp_pending_for_test() == false);
+                assert!(!session.has_target_mtp_pending_for_test());
             }
         }
         Ok(())
@@ -1442,7 +1441,7 @@ mod target_mtp_tests {
             context_limit: 128,
             mtp_calls: Vec::new(),
         };
-        let mut sampler = crate::core::sampler::Sampler(lisa_engine::sampling::Sampler {
+        let mut sampler = crate::core::sampler::Sampler::new(lisa_engine::sampling::Sampler {
             temperature: 0.8,
             seed: 0x5eed,
             mtp_exact_sampling: true,
@@ -1466,7 +1465,3 @@ mod target_mtp_tests {
         Ok(())
     }
 }
-
-#[cfg(test)]
-#[path = "session_block_tests.rs"]
-mod block_draft_session_tests;

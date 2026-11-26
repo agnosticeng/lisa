@@ -80,18 +80,20 @@ impl Config {
                 && self.num_key_value_heads > 0
                 && self.num_attention_heads > 0
                 && self.head_dim > 0
-                && self.head_dim % 2 == 0,
+                && self.head_dim.is_multiple_of(2),
             "invalid LFM3 dimensions"
         );
         ensure!(
             self.hidden_size == self.num_attention_heads * self.head_dim
-                && self.num_attention_heads % self.num_key_value_heads == 0,
+                && self
+                    .num_attention_heads
+                    .is_multiple_of(self.num_key_value_heads),
             "invalid LFM3 attention heads"
         );
         ensure!(
-            self.hidden_size % 512 == 0
-                && self.intermediate_size % 512 == 0
-                && self.vocab_size % 32 == 0,
+            self.hidden_size.is_multiple_of(512)
+                && self.intermediate_size.is_multiple_of(512)
+                && self.vocab_size.is_multiple_of(32),
             "unsupported LFM3 projection dimensions"
         );
         ensure!(

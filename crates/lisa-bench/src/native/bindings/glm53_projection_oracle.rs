@@ -1,19 +1,10 @@
 #![cfg(test)]
-#![allow(dead_code)]
 //! Original GGUF blocks, dispatched without affine conversion.
-use crate::core::gguf_resident::{PackedTensor, ResidentWeights};
+use crate::core::gguf_resident::PackedTensor;
 use anyhow::{Context, Result, ensure};
 use lisa_gguf::TensorType;
 use lisa_metal::kernels::{ggml as gpu, sparse::kernels};
 use lisa_metal::{Array, Dtype, Stream};
-
-pub fn plain(weights: &ResidentWeights, name: &str) -> Result<Array> {
-    weights
-        .tensors
-        .get(name)
-        .with_context(|| format!("missing GLM GGUF {name}"))?
-        .plain_view()
-}
 
 pub enum Projection {
     Plain(Array),
@@ -35,16 +26,6 @@ impl std::ops::Deref for Projection {
     }
 }
 impl Projection {
-    pub fn load(w: &ResidentWeights, name: &str) -> Result<Self> {
-        let p = w
-            .tensors
-            .get(name)
-            .with_context(|| format!("missing GLM GGUF {name}"))?;
-        Ok(match p.info.kind {
-            TensorType::F32 | TensorType::BF16 | TensorType::F16 => Self::Plain(plain(w, name)?),
-            _ => Self::Packed(p.clone()),
-        })
-    }
     pub fn forward(&self, x: &Array) -> Result<Array> {
         ensure!(
             x.rank() == 3 && x.dtype() == Dtype::Float32,
@@ -55,9 +36,9 @@ impl Projection {
         let s = Stream::thread_local_or_default();
         let out = match self {
             Self::Plain(w) if w.dtype() == Dtype::Bfloat16 => if rows <= 8 {
-                kernels::glm53_bf16_gemv(w, &input, &s)
+                kernels::bf16_gemv(w, &input, &s)
             } else {
-                kernels::glm53_bf16_gemm(w, &input, &s)
+                kernels::bf16_gemm(w, &input, &s)
             }
             .context("GLM BF16 projection declined")?,
             Self::Plain(w) => gpu::plain_matvec(w, &input, &s)?,

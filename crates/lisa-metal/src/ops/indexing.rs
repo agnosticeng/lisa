@@ -209,14 +209,14 @@ impl<T, Idx, Val> IndexMutOp<Idx, Val> for T where T: TryIndexMutOp<Idx, Val> {}
 
 macro_rules! impl_index_tuple {
     ($($name:ident),+) => {
-        #[allow(non_snake_case)]
+        #[allow(non_snake_case, reason = "tuple bindings reuse the generic parameter names")]
         impl<$($name: IndexElem),+> TryIndexOp<($($name,)+)> for Array {
             fn try_index(&self, i: ($($name,)+)) -> Result<Array> {
                 let ($($name,)+) = i;
                 Ok(Array::new(index_seq(&self.t, &[$(&$name as &dyn IndexElem),+])?))
             }
         }
-        #[allow(non_snake_case)]
+        #[allow(non_snake_case, reason = "tuple bindings reuse the generic parameter names")]
         impl<$($name: IndexElem),+> TryIndexMutOp<($($name,)+), Array> for Array {
             fn try_index_mut(&mut self, i: ($($name,)+), val: Array) -> Result<()> {
                 let ($($name,)+) = i;

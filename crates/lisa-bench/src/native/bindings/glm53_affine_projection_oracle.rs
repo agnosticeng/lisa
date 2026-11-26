@@ -15,28 +15,28 @@ pub fn original(w: &QuantizedLinear, x: &Array, native: bool) -> lisa_metal::err
         && matches!(w.scales.dtype(), Dtype::Float32 | Dtype::Bfloat16)
         && w.biases.dtype() == w.scales.dtype()
         && w.weight.dtype() == Dtype::Uint32
-        && k % 64 == 0
+        && k.is_multiple_of(64)
         && w.weight.shape()[1] as usize * 4 == k
     {
         let flat = x.reshape(&[rows, k as i32])?.contiguous()?;
         let output = if rows > 16 {
-            Array::new(lisa_metal::jit::glm53_affine_q8_prefill(
-                &x.t.device(),
+            Array::new(lisa_metal::jit::affine_q8_prefill(
+                x.t.device(),
                 &flat.t,
                 &w.weight.t,
                 &w.scales.contiguous()?.t,
                 &w.biases.contiguous()?.t,
             )?)
-        } else if rows == 1 || k % 128 == 0 {
-            Array::new(lisa_metal::jit::glm53_affine_q8_tiny_native(
-                &x.t.device(),
+        } else if rows == 1 || k.is_multiple_of(128) {
+            Array::new(lisa_metal::jit::affine_q8_tiny_native(
+                x.t.device(),
                 &flat.t,
                 &w.weight.t,
                 &w.scales.contiguous()?.t,
                 &w.biases.contiguous()?.t,
             )?)
         } else {
-            lisa_metal::kernels::sparse::kernels::glm53_affine_q8_mv_ds4(
+            lisa_metal::kernels::sparse::kernels::affine_q8_mv_ds4(
                 &w.weight,
                 &w.scales,
                 &w.biases,

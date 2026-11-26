@@ -1,13 +1,12 @@
-//! Routing operations with the pinned DS4 arithmetic.
+//! Routing operations with the pinned reference arithmetic.
 use super::*;
 
-
 pub(super) const ROUTER_SELECT_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/router_select.metal");
+    crate::kernel_source!("moe/router_select.metal");
 pub(super) const ROUTER_MV_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/router_mv.metal");
+    crate::kernel_source!("moe/router_mv.metal");
 pub(super) const ROUTER_MV_SMALL_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/router_mv_small.metal");
+    crate::kernel_source!("moe/router_mv_small.metal");
 
 pub(super) fn router_mv_kernel() -> &'static Option<MetalKernel> {
     static K: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
@@ -108,8 +107,8 @@ pub(super) fn router_matvec_f32_small(
         .next()
 }
 
-/// DS4's F32 dense matvec lanes used for GLM router projection.
-/// `weights` is row-major `[out, in]`; `x` is `[n_tokens, in]`. DS4 uses the
+/// The reference's F32 dense matvec lanes used for GLM router projection.
+/// `weights` is row-major `[out, in]`; `x` is `[n_tokens, in]`. The reference uses the
 /// 1-row path for decode, a specialized multi-token lane for 2–8 rows, and
 /// one F32 matvec per token above eight rows.
 pub fn router_matvec_f32(weights: &Array, x: &Array, stream: &Stream) -> Option<Array> {
@@ -123,7 +122,7 @@ pub fn router_matvec_f32(weights: &Array, x: &Array, stream: &Stream) -> Option<
     let out_dim = weights.dim(0) as usize;
     let in_dim = weights.dim(1) as usize;
     let n_tokens = x.dim(0) as usize;
-    if out_dim == 0 || in_dim == 0 || in_dim % 128 != 0 || n_tokens == 0 {
+    if out_dim == 0 || in_dim == 0 || !in_dim.is_multiple_of(128) || n_tokens == 0 {
         return None;
     }
     if x.dim(1) as usize != in_dim {
@@ -153,7 +152,7 @@ pub fn router_matvec_f32(weights: &Array, x: &Array, stream: &Stream) -> Option<
         .apply(
             &inputs,
             &[],
-            // MetalKernel::apply uses dispatch_threads, unlike DS4's
+            // MetalKernel::apply uses dispatch_threads, unlike the reference's
             // dispatchThreadgroups call. Scale the grid by the group shape so
             // each output row/token receives one full 32x8 group.
             (
@@ -189,7 +188,7 @@ pub(super) fn router_select_kernel() -> &'static Option<MetalKernel> {
     })
 }
 
-/// Fused MoE router select (ds4 `kernel_glm_router_select_one` port): logits
+/// Fused MoE router select (the reference `kernel_glm_router_select_one` port): logits
 /// `[n, E]` f32 (contiguous), bias `[E]` (any dtype, cast to f32) -> selected
 /// [n, top_k] i32 (descending by sigmoid+bias, ties by lower index) and
 /// weights [n, top_k] f32 (sigmoid renormalized over the selected list,

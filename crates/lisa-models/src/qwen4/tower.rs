@@ -5,7 +5,7 @@ use crate::{
     program::Build,
     vision::prompt::Splice,
 };
-use lisa_backend::{Kernel, ScalarType as D, TensorOperation as T};
+use lisa_backend::{Kernel, TensorOperation as T};
 pub const PREFILL_CHUNK: usize = 2048;
 pub const NGRAM_PREFIX: &str = "model.layers.1.ple.ple_embedding.ngram_embedding";
 pub const EMBEDDING: &str = "model.embed_tokens";
@@ -95,7 +95,27 @@ pub fn kv_bytes(c: &ModelConfig) -> usize {
         * 2
 }
 pub fn cost_key(c: &ModelConfig) -> String {
-    format!("qwen4_exp-{}L-{}h", c.num_hidden_layers, c.hidden_size)
+    // The independent-MTP controller no longer enters a different projection
+    // scope for the target. Old scoped round costs cannot price this schedule.
+    format!(
+        "qwen4_exp-{}L-{}h-serial-capture-v1",
+        c.num_hidden_layers, c.hidden_size
+    )
+}
+
+#[cfg(test)]
+mod cost_identity_tests {
+    use super::*;
+
+    #[test]
+    fn native_mtp_costs_exclude_legacy_implicit_scope() {
+        let mut config = ModelConfig::parse("{}").unwrap();
+        config.num_hidden_layers = 48;
+        config.hidden_size = 2560;
+        assert_eq!(cost_key(&config), "qwen4_exp-48L-2560h-serial-capture-v1");
+        assert_ne!(cost_key(&config), "qwen4_exp-48L-2560h");
+        assert_ne!(cost_key(&config), "qwen4_exp-48L-2560h-target-law-v1");
+    }
 }
 pub fn token_rows(flat: &[i32], b: usize, s: usize) -> anyhow::Result<Vec<Vec<i64>>> {
     anyhow::ensure!(
@@ -162,46 +182,16 @@ impl Entry {
         Ok(g.finish(vec![x]))
     }
 }
-pub fn shortlist(vocab: usize) -> Option<Graph> {
-    let (low, special) = (98304.min(vocab), 248044.min(vocab));
-    if special <= low {
-        return None;
-    }
-    let mut ids = (0..low as i32)
-        .chain(special as i32..vocab as i32)
-        .collect::<Vec<_>>();
-    while ids.len() % 8 != 0 {
-        ids.push(0)
-    }
-    let mut g = crate::graph::Builder::new(3, 0, 0);
-    let index = g.constant_i32(&ids, &[ids.len() as i32]);
-    let mut out = (0..3)
-        .map(|i| {
-            g.one(
-                Kernel::Tensor(T::Take { axis: 0 }),
-                vec![V::Input(i), index],
-            )
-        })
-        .collect::<Vec<_>>();
-    let map = g.constant(
-        ids.iter().flat_map(|&i| (i as u32).to_le_bytes()).collect(),
-        vec![ids.len() as i32],
-        D::U32,
-    );
-    out.push(map);
-    Some(g.finish(out))
-}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Readout {
     pub rows: i32,
     pub multi_rows: i32,
     pub quant: (i32, i32),
-    pub shortlist: bool,
 }
 impl Readout {
     pub fn graph(self) -> anyhow::Result<Graph> {
         let schema = Default::default();
-        let mut p = Build::new(if self.shortlist { 6 } else { 5 }, &schema);
+        let mut p = Build::new(5, &schema);
         let last = p.op(
             T::Select {
                 axis: 1,
@@ -216,16 +206,13 @@ impl Readout {
             },
             vec![last, V::Input(2), V::Input(3), V::Input(4)],
         );
-        let mut id = p.op(
+        let id = p.op(
             T::Argmax {
                 axis: -1,
                 keep_dims: false,
             },
             vec![logits],
         );
-        if self.shortlist {
-            id = p.op(T::Take { axis: 0 }, vec![V::Input(5), id]);
-        }
         let id = p.reshape(id, &[1, 1]);
         let multi = p.op(
             T::Select {
@@ -272,7 +259,5 @@ mod tests {
                 .count(),
             2
         );
-        assert!(shortlist(32768).is_none());
-        shortlist(248320).unwrap().validate().unwrap();
     }
 }

@@ -1,13 +1,10 @@
 #![cfg(test)]
-#![allow(dead_code)]
 //! Native scalar FFN graph for the original mixed GGUF expert formats.
 //! The owning model retains ResidentWeights for this object's full lifetime.
 
-use crate::bindings::deepseek41::config::Config;
-#[path = "deepseek41_projection_oracle.rs"]
-pub(super) mod projection;
-use crate::core::gguf_resident::{PackedTensor, ResidentWeights};
-use anyhow::{Context, Result, ensure};
+pub(super) use crate::bindings::deepseek41_projection_oracle as projection;
+use crate::core::gguf_resident::PackedTensor;
+use anyhow::{Result, ensure};
 use lisa_metal::kernels::ggml::{self as gpu, ActivationFormat};
 use lisa_metal::{Array, Stream};
 
@@ -30,42 +27,9 @@ pub struct Output {
 }
 
 impl Moe {
-    pub fn load(weights: &ResidentWeights, layer: usize, config: &Config) -> Result<Self> {
-        ensure!(layer < config.layers, "invalid DeepSeek FFN layer");
-        let get = |suffix: &str| {
-            weights
-                .tensors
-                .get(&format!("blk.{layer}.{suffix}"))
-                .cloned()
-                .with_context(|| format!("missing DeepSeek FFN tensor {suffix}"))
-        };
-        let gate = get("ffn_gate_exps.weight")?;
-        let up = get("ffn_up_exps.weight")?;
-        let down = get("ffn_down_exps.weight")?;
-        for weight in [&gate, &up, &down] {
-            projection::block_format(weight.info.kind)?;
-        }
-        ensure!(
-            gate.info.dimensions == [5120, 2304, config.experts as u64]
-                && up.info.dimensions == gate.info.dimensions
-                && down.info.dimensions == [2304, 5120, config.experts as u64],
-            "invalid DeepSeek routed expert geometry"
-        );
-        Ok(Self {
-            router: get("ffn_gate_inp.weight")?,
-            bias: projection::plain_view(&get("exp_probs_b.bias")?)?,
-            gate,
-            up,
-            down,
-            shared_gate: get("ffn_gate_shexp.weight")?,
-            shared_up: get("ffn_up_shexp.weight")?,
-            shared_down: get("ffn_down_shexp.weight")?,
-        })
-    }
-
-    /// Scalar decode with DS4's original router, BF16 shared-expert boundaries,
+    /// Scalar decode with the reference's original router, BF16 shared-expert boundaries,
     /// routed activation weighting, and ordered six-expert sum. Formats absent
-    /// from DS4 use the adjacent pinned GGML matvec extension.
+    /// from the reference use the adjacent pinned GGML matvec extension.
     pub fn forward(&self, norm: &Array, stream: &Stream) -> Result<Output> {
         ensure!(
             norm.rank() == 2 && (1..=8).contains(&norm.dim(0)) && norm.dim(1) == 5120,

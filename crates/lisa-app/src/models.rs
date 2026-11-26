@@ -1,7 +1,6 @@
 //! Apple app model discovery, sizes and curated download metadata.
 
 use crate::catalog;
-use lisa_engine::core::config::ReadConfig;
 
 #[derive(Clone, Debug)]
 pub struct Model {
@@ -32,14 +31,40 @@ pub(super) fn discover_models() -> Vec<Model> {
             continue;
         }
         for path in lisa_engine::checkpoint::hf::cached_snapshots(&repo_id) {
-            let qwen = path.join(lisa_engine::bindings::qwen35_gguf::ENTRY);
+            let qwen = path.join(lisa_engine::weights::qwen35::gguf::ENTRY);
             if qwen.is_file() {
-                if let Ok(resident_bytes) = lisa_engine::bindings::qwen35_gguf::inspect(&qwen) {
+                if let Ok(resident_bytes) = lisa_engine::weights::qwen35::gguf::inspect(&qwen) {
                     out.push(Model {
                         repo_id: repo_id.clone(),
                         path: path.to_string_lossy().into(),
                         size: std::fs::metadata(&qwen).map(|m| m.len()).unwrap_or(0),
                         resident_bytes: Some(resident_bytes),
+                    });
+                    break;
+                }
+                continue;
+            }
+            let inkling2 = path.join(lisa_engine::checkpoint::catalog::inkling2::ENTRY);
+            if inkling2.is_file()
+                && path
+                    .join(lisa_engine::checkpoint::catalog::inkling2::PROJECTOR)
+                    .is_file()
+            {
+                let info = (|| -> anyhow::Result<u64> {
+                    let header = lisa_gguf::Header::open(&inkling2)?;
+                    lisa_engine::checkpoint::inkling2::config(&header)?;
+                    Ok(std::fs::metadata(&inkling2)?.len()
+                        + std::fs::metadata(
+                            path.join(lisa_engine::checkpoint::catalog::inkling2::PROJECTOR),
+                        )?
+                        .len())
+                })();
+                if let Ok(size) = info {
+                    out.push(Model {
+                        repo_id: repo_id.clone(),
+                        path: path.to_string_lossy().into(),
+                        size,
+                        resident_bytes: Some(size),
                     });
                     break;
                 }
@@ -53,7 +78,12 @@ pub(super) fn discover_models() -> Vec<Model> {
                     Ok(std::fs::metadata(&olala)?.len())
                 })();
                 if let Ok(size) = info {
-                    out.push(Model { repo_id: repo_id.clone(), path: path.to_string_lossy().into(), size, resident_bytes: Some(size) });
+                    out.push(Model {
+                        repo_id: repo_id.clone(),
+                        path: path.to_string_lossy().into(),
+                        size,
+                        resident_bytes: Some(size),
+                    });
                     break;
                 }
                 continue;
@@ -79,7 +109,7 @@ pub(super) fn discover_models() -> Vec<Model> {
             let gguf = path.join(lisa_engine::checkpoint::catalog::deepseek41::GGUF_ENTRY);
             if gguf.is_file() {
                 let info = (|| -> anyhow::Result<(u64, u64)> {
-                    use lisa_engine::bindings::deepseek41_weights::WeightPlan;
+                    use lisa_engine::weights::deepseek41::plan::WeightPlan;
                     let package = lisa_gguf::Package::open(&gguf)?;
                     let plan = WeightPlan::inspect(
                         &package,
@@ -102,39 +132,21 @@ pub(super) fn discover_models() -> Vec<Model> {
                 }
                 continue;
             }
-            if let Some(mt) = config_model_type(&path) {
-                if lisa_engine::checkpoint::ModelKind::from_model_type(&mt)
+            if let Some(mt) = config_model_type(&path)
+                && lisa_engine::checkpoint::ModelKind::from_model_type(&mt)
                     .is_ok_and(|kind| kind != lisa_engine::checkpoint::ModelKind::Laya)
-                    && has_model_weights(&path, &mt)
-                {
-                    let size = model_weight_size(&path, &mt);
-                    out.push(Model {
-                        repo_id: repo_id.clone(),
-                        path: path.to_string_lossy().to_string(),
-                        size,
-                        resident_bytes: lisa_engine::checkpoint::catalog::bonsai::is_checkpoint(
-                            &path,
-                        )
+                && has_model_weights(&path, &mt)
+            {
+                let size = model_weight_size(&path, &mt);
+                out.push(Model {
+                    repo_id: repo_id.clone(),
+                    path: path.to_string_lossy().to_string(),
+                    size,
+                    resident_bytes: lisa_engine::checkpoint::catalog::bonsai::is_checkpoint(&path)
                         .then_some(lisa_engine::checkpoint::catalog::bonsai::REQUIRED_RAM as u64),
-                    });
-                    break;
-                }
+                });
+                break;
             }
-        }
-    }
-    let draft_bytes =
-        cached_dspine().map_or(catalog::DSPINE_DOWNLOAD_BYTES, |path| dir_size(&path));
-    for model in &mut out {
-        if uses_dspine_path(std::path::Path::new(&model.path)).unwrap_or(false) {
-            let mtp = dir_size(&std::path::Path::new(&model.path).join("mtp"));
-            let target = model.size.saturating_sub(mtp);
-            model.resident_bytes = Some(
-                model
-                    .resident_bytes
-                    .unwrap_or(target)
-                    .saturating_add(catalog::DSPINE_WEIGHT_BYTES),
-            );
-            model.size = target.saturating_add(draft_bytes);
         }
     }
     out.sort_by(|a, b| a.repo_id.cmp(&b.repo_id));
@@ -230,157 +242,60 @@ pub(super) fn model_ram_budget() -> u64 {
     lisa_engine::core::admission::MemoryBudget::from_host().budget() as u64
 }
 
-fn download_profile(repo: &str) -> lisa_engine::checkpoint::hf::DownloadProfile {
-    use lisa_engine::checkpoint::hf::DownloadProfile;
-    if catalog::uses_dspine(repo) {
-        DownloadProfile::WithoutMtp
-    } else {
-        DownloadProfile::Complete
-    }
-}
-
-/// Inspect metadata rather than applying the 27B draft to smaller dense Qwens.
-pub(super) fn uses_dspine_path(path: &std::path::Path) -> anyhow::Result<bool> {
-    use lisa_engine::{bindings::dspine, checkpoint};
-    use lisa_models::qwen3_5::config::Qwen35Config;
-    let path = checkpoint::hf::checkpoint_path(path.to_path_buf());
-    match checkpoint::model_type_of(&path)?.as_str() {
-        "qwen3_5" | "qwen3_5_text" => Ok(dspine::supports_target(&Qwen35Config::from_json(
-            &path.join("config.json"),
-        )?)),
-        _ => Ok(false),
-    }
-}
-
-fn draft_checkpoint_available(path: &std::path::Path) -> bool {
-    // Read metadata and mapped shard headers only; this does not initialize Metal
-    // or load tensor payloads. Nonempty files alone can still be truncated.
-    let config_ok = std::fs::read(path.join("config.json"))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-        .is_some_and(|config| config["model_type"] == "qwen3" && config["num_hidden_layers"] == 5);
-    if !config_ok || !has_model_weights(path, "qwen3") {
-        return false;
-    }
-    std::fs::read_dir(path).is_ok_and(|entries| {
-        let shards: Vec<_> = entries
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|file| file.extension().is_some_and(|ext| ext == "safetensors"))
-            .collect();
-        !shards.is_empty()
-            && shards.iter().all(|file| {
-                lisa_mlx::Shard::open(file).is_ok_and(|shard| shard.tensor_names().next().is_some())
-            })
-    })
-}
-
-fn cached_draft_repo(repo: &str) -> Option<std::path::PathBuf> {
-    lisa_engine::checkpoint::hf::cached_snapshots(repo)
-        .into_iter()
-        .find(|path| draft_checkpoint_available(path))
-}
-
-fn cached_dspine() -> Option<std::path::PathBuf> {
-    cached_draft_repo(lisa_engine::bindings::dspine::REPO)
-}
-
-/// Check locally first so complete cached drafts also work offline. Missing or
-/// interrupted downloads use the Hub client's resume/size-repair path.
-fn ensure_draft_repo(
-    repo: &str,
-    progress: impl Fn(u64, u64) + Send + Sync + 'static,
-) -> anyhow::Result<std::path::PathBuf> {
-    if let Some(path) = cached_draft_repo(repo) {
-        let size = dir_size(&path);
-        progress(size, size);
-        return Ok(path);
-    }
-    let path = lisa_engine::checkpoint::hf::download_repo_with_progress(repo, progress)?;
-    anyhow::ensure!(
-        draft_checkpoint_available(&path),
-        "downloaded drafter is incomplete or invalid: {}",
-        path.display()
-    );
-    Ok(path)
-}
-
-/// Existing target downloads acquire the missing companion on their next load.
-/// Progress is emitted only while fetching a missing companion, then cleared
-/// before loading the target. Explicit local overrides remain user-owned.
+/// Load a local checkpoint. A curated snapshot installed without its `mtp/`
+/// sidecar completes it first; when that fails (for example offline), the
+/// target still loads, without a drafter.
 pub(super) fn load_model(
     path: &std::path::Path,
     progress: impl Fn(Option<(u64, u64)>) + Send + Sync + 'static,
 ) -> anyhow::Result<lisa_serve::application::loading::Loaded> {
-    use lisa_engine::{bindings::dspine, checkpoint};
-    use lisa_serve::application::loading;
-    if !uses_dspine_path(path)? {
-        let mut loaded = loading::load_dir(path)?;
-        if config_model_type(path).as_deref() == Some("olala") {
-            if let loading::Loaded::Language(model) = &mut loaded {
-                // Ready means the common serial kernels are compiled; this
-                // bounded warmup owns fresh caches, never conversation state.
-                model.warmup(&[])?;
-            }
+    use lisa_engine::checkpoint::hf;
+    let missing_sidecar = hf::snapshot_identity(path).is_some_and(|(repo, _)| {
+        catalog::ships_mtp_sidecar(&repo) && !path.join("mtp/weights.safetensors").is_file()
+    });
+    if missing_sidecar {
+        let progress = std::sync::Arc::new(progress);
+        progress(Some((0, 0)));
+        let download_progress = progress.clone();
+        let result = hf::complete_snapshot(path, move |done, total| {
+            download_progress(Some((done, total)))
+        });
+        progress(None);
+        if let Err(error) = result {
+            eprintln!("[load] MTP sidecar unavailable; loading without a drafter: {error:#}");
         }
-        return Ok(loaded);
     }
-    let selection = match std::env::var("LISA_QWEN_DSPINE_MODEL") {
-        Ok(model) => model,
-        Err(std::env::VarError::NotPresent) => dspine::REPO.to_owned(),
-        Err(error) => return Err(error.into()),
-    };
-    let draft =
-        if checkpoint::hf::is_repo_id(&selection) && !std::path::Path::new(&selection).exists() {
-            match cached_draft_repo(&selection) {
-                Some(path) => path,
-                None => {
-                    let progress = std::sync::Arc::new(progress);
-                    progress(Some((0, 0)));
-                    let download_progress = progress.clone();
-                    let result = ensure_draft_repo(&selection, move |done, total| {
-                        download_progress(Some((done, total)))
-                    });
-                    progress(None);
-                    result?
-                }
-            }
-        } else {
-            checkpoint::resolve_model_dir(&selection)?
-        };
-    loading::load_dir_with_dspine(path, &draft)
+    warm_loaded_model(lisa_serve::application::loading::load_dir(path)?, path)
 }
 
-/// Download the shared draft first, then the target without optional MTP files.
-/// The model row only completes when both packages have succeeded. Hub cache
-/// hits are reused and both phases contribute to the same progress indicator.
+fn warm_loaded_model(
+    mut loaded: lisa_serve::application::loading::Loaded,
+    path: &std::path::Path,
+) -> anyhow::Result<lisa_serve::application::loading::Loaded> {
+    if matches!(
+        config_model_type(path).as_deref(),
+        Some(
+            "olala"
+                | "inkling2"
+                | "lfm3"
+                | "qwen3_5"
+                | "qwen3_5_text"
+                | "qwen35"
+                | "qwen4_exp"
+                | "qwen4_exp_text"
+        )
+    ) && let lisa_serve::application::loading::Loaded::Language(model) = &mut loaded
+    {
+        // Bounded, model-owned shapes use private caches. Warm once before
+        // reporting Ready, without changing the request's prefill law.
+        model.warmup(&[])?;
+    }
+    Ok(loaded)
+}
+
 pub(super) fn download_model_with_progress(
     repo: &str,
     progress: impl Fn(u64, u64) + Send + Sync + 'static,
 ) -> anyhow::Result<std::path::PathBuf> {
-    use lisa_engine::{bindings::dspine, checkpoint::hf};
-    use std::sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    };
-    let profile = download_profile(repo);
-    if !catalog::uses_dspine(repo) {
-        return hf::download_repo_with_progress(repo, progress);
-    }
-    let target_size = hf::download_size_with_profile(repo, profile)?;
-    let progress = Arc::new(progress);
-    let draft_size = Arc::new(AtomicU64::new(0));
-    let draft_completed = draft_size.clone();
-    let draft_progress = progress.clone();
-    ensure_draft_repo(dspine::REPO, move |done, total| {
-        draft_completed.store(total, Ordering::Relaxed);
-        draft_progress(done, total.saturating_add(target_size));
-    })?;
-    let draft_bytes = draft_size.load(Ordering::Relaxed);
-    hf::download_repo_with_profile(repo, profile, move |done, total| {
-        progress(
-            draft_bytes.saturating_add(done),
-            draft_bytes.saturating_add(total),
-        );
-    })
+    lisa_engine::checkpoint::hf::download_repo_with_progress(repo, progress)
 }

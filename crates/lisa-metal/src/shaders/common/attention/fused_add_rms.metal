@@ -1,4 +1,4 @@
-// Fused residual-add + RMSNorm (specs/08 §1): ONE kernel returns both the new
+// Fused residual-add + RMSNorm: ONE kernel returns both the new
 // residual sum and the normed input. Bit-exact by construction against the
 // composed chain `bf16_add(x, r)` → `rms_single_row`/`rms_looped`:
 // - the sum is computed as float(x)+float(r) and rounded to T (exactly what

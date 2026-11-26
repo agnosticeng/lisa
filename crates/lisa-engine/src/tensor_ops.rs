@@ -70,6 +70,9 @@ impl<'a, D: Device> TensorOps<'a, D> {
             Default::default(),
         )?)
     }
+    pub fn dtype(&self, tensor: &D::Tensor) -> Option<ScalarType> {
+        self.device.dtype(tensor)
+    }
     pub fn scalar(&self, value: f32) -> anyhow::Result<D::Tensor> {
         self.pull(&value.to_ne_bytes(), &[], ScalarType::F32)
     }
@@ -96,8 +99,10 @@ impl<D: HostAccessDevice> TensorOps<'_, D> {
         let bytes = self.device.read_bytes(tensor)?;
         anyhow::ensure!(bytes.len() % 4 == 0, "unaligned token IDs");
         Ok(bytes
-            .chunks_exact(4)
-            .map(|b| u32::from_ne_bytes(b.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| u32::from_ne_bytes(*b))
             .collect())
     }
     pub fn id(&self, tensor: &D::Tensor) -> anyhow::Result<u32> {

@@ -1,6 +1,8 @@
 //! Portable tensor dataflow with explicit inputs, multi-output calls and state
 //! commits. A graph is data; only the engine may prepare or execute it.
 use lisa_backend::{HostTensor, Kernel, ScalarType};
+pub mod regions;
+pub mod sequence;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Value {
@@ -42,6 +44,14 @@ pub struct Graph {
     pub writes: Vec<StateWrite>,
 }
 impl Graph {
+    /// Select the single-query affine law without changing graph topology,
+    /// weight identity or any non-projection operation.
+    pub fn with_serial_affine(mut self, allow_verify_splitk: bool) -> Self {
+        for call in &mut self.calls {
+            call.kernel = serial_affine_kernel(&call.kernel, allow_verify_splitk);
+        }
+        self
+    }
     pub fn validate(&self) -> Result<(), String> {
         let mut mutable = std::collections::HashSet::new();
         if self
@@ -74,7 +84,7 @@ impl Graph {
         for (i, call) in self.calls.iter().enumerate() {
             if call.inputs.len() != call.kernel.arity() || call.inputs.iter().any(|&v| !valid(v, i))
             {
-                return Err(format!("invalid graph call {i}"));
+                return Err(format!("invalid graph call {i}: {:?}", call.kernel));
             }
             for &slot in call.kernel.overwritten_inputs() {
                 let mut source = call.inputs.get(slot).copied();
@@ -112,6 +122,17 @@ impl Graph {
             }
         }
         Ok(())
+    }
+}
+
+pub(crate) fn serial_affine_kernel(kernel: &Kernel, allow_verify_splitk: bool) -> Kernel {
+    match *kernel {
+        Kernel::AffineLinear { group_size, bits } => Kernel::AffineSerialLinear {
+            group_size,
+            bits,
+            allow_verify_splitk,
+        },
+        _ => kernel.clone(),
     }
 }
 
@@ -172,10 +193,10 @@ impl Builder {
             },
         };
         for i in graph.mutable_inputs {
-            if let Value::Input(slot) = inputs[i] {
-                if !self.graph.mutable_inputs.contains(&slot) {
-                    self.graph.mutable_inputs.push(slot);
-                }
+            if let Value::Input(slot) = inputs[i]
+                && !self.graph.mutable_inputs.contains(&slot)
+            {
+                self.graph.mutable_inputs.push(slot);
             }
         }
         self.graph.constants.extend(graph.constants);

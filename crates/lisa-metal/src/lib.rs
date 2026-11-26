@@ -14,6 +14,7 @@
 
 pub mod array;
 pub mod device;
+pub mod diagnostics;
 pub mod error;
 pub mod ffi;
 pub mod jit;
@@ -33,9 +34,9 @@ pub use kernels::{
 };
 
 pub use ops::{
-    Array, Dtype, Stream, runtime_alloc_count, runtime_dispatch_count, runtime_encoder_count,
-    runtime_label_counts, runtime_label_dispatches, runtime_label_gpu_ms, runtime_poolhit_count,
-    runtime_wait_ns, runtime_zero_ns,
+    Array, Dtype, Stream, enable_allocation_labels, runtime_alloc_count, runtime_dispatch_count,
+    runtime_encoder_count, runtime_label_counts, runtime_label_dispatches, runtime_label_gpu_ms,
+    runtime_poolhit_count, runtime_wait_ns, runtime_zero_ns,
 };
 pub use ops::{fast, memory, nn, transforms};
 

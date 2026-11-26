@@ -37,7 +37,7 @@ impl Config {
                 selector: Vec::new(),
             }));
         }
-        let text = root.get("text_config").unwrap_or(&root);
+        let text = root.get("text_config").unwrap_or(root);
         let rope = text
             .get("rope_parameters")
             .or_else(|| text.get("rope_scaling"))
@@ -60,7 +60,7 @@ impl Config {
             .collect::<anyhow::Result<_>>()?;
         ensure!(
             rotary_dimensions > 0
-                && rotary_dimensions % 2 == 0
+                && rotary_dimensions.is_multiple_of(2)
                 && lengths.iter().sum::<usize>() == rotary_dimensions / 2,
             "M-RoPE sections do not match the rotary width"
         );

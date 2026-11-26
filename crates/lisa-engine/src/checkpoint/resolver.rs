@@ -1,4 +1,4 @@
-//! Checkpoint identity and local/Hub resolution without loading model weights.
+//! Checkpoint identity and Hub-cache resolution without loading model weights.
 
 use std::path::{Path, PathBuf};
 
@@ -6,32 +6,14 @@ use super::{catalog, hf};
 
 pub use lisa_models::identity::ModelKind;
 
-/// Resolve `target` to a checkpoint directory or a local GGUF file.
-///
-/// A path that exists is used as-is. Otherwise `target` is treated as a
-/// Hugging Face repo id and resolved against the Hugging Face hub cache; if it
-/// is not cached, the built-in Hub downloader fetches it into the same cache. These
-/// are the only two sources — there is no legacy fallback.
+/// Resolve the Hugging Face repo id `target` to its checkpoint in the Hub
+/// cache (a directory or its selected GGUF entry), downloading it into that
+/// cache when absent. Models are read from and stored in the Hub cache only.
 pub fn resolve_model_dir(target: &str) -> anyhow::Result<PathBuf> {
-    let direct = Path::new(target);
-    if direct.is_dir() {
-        return Ok(hf::checkpoint_path(direct.to_path_buf()));
-    }
-    if direct.is_file()
-        && direct
-            .extension()
-            .is_some_and(|s| s.eq_ignore_ascii_case("gguf"))
-    {
-        return Ok(direct.to_path_buf());
-    }
-    if direct.exists() {
-        anyhow::bail!("{} exists but is not a directory", direct.display());
-    }
-
     anyhow::ensure!(
         hf::is_repo_id(target),
-        "unknown model {target}: pass a local path or a Hugging Face repo id \
-         (models are cached in the HF hub cache)"
+        "unknown model {target}: pass a Hugging Face repo id \
+         (models are read from and downloaded to the Hub cache only)"
     );
 
     if let Some(dir) = hf::cached_snapshot(target) {

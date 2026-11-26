@@ -319,3 +319,32 @@ pub fn head(formats: &BTreeMap<String, Format>) -> Definition {
     let y = p.linear(I(0), "output.weight", 1536, 151936);
     p.finish(vec![y])
 }
+
+/// Layer-major prompt rows, retaining sequential Mamba/shift/cache feedback.
+pub fn layer_sequence(
+    c: &Config,
+    index: usize,
+    rows: usize,
+    formats: &BTreeMap<String, Format>,
+) -> Result<Definition, String> {
+    use crate::graph::sequence::{self, Feedback};
+    let mut def = layer(c, index, true, formats);
+    let feedback = (0..rows)
+        .map(|row| {
+            if row == 0 {
+                vec![]
+            } else {
+                (1..=if c.layers[index] { 1 } else { 4 })
+                    .map(|i| Feedback {
+                        input: i,
+                        output: i,
+                        view: None,
+                    })
+                    .collect()
+            }
+        })
+        .collect::<Vec<_>>();
+    let projections = sequence::single_row_projections(&def.graph);
+    def.graph = sequence::expand(&def.graph, rows, &feedback, &projections)?;
+    Ok(def)
+}

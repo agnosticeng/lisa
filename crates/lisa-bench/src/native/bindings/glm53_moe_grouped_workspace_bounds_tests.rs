@@ -44,7 +44,7 @@ fn grouped_moe_workspace_rejects_aliased_wrong_dtype_shape_and_bounds() {
         ("bounds", short),
         ("offset", offset),
     ] {
-        let result = jit::glm53_moe_grouped_swiglu_weight_prefill_with_output(
+        let result = jit::moe_grouped_swiglu_weight_prefill_with_output(
             device,
             &gate,
             &up,

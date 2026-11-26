@@ -1,14 +1,9 @@
 //! Portable checkpoint binding. Applications supply an owned device context.
 use crate::{
-    bindings::{
-        glm53_affine_moe::ExpertDevice, qwen35_gguf::execution::GgufExecution,
-        qwen35_mlx::MlxExecution, qwen35_tower::Qwen35Tower,
-    },
-    checkpoint::{self, ModelKind},
-    core::config::ReadConfig,
-    language::LanguageModel,
-    language_runtime::Runtime,
-    sampler::Sampler,
+    bindings::{glm53::affine::moe::ExpertDevice, qwen35::tower::Qwen35Tower},
+    checkpoint::{self, ModelKind, config::ReadConfig},
+    language::{LanguageModel, runtime::Runtime},
+    sampling::sampler::Sampler,
 };
 use lisa_backend::ReadbackDevice;
 use std::path::Path;
@@ -17,56 +12,50 @@ pub fn language<D: ExpertDevice + ReadbackDevice>(
     runtime: Runtime<D, Sampler<D>>,
     path: &Path,
     kind: ModelKind,
-    draft: Option<&Path>,
 ) -> anyhow::Result<Language<D>>
 where
     D::Error: From<anyhow::Error>,
 {
     let context = runtime.context.clone();
     anyhow::ensure!(
-        draft.is_none() || kind == ModelKind::Qwen35,
-        "DSpine requires a compatible MLX Qwen 3.8 27B checkpoint"
+        crate::memory::kv_format() != crate::memory::KvFormat::Int8 || kind == ModelKind::Inkling2,
+        "--kv-format int8 is supported only by Inkling 2; {kind:?} keeps its native key/value format"
     );
     let mut model: Language<D> = match kind {
-        ModelKind::Olala => Box::new(crate::bindings::olala::Tower::load(runtime, path)?),
-        ModelKind::Lfm3 => Box::new(crate::bindings::lfm3::Tower::load(runtime, path)?),
+        ModelKind::Inkling2 => Box::new(crate::weights::inkling2::gguf::load(runtime, path)?),
+        ModelKind::Olala => Box::new(crate::weights::olala::load(runtime, path)?),
+        ModelKind::Lfm3 => Box::new(crate::weights::lfm3::load(runtime, path)?),
         ModelKind::Qwen35 => {
             let cfg =
                 lisa_models::qwen3_5::config::Qwen35Config::from_json(&path.join("config.json"))?;
             Box::new(Qwen35Tower::from_execution(
                 runtime,
-                MlxExecution::load_with_dspine(context, path, cfg, draft)?,
+                crate::weights::qwen35::mlx::load(context, path, cfg)?,
             ))
         }
         ModelKind::Qwen35Gguf => Box::new(Qwen35Tower::from_execution(
             runtime,
-            GgufExecution::load(context, path)?,
+            crate::weights::qwen35::gguf::load(context, path)?,
         )),
         ModelKind::Qwen4 => {
             let cfg =
                 lisa_models::qwen4::config::ModelConfig::from_json(&path.join("config.json"))?;
-            Box::new(crate::bindings::qwen4_tower::Tower::load_on(
-                runtime, path, cfg,
-            )?)
+            Box::new(crate::weights::qwen4::load_on(runtime, path, cfg)?)
         }
         ModelKind::Glm53 => {
             let cfg = checkpoint::glm53::ModelConfig::from_json(&path.join("config.json"))?;
-            Box::new(crate::bindings::glm53_affine_tower::Tower::load_on(
-                runtime, path, cfg,
-            )?)
+            Box::new(crate::weights::glm53::affine::load(runtime, path, cfg)?)
         }
-        ModelKind::Glm53Gguf => Box::new(crate::bindings::glm53_packed_tower::Tower::load_on(
-            runtime, path,
-        )?),
-        ModelKind::DeepSeek41 => Box::new(crate::bindings::deepseek41_tower::Tower::load(
-            context, runtime, path,
-        )?),
+        ModelKind::Glm53Gguf => Box::new(crate::weights::glm53::packed::load(runtime, path)?),
+        ModelKind::DeepSeek41 => {
+            Box::new(crate::weights::deepseek41::load(context, runtime, path)?)
+        }
         _ => anyhow::bail!("{kind:?} is not a language model"),
     };
-    if let Some(capacity) = checkpoint::default_context_capacity(path)? {
-        if model.max_position_embeddings() != capacity {
-            model.set_context_capacity(capacity)?;
-        }
+    if let Some(capacity) = checkpoint::default_context_capacity(path)?
+        && model.max_position_embeddings() != capacity
+    {
+        model.set_context_capacity(capacity)?;
     }
     Ok(model)
 }

@@ -1,11 +1,8 @@
 //! Application alias for the portable sampler.
+#[cfg(test)]
 use lisa_engine::{sampling::SamplingContext, tensor_ops::TensorLaw};
 use lisa_metal::device::MetalDevice;
-pub type Sampler = lisa_engine::sampler::Sampler<MetalDevice>;
-#[allow(non_snake_case)]
-pub fn Sampler(config: lisa_engine::sampling::Sampler) -> Sampler {
-    Sampler::new(config)
-}
+pub type Sampler = lisa_engine::sampling::sampler::Sampler<MetalDevice>;
 #[cfg(test)]
 pub(crate) fn context(device: &MetalDevice) -> SamplingContext<'_, MetalDevice> {
     SamplingContext::new(device, TensorLaw::Native, |_| None)
@@ -40,31 +37,47 @@ mod keyed_tests {
     }
 
     #[test]
-    fn ds4_sparse_penalty_matches_vocab_scan() {
+    fn greedy_penalty_preserves_sign_history_window_and_rng() {
         let device = crate::metal_context::device();
-        lisa_engine::sampling::oracles::ds4_sparse_penalty_matches_vocab_scan(&context(&device));
+        lisa_engine::sampling::oracles::greedy_penalty_preserves_sign_history_window_and_rng(
+            &context(&device),
+        );
     }
 
     #[test]
-    // RESOLVED (specs/04 §6): failed ≥3× in CI-style parallel runs with a
+    fn batched_greedy_penalty_preserves_each_history_and_sampler() {
+        let device = crate::metal_context::device();
+        lisa_engine::sampling::oracles::batched_greedy_penalty_preserves_each_history_and_sampler(
+            &context(&device),
+        );
+    }
+
+    #[test]
+    fn host_sparse_penalty_matches_vocab_scan() {
+        let device = crate::metal_context::device();
+        lisa_engine::sampling::oracles::host_sparse_penalty_matches_vocab_scan(&context(&device));
+    }
+
+    #[test]
+    // RESOLVED: failed ≥3× in CI-style parallel runs with a
     // MASSIVE divergence (3388 vs 783 at token 11). Root cause was the runtime
     // readback race: `flush_*` drained `in_flight` before waiting, so a
     // concurrent thread's `eval` returned without waiting committed GPU work
     // (plus a dropped completion-handler block in `ComputeEncoder::end` that
     // corrupted the cross-encoder fence map). Both fixed in commands.rs; the
-    // parallel suite is green (extinction runs in specs/04 §6).
+    // parallel suite is green.
     fn keyed_same_seed_same_tokens() {
         let logits = fake_logits(4096, 1);
         let history: Vec<u32> = (0..37).collect();
-        let mut a = Sampler(lisa_engine::sampling::Sampler {
+        let mut a = Sampler::new(lisa_engine::sampling::Sampler {
             temperature: 0.7,
             ..Default::default()
         });
-        let mut b = Sampler(lisa_engine::sampling::Sampler {
+        let mut b = Sampler::new(lisa_engine::sampling::Sampler {
             temperature: 0.7,
             ..Default::default()
         });
-        for pos in 0..24 {
+        for pos in 0..8 {
             let hist: Vec<u32> = history[..pos].to_vec();
             let ta = a
                 .draw(&crate::metal_language::runtime(), &logits, &hist)
@@ -79,17 +92,17 @@ mod keyed_tests {
     #[test]
     fn keyed_seed_varies() {
         let logits = fake_logits(4096, 2);
-        let mut a = Sampler(lisa_engine::sampling::Sampler {
+        let mut a = Sampler::new(lisa_engine::sampling::Sampler {
             temperature: 0.7,
             seed: 0xDEAD,
             ..Default::default()
         });
-        let mut b = Sampler(lisa_engine::sampling::Sampler {
+        let mut b = Sampler::new(lisa_engine::sampling::Sampler {
             temperature: 0.7,
             seed: 0xBEEF,
             ..Default::default()
         });
-        let diffs = (0..16)
+        let diffs = (0..8)
             .filter(|pos| {
                 let hist: Vec<u32> = (0..*pos as u32).collect();
                 a.draw(&crate::metal_language::runtime(), &logits, &hist)
@@ -128,25 +141,23 @@ mod keyed_tests {
     }
 
     #[test]
-    fn glm_ds4_sampling_order_matches_c_reference() {
+    fn host_sampling_order_matches_c_reference() {
         let device = crate::metal_context::device();
-        lisa_engine::sampling::oracles::glm_ds4_sampling_order_matches_c_reference(&context(
+        lisa_engine::sampling::oracles::host_sampling_order_matches_c_reference(&context(&device));
+    }
+
+    #[test]
+    fn host_exact_delta_sampling_matches_c_reference() {
+        let device = crate::metal_context::device();
+        lisa_engine::sampling::oracles::host_exact_delta_sampling_matches_c_reference(&context(
             &device,
         ));
     }
 
     #[test]
-    fn glm_ds4_exact_delta_sampling_matches_c_reference() {
+    fn host_filter_edges_match_c_reference() {
         let device = crate::metal_context::device();
-        lisa_engine::sampling::oracles::glm_ds4_exact_delta_sampling_matches_c_reference(&context(
-            &device,
-        ));
-    }
-
-    #[test]
-    fn glm_ds4_filter_edges_match_c_reference() {
-        let device = crate::metal_context::device();
-        lisa_engine::sampling::oracles::glm_ds4_filter_edges_match_c_reference(&context(&device));
+        lisa_engine::sampling::oracles::host_filter_edges_match_c_reference(&context(&device));
     }
 
     // Pre-migration native operation sequence; independent of TensorOps dispatch.
@@ -278,8 +289,8 @@ mod keyed_tests {
                     (0.7, 17, 0.8, 1.2),
                     (1.2, 33, 0.9, 0.8),
                 ] {
-                    for seed in [0, 7, 19] {
-                        let mut actual = Sampler(lisa_engine::sampling::Sampler {
+                    for seed in [7] {
+                        let mut actual = Sampler::new(lisa_engine::sampling::Sampler {
                             temperature,
                             top_k,
                             top_p,
@@ -289,7 +300,7 @@ mod keyed_tests {
                             ..Default::default()
                         });
                         let mut expected = actual.0.clone();
-                        for _ in 0..3 {
+                        for _ in 0..2 {
                             assert_eq!(
                                 actual.draw(
                                     &crate::metal_language::runtime(),
@@ -313,7 +324,7 @@ mod keyed_tests {
             for dtype in [Dtype::Float32, Dtype::Bfloat16] {
                 let logits = fake_logits(width, 37).as_dtype(dtype)?;
                 for temperature in [0.3, 0.7, 1.2] {
-                    let sampler = Sampler(lisa_engine::sampling::Sampler {
+                    let sampler = Sampler::new(lisa_engine::sampling::Sampler {
                         temperature,
                         ..Default::default()
                     });

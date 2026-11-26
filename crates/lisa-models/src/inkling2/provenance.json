@@ -1,0 +1,29 @@
+{
+  "reference": {
+    "repository": "https://github.com/ggml-org/llama.cpp",
+    "revision": "29b52d398b294509746ec0a3f28948a3107c0213",
+    "source_sha256": {
+      "tools/mtmd/models/inkling2v.cpp": "a8cc18c703b2827ca1591a63e53d2ac0be058f29961a959244d2da4f1a4415ec",
+      "tools/mtmd/mtmd-graph.cpp": "8385aa24e6b21089910fba5e0e20f6e0446ad27322be679ffcff0fcfa986f717",
+      "tools/mtmd/mtmd-image.cpp": "17b0814d3ea5e8826ec85c94852ff31d47902ddc3862083938ef2f4531df4141"
+    }
+  },
+  "checkpoint": {
+    "repository": "unsloth/Inkling-2-Mini-GGUF",
+    "revision": "29eac40c55957e3b76db6b7028e549cb244745de",
+    "text": "Inkling-2-Mini-UD-Q4_K_M.gguf",
+    "projector": "mmproj-F16.gguf",
+    "license": "Apache-2.0"
+  },
+  "reference_adapter": "The source release has architecture inkling2 and 48 logical layers, with 24 physical weight sets. The [Q,K,V,FFN] message queries are reconstructed from loop_res_query and loop_kv_res_query. No checkpoint payload is requantized.",
+  "scope": "Still-image encoder plans (vision.rs, image.rs) follow the reference's image path. Text execution runs the vendored decode step (crates/lisa-metal/src/shaders/reference/, its own provenance.json); no checkpoint payload is requantized. See specs/models/inkling2.md.",
+  "dflash2_draft": {
+    "repository": "incoai/Inkling-2-Mini-DFlash2",
+    "revision": "4f9088ea66c21f2b99ed657d1941c306b03e84d2",
+    "weights": "model.safetensors",
+    "weights_sha256": "217980ab00d116693fa5946df7bbfd967caf5fac1f529afd541fbd470ddb54ee",
+    "license": "Apache-2.0",
+    "reference_integration": "The checkpoint's sglang_inkling_dflash2.py: features are the inputs to visits 5, 23 and 41 and the final-norm output; block rows use the target's normalized embedding rows; the selector softcap applies after the edge correction; candidates are limited to the 200,058 valid tokens.",
+    "scope": "Tree rounds of the GGUF target: the draft step's af4g64 image is quantized from the BF16 weights at load; the BF16 norms, convolution kernels and codebooks are bound as stored."
+  }
+}

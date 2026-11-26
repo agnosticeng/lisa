@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
+    MTLBarrierScope, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
     MTLComputeCommandEncoder, MTLDevice, MTLDispatchType, MTLResource, MTLResourceUsage, MTLSize,
 };
 
@@ -19,7 +19,34 @@ use super::buffer::Buffer;
 use super::env::{DISPATCH_COUNT, ENCODER_COUNT, WAIT_NS, add_gpu_ns_split, err};
 use super::fence::Fence;
 use super::pipeline::ComputePipeline;
+use super::program;
 use super::residency::ResidencySet;
+
+static RECORDED_OWNER: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+mod fence_tests;
+
+/// One replay owns its concurrent encoder across separately locked sections.
+/// Drop closes that encoder before the caller releases queue-private scratch.
+/// Ordinary callers or another replay end it before binding their own work.
+pub(super) struct RecordedEncoderScope<'a> {
+    commands: &'a Commands,
+    owner: u64,
+}
+impl RecordedEncoderScope<'_> {
+    pub(super) fn encoder(&self) -> Result<EncoderGuard<'_>> {
+        self.commands.encoder_inner(Some(self.owner))
+    }
+}
+impl Drop for RecordedEncoderScope<'_> {
+    fn drop(&mut self) {
+        let mut state = self.commands.state.lock().unwrap();
+        if state.encoder_owner == Some(self.owner) {
+            self.commands.end_encoder(&mut state);
+        }
+    }
+}
 
 // ──────────────────────────── command encoder ────────────────────────────
 
@@ -33,6 +60,9 @@ struct EncoderState {
     all_outputs: Vec<usize>,
 }
 
+// SAFETY: Metal encoder and command-buffer handles may move between threads. Encoders
+// are only reached through `EncoderGuard`, which holds the `Commands` state mutex, so
+// encoder calls never run concurrently; shared fields are `Arc<Mutex>` or atomics.
 unsafe impl Send for ComputeEncoder {}
 unsafe impl Sync for ComputeEncoder {}
 
@@ -65,6 +95,10 @@ pub struct ComputeEncoder {
 }
 
 impl ComputeEncoder {
+    fn program_identity(&self) -> usize {
+        Arc::as_ptr(&self.cb_keepalive) as usize
+    }
+
     fn new(
         raw: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
         command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
@@ -85,7 +119,13 @@ impl ComputeEncoder {
         }
     }
 
+    pub(super) fn buffer_barrier(&self) {
+        self.raw.memoryBarrierWithScope(MTLBarrierScope::Buffers);
+        trace::event("program.concurrent.barrier");
+    }
+
     pub fn set_pipeline(&self, pipeline: &ComputePipeline) {
+        program::pipeline(self.program_identity(), pipeline);
         self.current_label
             .store(pipeline.label_id(), Ordering::Relaxed);
         self.raw.setComputePipelineState(pipeline.raw());
@@ -94,11 +134,15 @@ impl ComputeEncoder {
     /// Attach an indirect-resource set to the command buffer that owns this
     /// encoder. Metal makes those allocations resident for its execution.
     pub fn use_residency_set(&self, set: &ResidencySet) {
+        program::unsupported(self.program_identity());
         self.command_buffer.useResidencySet(set.raw());
     }
 
     /// Bind dynamic threadgroup scratch declared with `[[threadgroup(0)]]`.
     pub fn set_threadgroup_memory_length(&self, index: usize, length: usize) {
+        program::threadgroup(self.program_identity(), index, length);
+        // SAFETY: `self.raw` is the open encoder, used under the `Commands` lock; `index` and
+        // `length` are the caller's `[[threadgroup(n)]]` slot and scratch size.
         unsafe {
             self.raw.setThreadgroupMemoryLength_atIndex(length, index);
         }
@@ -123,14 +167,18 @@ impl ComputeEncoder {
     /// Bind a read-only input. (Hazard bookkeeping removed: Serial dispatch
     /// type already orders memory across dispatches — see `EncoderState`.)
     pub fn set_input(&self, index: usize, buffer: Option<&Arc<Buffer>>, offset: usize) {
+        program::buffer(self.program_identity(), index, buffer, offset, false);
         if let Some(b) = buffer {
             b.mark_used_cb(self.cb_id);
             let b: &Buffer = b;
+            // SAFETY: `b` is a live retained MTLBuffer that its Arc keeps alive through encoding;
+            // `index`/`offset` are caller-supplied kernel slot and in-buffer offset (unchecked here).
             unsafe {
                 self.raw
-                    .setBuffer_offset_atIndex(Some(b.as_ref()), offset, index)
+                    .setBuffer_offset_atIndex(Some(b.raw_buffer()), offset, index)
             }
         } else {
+            // SAFETY: binding nil is valid for the open encoder; `index` is a caller-supplied slot.
             unsafe {
                 self.raw.setBuffer_offset_atIndex(None, offset, index);
             }
@@ -150,26 +198,54 @@ impl ComputeEncoder {
         self.retain_until_completion_with_usage(buffer, false);
     }
 
-    fn retain_until_completion_with_usage(&self, buffer: &Arc<Buffer>, declare_usage: bool) {
+    /// Retain a buffer that kernels read and write through GPU addresses
+    /// until its command buffer completes, declaring read-write residency.
+    pub fn retain_written_until_completion(&self, buffer: &Arc<Buffer>) {
+        program::unsupported(self.program_identity());
         let first_use = {
             let mut keepalive = self.cb_keepalive.lock().unwrap();
             let resources = keepalive.entry(self.cb_id).or_default();
-            if resources.contains_key(&buffer.id()) {
-                false
-            } else {
-                resources.insert(buffer.id(), Arc::clone(buffer));
+            if let std::collections::hash_map::Entry::Vacant(e) = resources.entry(buffer.id()) {
+                e.insert(Arc::clone(buffer));
                 true
+            } else {
+                false
+            }
+        };
+        buffer.mark_used_cb(self.cb_id);
+        {
+            let mut s = self.state.lock().unwrap();
+            s.all_outputs.push(buffer.id());
+        }
+        if first_use {
+            let resource: &ProtocolObject<dyn MTLResource> = buffer.raw_buffer().as_ref();
+            self.raw
+                .useResource_usage(resource, MTLResourceUsage::Read | MTLResourceUsage::Write);
+        }
+    }
+
+    fn retain_until_completion_with_usage(&self, buffer: &Arc<Buffer>, declare_usage: bool) {
+        program::unsupported(self.program_identity());
+        let first_use = {
+            let mut keepalive = self.cb_keepalive.lock().unwrap();
+            let resources = keepalive.entry(self.cb_id).or_default();
+            if let std::collections::hash_map::Entry::Vacant(e) = resources.entry(buffer.id()) {
+                e.insert(Arc::clone(buffer));
+                true
+            } else {
+                false
             }
         };
         buffer.mark_used_cb(self.cb_id);
         if first_use && declare_usage {
-            let resource: &ProtocolObject<dyn MTLResource> = buffer.mtlbuffer().as_ref();
+            let resource: &ProtocolObject<dyn MTLResource> = buffer.raw_buffer().as_ref();
             self.raw.useResource_usage(resource, MTLResourceUsage::Read);
         }
     }
 
     /// Bind a writable output.
     pub fn set_output(&self, index: usize, buffer: Option<&Arc<Buffer>>, offset: usize) {
+        program::buffer(self.program_identity(), index, buffer, offset, true);
         let buf_arc = buffer.expect("output buffer");
         buf_arc.mark_used_cb(self.cb_id);
         let buffer: &Buffer = buf_arc;
@@ -177,22 +253,35 @@ impl ComputeEncoder {
             let mut s = self.state.lock().unwrap();
             s.all_outputs.push(buffer.id());
         }
+        // SAFETY: `buffer` is a live retained MTLBuffer that its Arc keeps alive through encoding;
+        // `index`/`offset` are caller-supplied kernel slot and in-buffer offset (unchecked here).
         unsafe {
             self.raw
-                .setBuffer_offset_atIndex(Some(buffer.as_ref()), offset, index)
+                .setBuffer_offset_atIndex(Some(buffer.raw_buffer()), offset, index)
         }
     }
 
     /// A raw byte blob (e.g. an array of `size_t` dims/strides), copied into
     /// the command buffer at encode time.
     pub fn set_bytes_directly(&self, index: usize, length: usize, bytes: *const c_void) {
+        program::bytes(self.program_identity(), index, length, bytes.cast());
         let ptr = NonNull::new(bytes as *mut c_void).unwrap();
+        // SAFETY: the caller guarantees `bytes` points to `length` readable bytes; Metal copies
+        // them into the command buffer before returning.
         unsafe { self.raw.setBytes_length_atIndex(ptr, length, index) }
     }
 
     /// A 0-d / scalar argument.
     pub fn set_bytes<T>(&self, index: usize, data: &T) {
+        program::bytes(
+            self.program_identity(),
+            index,
+            std::mem::size_of::<T>(),
+            std::ptr::from_ref(data).cast(),
+        );
         let ptr = NonNull::new(data as *const T as *mut c_void).unwrap();
+        // SAFETY: `ptr` points to a live `&T` of exactly `size_of::<T>()` bytes; Metal copies
+        // them into the command buffer before returning.
         unsafe {
             self.raw
                 .setBytes_length_atIndex(ptr, std::mem::size_of::<T>(), index)
@@ -200,6 +289,7 @@ impl ComputeEncoder {
     }
 
     pub fn dispatch_threads(&self, grid: (usize, usize, usize), group: (usize, usize, usize)) {
+        program::dispatch(self.program_identity(), false, grid, group);
         DISPATCH_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.note_dispatch();
         self.raw.dispatchThreads_threadsPerThreadgroup(
@@ -217,6 +307,7 @@ impl ComputeEncoder {
     }
 
     pub fn dispatch_groups(&self, groups: (usize, usize, usize), group: (usize, usize, usize)) {
+        program::dispatch(self.program_identity(), true, groups, group);
         DISPATCH_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.note_dispatch();
         self.raw.dispatchThreadgroups_threadsPerThreadgroup(
@@ -233,6 +324,42 @@ impl ComputeEncoder {
         );
     }
 
+    /// Threadgroup dispatch whose grid a previous dispatch wrote into
+    /// `arguments` at `offset` (three `u32`, `MTLDispatchThreadgroupsIndirectArguments`).
+    /// The serial encoder orders the write before this read. The arguments
+    /// buffer is retained until the command buffer completes; replay capture
+    /// declines because the grid is not part of the recorded geometry.
+    pub fn dispatch_groups_indirect(
+        &self,
+        arguments: &Arc<Buffer>,
+        offset: usize,
+        group: (usize, usize, usize),
+    ) {
+        assert!(
+            offset.is_multiple_of(4) && offset + 12 <= arguments.length(),
+            "indirect dispatch arguments out of range"
+        );
+        program::unsupported(self.program_identity());
+        DISPATCH_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.note_dispatch();
+        // The dispatch call itself makes the arguments resident.
+        self.retain_resident_until_completion(arguments);
+        // SAFETY: `arguments` is a live MTLBuffer retained until completion
+        // above; `offset` is 4-byte aligned and its three words lie inside it.
+        unsafe {
+            self.raw
+                .dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
+                    arguments.raw_buffer(),
+                    offset,
+                    MTLSize {
+                        width: group.0,
+                        height: group.1,
+                        depth: group.2,
+                    },
+                );
+        }
+    }
+
     /// Tuple-taking dispatch (avoids exporting the objc2 MTLSize type).
     pub fn dispatch_threads_3d(&self, grid: (usize, usize, usize), group: (usize, usize, usize)) {
         self.dispatch_threads(grid, group);
@@ -246,6 +373,12 @@ impl ComputeEncoder {
 
     /// `MTLSize`-taking dispatch (shape), for `mlx_rt`'s sites.
     pub fn dispatch_threads_size(&self, grid: MTLSize, group: MTLSize) {
+        program::dispatch(
+            self.program_identity(),
+            false,
+            (grid.width, grid.height, grid.depth),
+            (group.width, group.height, group.depth),
+        );
         DISPATCH_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.note_dispatch();
         self.raw.dispatchThreads_threadsPerThreadgroup(grid, group);
@@ -253,6 +386,12 @@ impl ComputeEncoder {
 
     /// `MTLSize`-taking threadgroup dispatch.
     pub fn dispatch_groups_size(&self, groups: MTLSize, group: MTLSize) {
+        program::dispatch(
+            self.program_identity(),
+            true,
+            (groups.width, groups.height, groups.depth),
+            (group.width, group.height, group.depth),
+        );
         DISPATCH_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.note_dispatch();
         self.raw
@@ -297,7 +436,9 @@ impl ComputeEncoder {
         if outs.is_empty() {
             self.raw.updateFence(self.fence.raw());
             self.raw.endEncoding();
-            return None;
+            // Read-only predecessor fences also protect WAR at a concurrent
+            // mode transition. Keep them through command-buffer completion.
+            return Some((outs, Arc::clone(&self.fence)));
         }
         {
             let mut map = prev_outputs.lock().unwrap();
@@ -316,8 +457,7 @@ impl ComputeEncoder {
         // intact, but under parallel-test heap churn the stale captures
         // removed the WRONG fence entry (or none), the next encoder skipped
         // its `waitForFence`, and kernels/readbacks read buffers whose
-        // producer command buffer was still in flight — the specs/04 §6
-        // readback-race flake family. Returning the (outputs, fence) to
+        // producer command buffer was still in flight (a readback race). Returning the (outputs, fence) to
         // `end_encoder` here hands the cleanup to a block that provably outlives
         // the buffer.
         Some((outs, Arc::clone(&self.fence)))
@@ -330,11 +470,17 @@ struct EntryState {
     current_id: u64,
     in_flight: Vec<(u64, Retained<ProtocolObject<dyn MTLCommandBuffer>>)>,
     encoder: Option<ComputeEncoder>,
+    encoder_owner: Option<u64>,
+    /// Direct predecessor ordering is required for mode changes, including a
+    /// predecessor that only read storage and has no output-map entry.
+    predecessor: Option<(Arc<Fence>, bool)>,
     /// Each encoder in the current command buffer owns a distinct fence.
     /// Keep all cleanup records until that command buffer completes.
     fence_cleanups: Vec<(Vec<usize>, Arc<Fence>)>,
 }
 
+// SAFETY: Metal command-buffer and encoder handles may be used from any thread, and
+// `EntryState` is only accessed through the `Commands::state` mutex.
 unsafe impl Send for EntryState {}
 
 /// Contiguous completion watermark over command-buffer ids. Command buffers are
@@ -368,6 +514,10 @@ pub struct Commands {
     compute_count: AtomicUsize,
     per_buffer: AtomicUsize,
     prev_outputs: Arc<Mutex<HashMap<usize, Arc<Fence>>>>,
+    #[cfg(test)]
+    map_fence_waits: AtomicUsize,
+    #[cfg(test)]
+    predecessor_fence_waits: AtomicUsize,
     /// Monotonic command-buffer ids and the highest one known complete.
     next_id: AtomicU64,
     completed_id: AtomicU64,
@@ -389,6 +539,8 @@ pub struct Commands {
     cb_leases: Arc<Mutex<HashMap<u64, HashMap<usize, Arc<dyn std::any::Any + Send + Sync>>>>>,
 }
 
+// SAFETY: MTLDevice and MTLCommandQueue are thread-safe; all mutable state, including
+// `EntryState`, lives behind `Mutex`es or atomics.
 unsafe impl Send for Commands {}
 unsafe impl Sync for Commands {}
 
@@ -402,7 +554,27 @@ impl EncoderGuard<'_> {
     }
 }
 
+impl Drop for EncoderGuard<'_> {
+    fn drop(&mut self) {
+        program::end_encoder(self.encoder().program_identity());
+    }
+}
+
 impl Commands {
+    pub(super) fn program_identity(&self) -> usize {
+        Arc::as_ptr(&self.cb_keepalive) as usize
+    }
+
+    /// Whether this thread is recording an audited dispatch region.
+    pub(crate) fn is_capturing_program(&self) -> bool {
+        program::is_capturing(self.program_identity())
+    }
+
+    /// Continue executing normally but decline replay for the current region.
+    pub(crate) fn decline_program_capture(&self) {
+        program::unsupported(self.program_identity());
+    }
+
     pub fn new(
         queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
         device: Retained<ProtocolObject<dyn MTLDevice>>,
@@ -415,6 +587,8 @@ impl Commands {
                 current_id: 1,
                 in_flight: Vec::new(),
                 encoder: None,
+                encoder_owner: None,
+                predecessor: None,
                 fence_cleanups: Vec::new(),
             }),
             queue,
@@ -422,6 +596,10 @@ impl Commands {
             compute_count: AtomicUsize::new(0),
             per_buffer: AtomicUsize::new(per_buffer.max(1)),
             prev_outputs: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            map_fence_waits: AtomicUsize::new(0),
+            #[cfg(test)]
+            predecessor_fence_waits: AtomicUsize::new(0),
             next_id: AtomicU64::new(2),
             completed_id: AtomicU64::new(0),
             completed: Arc::new(Mutex::new(CompletionState::default())),
@@ -435,12 +613,22 @@ impl Commands {
     /// Retain an opaque storage owner through one encoded consumer. The shared
     /// completion lock closes the race with callbacks and covers out-of-order
     /// completion reports. No GPU wait or allocation lock is taken here.
-    pub fn retain_lease<T: Send + Sync + 'static>(&self, id:u64, owner:Arc<T>) {
-        if id==0{return;}
-        let completed=self.completed.lock().unwrap();
-        if id<=completed.watermark||completed.pending.contains(&id){return;}
-        let key=Arc::as_ptr(&owner) as usize;
-        self.cb_leases.lock().unwrap().entry(id).or_default().entry(key).or_insert(owner);
+    pub fn retain_lease<T: Send + Sync + 'static>(&self, id: u64, owner: Arc<T>) {
+        if id == 0 {
+            return;
+        }
+        let completed = self.completed.lock().unwrap();
+        if id <= completed.watermark || completed.pending.contains(&id) {
+            return;
+        }
+        let key = Arc::as_ptr(&owner) as usize;
+        self.cb_leases
+            .lock()
+            .unwrap()
+            .entry(id)
+            .or_default()
+            .entry(key)
+            .or_insert(owner);
     }
 
     /// The highest command-buffer id known to have completed.
@@ -471,7 +659,7 @@ impl Commands {
         // Lives in this block because this is the one completion block that is
         // provably kept alive (the leak below): the former dedicated cleanup
         // block in `ComputeEncoder::end` was dropped while still registered —
-        // a use-after-free at completion time (specs/04 §6).
+        // a use-after-free at completion time.
         let map_for_cleanup = Arc::clone(&self.prev_outputs);
         // The completion block itself is kept alive below. Release these
         // per-encoder vectors and fences when it fires, not at process exit.
@@ -492,7 +680,7 @@ impl Commands {
                 .unwrap_or_default(),
         )));
         let keepalive_for_callback = Arc::clone(&keepalive);
-        let leases_for_callback=Arc::clone(&self.cb_leases);
+        let leases_for_callback = Arc::clone(&self.cb_leases);
         let block = RcBlock::new(move |_cb: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
             trace::record_elapsed(
                 "mlx.commands.submit_to_completion",
@@ -500,8 +688,8 @@ impl Commands {
                 submitted_at.elapsed(),
             );
             drop(keepalive_for_callback.lock().unwrap().take());
-            let completed_leases={
-                let mut tracker=tracker.lock().unwrap();
+            let completed_leases = {
+                let mut tracker = tracker.lock().unwrap();
                 tracker.note(id);
                 leases_for_callback.lock().unwrap().remove(&id)
             };
@@ -512,15 +700,17 @@ impl Commands {
                 let mut map = map_for_cleanup.lock().unwrap();
                 for (outs, fence) in &fence_cleanups {
                     for &buf in outs {
-                        if let Some(f) = map.get(&buf) {
-                            if Arc::ptr_eq(f, fence) {
-                                map.remove(&buf);
-                            }
+                        if let Some(f) = map.get(&buf)
+                            && Arc::ptr_eq(f, fence)
+                        {
+                            map.remove(&buf);
                         }
                     }
                 }
             }
             if !labels.is_empty() {
+                // SAFETY: Metal invokes the completed handler with the live command buffer it was
+                // registered on, valid for the duration of the callback.
                 let cb: &ProtocolObject<dyn MTLCommandBuffer> = unsafe { _cb.as_ref() };
                 let start = cb.GPUStartTime();
                 let end = cb.GPUEndTime();
@@ -571,6 +761,8 @@ impl Commands {
         // (LABEL_GPU_NS/GPU_PROBE_RECORDS stayed empty). Keep it alive for the
         // process; diagnostics only, bounded by the buffer count.
         std::mem::forget(block.clone());
+        // SAFETY: `cb` is a live, not yet committed command buffer; the leaked clone keeps
+        // `block` alive past completion because this binding does not copy it.
         unsafe {
             cb.addCompletedHandler(RcBlock::as_ptr(&block));
         }
@@ -585,6 +777,7 @@ impl Commands {
     /// experiments: a large budget holds rotations until the step-boundary
     /// flush, removing mid-step cb commit/fence boundaries).
     pub fn set_per_buffer(&self, n: usize) {
+        program::unsupported(self.program_identity());
         self.per_buffer.store(n.max(1), Ordering::Release);
     }
 
@@ -594,16 +787,36 @@ impl Commands {
 
     /// Make a model residency set visible to the whole queue once at setup.
     pub fn add_residency_set_to_queue(&self, set: &ResidencySet) -> bool {
+        program::unsupported(self.program_identity());
         set.add_to_queue(&self.queue)
     }
 
     /// Register a model residency set without prewarming all of its allocations.
     pub fn add_residency_set_to_queue_without_request(&self, set: &ResidencySet) -> bool {
+        program::unsupported(self.program_identity());
         set.add_to_queue_without_request(&self.queue)
     }
 
     /// Open (or reuse) the current session's encoder.
     pub fn encoder(&self) -> Result<EncoderGuard<'_>> {
+        self.encoder_inner(None)
+    }
+
+    #[cfg(test)]
+    pub(super) fn recorded_encoder_is_open(&self) -> bool {
+        self.state.lock().unwrap().encoder_owner.is_some()
+    }
+
+    pub(super) fn recorded_encoder_scope(&self) -> RecordedEncoderScope<'_> {
+        let owner = RECORDED_OWNER.fetch_add(1, Ordering::Relaxed);
+        assert_ne!(owner, 0, "recorded encoder identity exhausted");
+        RecordedEncoderScope {
+            commands: self,
+            owner,
+        }
+    }
+
+    fn encoder_inner(&self, owner: Option<u64>) -> Result<EncoderGuard<'_>> {
         ENCODER_COUNT.fetch_add(1, Ordering::Relaxed);
         let mut st = self.state.lock().unwrap();
         if self.compute_count.fetch_add(1, Ordering::Relaxed)
@@ -614,24 +827,54 @@ impl Commands {
             // command buffer, so count it (otherwise a flush can miss it).
             self.compute_count.store(1, Ordering::Release);
         }
+        if st.encoder.is_some() && st.encoder_owner != owner {
+            self.end_encoder(&mut st);
+        }
         if st.encoder.is_none() {
             let fence = Arc::new(Fence::new(&self.device)?);
             let raw = st
                 .current
-                .computeCommandEncoderWithDispatchType(MTLDispatchType::Serial)
+                .computeCommandEncoderWithDispatchType(if owner.is_some() {
+                    MTLDispatchType::Concurrent
+                } else {
+                    MTLDispatchType::Serial
+                })
                 .ok_or_else(|| err("computeCommandEncoder"))?;
             // Every buffer written by a previous encoder must be visible before
             // this encoder's first dispatch. Skipped in GPU-probe mode because the
             // wait would contaminate the measured GPU execution window.
-            if !super::env::gpu_probe_enabled() {
+            // An already-required predecessor wait also covers every older
+            // output fence: that pass waited on them before updating its own
+            // fence. One Commands state serializes all encoder transitions;
+            // callbacks only remove matching entries. Keep ordinary/no-prior
+            // fallback and probe behavior unchanged.
+            if !super::env::gpu_probe_enabled()
+                && !st
+                    .predecessor
+                    .as_ref()
+                    .is_some_and(|(_, was_parallel)| owner.is_some() || *was_parallel)
+            {
                 let prev = self.prev_outputs.lock().unwrap();
                 let mut seen = HashSet::new();
                 for f in prev.values() {
                     if seen.insert(Arc::as_ptr(f) as usize) {
                         raw.waitForFence(f.raw());
+                        #[cfg(test)]
+                        self.map_fence_waits.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
+            if let Some((prior, was_parallel)) = st.predecessor.take()
+                && (owner.is_some() || was_parallel)
+            {
+                raw.waitForFence(prior.raw());
+                #[cfg(test)]
+                self.predecessor_fence_waits.fetch_add(1, Ordering::Relaxed);
+                // The new command buffer retains this wait dependency even
+                // if the producer completes and its cleanup runs first.
+                st.fence_cleanups.push((Vec::new(), prior));
+            }
+            st.encoder_owner = owner;
             st.encoder = Some(ComputeEncoder::new(
                 raw,
                 st.current.clone(),
@@ -640,16 +883,17 @@ impl Commands {
                 Arc::clone(&self.cb_keepalive),
             ));
         }
+        program::begin_encoder(self.program_identity());
         Ok(EncoderGuard { guard: st })
     }
 
     fn end_encoder(&self, st: &mut EntryState) {
-        if let Some(cleanup) = st
-            .encoder
-            .take()
-            .and_then(|enc| enc.end(&self.prev_outputs, &self.cb_labels))
-        {
-            st.fence_cleanups.push(cleanup);
+        if let Some(enc) = st.encoder.take() {
+            let parallel = st.encoder_owner.take().is_some();
+            st.predecessor = Some((Arc::clone(&enc.fence), parallel));
+            if let Some(cleanup) = enc.end(&self.prev_outputs, &self.cb_labels) {
+                st.fence_cleanups.push(cleanup);
+            }
         }
     }
 
@@ -658,6 +902,7 @@ impl Commands {
     /// usual cross-encoder fences. This never commits, waits, advances the
     /// completion watermark, or makes its temporary buffers reusable.
     pub fn flush_encoder(&self) {
+        program::encoder_boundary(self.program_identity());
         let mut st = self.state.lock().unwrap();
         let _span = trace::span_detail("mlx.commands.flush_encoder", st.current_id);
         self.end_encoder(&mut st);
@@ -703,18 +948,28 @@ impl Commands {
     /// a still-in-flight later buffer is not handed out until that buffer
     /// completes (`reusable_after` gates the pool on the watermark).
     ///
-    /// CONCURRENCY CONTRACT (specs/04 §6): committed command buffers are NEVER
+    /// CONCURRENCY CONTRACT: committed command buffers are NEVER
     /// removed from `in_flight` by the thread that waits them — the entry is
     /// cloned, waited outside the lock, and only pruned afterwards. The former
     /// drain-then-wait let a concurrent `eval` observe an empty `in_flight`
     /// (the other thread had "checked out" the entries) and return while the
     /// GPU was still writing the very buffer the caller was about to read.
     pub fn flush_wait_through(&self, id: u64) -> Result<()> {
+        program::unsupported(self.program_identity());
         let _span = trace::span_detail("mlx.commands.flush_wait_through", id);
         let target = {
             let mut st = self.state.lock().unwrap();
             if st.encoder.is_some() || self.compute_count.load(Ordering::Acquire) > 0 {
                 self.rotate(&mut st)?;
+            }
+            // A repeated wait must still submit newly queued work, but must
+            // not substitute a later command buffer for a retired completion.
+            // Require pruning as well as the explicitly waited watermark:
+            // a failed post-wait status check leaves its entry in flight.
+            if id <= self.completed_id.load(Ordering::Acquire)
+                && st.in_flight.first().is_none_or(|(cid, _)| *cid > id)
+            {
+                return Ok(());
             }
             // The queue executes in commit order, so waiting for `id` implies
             // everything committed before it is done too. Clone the entry;
@@ -762,6 +1017,7 @@ impl Commands {
     /// dispatch — no `waitUntilCompleted`). Buffer reuse stays sound via the
     /// pool's `reusable_after(completed_watermark)` gate.
     pub fn flush(&self) -> Result<()> {
+        program::unsupported(self.program_identity());
         let mut st = self.state.lock().unwrap();
         if st.encoder.is_some() || self.compute_count.load(Ordering::Acquire) > 0 {
             self.rotate(&mut st)?;
@@ -771,6 +1027,7 @@ impl Commands {
 
     /// Commit and wait for everything queued so far; drops the fence map.
     pub fn flush_and_wait(&self) -> Result<()> {
+        program::unsupported(self.program_identity());
         let _span = trace::span("mlx.commands.flush_and_wait");
         let to_wait = {
             let mut st = self.state.lock().unwrap();
@@ -852,6 +1109,73 @@ fn wait(cb: &ProtocolObject<dyn MTLCommandBuffer>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn repeated_completed_wait_preserves_later_work(precommit: bool) -> Result<()> {
+        if !crate::device::metal_available() {
+            return Ok(());
+        }
+        let rt = Arc::new(crate::runtime::MetalRuntime::new(64)?);
+        let commands = &rt.commands;
+        let input = crate::array::Array::from_slice(&rt, &[1.0f32, 2.0, 3.0, 4.0], &[4])?;
+        let increment = crate::array::Array::from_slice(&rt, &[10.0f32; 4], &[4])?;
+        let produced = input.broadcast_add(&increment)?;
+        // The host mirror has no later GPU consumers. The original is read by
+        // the next command buffer, so its last-use ID is not a producer ID.
+        let mirror = produced.copied()?;
+        let producer_id = mirror.readback_cb_id();
+        commands.flush_wait_through(producer_id)?;
+        assert_eq!(commands.completed_id(), producer_id);
+        assert!(commands.state.lock().unwrap().in_flight.is_empty());
+
+        let later = produced.broadcast_add(&increment)?;
+        let later_id = later.readback_cb_id();
+        assert!(later_id > producer_id);
+        assert_eq!(produced.readback_cb_id(), later_id);
+        assert_eq!(mirror.readback_cb_id(), producer_id);
+        if precommit {
+            commands.flush()?;
+        } else {
+            assert_eq!(commands.current_cb_id(), later_id);
+            assert!(commands.state.lock().unwrap().encoder.is_some());
+        }
+
+        commands.flush_wait_through(producer_id)?;
+        assert_eq!(
+            commands.completed_id(),
+            producer_id,
+            "an already-retired producer must not wait for its later consumer"
+        );
+        {
+            let state = commands.state.lock().unwrap();
+            assert!(state.current_id > later_id, "later work must be submitted");
+            assert!(state.encoder.is_none());
+            let (_, later_cb) = state
+                .in_flight
+                .iter()
+                .find(|(id, _)| *id == later_id)
+                .expect("later command buffer must remain tracked until an explicit wait");
+            assert_ne!(later_cb.status(), MTLCommandBufferStatus::NotEnqueued);
+        }
+        assert_eq!(
+            mirror.to_vec_wait_through::<f32>(producer_id)?,
+            vec![11.0, 12.0, 13.0, 14.0]
+        );
+        assert_eq!(commands.completed_id(), producer_id);
+        // Only this final read explicitly waits for the later consumer.
+        assert_eq!(later.to_vec::<f32>()?, vec![21.0, 22.0, 23.0, 24.0]);
+        assert_eq!(commands.completed_id(), later_id);
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_completed_wait_submits_later_queued_consumer() -> Result<()> {
+        repeated_completed_wait_preserves_later_work(false)
+    }
+
+    #[test]
+    fn repeated_completed_wait_preserves_later_committed_consumer() -> Result<()> {
+        repeated_completed_wait_preserves_later_work(true)
+    }
 
     #[test]
     fn encoder_only_boundaries_preserve_command_buffer_and_clean_all_fences() -> Result<()> {

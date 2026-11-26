@@ -46,7 +46,7 @@ fn coefficients(input: usize, output: usize) -> Vec<(usize, Vec<i32>)> {
         .collect()
 }
 
-fn resize(input: &RgbImage, width: usize, height: usize) -> RgbImage {
+pub(crate) fn resize(input: &RgbImage, width: usize, height: usize) -> RgbImage {
     let iw = input.width() as usize;
     let ih = input.height() as usize;
     let horizontal = if iw == width {

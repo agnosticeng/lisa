@@ -6,7 +6,6 @@ use crate::{Kernel, ScalarType};
 pub enum KernelKind {
     IndexedAttention(crate::IndexedAttentionKind),
     Tensor(crate::TensorOperationKind),
-    Refinement(crate::RefinementKind),
     OrderedF32(crate::OrderedF32Kind),
     PackedCompute(crate::PackedComputeKind),
     SparseF32(crate::SparseF32Kind),
@@ -15,7 +14,7 @@ pub enum KernelKind {
     BlockAttention(crate::BlockAttentionKind),
     ResidualBf16(crate::ResidualBf16Kind),
     AffineLinear,
-    Bf16SmallRowLinear,
+    AffineSerialLinear,
     Affine4WideLinear,
     AffineDequantize,
     AffineQuantize,
@@ -26,25 +25,27 @@ pub enum KernelKind {
     SigmoidGateTail,
     SwiGlu,
     PackedSwiGlu,
-    DeltaReplayCapture,
     Zeros,
+    DeviceZeros,
     DeltaDecode,
     DeltaScan { gated: bool, reuse: bool },
     GatedRms,
     DeltaPrepSeparate,
     DeltaPrepPacked,
-    DeltaReplayRestore,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NumericalLaw {
     IndexedAttentionV1,
-    /// DS4 scalar projections, original GGML block reductions and ordered routing.
+    /// The reference scalar projections, original GGML block reductions and ordered routing.
     PackedScalarV1,
-    /// Original DS4 GLM F32 sparse arithmetic, separate from six-expert routing.
+    /// Matrix expert reductions and online attention with F32 accumulation.
+    /// Internal reduced precision and reassociation are allowed explicitly.
+    PackedFastV1,
+    /// Original reference GLM F32 sparse arithmetic, separate from six-expert routing.
     SparseF32V1,
     /// Original affine expert reductions, routing selection and sorted combine.
     AffineExpertsV1,
-    /// Original DS4 affine Q2/group-128 indirect projections and ordered slot sums.
+    /// Original reference affine Q2/group-128 indirect projections and ordered slot sums.
     IndirectAffineV1,
     BlockAttentionV1,
     /// Original affine residual projection, stepped SiLU and sequential BF16 stream fold.
@@ -53,8 +54,6 @@ pub enum NumericalLaw {
     OrderedF32V1,
     /// Native tensor primitive law; operation variants preserve distinct cast/order semantics.
     TensorV1,
-    /// Independent MLX reduction/cast and stable integer selection laws.
-    MlxRefinementV1,
     KeyedGumbelV1,
     StorageBytesV1,
     Bf16QkRotaryV1,
@@ -64,7 +63,9 @@ pub enum NumericalLaw {
     /// Existing affine QMV/QMM law, including the explicitly scoped verify
     /// exception. The engine must keep the scope in its session identity.
     AffineV1,
-    MlxSmallRowBf16V1,
+    /// Ordinary single-query affine arithmetic for every independent row,
+    /// with only the operation's explicit, entered verify-scope exception.
+    AffineSerialV1,
     MlxWideAffine4V1,
     AffineDequantizeV1,
     AffineQuantizeV1,
@@ -96,7 +97,7 @@ pub struct TensorConstraint {
 pub enum ShapeRelation {
     /// Shape follows the typed tensor operation attributes.
     TensorOperation,
-    /// q/k [B,T,Hk,Dk], value/history [B,T,Hv,Dv], state [B,Hv,Dv,Dk].
+    /// q/k `[B,T,Hk,Dk]`, value/history `[B,T,Hv,Dv]`, state `[B,Hv,Dv,Dk]`.
     DeltaRecurrence,
     /// Last input dimension is the packed matrix input width; scale/bias rows
     /// match output rows and their columns match the group count.
@@ -152,7 +153,11 @@ impl KernelCapability {
                 | Kernel::AffineLinear { bits, group_size } => self
                     .encoding
                     .is_some_and(|e| e.bits.contains(bits) && e.group_sizes.contains(group_size)),
-                Kernel::Refinement(op) => self.encoding.is_none() && op.validate(),
+                Kernel::AffineSerialLinear {
+                    bits, group_size, ..
+                } => self
+                    .encoding
+                    .is_some_and(|e| e.bits.contains(bits) && e.group_sizes.contains(group_size)),
                 Kernel::OrderedF32(op) => self.encoding.is_none() && op.validate(),
                 Kernel::PackedCompute(op) => self.encoding.is_none() && op.validate(),
                 Kernel::SparseF32(op) => self.encoding.is_none() && op.validate(),
@@ -188,7 +193,7 @@ impl KernelCapability {
                     heads,
                     width,
                 } => [*batch, *rows, *heads, *width].iter().all(|&d| d > 0),
-                Kernel::Zeros { shape, dtype } => {
+                Kernel::Zeros { shape, dtype } | Kernel::DeviceZeros { shape, dtype } => {
                     self.encoding.is_none() && crate::tensor_bytes(shape, *dtype).is_some()
                 }
                 Kernel::DeltaDecode(spec) => self.encoding.is_none() && spec.validate(),
@@ -209,7 +214,7 @@ impl KernelCapability {
                     capture,
                     reuse,
                 } => match mode {
-                    crate::DeltaScan::Verify { epsilon } => {
+                    crate::DeltaScan::Verify { epsilon, .. } => {
                         *capture
                             && f32::from_bits(*epsilon).is_finite()
                             && f32::from_bits(*epsilon) >= 0.

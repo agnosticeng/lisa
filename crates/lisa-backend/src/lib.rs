@@ -14,16 +14,14 @@ mod sparse_f32;
 pub use affine_experts::*;
 pub use block_attention::*;
 pub use indexed_attention::*;
+pub use ordered_f32::*;
 pub use packed::*;
 pub use residual_bf16::*;
 pub use sparse_f32::*;
-mod refinement;
-pub use ordered_f32::*;
 mod tensor;
 pub use capability::*;
 pub use delta::*;
 pub use import::*;
-pub use refinement::*;
 pub use tensor::*;
 
 /// Scalar storage interpretation. Packed quantized weights remain U32/bytes;
@@ -70,10 +68,13 @@ impl HostTensor<'_> {
 /// Exact existing MLX-affine numerical semantics, independent of hardware.
 /// A backend must reject an unsupported contract rather than silently changing
 /// casts or reduction order. Additional numerical laws need distinct variants.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "kernel descriptors are built once per plan, not per dispatch"
+)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Kernel {
     Tensor(TensorOperation),
-    Refinement(Refinement),
     OrderedF32(OrderedF32),
     PackedCompute(PackedCompute),
     SparseF32(SparseF32),
@@ -82,8 +83,6 @@ pub enum Kernel {
     IndirectAffine(IndirectAffine),
     BlockAttention(BlockAttention),
     IndexedAttention(IndexedAttention),
-    /// MLX 0.32.4 BF16 small-row projection with its wide/thin reduction law.
-    Bf16SmallRowLinear,
     /// MLX 0.32.4 Q4/group-64 projection, including its F32 split-K accumulation.
     Affine4WideLinear,
     /// Strided source rows into contiguous destination storage; preserves bytes.
@@ -119,6 +118,12 @@ pub enum Kernel {
         shape: Vec<i32>,
         dtype: ScalarType,
     },
+    /// Zeros written by the device on its queue, as a kernel writes its
+    /// output: no host clear, for large state only device kernels touch.
+    DeviceZeros {
+        shape: Vec<i32>,
+        dtype: ScalarType,
+    },
     DeltaDecode(DeltaDecode),
     DeltaPrep(DeltaPrep),
     DeltaScan {
@@ -131,6 +136,8 @@ pub enum Kernel {
         width: i32,
         epsilon: u32,
         swish: bool,
+        /// Match the fused single-query delta decoder's gate transcendental.
+        serial_gate: bool,
     },
     /// Ordered host f32 arithmetic, including its sequential reductions and libm erf.
     HostTensor(TensorOperation),
@@ -148,16 +155,18 @@ pub enum Kernel {
         group_size: i32,
         bits: i32,
     },
+    /// Independent rows retain the ordinary M=1 affine reduction. The only
+    /// exception requires both this explicit flag and AffineVerifySplitK scope;
+    /// it admits the existing eligible 2..8-row verify tile, never large heads.
+    AffineSerialLinear {
+        group_size: i32,
+        bits: i32,
+        allow_verify_splitk: bool,
+    },
     /// BF16 SiLU(gate) * up, including the established intermediate rounding.
     SwiGlu,
     /// The same operation over a row-concatenated gate/up projection.
     PackedSwiGlu,
-    /// Sequential delta recurrence returning activation, final state and compact delta history.
-    DeltaReplayCapture,
-    /// Reapply compact history to the base state for the supplied prefix.
-    DeltaReplayRestore {
-        prefix: usize,
-    },
 }
 impl Kernel {
     /// Fresh storage suitable for a later explicitly effectful write. Views
@@ -172,7 +181,9 @@ impl Kernel {
         output == 0
             && matches!(
                 self,
-                Self::Zeros { .. } | Self::Tensor(TensorOperation::AssignSlice { .. })
+                Self::Zeros { .. }
+                    | Self::DeviceZeros { .. }
+                    | Self::Tensor(TensorOperation::AssignSlice { .. })
             )
     }
     /// Storage-preserving views used to trace an explicit write back to its
@@ -205,7 +216,10 @@ impl Kernel {
             Self::PackedCompute(PackedCompute::GatedResidual4 { .. }) => &[0],
             Self::IndexedAttention(op) => op.overwritten_inputs(),
             Self::CopyRowsConcatInto { .. } => &[2],
-            Self::CopyRowsInto { .. } | Self::Tensor(TensorOperation::CopySliceInto { .. }) => &[1],
+            Self::CopyRowsInto { .. }
+            | Self::Tensor(
+                TensorOperation::CopySliceInto { .. } | TensorOperation::CopyTailInto { .. },
+            ) => &[1],
             Self::DeltaScan {
                 mode: DeltaScan::Verify { .. },
                 reuse: true,
@@ -218,7 +232,6 @@ impl Kernel {
     pub fn outputs(&self) -> usize {
         match self {
             Self::Tensor(op) | Self::HostTensor(op) => op.outputs(),
-            Self::Refinement(op) => op.outputs(),
             Self::OrderedF32(op) => op.outputs(),
             Self::PackedCompute(op) => op.outputs(),
             Self::SparseF32(op) => op.outputs(),
@@ -227,7 +240,7 @@ impl Kernel {
             Self::IndexedAttention(_) => 1,
             Self::BlockAttention(op) => op.outputs(),
             Self::ResidualBf16(op) => op.outputs(),
-            Self::DeltaReplayCapture | Self::DeltaDecode(_) | Self::AffineQuantize { .. } => 3,
+            Self::DeltaDecode(_) | Self::AffineQuantize { .. } => 3,
             Self::QkNormRotary { interleaved, .. } => {
                 if *interleaved {
                     3
@@ -249,7 +262,6 @@ impl Kernel {
     pub fn kind(&self) -> KernelKind {
         match self {
             Self::Tensor(op) | Self::HostTensor(op) => KernelKind::Tensor(op.kind()),
-            Self::Refinement(op) => KernelKind::Refinement(op.kind()),
             Self::OrderedF32(op) => KernelKind::OrderedF32(op.kind()),
             Self::PackedCompute(op) => KernelKind::PackedCompute(op.kind()),
             Self::SparseF32(op) => KernelKind::SparseF32(op.kind()),
@@ -259,6 +271,7 @@ impl Kernel {
             Self::BlockAttention(op) => KernelKind::BlockAttention(op.kind()),
             Self::ResidualBf16(op) => KernelKind::ResidualBf16(op.kind()),
             Self::Zeros { .. } => KernelKind::Zeros,
+            Self::DeviceZeros { .. } => KernelKind::DeviceZeros,
             Self::KeyedGumbel { .. } => KernelKind::KeyedGumbel,
             Self::CopyRowsInto { .. } => KernelKind::CopyRowsInto,
             Self::CopyRowsConcatInto { .. } => KernelKind::CopyRowsConcatInto,
@@ -280,20 +293,26 @@ impl Kernel {
             Self::AffineDequantize { .. } => KernelKind::AffineDequantize,
             Self::AffineQuantize { .. } => KernelKind::AffineQuantize,
             Self::AffineLinear { .. } => KernelKind::AffineLinear,
-            Self::Bf16SmallRowLinear => KernelKind::Bf16SmallRowLinear,
+            Self::AffineSerialLinear { .. } => KernelKind::AffineSerialLinear,
             Self::Affine4WideLinear => KernelKind::Affine4WideLinear,
             Self::SwiGlu => KernelKind::SwiGlu,
             Self::PackedSwiGlu => KernelKind::PackedSwiGlu,
-            Self::DeltaReplayCapture => KernelKind::DeltaReplayCapture,
-            Self::DeltaReplayRestore { .. } => KernelKind::DeltaReplayRestore,
         }
     }
     pub fn law(&self) -> NumericalLaw {
         match self {
-            Self::Tensor(_) | Self::Zeros { .. } => NumericalLaw::TensorV1,
+            Self::Tensor(_) | Self::Zeros { .. } | Self::DeviceZeros { .. } => {
+                NumericalLaw::TensorV1
+            }
             Self::HostTensor(_) => NumericalLaw::HostSequentialF32,
-            Self::Refinement(_) => NumericalLaw::MlxRefinementV1,
             Self::OrderedF32(_) => NumericalLaw::OrderedF32V1,
+            Self::PackedCompute(
+                PackedCompute::RepackPlanes { .. }
+                | PackedCompute::DraftTree { .. }
+                | PackedCompute::Vendored(_)
+                | PackedCompute::KvPageTable { .. }
+                | PackedCompute::PlaneAddresses { .. },
+            ) => NumericalLaw::PackedFastV1,
             Self::PackedCompute(_) => NumericalLaw::PackedScalarV1,
             Self::SparseF32(_) => NumericalLaw::SparseF32V1,
             Self::AffineExperts(_) => NumericalLaw::AffineExpertsV1,
@@ -310,21 +329,18 @@ impl Kernel {
             Self::AffineDequantize { .. } => NumericalLaw::AffineDequantizeV1,
             Self::AffineQuantize { .. } => NumericalLaw::AffineQuantizeV1,
             Self::AffineLinear { .. } => NumericalLaw::AffineV1,
-            Self::Bf16SmallRowLinear => NumericalLaw::MlxSmallRowBf16V1,
+            Self::AffineSerialLinear { .. } => NumericalLaw::AffineSerialV1,
             Self::Affine4WideLinear => NumericalLaw::MlxWideAffine4V1,
             Self::SwiGlu | Self::PackedSwiGlu => NumericalLaw::Bf16SwiGluV1,
             Self::GatedRms { .. } => NumericalLaw::Bf16GatedRmsV1,
             Self::DeltaPrep(_) => NumericalLaw::DeltaPrepV1,
             Self::DeltaDecode(_) => NumericalLaw::DeltaDecodeV1,
-            Self::DeltaScan { .. } | Self::DeltaReplayCapture | Self::DeltaReplayRestore { .. } => {
-                NumericalLaw::DeltaSequentialV1
-            }
+            Self::DeltaScan { .. } => NumericalLaw::DeltaSequentialV1,
         }
     }
     pub fn arity(&self) -> usize {
         match self {
             Self::Tensor(op) | Self::HostTensor(op) => op.arity(),
-            Self::Refinement(op) => op.arity(),
             Self::OrderedF32(op) => op.arity(),
             Self::PackedCompute(op) => op.arity(),
             Self::SparseF32(op) => op.arity(),
@@ -335,16 +351,16 @@ impl Kernel {
             Self::ResidualBf16(op) => op.arity(),
             Self::AffineDequantize { .. } => 3,
             Self::AffineQuantize { .. } => 1,
-            Self::AffineLinear { .. } | Self::Affine4WideLinear => 4,
-            Self::Bf16SmallRowLinear => 2,
+            Self::AffineLinear { .. }
+            | Self::AffineSerialLinear { .. }
+            | Self::Affine4WideLinear => 4,
             Self::KeyedGumbel { .. } => 1,
             Self::CopyRowsConcatInto { .. } => 3,
             Self::CopyRowsInto { .. } | Self::SigmoidGateTail { .. } => 2,
             Self::QkNormRotary { .. } => 6,
             Self::SwiGlu => 2,
             Self::PackedSwiGlu => 1,
-            Self::DeltaReplayCapture => 6,
-            Self::Zeros { .. } => 0,
+            Self::Zeros { .. } | Self::DeviceZeros { .. } => 0,
             Self::DeltaScan { mode, reuse, .. } => {
                 6 + 2 * usize::from(mode.gated()) + 2 * usize::from(*reuse)
             }
@@ -357,7 +373,6 @@ impl Kernel {
                     5
                 }
             }
-            Self::DeltaReplayRestore { .. } => 4,
         }
     }
 }
@@ -386,6 +401,30 @@ pub trait Device {
     type Completion;
     type Error: std::error::Error + Send + Sync + 'static;
     fn capabilities(&self) -> &[KernelCapability];
+    /// The device's GPU cores, where it has them and knows their count.
+    fn gpu_cores(&self) -> Option<u32> {
+        None
+    }
+    /// The device's Apple GPU family (7 for M1-class GPUs, 9 for M3 and M4,
+    /// 10 for M5), where it has one.
+    fn apple_gpu_family(&self) -> Option<u32> {
+        None
+    }
+    /// Whether the device runs the Metal 4 language and its tensor
+    /// operations (an Apple7 or newer GPU on an OS 26 or later).
+    fn metal4(&self) -> bool {
+        false
+    }
+    /// Keep `tensors`, and every pooled device allocation, resident while
+    /// the returned handle lives, so their memory stays wired across idle
+    /// gaps between requests (Metal: one residency set re-requested on a
+    /// heartbeat). `None` where the device has no such control.
+    fn hold_resident(
+        &self,
+        _tensors: &[&Self::Tensor],
+    ) -> Option<Box<dyn std::any::Any + Send + Sync>> {
+        None
+    }
     fn pull(
         &self,
         source: TensorSource<'_>,
@@ -406,7 +445,24 @@ pub trait Device {
         stream: &Self::Stream,
     ) -> Result<Option<Dispatch<Outputs<Self::Tensor>, Self::Completion>>, Self::Error>;
     fn wait(&self, completion: &Self::Completion) -> Result<(), Self::Error>;
+    /// Execute an audited GPU-only region once and optionally retain its
+    /// dispatch schedule. Inputs include all external tensors; scalar kernel
+    /// attributes must remain fixed for the lifetime of the resulting program.
+    /// Providers must decline unsupported operations without changing execution.
+    /// `encode` must run exactly once, including when capture is declined.
+    fn capture_program(
+        &self,
+        inputs: &[&Self::Tensor],
+        stream: &Self::Stream,
+        encode: &mut dyn FnMut() -> anyhow::Result<Vec<Self::Tensor>>,
+    ) -> anyhow::Result<ProgramCapture<Self::Tensor>> {
+        let _ = (inputs, stream);
+        Ok((encode()?, None))
+    }
 }
+
+mod program;
+pub use program::{ProgramCapture, ProgramScheduling, RecordedProgram};
 
 /// Explicit synchronized readback. No implicit cast, sampling or model policy.
 pub trait ReadbackDevice: Device {

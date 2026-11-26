@@ -67,7 +67,7 @@
       248069,
       271
     ],
-    "storage": "External capture, not a tracked weight fixture. Set LISA_QWEN_GGUF_REFERENCE to its path; the explicitly enabled integration test fails if absent."
+    "storage": "External capture, not a tracked weight fixture."
   },
   "pointwise_performance_receipt": {
     "date": "2026-11-06",
@@ -139,10 +139,10 @@
       "prompt": "Explain why the sky is blue.",
       "mode": "raw, depth 0, greedy, 8 output tokens, context 512, default detected RAM budget",
       "controls": [
-        "LISA_TRACE",
-        "LISA_TRACE_JSON",
-        "LISA_CB_RECORD",
-        "LISA_GPU_PROBE"
+        "--trace",
+        "--trace-json",
+        "--cb-record",
+        "--gpu-probe"
       ],
       "before_dispatches": 38120,
       "after_dispatches": 22104,
@@ -320,7 +320,7 @@
       {
         "change": "Two token rows per group, four output rows per SIMD",
         "correctness": "Interleaved accumulator updates failed bitwise equality. Separate token loops passed the full matrix.",
-        "timing": "At K=5120,N=17408,M=3: original 187.996\u2013188.185 us, candidate 292.672\u2013293.930 us; M=16: last original 961.620 us, candidates 1204.152\u20131207.574 us. Rejected."
+        "timing": "At K=5120,N=17408,M=3: original 187.996–188.185 us, candidate 292.672–293.930 us; M=16: last original 961.620 us, candidates 1204.152–1207.574 us. Rejected."
       },
       {
         "change": "Two token rows, two output rows per SIMD, four SIMD groups",
@@ -330,7 +330,7 @@
       {
         "change": "Original one-token body with output tile 2 or 8",
         "correctness": "Passed bitwise cases.",
-        "timing": "Tile 2 regressed. Tile 8 changed large-M latency by roughly 0\u20133% but regressed small-M cases; no compelling adoption evidence."
+        "timing": "Tile 2 regressed. Tile 8 changed large-M latency by roughly 0–3% but regressed small-M cases; no compelling adoption evidence."
       },
       {
         "change": "32-bit codebook loads unpacked to uchar4",

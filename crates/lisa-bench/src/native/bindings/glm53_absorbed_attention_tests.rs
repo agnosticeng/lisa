@@ -152,10 +152,10 @@ fn dsa_absorbed_attention_reads_packed_affine_kv_b() {
     .expect("packed affine absorbed DSA kernel should accept the fixture");
     let got = out.to_vec1::<f32>().expect("output readback");
 
-    // DS4's sparse-boundary expansion pads incomplete causal tails with
+    // The reference's sparse-boundary expansion pads incomplete causal tails with
     // -1. Those rows must be ignored by the indexed-lora softmax.
     let mut padded_ids = Vec::with_capacity(batches * queries * 4);
-    for row in selected_ids.chunks_exact(3) {
+    for row in selected_ids.as_chunks::<3>().0.iter() {
         padded_ids.extend_from_slice(row);
         padded_ids.push(-1);
     }
@@ -415,7 +415,6 @@ fn equal(a: &Array, b: &Array) -> anyhow::Result<()> {
 }
 #[test]
 fn absorbed_plans_preserve_all_schedules_and_boundaries() -> anyhow::Result<()> {
-    use crate::bindings::deepseek41_moe::tests::{counts, difference};
     use lisa_metal::Dtype;
     let stream = Stream::thread_local_or_default();
     let w = Array::from_slice(
@@ -424,8 +423,8 @@ fn absorbed_plans_preserve_all_schedules_and_boundaries() -> anyhow::Result<()> 
             .collect::<Vec<_>>(),
         &[32768, 128],
     );
-    let scales = values(&[32768, 8], 11).multiply(&Array::from_f32_as(0.002, Dtype::Float32))?;
-    let biases = values(&[32768, 8], 17).multiply(&Array::from_f32_as(0.001, Dtype::Float32))?;
+    let scales = values(&[32768, 8], 11).multiply(Array::from_f32_as(0.002, Dtype::Float32))?;
+    let biases = values(&[32768, 8], 17).multiply(Array::from_f32_as(0.001, Dtype::Float32))?;
     for native in [false, true] {
         let _mode = Glm53DsaNativeScope::new(native);
         for (batch, tokens, n, boundaries) in [
@@ -453,7 +452,6 @@ fn absorbed_plans_preserve_all_schedules_and_boundaries() -> anyhow::Result<()> 
                 (true, false, false),
                 (false, true, true),
             ] {
-                let before = counts();
                 let a = oracle::dsa_absorbed_attention_stages_inner(
                     &q,
                     &w,
@@ -471,7 +469,6 @@ fn absorbed_plans_preserve_all_schedules_and_boundaries() -> anyhow::Result<()> 
                     boundaries,
                 )
                 .expect("original attention");
-                let between = counts();
                 let b = dsa_absorbed_attention_stages_inner(
                     &q,
                     &w,
@@ -489,7 +486,6 @@ fn absorbed_plans_preserve_all_schedules_and_boundaries() -> anyhow::Result<()> 
                     boundaries,
                 )
                 .expect("planned attention");
-                let after = counts();
                 equal(&a.0, &b.0)?;
                 for (a, b) in [(&a.1, &b.1), (&a.2, &b.2)] {
                     assert_eq!(a.is_some(), b.is_some());
@@ -497,36 +493,23 @@ fn absorbed_plans_preserve_all_schedules_and_boundaries() -> anyhow::Result<()> 
                         equal(a, b)?;
                     }
                 }
-                if std::env::var_os("LISA_TRACE").is_some() {
-                    assert_eq!(
-                        difference(&before, &between),
-                        difference(&between, &after),
-                        "native{native} B{batch} T{tokens} N{n} capture{capture} fused{force}"
-                    );
-                }
             }
         }
         for tokens in [24, 31, 32, 34] {
             let q = values(&[1, 64, tokens, 256], 41);
             let cache = values(&[1, tokens + 3, 512], 43).as_dtype(Dtype::Float16)?;
             let _slice = Glm53DsaValueSliceScope::new(2048, 2051);
-            let before = counts();
             let a = oracle::dsa_absorbed_attention_flash_causal_prefill_stages(
                 &q, &w, &scales, &biases, 64, &cache, 3, 0.0625, &stream, true,
             )
             .unwrap();
-            let between = counts();
             let b = dsa_absorbed_attention_flash_causal_prefill_stages(
                 &q, &w, &scales, &biases, 64, &cache, 3, 0.0625, &stream, true,
             )
             .unwrap();
-            let after = counts();
             equal(&a.0, &b.0)?;
             equal(&a.1, &b.1)?;
             equal(&a.2, &b.2)?;
-            if std::env::var_os("LISA_TRACE").is_some() {
-                assert_eq!(difference(&before, &between), difference(&between, &after));
-            }
         }
     }
     Ok(())

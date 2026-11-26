@@ -220,8 +220,8 @@ fn generic_binding_runs_cpu_laya_without_a_native_provider() -> anyhow::Result<(
     file.extend(header);
     file.extend(payload);
     std::fs::write(root.join("model.safetensors"), file)?;
-    let direct = super::Laya::load_on(root, lisa_cpu::CpuDevice, Arithmetic::HostF32)?;
-    let selected = super::Laya::load_on(
+    let direct = crate::weights::laya::load_on(root, lisa_cpu::CpuDevice, Arithmetic::HostF32)?;
+    let selected = crate::weights::laya::load_on(
         root,
         lisa_backend::erased::DeviceHandle::new(lisa_cpu::CpuDevice),
         Arithmetic::HostF32,

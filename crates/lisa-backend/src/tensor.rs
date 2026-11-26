@@ -53,6 +53,12 @@ pub enum TensorOperation {
         start: i32,
         end: i32,
     },
+    /// Copy source values into the final rows of an explicitly writable
+    /// destination along `axis`; the offset follows the run-time shapes. An
+    /// F32 source may fill an F16 destination, rounding to nearest even.
+    CopyTailInto {
+        axis: i32,
+    },
     /// Copy with one replaced rectangular region; one half-open range per axis.
     AssignRegion(Vec<(i32, i32)>),
     AssignSlice {
@@ -94,11 +100,16 @@ pub enum TensorOperation {
     },
     SequentialAttention,
     /// F32 MIMO recurrence. Inputs: dynamic/static projections, B/C biases,
-    /// x/z factors, output factors, norms, dt/D, immutable [S,K,V,phase] state.
+    /// x/z factors, output factors, norms, dt/D, immutable `[S,K,V,phase]` state.
     /// Outputs: mixed rows and replacement state; Dqk=128, Dv=64, rank=4.
-    Mamba3Mimo { heads: u32, epsilon: u32 },
+    Mamba3Mimo {
+        heads: u32,
+        epsilon: u32,
+    },
     /// Rotate an F32 residual towards an update, with learned scalar scale/bias.
-    GeodesicResidual { inverse_depth: u32 },
+    GeodesicResidual {
+        inverse_depth: u32,
+    },
     Matmul,
     /// Whole-tensor reductions retain their own reduction and cast order.
     SumAll,
@@ -118,6 +129,12 @@ pub enum TensorOperation {
         dimensions: i32,
         base: u32,
         offset: i32,
+    },
+    /// The same rotary law with a signed `I32[1]` offset supplied as input 1.
+    /// The offset is read on device and may change between prepared executions.
+    RotaryAt {
+        dimensions: i32,
+        base: u32,
     },
     Top32Indices,
     Argsort,
@@ -150,7 +167,7 @@ pub enum TensorOperation {
         epsilon: u32,
     },
     /// BF16 groups of 128: four sequential F32 squares per lane, the original
-    /// DS4 lane reduction, reciprocal square root, then BF16 output. No scale.
+    /// the reference lane reduction, reciprocal square root, then BF16 output. No scale.
     GroupedRms128 {
         epsilon: u32,
     },
@@ -163,12 +180,19 @@ pub enum TensorOperation {
         scale: u32,
         mask: AttentionMask,
     },
+    /// Causal rows use exactly the arithmetic of separate single-query calls
+    /// to `Attention`, each with its visible key/value prefix. Providers may
+    /// group independent rows only while preserving that reduction schedule.
+    AttentionSerialCausal {
+        scale: u32,
+    },
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TensorOperationKind {
     Reshape,
     SplitLastAxis,
     CopySliceInto,
+    CopyTailInto,
     AssignRegion,
     AssignSlice,
     Transpose,
@@ -194,6 +218,7 @@ pub enum TensorOperationKind {
     TakeAlong,
     Mean,
     Rotary,
+    RotaryAt,
     Top32Indices,
     Argsort,
     ArgPartition,
@@ -211,12 +236,19 @@ pub enum TensorOperationKind {
     GroupedRms128,
     AddRmsNorm,
     Attention(AttentionMask),
+    AttentionSerialCausal,
 }
 impl TensorOperation {
     pub fn validate(&self) -> bool {
         match self {
-            Self::Mamba3Mimo { heads, epsilon } => (1..=256).contains(heads) && f32::from_bits(*epsilon).is_finite() && f32::from_bits(*epsilon) > 0.0,
-            Self::GeodesicResidual { inverse_depth } => f32::from_bits(*inverse_depth).is_finite() && f32::from_bits(*inverse_depth) > 0.0,
+            Self::Mamba3Mimo { heads, epsilon } => {
+                (1..=256).contains(heads)
+                    && f32::from_bits(*epsilon).is_finite()
+                    && f32::from_bits(*epsilon) > 0.0
+            }
+            Self::GeodesicResidual { inverse_depth } => {
+                f32::from_bits(*inverse_depth).is_finite() && f32::from_bits(*inverse_depth) > 0.0
+            }
             Self::ArgPartition { kth, .. } => *kth >= 0,
             Self::Reshape(shape) => {
                 shape.iter().all(|&d| d >= -1) && shape.iter().filter(|&&d| d == -1).count() <= 1
@@ -257,7 +289,15 @@ impl TensorOperation {
                     && f32::from_bits(*base).is_finite()
                     && f32::from_bits(*base) > 0.
             }
-            Self::Attention { scale, .. } => f32::from_bits(*scale).is_finite(),
+            Self::RotaryAt { dimensions, base } => {
+                *dimensions > 0
+                    && *dimensions % 2 == 0
+                    && f32::from_bits(*base).is_finite()
+                    && f32::from_bits(*base) > 0.
+            }
+            Self::Attention { scale, .. } | Self::AttentionSerialCausal { scale } => {
+                f32::from_bits(*scale).is_finite()
+            }
             _ => true,
         }
     }
@@ -266,6 +306,7 @@ impl TensorOperation {
             Self::Reshape(_) => TensorOperationKind::Reshape,
             Self::SplitLastAxis(_) => TensorOperationKind::SplitLastAxis,
             Self::CopySliceInto { .. } => TensorOperationKind::CopySliceInto,
+            Self::CopyTailInto { .. } => TensorOperationKind::CopyTailInto,
             Self::AssignRegion(_) => TensorOperationKind::AssignRegion,
             Self::AssignSlice { .. } => TensorOperationKind::AssignSlice,
             Self::Transpose(_) => TensorOperationKind::Transpose,
@@ -293,6 +334,7 @@ impl TensorOperation {
             Self::TakeAlong { .. } => TensorOperationKind::TakeAlong,
             Self::Mean { .. } => TensorOperationKind::Mean,
             Self::Rotary { .. } => TensorOperationKind::Rotary,
+            Self::RotaryAt { .. } => TensorOperationKind::RotaryAt,
             Self::Top32Indices => TensorOperationKind::Top32Indices,
             Self::Argsort => TensorOperationKind::Argsort,
             Self::ArgPartition { .. } => TensorOperationKind::ArgPartition,
@@ -310,6 +352,7 @@ impl TensorOperation {
             Self::GroupedRms128 { .. } => TensorOperationKind::GroupedRms128,
             Self::AddRmsNorm { .. } => TensorOperationKind::AddRmsNorm,
             Self::Attention { mask, .. } => TensorOperationKind::Attention(*mask),
+            Self::AttentionSerialCausal { .. } => TensorOperationKind::AttentionSerialCausal,
         }
     }
     pub fn arity(&self) -> usize {
@@ -323,6 +366,7 @@ impl TensorOperation {
             Self::Compare(_) | Self::LogicalAnd | Self::LogicalOr => 2,
             Self::Concatenate { inputs, .. } => *inputs,
             Self::CopySliceInto { .. }
+            | Self::CopyTailInto { .. }
             | Self::AssignRegion(_)
             | Self::AssignSlice { .. }
             | Self::Binary(_)
@@ -330,13 +374,14 @@ impl TensorOperation {
             | Self::Matmul
             | Self::TakeAlong { .. }
             | Self::Take { .. }
+            | Self::RotaryAt { .. }
             | Self::RmsNorm { .. } => 2,
             Self::AddRmsNorm { .. } | Self::LayerNorm { .. } => 3,
             Self::Attention {
                 mask: AttentionMask::Tensor,
                 ..
             } => 4,
-            Self::Attention { .. } => 3,
+            Self::Attention { .. } | Self::AttentionSerialCausal { .. } => 3,
             _ => 1,
         }
     }

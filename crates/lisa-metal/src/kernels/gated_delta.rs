@@ -7,9 +7,9 @@ use crate::kernels::EXACT_HEADER;
 
 /// The gated delta rule scan kernel from `GatedDelta.swift`.
 ///
-/// Inputs: q [B,T,Hk,Dk], k [B,T,Hk,Dk], v [B,T,Hv,Dv], g [B,T,Hv] f32,
-/// beta [B,T,Hv] f32, state_in [B,Hv,Dv,Dk], T scalar i32.
-/// Outputs: y [B,T,Hv,Dv] (activation dtype), state_out [B,Hv,Dv,Dk] (StT).
+/// Inputs: q `[B,T,Hk,Dk]`, k `[B,T,Hk,Dk]`, v `[B,T,Hv,Dv]`, g `[B,T,Hv]` f32,
+/// beta `[B,T,Hv]` f32, state_in `[B,Hv,Dv,Dk]`, T scalar i32.
+/// Outputs: y `[B,T,Hv,Dv]` (activation dtype), state_out `[B,Hv,Dv,Dk]` (StT).
 const GATED_DELTA_SOURCE: &crate::shader_pack::Source =
     crate::kernel_source!("gdn/gated_delta.metal");
 
@@ -266,7 +266,7 @@ const GDN_ROWS_SOURCE: &crate::shader_pack::Source = crate::kernel_source!("gdn/
 static GDN_ROWS: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 static GDN_TWO_ROW: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
 
-/// The `T` scalar argument, cached per value (specs/08 item 3): rebuilding it
+/// The `T` scalar argument, cached per value: rebuilding it
 /// per layer per step was a host-side graph-node reconstruction. `Array` is
 /// immutable and `Arc`-backed, so sharing one instance is safe.
 pub fn t_scalar_pub(t: i32) -> Array {
@@ -432,6 +432,27 @@ pub fn gdn_verify_fused(
     prealloc: Option<(&Array, &Array)>,
     stream: &Stream,
 ) -> Option<(Array, Array)> {
+    gdn_verify_fused_with_serial_gate(
+        q, k, v, g, beta, state, z, weight, eps, prealloc, false, stream,
+    )
+}
+
+/// Captured prefixes may require the ordinary fused decoder's gate law.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_verify_fused_with_serial_gate(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    g: &Array,
+    beta: &Array,
+    state: &Array,
+    z: &Array,
+    weight: &Array,
+    eps: f32,
+    prealloc: Option<(&Array, &Array)>,
+    serial_gate: bool,
+    stream: &Stream,
+) -> Option<(Array, Array)> {
     let (b, t, hk, dk) = (k.dim(0), k.dim(1), k.dim(2), k.dim(3));
     let (hv, dv) = (v.dim(2), v.dim(3));
     if dk != 128
@@ -489,6 +510,7 @@ pub fn gdn_verify_fused(
         TemplateArg::Int("EPS_BITS", eps.to_bits() as i32),
         TemplateArg::Bool("CAPTURE", true),
         TemplateArg::Bool("SIGLU", true),
+        TemplateArg::Bool("SERIAL_GATE", serial_gate),
     ];
     let outs = [
         OutputArg {
@@ -884,348 +906,6 @@ pub fn warm() {
     let _ = gdn_decode_complete_kernel();
 }
 
-// Both replay kernels fully overwrite these outputs. Keep the ordinary pool's
-// completion requirements (no ordered-reuse scope) but omit the redundant CPU
-// zero fill of hundreds of MB of state per round. apply_into retains the leases.
-fn replay_output(shape: &[i32], dtype: Dtype, stream: &Stream) -> crate::error::Result<Array> {
-    let shape: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
-    let bytes = shape.iter().product::<usize>() * dtype.size_of();
-    let buffer = stream
-        .runtime()
-        .buffer_for_full_write(bytes, "gdn_replay_output")?;
-    Ok(Array::new(crate::array::Array::from_parts(
-        stream.runtime(),
-        buffer,
-        &shape,
-        dtype,
-    )))
-}
-
-/// Apply one compact-history recurrence kernel. Prefix selection and transaction
-/// lifetime belong to the model plan and engine, not the device.
-pub fn gdn_replay_restore(
-    base: &Array,
-    keys: &Array,
-    decay: &Array,
-    delta: &Array,
-    n: usize,
-    stream: &Stream,
-) -> crate::error::Result<Array> {
-    if keys.rank() != 4 || n > keys.dim(1) as usize {
-        return Err(crate::error::Error::msg("invalid delta replay prefix"));
-    }
-    static KERNEL: std::sync::OnceLock<std::result::Result<MetalKernel, String>> =
-        std::sync::OnceLock::new();
-    let kernel = KERNEL
-        .get_or_init(|| {
-            MetalKernel::new(
-                "gdn_replay_restore",
-                &["state_in", "k", "g", "delta", "T", "N"],
-                &["state_out"],
-                crate::kernel_source!("gdn/gdn_replay_restore.metal"),
-                "",
-                true,
-                false,
-            )
-            .map_err(|e| e.to_string())
-        })
-        .as_ref()
-        .map_err(|e| crate::error::Error::msg(e.clone()))?;
-    let t = t_scalar(keys.dim(1));
-    let n = t_scalar(n as i32);
-    let b = base.dim(0);
-    let hv = base.dim(1);
-    let dv = base.dim(2);
-    let dk = base.dim(3);
-    let template = [
-        TemplateArg::Dtype("InT", Dtype::Bfloat16),
-        TemplateArg::Int("Hk", keys.dim(2)),
-        TemplateArg::Int("Hv", hv),
-        TemplateArg::Int("Dv", dv),
-        TemplateArg::Int("Dk", dk),
-    ];
-    let output = replay_output(base.shape(), Dtype::Float32, stream)?;
-    let mut result = kernel.apply_into(
-        &[&base, &keys, &decay, &delta, &t, &n],
-        &template,
-        (32, dv / 2, b * hv),
-        (32, 4, 1),
-        &[OutputArg {
-            shape: base.shape().to_vec(),
-            dtype: Dtype::Float32,
-        }],
-        &[&output],
-        stream,
-    )?;
-    Ok(result.remove(0))
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn gdn_replay_capture(
-    q: &Array,
-    k: &Array,
-    v: &Array,
-    g: &Array,
-    beta: &Array,
-    state: &Array,
-    stream: &Stream,
-) -> crate::error::Result<(Array, Array, Array)> {
-    // Supported shape of this kernel specialization; request policy is external.
-    if k.dim(0) != 1
-        || k.dim(3) != 128
-        || v.dim(3) != 128
-        || k.dim(1) <= 1
-        || q.dtype() != Dtype::Bfloat16
-        || k.dtype() != Dtype::Bfloat16
-        || v.dtype() != Dtype::Bfloat16
-        || state.dtype() != Dtype::Float32
-    {
-        return Err(crate::error::Error::msg(
-            "unsupported delta capture geometry",
-        ));
-    }
-    static KERNEL: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
-    let kernel = KERNEL
-        .get_or_init(|| {
-            MetalKernel::new(
-                "gdn_replay_capture",
-                &["q", "k", "v", "g", "beta", "state_in", "T"],
-                &["y", "state_out", "delta"],
-                crate::kernel_source!("gdn/gdn_replay_capture.metal"),
-                "",
-                true,
-                false,
-            )
-            .ok()
-        })
-        .as_ref()
-        .ok_or_else(|| crate::error::Error::msg("delta capture kernel unavailable"))?;
-    let b = k.dim(0);
-    let t = k.dim(1);
-    let hk = k.dim(2);
-    let dk = k.dim(3);
-    let hv = v.dim(2);
-    let dv = v.dim(3);
-    let state = &state.reshape(&[b, hv, dv, dk])?;
-    let template = [
-        TemplateArg::Dtype("InT", Dtype::Bfloat16),
-        TemplateArg::Dtype("StT", Dtype::Float32),
-        TemplateArg::Int("Dk", dk),
-        TemplateArg::Int("Dv", dv),
-        TemplateArg::Int("Hk", hk),
-        TemplateArg::Int("Hv", hv),
-    ];
-    let ts = t_scalar(t);
-    let outs = [
-        OutputArg {
-            shape: vec![b, t, hv, dv],
-            dtype: Dtype::Bfloat16,
-        },
-        OutputArg {
-            shape: state.shape().to_vec(),
-            dtype: Dtype::Float32,
-        },
-        OutputArg {
-            shape: vec![b, t, hv, dv],
-            dtype: Dtype::Float32,
-        },
-    ];
-    let allocated = outs
-        .iter()
-        .map(|out| replay_output(&out.shape, out.dtype, stream))
-        .collect::<crate::error::Result<Vec<_>>>()?;
-    let prealloc: Vec<_> = allocated.iter().collect();
-    let mut r = kernel
-        .apply_into(
-            &[q, k, v, g, beta, state, &ts],
-            &template,
-            (32, dv / 2, b * hv),
-            (32, 4, 1),
-            &outs,
-            &prealloc,
-            stream,
-        )?
-        .into_iter();
-    let y = r.next().expect("validated capture output");
-    let final_state = r.next().expect("validated final state output");
-    let delta = r.next().expect("validated delta output");
-    Ok((y, final_state, delta))
-}
-
 #[cfg(test)]
-mod replay_tests {
-    use super::*;
-    #[test]
-    fn fused_verify_preserves_epilogue_and_every_snapshot() -> crate::error::Result<()> {
-        let stream = Stream::thread_local_or_default();
-        let values = |shape: &[i32], scale: f32, bias: f32, dtype| {
-            let len: i32 = shape.iter().product();
-            let data: Vec<f32> = (0..len)
-                .map(|i| (((i * 37 + 11) % 257) as f32 - 128.) * scale + bias)
-                .collect();
-            Array::from_slice(&data, shape).as_dtype(dtype)
-        };
-        for (b, t, hk, hv) in [
-            (1, 2, 4, 16),
-            (1, 3, 16, 48),
-            (1, 6, 16, 48),
-            (1, 7, 16, 48),
-            (1, 8, 16, 48),
-            (1, 16, 16, 48),
-            (2, 7, 16, 48),
-        ] {
-            let q = values(&[b, t, hk, 128], 0.0013, 0.0, Dtype::Bfloat16)?;
-            let k = values(&[b, t, hk, 128], 0.0017, 0.0, Dtype::Bfloat16)?;
-            let v = values(&[b, t, hv, 128], 0.0031, 0.0, Dtype::Bfloat16)?;
-            let g = values(&[b, t, hv], 0.0007, 0.90, Dtype::Float32)?;
-            let beta = values(&[b, t, hv], 0.0019, 0.5, Dtype::Float32)?;
-            let state = values(&[b, hv, 128, 128], 0.0023, 0.0, Dtype::Float32)?;
-            let weight = values(&[128], 0.0019, 1.0, Dtype::Bfloat16)?;
-            // Includes every BF16 gate encoding across the suite; retain a
-            // nonzero binding offset and a wider projection row stride.
-            let gates: Vec<_> = (0..b * t * (hv * 128 + 16))
-                .map(|i| half::bf16::from_bits(i as u16))
-                .collect();
-            let backing = Array::from_slice(&gates, &[b, t, hv * 128 + 16]);
-            let z = backing.index((.., .., 8..8 + hv * 128));
-            let (raw, expected_state) =
-                gdn_two_row(&q, &k, &v, &g, &beta, &state, true, &stream).unwrap();
-            for eps in [1e-6, 1e-5] {
-                let expected =
-                    crate::kernels::gated_rms_silu(&raw, &z, &weight, hv, 128, eps, &stream)
-                        .unwrap();
-                let (y, snapshots) = gdn_verify_fused(
-                    &q, &k, &v, &g, &beta, &state, &z, &weight, eps, None, &stream,
-                )
-                .unwrap();
-                for (a, e) in y
-                    .to_vec1::<half::bf16>()?
-                    .iter()
-                    .zip(expected.to_vec1::<half::bf16>()?)
-                {
-                    assert!(
-                        a.to_bits() == e.to_bits() || a.is_nan() && e.is_nan(),
-                        "B={b} T={t} eps={eps} {a:?} != {e:?}"
-                    );
-                }
-                assert_eq!(
-                    snapshots.to_vec1::<u32>()?,
-                    expected_state.to_vec1::<u32>()?,
-                    "B={b} T={t} capture"
-                );
-                let reference = y.to_vec1::<u16>()?;
-                let (reused, _) = gdn_verify_fused(
-                    &q,
-                    &k,
-                    &v,
-                    &g,
-                    &beta,
-                    &state,
-                    &z,
-                    &weight,
-                    eps,
-                    Some((&y, &snapshots)),
-                    &stream,
-                )
-                .unwrap();
-                assert_eq!(reused.to_vec1::<u16>()?, reference, "persistent output");
-                if b == 1 {
-                    // Production commits a rank-3 view of an accepted prefix.
-                    // The next round can reuse that same snapshot allocation.
-                    // Check both activation and bits through repeated commits,
-                    // including partial acceptance and nonzero input offsets.
-                    let (mut y, mut snapshots) = (reused, snapshots);
-                    for keep in [t, 1, t - 1, 2] {
-                        let committed = snapshots
-                            .index((keep - 1, .., .., ..))
-                            .contiguous()?
-                            .detach();
-                        assert_eq!(committed.shape(), [hv, 128, 128]);
-                        let (raw, expected_state) =
-                            gdn_two_row(&q, &k, &v, &g, &beta, &committed, true, &stream).unwrap();
-                        let expected = crate::kernels::gated_rms_silu(
-                            &raw, &z, &weight, hv, 128, eps, &stream,
-                        )
-                        .unwrap()
-                        .to_vec1::<half::bf16>()?;
-                        let expected_state = expected_state.to_vec1::<u32>()?;
-                        (y, snapshots) = gdn_verify_fused(
-                            &q,
-                            &k,
-                            &v,
-                            &g,
-                            &beta,
-                            &committed,
-                            &z,
-                            &weight,
-                            eps,
-                            Some((&y, &snapshots)),
-                            &stream,
-                        )
-                        .expect("fused verification must accept a committed rank-3 state");
-                        for (a, e) in y.to_vec1::<half::bf16>()?.iter().zip(expected) {
-                            assert!(
-                                a.to_bits() == e.to_bits() || a.is_nan() && e.is_nan(),
-                                "T={t} keep={keep} resumed epilogue"
-                            );
-                        }
-                        assert_eq!(
-                            snapshots.to_vec1::<u32>()?,
-                            expected_state,
-                            "T={t} keep={keep} resumed capture"
-                        );
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-    #[test]
-    fn compact_replay_matches_every_snapshot_bitwise() -> crate::error::Result<()> {
-        let stream = Stream::thread_local_or_default();
-        let values = |shape: &[i32], scale: f32, bias: f32, dtype| {
-            let len: i32 = shape.iter().product();
-            let data: Vec<f32> = (0..len)
-                .map(|i| (((i * 37 + 11) % 257) as f32 - 128.) * scale + bias)
-                .collect();
-            Array::from_slice(&data, shape).as_dtype(dtype)
-        };
-        for (hk, hv) in [(4, 16), (16, 48)] {
-            for t in [2, 3, 7, 8, 12, 16] {
-                let q = values(&[1, t, hk, 128], 0.0013, 0.0, Dtype::Bfloat16)?;
-                let k = values(&[1, t, hk, 128], 0.0017, 0.0, Dtype::Bfloat16)?;
-                let v = values(&[1, t, hv, 128], 0.0031, 0.0, Dtype::Bfloat16)?;
-                let g = values(&[1, t, hv], 0.0007, 0.90, Dtype::Float32)?;
-                let beta = values(&[1, t, hv], 0.0019, 0.5, Dtype::Float32)?;
-                let state = values(&[1, hv, 128, 128], 0.0023, 0.0, Dtype::Float32)?;
-                let (expected_y, snapshots) =
-                    gdn_two_row(&q, &k, &v, &g, &beta, &state, true, &stream)
-                        .expect("snapshot kernel");
-                let (y, _, delta) = gdn_replay_capture(&q, &k, &v, &g, &beta, &state, &stream)
-                    .expect("replay kernel");
-                assert_eq!(
-                    y.to_vec1::<u16>()?,
-                    expected_y.to_vec1::<u16>()?,
-                    "T={t} output"
-                );
-                for n in (0..=t).rev().chain(0..=t) {
-                    let expected = if n == 0 {
-                        state.clone()
-                    } else {
-                        snapshots.index((n - 1, .., .., ..)).contiguous()?
-                    };
-                    assert_eq!(
-                        gdn_replay_restore(&state, &k, &g, &delta, n as usize, &stream)?
-                            .to_vec1::<u32>()?,
-                        expected.to_vec1::<u32>()?,
-                        "T={t}, prefix={n}"
-                    );
-                }
-                assert!(
-                    gdn_replay_restore(&state, &k, &g, &delta, t as usize + 1, &stream).is_err()
-                );
-            }
-        }
-        Ok(())
-    }
-}
+#[path = "gated_delta/parity_tests.rs"]
+mod decode_capture_tests;

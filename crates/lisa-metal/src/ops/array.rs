@@ -59,7 +59,7 @@ impl Array {
             ));
         }
         let element_size = dtype.size_of();
-        if offset_bytes % element_size != 0 {
+        if !offset_bytes.is_multiple_of(element_size) {
             return Err(crate::error::Exception::custom(
                 "buffer tensor offset is not dtype-aligned".to_string(),
             ));
@@ -100,18 +100,6 @@ impl Array {
     /// declaration. Array views into the same mapped window share this id.
     pub fn backing_buffer_id(&self) -> usize {
         self.t.buffer().id()
-    }
-
-    /// Create a command-scoped residency set for indirectly addressed model
-    /// resources on supported Metal versions.
-    pub fn new_residency_set(initial_capacity: usize) -> Option<crate::runtime::ResidencySet> {
-        crate::runtime::ResidencySet::new(Self::runtime_ref().device(), initial_capacity)
-    }
-
-    /// Register this array's backing allocation in a residency set used by
-    /// kernels that access the array through a GPU address.
-    pub fn add_to_residency_set(&self, set: &crate::runtime::ResidencySet) -> bool {
-        set.add(self.t.buffer())
     }
 
     /// Register a committed model residency set on the default Metal queue.
@@ -184,12 +172,11 @@ impl Array {
     }
 
     fn axis(&self, dim: i32) -> usize {
-        let d = if dim.is_negative() {
+        if dim.is_negative() {
             (self.ndim() as i32 + dim) as usize
         } else {
             dim as usize
-        };
-        d
+        }
     }
 
     /// lisa-metal `Array::dim` (negative indices count from the end).
@@ -265,6 +252,8 @@ impl Array {
         let buffer = rt
             .buffer_for_full_write(bytes, "array")
             .expect("from_raw_data");
+        // SAFETY: the caller guarantees `ptr` covers `bytes` readable bytes; `buffer` is fresh,
+        // unshared storage of at least `bytes` bytes, so the ranges cannot overlap.
         unsafe {
             std::ptr::copy_nonoverlapping(ptr.cast::<u8>(), buffer.contents(), bytes);
         }
@@ -300,6 +289,8 @@ impl Array {
             let v: Vec<T> = self.t.to_vec::<T>().unwrap_or_default();
             let mut b = vec![0u8; v.len() * std::mem::size_of::<T>()];
             if !b.is_empty() {
+                // SAFETY: `v` holds `v.len()` `T`s, exactly `b.len()` bytes, in a distinct allocation.
+                // The bytes are initialised only if `T` is a padding-free scalar, which is not enforced.
                 unsafe {
                     std::ptr::copy_nonoverlapping(v.as_ptr() as *const u8, b.as_mut_ptr(), b.len());
                 }
@@ -307,6 +298,13 @@ impl Array {
             b
         });
         let n = bytes.len() / std::mem::size_of::<T>();
+        assert_eq!(
+            bytes.as_ptr().align_offset(std::mem::align_of::<T>()),
+            0,
+            "host readback cache is not aligned for the requested element type"
+        );
+        // SAFETY: the cached bytes hold `n` immutable `T`s and their alignment was
+        // checked above.
         unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const T, n) }
     }
 
@@ -410,7 +408,7 @@ impl Array {
     /// engine — the producing dispatches are already encoded into the open
     /// serial encoder, and the kernel bound right after lands behind them in
     /// the same encoder (FIFO order guarantees the buffer is written first).
-    /// No commit, no rotate, no fence — the ds4 single-stream model. (A
+    /// No commit, no rotate, no fence — the reference single-stream model. (A
     /// `commands.flush()` here rotated the encoder per kernel and exploded
     /// the cross-encoder fence count: 110 s/token decode.)
     pub fn eval_enqueue(&self) -> Result<()> {

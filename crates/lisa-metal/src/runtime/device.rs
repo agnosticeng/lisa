@@ -18,7 +18,9 @@ use crate::error::Result;
 use super::buffer::{Buffer, BufferPool};
 use super::commands::Commands;
 use super::env::{ALLOC_COUNT, LABEL_COUNTS, POOLHIT_COUNT, err, ns};
+use super::library_cache::LibraryCache;
 use super::pipeline::ComputePipeline;
+use super::program::{self, AllocationPolicy};
 
 thread_local! {
     static ORDERED_GPU_REUSE_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -45,7 +47,7 @@ impl Drop for OrderedGpuReuseScope {
     }
 }
 
-fn ordered_gpu_reuse_enabled() -> bool {
+pub(super) fn ordered_gpu_reuse_enabled() -> bool {
     ORDERED_GPU_REUSE_DEPTH.with(|depth| depth.get() != 0)
 }
 
@@ -54,6 +56,8 @@ const ORDERED_GPU_ZERO_SOURCE: &crate::shader_pack::Source =
 
 // ───────────────────────────── runtime ─────────────────────────────
 
+// SAFETY: MTLDevice and MTLCommandQueue are thread-safe Metal objects; every other
+// field is an `Arc`, `Mutex`, atomic or immutable `bool`, so shared access is synchronised.
 unsafe impl Send for MetalRuntime {}
 unsafe impl Sync for MetalRuntime {}
 
@@ -144,24 +148,19 @@ pub fn kernel_law() -> u64 {
 }
 
 /// Record a pipeline's source fingerprint — SLOW PATH ONLY (once per compile).
-/// A same-name compile with a different body is a warm-cache hazard: warn, and
-/// bail under `LISA_STRICT_KERNELS`. Cannot see a source edit that never
+/// A same-name compile with a different body is a warm-cache hazard and fails
+/// immediately. Cannot see a source edit that never
 /// recompiles; that axis is covered by "kernels compile once at launch" + the
 /// goldens (documented limitation, not a silent gap).
 fn record_pipeline(name: &str, source_hash: u64) {
     let mut reg = pipeline_hashes().lock().unwrap();
-    if let Some(prev) = reg.get(name) {
-        if *prev != source_hash {
-            if std::env::var_os("LISA_STRICT_KERNELS").is_some() {
-                panic!(
-                    "[jit] twin-mismatch on `{name}`: body changed under a warm \
-                     pipeline cache (LISA_STRICT_KERNELS)"
-                );
-            }
-            eprintln!(
-                "[jit] twin-mismatch {name}: src {prev:016x} -> {source_hash:016x} (rerouted)"
-            );
-        }
+    if let Some(prev) = reg.get(name)
+        && *prev != source_hash
+    {
+        panic!(
+            "[jit] twin-mismatch on `{name}`: src {prev:016x} -> {source_hash:016x} \
+             under a warm pipeline cache"
+        );
     }
     reg.insert(name.to_string(), source_hash);
 }
@@ -176,7 +175,9 @@ pub struct MetalRuntime {
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     pub pool: Arc<BufferPool>,
     pub commands: Arc<Commands>,
-    pipelines: Mutex<HashMap<String, ComputePipeline>>,
+    /// Compiled pipelines by key hash; entries keep the full key for equality.
+    pipelines: Mutex<HashMap<u64, Vec<(PipelineKey, ComputePipeline)>>>,
+    libraries: Mutex<LibraryCache<Retained<ProtocolObject<dyn MTLLibrary>>>>,
     allocation_limit: AtomicUsize,
     /// Whether the MetalPerformancePrimitives tensor ops (the M5/Apple10
     /// "NAX" path) are usable on this GPU. False on M1–M4, where the runtime
@@ -197,9 +198,9 @@ pub struct MetalRuntime {
 ///   `MathModeFast` + `Fast` and the default language version. Without it,
 ///   `bdiv` differs by 1 ulp (fast math turns division into a reciprocal
 ///   multiply).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Math {
-    /// Leave Metal's compile options at their platform defaults. ds4 creates
+    /// Leave Metal's compile options at their platform defaults. The reference creates
     /// one library with a fresh `MTLCompileOptions` and does not override its
     /// math or language settings on the normal path; this mode lets a ported
     /// kernel match that compiler contract instead of approximating it with
@@ -219,16 +220,61 @@ pub enum Math {
 }
 
 /// A specialised Metal function constant.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum ConstVal {
     Bool(bool),
     Int(i32),
+    UInt(u32),
     Short(i16),
+}
+
+/// Full identity of a cached pipeline.
+struct PipelineKey {
+    name: Box<str>,
+    math: Math,
+    nax: bool,
+    consts: Vec<(usize, ConstVal)>,
+}
+
+impl PipelineKey {
+    fn matches(&self, name: &str, math: Math, nax: bool, consts: &[(usize, ConstVal)]) -> bool {
+        &*self.name == name && self.math == math && self.nax == nax && self.consts == consts
+    }
 }
 
 /// Check before creating a runtime or loading weights. The compiler's separate
 /// math controls and MSL 3.2 require macOS 15 or iOS 18; older Objective-C
 /// runtimes throw for these selectors rather than returning a Metal error.
+/// The default device's Apple GPU family (7 for M1-class GPUs, 9 for M3/M4,
+/// 10 for M5, ...), or 0 without an Apple family. Families nest, so this is
+/// the highest one the device supports.
+pub fn apple_gpu_family() -> u32 {
+    let Some(device) = MTLCreateSystemDefaultDevice() else {
+        return 0;
+    };
+    let mut family = 0;
+    for next in 1..=20 {
+        if device.supportsFamily(MTLGPUFamily(1000 + next)) {
+            family = next as u32;
+        } else if next >= 7 {
+            break;
+        }
+    }
+    family
+}
+
+/// Whether the default device runs the Metal 4 language and its tensor
+/// operations: an Apple7 (M1-class) or newer GPU on macOS or iOS 26 or
+/// later. Kernels compiled at the OS's default language version need it when
+/// they use Metal 4 features; it is distinct from [`nax_available`], the
+/// Apple10 neural-accelerator path.
+pub fn metal4_supported() -> bool {
+    if !objc2::available!(macos = 26.0, ios = 26.0) {
+        return false;
+    }
+    MTLCreateSystemDefaultDevice().is_some_and(|device| device.supportsFamily(MTLGPUFamily::Metal4))
+}
+
 pub fn check_platform_support() -> Result<()> {
     let version = objc2_foundation::NSProcessInfo::processInfo().operatingSystemVersion();
     #[cfg(target_os = "ios")]
@@ -304,14 +350,9 @@ impl MetalRuntime {
             .newCommandQueue()
             .ok_or_else(|| err("newCommandQueue"))?;
         let pool = Arc::new(BufferPool::new());
-        // Bound retained native buffers to 512 MiB by default. LISA_POOL_CAP_MB
-        // overrides this pool-only budget; zero leaves it uncapped. Resident
-        // model reservations and admission are accounted separately.
-        let cap_mb = std::env::var("LISA_POOL_CAP_MB")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(512);
-        pool.set_limit(cap_mb << 20);
+        // Miss-time retention threshold when no resident hard budget is active.
+        // Reuse adds no storage; the hard allocation limits stay independent.
+        pool.set_default_limit(512 << 20);
         let commands = Arc::new(Commands::new(queue.clone(), device.clone(), per_buffer)?);
         // MPP tensor ops are the Apple10 (M5) "NAX" path; M1–M4 fall back.
         let nax = device.supportsFamily(MTLGPUFamily::Apple10);
@@ -322,6 +363,7 @@ impl MetalRuntime {
             pool,
             commands,
             pipelines: Mutex::new(HashMap::new()),
+            libraries: Mutex::new(LibraryCache::default()),
             allocation_limit: AtomicUsize::new(0),
             nax,
         })
@@ -373,16 +415,34 @@ impl MetalRuntime {
         &self.queue
     }
 
-    /// Allocate (or reuse) a shared-storage buffer of at least `bytes`.
+    /// Allocate (or reuse) shared storage with the requested size bucket zeroed.
+    /// The buffer may have larger capacity; that unused tail is not initialized.
     pub fn buffer(&self, bytes: usize, label: &str) -> Result<Arc<Buffer>> {
-        self.buffer_inner(bytes, label, true, false)
+        let buffer = self.buffer_inner(bytes, label, true, false)?;
+        program::allocation(
+            self.commands.program_identity(),
+            &buffer,
+            bytes,
+            AllocationPolicy::Zeroed,
+        );
+        Ok(buffer)
     }
 
     /// Allocate shared storage for a caller that will overwrite every logical
     /// byte before exposing the resulting array. This avoids clearing large
     /// imported weight tensors immediately before copying their full payload.
     pub fn buffer_for_full_write(&self, bytes: usize, label: &str) -> Result<Arc<Buffer>> {
+        program::unsupported(self.commands.program_identity());
         self.buffer_inner(bytes, label, false, false)
+    }
+
+    /// Completion-gated CPU import storage with exactly the requested 1 KiB
+    /// capacity bucket. The caller overwrites every logical byte; unused bucket
+    /// padding remains unspecified. Even an ordered GPU scope cannot permit a
+    /// CPU writer to reuse in-flight storage. Host imports cannot be replayed.
+    pub fn buffer_for_compact_full_write(&self, bytes: usize, label: &str) -> Result<Arc<Buffer>> {
+        program::unsupported(self.commands.program_identity());
+        self.buffer_inner_with_capacity(bytes, label, false, false, true)
     }
 
     /// Allocate an output that a GPU kernel overwrites completely. Within an
@@ -393,7 +453,81 @@ impl MetalRuntime {
         if !ordered_gpu_reuse_enabled() {
             return self.buffer(bytes, label);
         }
-        self.buffer_inner(bytes, label, false, true)
+        let buffer = self.buffer_inner(bytes, label, false, true)?;
+        program::allocation(
+            self.commands.program_identity(),
+            &buffer,
+            bytes,
+            AllocationPolicy::FullGpuWrite,
+        );
+        Ok(buffer)
+    }
+
+    /// Storage for an audited GPU producer that writes every logical byte
+    /// before any consumer reads it. No CPU clear is performed, including on
+    /// completion-gated reuse outside an ordered scope. Bucket padding remains
+    /// unspecified and must not be read. Ordered scopes retain their existing
+    /// serial-queue reuse law; this method never enables that policy itself.
+    pub fn buffer_for_audited_full_gpu_write(
+        &self,
+        bytes: usize,
+        label: &str,
+    ) -> Result<Arc<Buffer>> {
+        let buffer = self.buffer_inner(bytes, label, false, ordered_gpu_reuse_enabled())?;
+        program::allocation(
+            self.commands.program_identity(),
+            &buffer,
+            bytes,
+            AllocationPolicy::FullGpuWrite,
+        );
+        Ok(buffer)
+    }
+
+    /// Audited full GPU output whose retained capacity is exactly the requested
+    /// 1 KiB bucket. A small persistent state must not inherit a large scratch
+    /// allocation through best-fit reuse. Completion and ordered-scope rules
+    /// are unchanged; this method does not enable ordered reuse.
+    pub fn buffer_for_audited_compact_gpu_write(
+        &self,
+        bytes: usize,
+        label: &str,
+    ) -> Result<Arc<Buffer>> {
+        let buffer = self.buffer_inner_with_capacity(
+            bytes,
+            label,
+            false,
+            ordered_gpu_reuse_enabled(),
+            true,
+        )?;
+        program::allocation(
+            self.commands.program_identity(),
+            &buffer,
+            bytes,
+            AllocationPolicy::CompactFullGpuWrite,
+        );
+        Ok(buffer)
+    }
+
+    /// Queue-private, exact-capacity storage for a sealed program's disjoint
+    /// nonescaping full-write slots. Only replay owns these leases. Dropping
+    /// its last Arc proves every old access has already been encoded, allowing
+    /// the next full GPU producer on this Commands queue to reuse the storage.
+    /// No general allocator or CPU import can draw from this private lane.
+    pub(super) fn buffer_for_recorded_scratch(&self, bytes: usize) -> Result<Arc<Buffer>> {
+        let identity = self.commands.program_identity();
+        if program::is_capturing(identity) || ordered_gpu_reuse_enabled() {
+            // Captures retain ordinary allocation identities; this mechanism
+            // neither nests nor enables the independent GLM reuse scope.
+            return self.buffer_for_audited_compact_gpu_write(bytes, "dispatch_program_scratch");
+        }
+        self.buffer_inner_in_lane(
+            bytes,
+            "dispatch_program_scratch",
+            false,
+            false,
+            true,
+            Some(identity),
+        )
     }
 
     /// Allocate a GPU output with the same zero-initialized contract as
@@ -403,7 +537,33 @@ impl MetalRuntime {
         if !ordered_gpu_reuse_enabled() {
             return self.buffer(bytes, label);
         }
-        let buffer = self.buffer_inner(bytes, label, false, true)?;
+        self.buffer_cleared_by_gpu(bytes, label, true)
+    }
+
+    /// Zeroed storage whose clear is always a GPU command on this queue, in
+    /// or out of the ordered scope: large state skips the host clear. Outside
+    /// the scope the lease is completion-gated, so the clear has no earlier
+    /// GPU user to race. A CPU reader must synchronize first, as for any
+    /// kernel output.
+    pub fn buffer_zeroed_on_gpu(&self, bytes: usize, label: &str) -> Result<Arc<Buffer>> {
+        self.buffer_cleared_by_gpu(bytes, label, ordered_gpu_reuse_enabled())
+    }
+
+    fn buffer_cleared_by_gpu(
+        &self,
+        bytes: usize,
+        label: &str,
+        ordered_gpu_write: bool,
+    ) -> Result<Arc<Buffer>> {
+        let buffer = self.buffer_inner(bytes, label, false, ordered_gpu_write)?;
+        // Its zeroing dispatch is recorded below, so replay allocates the
+        // same uncleared storage and replays that clear exactly once.
+        program::allocation(
+            self.commands.program_identity(),
+            &buffer,
+            bytes,
+            AllocationPolicy::FullGpuWrite,
+        );
         // Only the requested output is published. A best-fit lease may be
         // much larger; clearing its unused tail would waste GPU bandwidth.
         let words = bytes.div_ceil(std::mem::size_of::<u32>());
@@ -442,15 +602,17 @@ impl MetalRuntime {
         owner: Arc<dyn std::any::Any + Send + Sync>,
         label: &str,
     ) -> Result<Arc<Buffer>> {
+        program::unsupported(self.commands.program_identity());
         if length == 0 || length > self.device.maxBufferLength() {
             return Err(err(format!(
                 "external Metal buffer length {length} is invalid"
             )));
         }
+        // SAFETY: `getpagesize` takes no arguments and only reports the VM page size.
         let page_size = unsafe { getpagesize() };
         if page_size <= 0
-            || pointer.as_ptr() as usize % page_size as usize != 0
-            || length % page_size as usize != 0
+            || !(pointer.as_ptr() as usize).is_multiple_of(page_size as usize)
+            || !length.is_multiple_of(page_size as usize)
         {
             return Err(err("external Metal buffer must be page-aligned"));
         }
@@ -458,6 +620,8 @@ impl MetalRuntime {
             // Capturing the owner retains the mapping until Metal releases this block.
             let _ = &owner;
         });
+        // SAFETY: the region is non-empty, page-aligned and within `maxBufferLength` (checked
+        // above); the deallocator captures `owner`, keeping the mapping alive until Metal releases it.
         let raw = unsafe {
             self.device
                 .newBufferWithBytesNoCopy_length_options_deallocator(
@@ -480,17 +644,41 @@ impl MetalRuntime {
         clear: bool,
         ordered_gpu_write: bool,
     ) -> Result<Arc<Buffer>> {
+        self.buffer_inner_with_capacity(bytes, label, clear, ordered_gpu_write, false)
+    }
+
+    fn buffer_inner_with_capacity(
+        &self,
+        bytes: usize,
+        label: &str,
+        clear: bool,
+        ordered_gpu_write: bool,
+        exact_bucket: bool,
+    ) -> Result<Arc<Buffer>> {
+        self.buffer_inner_in_lane(bytes, label, clear, ordered_gpu_write, exact_bucket, None)
+    }
+
+    fn buffer_inner_in_lane(
+        &self,
+        bytes: usize,
+        label: &str,
+        clear: bool,
+        ordered_gpu_write: bool,
+        exact_bucket: bool,
+        program_queue: Option<usize>,
+    ) -> Result<Arc<Buffer>> {
         debug_assert!(
             !clear || !ordered_gpu_write,
             "in-flight GPU storage must not be cleared on the CPU"
         );
+        debug_assert!(program_queue.is_none() || (!clear && !ordered_gpu_write && exact_bucket));
         let allocation_bytes = bytes
             .max(1)
             .checked_add(1023)
             .map(|rounded| rounded / 1024 * 1024)
             .ok_or_else(|| err("Metal allocation size overflow"))?;
         ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
-        {
+        if super::env::ALLOCATION_LABELS.load(Ordering::Relaxed) || crate::trace::enabled() {
             let mut c = LABEL_COUNTS.lock().unwrap();
             match c.iter_mut().find(|(l, _)| l == label) {
                 Some(e) => e.1 += 1,
@@ -498,12 +686,11 @@ impl MetalRuntime {
             }
         }
         let completed = self.commands.completed_watermark();
-        if self.pool.reserved_model_bytes() > 0 {
-            self.pool.sweep_if_over_completed(completed);
-        } else {
-            self.pool.sweep_if_over();
-        }
-        let reusable = if ordered_gpu_write {
+        let reusable = if let Some(queue) = program_queue {
+            self.pool.take_program_scratch(bytes, queue)
+        } else if exact_bucket {
+            self.pool.take_exact(bytes, completed, ordered_gpu_write)
+        } else if ordered_gpu_write {
             self.pool.take_for_ordered_gpu_write(bytes)
         } else {
             self.pool.take(bytes, completed)
@@ -512,13 +699,18 @@ impl MetalRuntime {
             POOLHIT_COUNT.fetch_add(1, Ordering::Relaxed);
             b.set_label(label);
             if clear {
-                // `take` only returns buffers whose last command buffer has
-                // completed, so clearing shared storage here cannot race a GPU
-                // reader. Fresh buffers receive the same initial contents below.
-                unsafe { std::ptr::write_bytes(b.contents(), 0, b.length()) };
+                // SAFETY: completion-gated `take*` leases have no GPU user; pool lengths are 1 KiB multiples
+                // >= `bytes`. Spare best-fit capacity stays uncleared to avoid stalling context growth.
+                unsafe { std::ptr::write_bytes(b.contents(), 0, allocation_bytes) };
             }
             return Ok(b);
         }
+        // Soft reclamation is independent of hard admission. The default
+        // threshold yields to a live resident budget; explicit caller limits
+        // retain their existing sweep policy. New allocations still pass both
+        // unchanged hard-budget checks below, and hits add no storage.
+        self.pool
+            .sweep_on_allocation_miss(completed, program_queue.is_some());
         let limit = self.allocation_limit.load(Ordering::Acquire);
         let mut completed = completed;
         if limit > 0 && self.allocated_bytes().saturating_add(allocation_bytes) > limit {
@@ -529,20 +721,24 @@ impl MetalRuntime {
             self.pool.sweep_completed(completed);
             let allocated = self.allocated_bytes();
             if allocated.saturating_add(allocation_bytes) > limit {
-                return Err(err(format!(
+                return Err(crate::error::Error::AllocationUnavailable(format!(
                     "Metal memory budget exceeded: {} MiB allocated + {} MiB requested > {} MiB limit",
-                    allocated >> 20, allocation_bytes >> 20, limit >> 20
+                    allocated >> 20,
+                    allocation_bytes >> 20,
+                    limit >> 20
                 )));
             }
         }
-        self.pool.allocate_new(allocation_bytes, completed, || {
+        let create = || {
             let raw = self
                 .device
                 .newBufferWithLength_options(
                     allocation_bytes,
                     MTLResourceOptions::StorageModeShared,
                 )
-                .ok_or_else(|| err(format!("newBuffer({bytes})")))?;
+                .ok_or_else(|| {
+                    crate::error::Error::AllocationUnavailable(format!("newBuffer({bytes})"))
+                })?;
             let buf = Arc::new(Buffer::wrap(raw));
             buf.set_label(label);
             // General-purpose buffers start at zero so a kernel that reads a region
@@ -550,10 +746,18 @@ impl MetalRuntime {
             // host-write imports skip this; their caller overwrites the logical
             // tensor payload before making the Array visible.
             if clear {
+                // SAFETY: `buf` was just created with `allocation_bytes` of shared storage and has
+                // not been bound to any command buffer.
                 unsafe { std::ptr::write_bytes(buf.contents(), 0, buf.length()) };
             }
             Ok(buf)
-        })
+        };
+        if let Some(queue) = program_queue {
+            self.pool
+                .allocate_program_scratch(allocation_bytes, completed, queue, create)
+        } else {
+            self.pool.allocate_new(allocation_bytes, completed, create)
+        }
     }
 
     /// Compile `source`'s kernel `name` with the MLX (`Safe`) options, cached.
@@ -580,6 +784,48 @@ impl MetalRuntime {
         self.compile_full(source, name, math, consts)
     }
 
+    /// Like [`Self::compile_with_constants`], building the source only when
+    /// the pipeline is not cached. Dispatch paths use this so a cache hit
+    /// costs one hash and one lookup, with no source assembly.
+    pub fn compile_lazy(
+        &self,
+        name: &str,
+        math: Math,
+        consts: &[(usize, ConstVal)],
+        source: impl FnOnce() -> String,
+    ) -> Result<ComputePipeline> {
+        if let Some(pipeline) = self.cached_pipeline(name, math, consts) {
+            return Ok(pipeline);
+        }
+        self.compile_full(&source(), name, math, consts)
+    }
+
+    fn pipeline_hash(&self, name: &str, math: Math, consts: &[(usize, ConstVal)]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (name, math, self.nax, consts).hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn cached_pipeline(
+        &self,
+        name: &str,
+        math: Math,
+        consts: &[(usize, ConstVal)],
+    ) -> Option<ComputePipeline> {
+        let hash = self.pipeline_hash(name, math, consts);
+        self.pipelines
+            .lock()
+            .unwrap()
+            .get(&hash)
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|(key, _)| key.matches(name, math, self.nax, consts))
+                    .map(|(_, pipeline)| pipeline.clone())
+            })
+    }
+
     fn compile_full(
         &self,
         source: &str,
@@ -587,33 +833,39 @@ impl MetalRuntime {
         math: Math,
         consts: &[(usize, ConstVal)],
     ) -> Result<ComputePipeline> {
-        // O2: the key must encode every RUN-time behaviour axis, not only the
-        // caller-built name. The NAX language version (baked by
-        // `compile_options`) changes the arithmetic and was absent from the key
-        // entirely — on an M5 a `nax=true` pipeline could collide with a
-        // `nax=false` one. CHEAP FIELDS ONLY: no hashing here (this function is
-        // the per-dispatch cache lookup).
-        let key = format!(
-            "{name}|{math:?}|nax={}|{}",
-            self.nax as u8,
-            consts
-                .iter()
-                .map(|(i, v)| format!("{i}{v:?}"))
-                .collect::<String>()
-        );
-        if let Some(p) = self.pipelines.lock().unwrap().get(&key) {
-            return Ok(p.clone());
+        // The key encodes every run-time behaviour axis: kernel name, math
+        // mode, NAX language target and function constants. Source hashing
+        // stays on the compile path below.
+        if let Some(pipeline) = self.cached_pipeline(name, math, consts) {
+            return Ok(pipeline);
         }
-        let opts = compile_options(math, self.nax);
         JIT_COMPILES.fetch_add(1, Ordering::Relaxed);
         crate::trace::event("jit.compile");
         if crate::trace::enabled() {
             eprintln!("[jit] compile {name}");
         }
-        let lib = self
-            .device
-            .newLibraryWithSource_options_error(&ns(source), Some(&opts))
-            .map_err(|e| err(format!("library `{name}`: {}", e.localizedDescription())))?;
+        // Source lookup is deliberately below the unchanged pipeline fast path.
+        // One library can provide several entry points and constant-specialized
+        // functions. Serialize library creation independently of pipeline and
+        // allocator locks; compilation does not submit or wait for GPU work.
+        let lib = self.libraries.lock().unwrap().get_or_try_insert_with(
+            source,
+            math,
+            self.nax,
+            || {
+                let _span = crate::trace::span("jit.library.compile");
+                if crate::trace::enabled() {
+                    eprintln!("[jit] library {name}|{math:?}|nax={}", self.nax as u8);
+                }
+                let opts = compile_options(math, self.nax);
+                self.device
+                    .newLibraryWithSource_options_error(&ns(source), Some(&opts))
+                    .map_err(|e| err(format!("library `{name}`: {}", e.localizedDescription())))
+            },
+        )?;
+        // The retained library remains alive if another compiler thread evicts
+        // its cache entry while this function or pipeline is being created.
+        let specialize = crate::trace::span("jit.pipeline.specialize");
         let f: Retained<ProtocolObject<dyn MTLFunction>> = if consts.is_empty() {
             lib.newFunctionWithName(&ns(name))
                 .ok_or_else(|| err(format!("function `{name}`")))?
@@ -623,8 +875,11 @@ impl MetalRuntime {
                 let (ptr, ty) = match v {
                     ConstVal::Bool(b) => (NonNull::from(b).cast(), MTLDataType::Bool),
                     ConstVal::Int(x) => (NonNull::from(x).cast(), MTLDataType::Int),
+                    ConstVal::UInt(x) => (NonNull::from(x).cast(), MTLDataType::UInt),
                     ConstVal::Short(x) => (NonNull::from(x).cast(), MTLDataType::Short),
                 };
+                // SAFETY: `ptr` borrows the `ConstVal` payload in `consts`, which outlives this call;
+                // `ty` matches its Rust type (bool/i32/u32/i16) and Metal copies the value.
                 unsafe { cvs.setConstantValue_type_atIndex(ptr, ty, *i) };
             }
             lib.newFunctionWithName_constantValues_error(&ns(name), &cvs)
@@ -634,12 +889,20 @@ impl MetalRuntime {
             .device
             .newComputePipelineStateWithFunction_error(&f)
             .map_err(|e| err(format!("pipeline `{name}`: {}", e.localizedDescription())))?;
-        let p = ComputePipeline {
-            raw: state,
-            name: name.to_string(),
-            label: std::cell::OnceCell::new(),
+        drop(specialize);
+        let p = ComputePipeline::new(state, name);
+        let key = PipelineKey {
+            name: name.into(),
+            math,
+            nax: self.nax,
+            consts: consts.iter().map(|(i, v)| (*i, *v)).collect(),
         };
-        self.pipelines.lock().unwrap().insert(key, p.clone());
+        self.pipelines
+            .lock()
+            .unwrap()
+            .entry(self.pipeline_hash(name, math, consts))
+            .or_default()
+            .push((key, p.clone()));
         // Twin-check on the SLOW path only (one source hash per real compile).
         record_pipeline(name, fnv1a(source.as_bytes()));
         Ok(p)
@@ -675,6 +938,146 @@ mod ordered_gpu_reuse_scope_tests {
 }
 
 #[cfg(test)]
+mod reuse_first_tests {
+    use super::*;
+
+    #[test]
+    fn soft_cap_preserves_hot_best_fit_leases_and_sweeps_only_on_a_miss() {
+        let runtime = MetalRuntime::new(4).unwrap();
+        runtime.pool.set_limit(0);
+        let held = runtime.buffer(4096, "reuse_first_held").unwrap();
+        let medium = runtime.buffer(2048, "reuse_first_medium").unwrap();
+        let large = runtime.buffer(4096, "reuse_first_large").unwrap();
+        let cold = runtime.buffer(1024, "reuse_first_cold").unwrap();
+        let medium_id = medium.id();
+        let large_id = large.id();
+        drop((medium, large, cold));
+        runtime.pool.set_limit(1024);
+        let before = runtime.pool.bytes();
+
+        let first = runtime.buffer(1500, "reuse_first_hit").unwrap();
+        let second = runtime.buffer(3000, "reuse_first_next_hit").unwrap();
+        assert_eq!(
+            first.id(),
+            medium_id,
+            "smallest eligible capacity remains first"
+        );
+        assert_eq!(second.id(), large_id);
+        assert_eq!(
+            runtime.pool.bytes(),
+            before,
+            "hits add no storage or trim cold entries"
+        );
+
+        let miss = runtime.buffer(8192, "reuse_first_miss").unwrap();
+        assert_eq!(
+            runtime.pool.bytes(),
+            before - 1024 + 8192,
+            "a miss releases the cold entry"
+        );
+        assert_eq!(held.length(), 4096, "active leases survive the sweep");
+        assert_eq!(miss.length(), 8192);
+
+        // Reordering the soft trim does not bypass the separate hard native
+        // allocation limit on a miss. All existing leases remain live here.
+        runtime.swap_allocation_limit(runtime.allocated_bytes());
+        let error = runtime
+            .buffer(32 * 1024, "reuse_first_over_budget")
+            .err()
+            .unwrap();
+        assert!(matches!(
+            error,
+            crate::error::Error::AllocationUnavailable(_)
+        ));
+        assert_eq!(runtime.pool.bytes(), before - 1024 + 8192);
+    }
+
+    #[test]
+    fn soft_cap_cannot_reuse_or_clear_pending_cpu_storage_under_resident_admission() {
+        // No commands are submitted: explicit watermarks exercise eligibility
+        // independently of GPU scheduling or completion timing.
+        let runtime = MetalRuntime::new(4).unwrap();
+        runtime.pool.set_limit(0);
+        let held = runtime.buffer(4096, "reuse_first_resident_held").unwrap();
+        let pending = runtime.buffer(2048, "reuse_first_pending").unwrap();
+        let pending_id = pending.id();
+        // SAFETY: `pending` is a fresh shared buffer never bound to a submitted command buffer.
+        unsafe { std::ptr::write_bytes(pending.contents(), 0xa5, pending.length()) };
+        pending.mark_used_cb(100);
+        drop(pending);
+        let _reservation = runtime.reserve_model_memory(1024, 7168).unwrap();
+        runtime.pool.set_limit(1024);
+        let error = runtime
+            .buffer(2048, "reuse_first_pending_rejected")
+            .err()
+            .unwrap();
+        assert!(matches!(
+            error,
+            crate::error::Error::AllocationUnavailable(_)
+        ));
+        assert_eq!(runtime.pool.total_bytes(), 7168);
+        assert_eq!(held.length(), 4096);
+        let completed = runtime.pool.take(2048, 100).unwrap();
+        assert_eq!(completed.id(), pending_id);
+        assert!(
+            // SAFETY: no command was submitted (watermarks are synthetic), so these `length()`
+            // bytes are initialised CPU-only storage.
+            unsafe { std::slice::from_raw_parts(completed.contents(), completed.length()) }
+                .iter()
+                .all(|&byte| byte == 0xa5),
+            "an ineligible CPU destination must not be cleared"
+        );
+    }
+
+    #[test]
+    fn soft_cap_hits_preserve_exact_capacity_and_private_queue_isolation() {
+        let runtime = MetalRuntime::new(4).unwrap();
+        runtime.pool.set_limit(0);
+        let private = runtime.buffer_for_recorded_scratch(1024).unwrap();
+        let private_id = private.id();
+        // Simulated unfinished work: only the same queue's private lane may
+        // lease this after its former host owner has encoded all accesses.
+        private.mark_used_cb(100);
+        let general = runtime.buffer(4096, "reuse_first_general").unwrap();
+        let general_id = general.id();
+        drop((private, general));
+        runtime.pool.set_limit(1024);
+
+        let private = runtime.buffer_for_recorded_scratch(1024).unwrap();
+        assert_eq!(private.id(), private_id);
+        assert_eq!(private.length(), 1024);
+        let general = runtime
+            .buffer_for_audited_compact_gpu_write(4096, "reuse_first_exact")
+            .unwrap();
+        assert_eq!(general.id(), general_id);
+        assert_eq!(runtime.pool.bytes(), 5120);
+        drop(private);
+        let queue = runtime.commands.program_identity();
+        assert!(
+            runtime
+                .pool
+                .take_program_scratch(1024, queue.wrapping_add(1))
+                .is_none()
+        );
+        assert!(runtime.pool.take_program_scratch(2048, queue).is_none());
+
+        let cpu = runtime
+            .buffer_for_compact_full_write(1024, "reuse_first_cpu")
+            .unwrap();
+        assert_ne!(
+            cpu.id(),
+            private_id,
+            "a CPU import cannot draw from private scratch"
+        );
+        assert_eq!(cpu.length(), 1024);
+        let private = runtime.buffer_for_recorded_scratch(1024).unwrap();
+        assert_eq!(private.id(), private_id);
+        assert_ne!(private.id(), general.id());
+        assert_ne!(private.id(), cpu.id());
+    }
+}
+
+#[cfg(test)]
 mod platform_tests {
     use super::check_macos_version;
 
@@ -695,5 +1098,29 @@ mod platform_tests {
         for (major, minor, patch) in [(15, 0, 0), (15, 1, 1), (26, 0, 0), (27, 0, 0)] {
             check_macos_version(major, minor, patch).unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod retention_tests;
+
+#[cfg(test)]
+mod library_cache_tests;
+
+#[cfg(test)]
+mod family_tests {
+    #[test]
+    fn apple_silicon_reports_its_gpu_family() {
+        // Every supported Mac has at least an M1-class (Apple7) GPU.
+        assert!(super::apple_gpu_family() >= 7);
+    }
+
+    #[test]
+    fn metal4_follows_the_os() {
+        // Every Apple silicon GPU runs Metal 4 from macOS 26.
+        assert_eq!(
+            super::metal4_supported(),
+            objc2::available!(macos = 26.0, ios = 26.0)
+        );
     }
 }

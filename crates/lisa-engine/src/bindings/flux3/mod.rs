@@ -11,39 +11,23 @@ use anyhow::ensure;
 
 use lisa_models::flux::pipeline::{self as model, Family};
 use model::schedule3 as schedule;
-use std::path::{Path, PathBuf};
 
 pub const DEFAULT_STEPS: u32 = 16;
+/// Each stage supplies prepared tensors and releases them before the next one.
+pub trait StageSource<D: BindingDevice + ManagedDevice> {
+    fn required_ram(&self) -> anyhow::Result<usize>;
+    fn text_encoder(&self) -> anyhow::Result<text::Encoder<D>>;
+    fn denoiser_weights(&self) -> anyhow::Result<Weights<D>>;
+    fn decoder_weights(&self) -> anyhow::Result<Weights<D>>;
+}
 pub struct Pipeline<D: BindingDevice + ManagedDevice> {
     pub context: DeviceContext<D>,
-    dir: PathBuf,
+    source: Box<dyn StageSource<D>>,
 }
 
-pub use crate::checkpoint::catalog::is_flux3 as is_checkpoint;
 impl<D: BindingDevice + ManagedDevice> Pipeline<D> {
-    pub fn load(context: DeviceContext<D>, dir: &Path) -> anyhow::Result<Self> {
-        ensure!(
-            is_checkpoint(dir),
-            "expected the distilled FLUX 3 Image Klein native checkpoint"
-        );
-        let config: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
-        model::validate3(&config)?;
-        for name in [
-            "model.safetensors",
-            "ae.safetensors",
-            "text_encoder/config.json",
-            "text_encoder/tokenizer.json",
-        ] {
-            ensure!(
-                dir.join(name).is_file(),
-                "missing FLUX 3 file {name}; complete the model download"
-            );
-        }
-        Ok(Self {
-            context,
-            dir: dir.into(),
-        })
+    pub fn from_prepared(context: DeviceContext<D>, source: Box<dyn StageSource<D>>) -> Self {
+        Self { context, source }
     }
     pub fn generate(
         &self,
@@ -59,10 +43,7 @@ impl<D: BindingDevice + ManagedDevice> Pipeline<D> {
         let steps = options.steps.unwrap_or(DEFAULT_STEPS);
         // Original mapped weights, their cached dense layouts, and bounded
         // attention/VAE scratch. This is a model estimate, never a machine cap.
-        let needed = usize::try_from(std::fs::metadata(self.dir.join("model.safetensors"))?.len())?
-            .checked_mul(2)
-            .and_then(|bytes| bytes.checked_add(8usize << 30))
-            .ok_or_else(|| anyhow::anyhow!("image memory estimate overflow"))?;
+        let needed = self.source.required_ram()?;
         ensure!(
             self.context
                 .device()
@@ -78,7 +59,7 @@ impl<D: BindingDevice + ManagedDevice> Pipeline<D> {
         let enc = {
             let _trace = self.context.trace("image.text_encoder");
             progress("Loading text encoder", 0, steps)?;
-            let encoder = text::Encoder::load(self.context.clone(), &self.dir)?;
+            let encoder = self.source.text_encoder()?;
             let caption = if options.prompt_is_caption {
                 prompt.to_owned()
             } else {
@@ -112,7 +93,7 @@ impl<D: BindingDevice + ManagedDevice> Pipeline<D> {
             progress("Loading image model", 0, steps)?;
             let model = {
                 let _trace = self.context.trace("image.denoiser.load");
-                dit::Dit::load(self.context.clone(), &self.dir)?
+                dit::Dit::from_weights(self.context.clone(), self.source.denoiser_weights()?)?
             };
             let times = schedule(steps);
             for i in 0..steps as usize {
@@ -132,7 +113,7 @@ impl<D: BindingDevice + ManagedDevice> Pipeline<D> {
         progress("Decoding image", steps, steps)?;
         let pixels = {
             let _trace = self.context.trace("image.vae");
-            let weights = decoder_weights(&self.context, &self.dir)?;
+            let weights = self.source.decoder_weights()?;
             vae::decode_weights(
                 &weights,
                 &run(&self.context, model::decoder_input(h, w), &[&latent])?,
@@ -150,26 +131,3 @@ impl<D: BindingDevice + ManagedDevice> Pipeline<D> {
         Ok(out.into_inner())
     }
 }
-
-/// Rename the original f32 decoder into the shared VAE operation layout.
-/// Only convolution storage is transposed (OIHW -> OHWI); payload precision is retained.
-pub fn decoder_weights<D: BindingDevice>(
-    context: &DeviceContext<D>,
-    dir: &Path,
-) -> anyhow::Result<Weights<D>> {
-    let source = Weights::load_file(context.clone(), &dir.join("ae.safetensors"), |k| {
-        k.starts_with("decoder.") || k.starts_with("bn.")
-    })?;
-    let mut out = std::collections::HashMap::new();
-    for (key, value) in source.0 {
-        let (name, preparation) = model::decoder_weight(&key, value.shape())?;
-        let value = match preparation {
-            Some(graph) => run(context, graph, &[&value])?,
-            None => value,
-        };
-        out.insert(name, value);
-    }
-    Ok(Weights::from_map(context.clone(), out))
-}
-
-pub use crate::checkpoint::catalog::flux3::REPO;

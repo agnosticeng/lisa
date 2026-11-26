@@ -1,12 +1,12 @@
-//! Indexing operations with the pinned DS4 arithmetic.
+//! Indexing operations with the pinned reference arithmetic.
 use super::*;
 
 pub(super) const INDEXER_TOPK_SORT_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/indexer_topk_sort.metal");
+    crate::kernel_source!("sparse_attention/indexer_topk_sort.metal");
 pub(super) const INDEXER_TOPK_MERGE_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/indexer_topk_merge.metal");
+    crate::kernel_source!("sparse_attention/indexer_topk_merge.metal");
 pub(super) const INDEXER_EXPAND_SELECTION_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/indexer_expand_selection.metal");
+    crate::kernel_source!("sparse_attention/indexer_expand_selection.metal");
 
 pub(super) fn indexer_topk_sort_kernel() -> &'static Option<MetalKernel> {
     static K: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
@@ -82,7 +82,7 @@ pub(super) fn indexer_expand_selection_kernel() -> &'static Option<MetalKernel> 
 /// Expand selected DSA pool ids into token ids and append the causal tail.
 /// `pool_selected` is `[batch * tokens, selected_pools]`; the returned
 /// contiguous tensor is `[batch * tokens, output_width]`.
-pub fn glm53_expand_pool_selection(
+pub fn expand_pool_selection(
     pool_selected: &Array,
     n_tokens: usize,
     pos0: usize,
@@ -90,7 +90,7 @@ pub fn glm53_expand_pool_selection(
     always_tail: bool,
     stream: &Stream,
 ) -> Option<Array> {
-    glm53_expand_pool_selection_mode(
+    expand_pool_selection_mode(
         pool_selected,
         n_tokens,
         pos0,
@@ -101,10 +101,10 @@ pub fn glm53_expand_pool_selection(
     )
 }
 
-/// Expand pool IDs for absorbed attention. Queries in DS4's dense-causal
+/// Expand pool IDs for absorbed attention. Queries in the reference's dense-causal
 /// prefix use chronological token IDs so their lora reduction visits cache
-/// rows in the same order as DS4's causal kernel.
-pub fn glm53_expand_pool_selection_for_attention(
+/// rows in the same order as the reference's causal kernel.
+pub fn expand_pool_selection_for_attention(
     pool_selected: &Array,
     n_tokens: usize,
     pos0: usize,
@@ -112,7 +112,7 @@ pub fn glm53_expand_pool_selection_for_attention(
     always_tail: bool,
     stream: &Stream,
 ) -> Option<Array> {
-    glm53_expand_pool_selection_mode(
+    expand_pool_selection_mode(
         pool_selected,
         n_tokens,
         pos0,
@@ -123,7 +123,7 @@ pub fn glm53_expand_pool_selection_for_attention(
     )
 }
 
-pub(super) fn glm53_expand_pool_selection_mode(
+pub(super) fn expand_pool_selection_mode(
     pool_selected: &Array,
     n_tokens: usize,
     pos0: usize,
@@ -193,7 +193,7 @@ pub(super) fn glm53_expand_pool_selection_mode(
 }
 
 pub(super) const INDEXER_POOL_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/indexer_pool.metal");
+    crate::kernel_source!("sparse_attention/indexer_pool.metal");
 
 pub(super) fn indexer_pool_kernel() -> &'static Option<MetalKernel> {
     static K: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
@@ -225,7 +225,7 @@ pub(super) fn indexer_pool_kernel() -> &'static Option<MetalKernel> {
 
 /// Fused DSA indexer pool update: raw keys and gates are separate F32
 /// `[B,n,4,hd]` arrays, APE is checkpoint BF16, and layer-norm weights are
-/// F32. The kernel writes the ds4-style F16 pooled-key cache.
+/// F32. The kernel writes the reference-style F16 pooled-key cache.
 pub fn indexer_pool_fused(
     raw_key: &Array,
     gate: &Array,
@@ -295,16 +295,16 @@ pub fn indexer_pool_fused(
             return None;
         }
     };
-    Some(out.into_iter().next()?)
+    out.into_iter().next()
 }
 pub(super) const INDEXER_SCORES_BATCH_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/indexer_scores_batch.metal");
+    crate::kernel_source!("sparse_attention/indexer_scores_batch.metal");
 pub(super) const INDEXER_SCORES_DECODE_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/indexer_scores_decode.metal");
+    crate::kernel_source!("sparse_attention/indexer_scores_decode.metal");
 pub(super) const INDEXER_SCORES_DECODE_ROWS4_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/indexer_scores_decode_rows4.metal");
+    crate::kernel_source!("sparse_attention/indexer_scores_decode_rows4.metal");
 pub(super) const INDEXER_SCORES_TILED_SOURCE: &crate::shader_pack::Source =
-    crate::kernel_source!("glm53/indexer_scores_tiled.metal");
+    crate::kernel_source!("sparse_attention/indexer_scores_tiled.metal");
 
 pub(super) fn indexer_scores_batch_kernel() -> &'static Option<MetalKernel> {
     static K: std::sync::OnceLock<Option<MetalKernel>> = std::sync::OnceLock::new();
@@ -397,10 +397,10 @@ pub(super) fn indexer_scores_tiled_kernel() -> &'static Option<MetalKernel> {
     })
 }
 
-/// Compute DSA selector scores with ds4's headwise F32 reduction schedule.
+/// Compute DSA selector scores with the reference's headwise F32 reduction schedule.
 /// `q=[B,32,T,128]`, `weights=[B,T,32]`, pooled F16 keys `[B,P,128]`;
 /// return `[B,T,P]` F32 with future pools set to negative infinity.
-pub fn glm53_indexer_scores(
+pub fn indexer_scores(
     q: &Array,
     weights: &Array,
     pooled: &Array,
@@ -409,15 +409,15 @@ pub fn glm53_indexer_scores(
     scale: f32,
     stream: &Stream,
 ) -> Option<Array> {
-    glm53_indexer_scores_with_decode_rows4(
+    indexer_scores_with_decode_rows4(
         q, weights, pooled, pos0, pool_size, scale, false, false, stream,
     )
 }
 
-/// Compute DSA selector scores with the DS4 prefill batch reduction schedule,
-/// including a one-row prefill tail. DS4 uses its batch kernel for that tail;
+/// Compute DSA selector scores with the reference prefill batch reduction schedule,
+/// including a one-row prefill tail. The reference uses its batch kernel for that tail;
 /// the decode-only kernels have a different float accumulation order.
-pub fn glm53_indexer_scores_batch(
+pub fn indexer_scores_batch(
     q: &Array,
     weights: &Array,
     pooled: &Array,
@@ -426,14 +426,14 @@ pub fn glm53_indexer_scores_batch(
     scale: f32,
     stream: &Stream,
 ) -> Option<Array> {
-    glm53_indexer_scores_with_decode_rows4(
+    indexer_scores_with_decode_rows4(
         q, weights, pooled, pos0, pool_size, scale, false, true, stream,
     )
 }
 
-/// Compute DSA selector scores using DS4's four-pool-per-SIMD-group scorer on
+/// Compute DSA selector scores using the reference's four-pool-per-SIMD-group scorer on
 /// one-token decode rows; all other row shapes retain the existing schedule.
-pub fn glm53_indexer_scores_rows4(
+pub fn indexer_scores_rows4(
     q: &Array,
     weights: &Array,
     pooled: &Array,
@@ -442,12 +442,12 @@ pub fn glm53_indexer_scores_rows4(
     scale: f32,
     stream: &Stream,
 ) -> Option<Array> {
-    glm53_indexer_scores_with_decode_rows4(
+    indexer_scores_with_decode_rows4(
         q, weights, pooled, pos0, pool_size, scale, true, false, stream,
     )
 }
 
-pub(super) fn glm53_indexer_scores_with_decode_rows4(
+pub(super) fn indexer_scores_with_decode_rows4(
     q: &Array,
     weights: &Array,
     pooled: &Array,
@@ -528,9 +528,7 @@ pub(super) fn glm53_indexer_scores_with_decode_rows4(
     }
 
     if t >= 8 {
-        let Some(kernel) = indexer_scores_tiled_kernel().as_ref() else {
-            return None;
-        };
+        let kernel = indexer_scores_tiled_kernel().as_ref()?;
         let inputs = [
             KernelInput::I32(p as i32),
             KernelInput::I32(t as i32),
@@ -559,9 +557,7 @@ pub(super) fn glm53_indexer_scores_with_decode_rows4(
             .next();
     }
 
-    let Some(kernel) = indexer_scores_batch_kernel().as_ref() else {
-        return None;
-    };
+    let kernel = indexer_scores_batch_kernel().as_ref()?;
     let inputs = [
         KernelInput::I32(p as i32),
         KernelInput::I32(t as i32),

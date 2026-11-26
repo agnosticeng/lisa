@@ -54,7 +54,7 @@ impl Attention {
                     order.push((h * 2 * d + d + i) as u32);
                 }
             }
-            let idx = Array::from_slice(&order, &[(hq * d * 2) as i32]);
+            let idx = Array::from_slice(&order, &[(hq * d * 2)]);
             q_proj.weight = q_proj.weight.take_axis(&idx, 0)?;
             q_proj.scales = q_proj.scales.take_axis(&idx, 0)?;
             q_proj.biases = q_proj.biases.take_axis(&idx, 0)?;
@@ -244,14 +244,12 @@ impl Attention {
                         let rinds: Vec<f32> = (0..kv_len).map(|x| x as f32).collect();
                         let rinds = Array::from_slice(&rinds, &[kv_len]);
                         let linds: Vec<f32> = ((kv_len - s)..kv_len).map(|x| x as f32).collect();
-                        let linds = Array::from_slice(&linds, &[s as i32, 1]);
-                        let l = lisa_metal::ops::broadcast_to(&linds, &[s as i32, kv_len])?
-                            .contiguous()?;
-                        let r = lisa_metal::ops::broadcast_to(
-                            &rinds.expand_dims(0)?,
-                            &[s as i32, kv_len],
-                        )?
-                        .contiguous()?;
+                        let linds = Array::from_slice(&linds, &[s, 1]);
+                        let l =
+                            lisa_metal::ops::broadcast_to(&linds, &[s, kv_len])?.contiguous()?;
+                        let r =
+                            lisa_metal::ops::broadcast_to(&rinds.expand_dims(0)?, &[s, kv_len])?
+                                .contiguous()?;
                         let causal = l.ge(&r)?;
                         let mask = causal.expand_dims(0)?.logical_and(&keep)?;
                         fast::scaled_dot_product_attention(

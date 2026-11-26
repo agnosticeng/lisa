@@ -110,7 +110,7 @@ fn assert_exact(actual: &[f32], expected: &[f32], label: &str) {
 }
 
 #[test]
-fn glm53_q2_pair_multi_output_matches_scalar_rows_exactly() {
+fn q2_pair_multi_output_matches_scalar_rows_exactly() {
     if !crate::device::metal_available() {
         return;
     }
@@ -169,7 +169,7 @@ fn glm53_q2_pair_multi_output_matches_scalar_rows_exactly() {
 }
 
 #[test]
-fn glm53_q2_pair_overlap_ownership_matches_scalar_rows_exactly() {
+fn q2_pair_overlap_ownership_matches_scalar_rows_exactly() {
     if !crate::device::metal_available() {
         return;
     }
@@ -261,7 +261,7 @@ fn glm53_q2_pair_overlap_ownership_matches_scalar_rows_exactly() {
 }
 
 #[test]
-fn glm53_q2_down_group_metadata_matches_scalar_routes_exactly() {
+fn q2_down_group_metadata_matches_scalar_routes_exactly() {
     if !crate::device::metal_available() {
         return;
     }

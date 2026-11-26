@@ -1,4 +1,4 @@
-use lisa_engine::core::config::ReadConfig;
+use lisa_engine::checkpoint::config::ReadConfig;
 
 use std::path::PathBuf;
 
@@ -6,12 +6,11 @@ use clap::{Parser, Subcommand};
 use lisa_models::qwen4::config;
 
 use lisa_engine::cli::{DepthArg, ModelDir, build_sampler};
-use lisa_serve::application::memory_line as mlx_mem_line;
 use lisa_engine::language::LanguageModel;
-use lisa_engine::laya::Laya;
 use lisa_engine::{generation as generate, tokenizer};
-use lisa_serve::application::{Batch, Session};
 use lisa_serve as serve;
+use lisa_serve::application::memory_line as mlx_mem_line;
+use lisa_serve::application::{Batch, Session};
 
 /// These commands currently use Qwen4-specific loading and turn framing.
 fn require_qwen4_command(model: &std::path::Path, command: &str) -> anyhow::Result<()> {
@@ -23,18 +22,43 @@ fn require_qwen4_command(model: &std::path::Path, command: &str) -> anyhow::Resu
     Ok(())
 }
 
-fn olala_prompt(model: &std::path::Path, prompt: &str, system: Option<&str>, thinking: bool) -> anyhow::Result<String> {
-    let source = tokenizer::load_chat_template(model)?.ok_or_else(|| anyhow::anyhow!("Olala GGUF has no chat template"))?;
+fn checkpoint_prompt(
+    model: &std::path::Path,
+    prompt: &str,
+    system: Option<&str>,
+    thinking: bool,
+    images: usize,
+) -> anyhow::Result<String> {
+    let source = lisa_engine::checkpoint::tokenizer::load_chat_template(model)?
+        .ok_or_else(|| anyhow::anyhow!("GGUF has no chat template"))?;
     let template = lisa_serve::ChatTemplate::new(&source)?;
     let mut messages = Vec::new();
-    for (role, content) in system.map(|s| ("system", s)).into_iter().chain(std::iter::once(("user", prompt))) {
-        messages.push(lisa_serve::ChatMessage { role: role.into(), content: content.into(), reasoning_content: None, tool_calls: vec![], tool_call_id: None, parts: None });
+    for (role, content) in system
+        .map(|s| ("system", s))
+        .into_iter()
+        .chain(std::iter::once(("user", prompt)))
+    {
+        messages.push(lisa_serve::ChatMessage {
+            role: role.into(),
+            content: content.into(),
+            reasoning_content: None,
+            tool_calls: vec![],
+            tool_call_id: None,
+            parts: None,
+        });
+    }
+    if images > 0 {
+        let mut parts = (0..images)
+            .map(|_| serde_json::json!({"type":"image"}))
+            .collect::<Vec<_>>();
+        parts.push(serde_json::json!({"type":"text","text":prompt}));
+        messages.last_mut().unwrap().parts = Some(parts);
     }
     template.render(&messages, true, &[], thinking)
 }
 
 fn tokenize(model: &std::path::Path, prompt: &str, raw: bool) -> anyhow::Result<()> {
-    let tok = tokenizer::Tokenizer::load(model)?;
+    let tok = lisa_engine::checkpoint::tokenizer::load(model)?;
     if lisa_engine::checkpoint::model_type_of(model)? == "deepseek41" {
         let ids = if raw {
             tok.encode_plain(prompt)?
@@ -50,13 +74,16 @@ fn tokenize(model: &std::path::Path, prompt: &str, raw: bool) -> anyhow::Result<
     );
     let text = if raw {
         prompt.to_owned()
-    } else if lisa_engine::checkpoint::model_type_of(model)? == "olala" {
-        olala_prompt(model, prompt, None, false)?
+    } else if matches!(
+        lisa_engine::checkpoint::model_type_of(model)?.as_str(),
+        "olala" | "inkling2"
+    ) {
+        checkpoint_prompt(model, prompt, None, false, 0)?
     } else if is_glm {
         tokenizer::glm_generation_prompt(
-            &prompt,
+            prompt,
             Some("You are a helpful assistant"),
-            tokenizer::GlmReasoning::High,
+            tokenizer::ReasoningEffort::High,
         )
     } else {
         tokenizer::generation_prompt(&[("user".to_string(), prompt.to_owned())])
@@ -147,6 +174,21 @@ fn trim_topk(v: &mut serde_json::Value, k: usize) {
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// Compute device: `metal`, `cpu` or `auto` (Metal when present).
+    #[arg(long, global = true)]
+    device: Option<String>,
+    /// Cap the RAM budget in GiB; it can only lower the detected budget and
+    /// also arms HTTP request admission.
+    #[arg(long, global = true, value_parser = clap::value_parser!(u64).range(1..))]
+    ram_cap_gb: Option<u64>,
+    /// Key/value cache format: `auto` (8-bit where the model implements it),
+    /// `native` (each model's own) or `int8` (required; others refuse to load).
+    #[arg(long, global = true, default_value = "auto", value_parser = ["auto", "native", "int8"])]
+    kv_format: String,
+    /// Most rows a greedy tree round verifies (1 to 16). Each round chooses
+    /// its rows from measured costs and learned acceptance, up to this cap.
+    #[arg(long, global = true, default_value_t = 16, value_parser = clap::value_parser!(u64).range(1..=16))]
+    tree_nodes: u64,
 }
 
 #[derive(Subcommand)]
@@ -202,10 +244,6 @@ enum Command {
         #[arg(long = "temperature-by-options")]
         temperature_by_options: Vec<String>,
 
-        /// Device override: `metal` | `cpu`.
-        #[arg(long)]
-        device: Option<String>,
-
         /// Keep only the top-k probabilities per answer (display).
         #[arg(long)]
         top_k: Option<usize>,
@@ -243,17 +281,17 @@ enum Command {
         /// PNG, JPEG or WebP image; repeat for multiple images.
         #[arg(long)]
         image: Vec<std::path::PathBuf>,
-        /// System message; GLM defaults to ds4's "You are a helpful assistant".
+        /// System message; GLM defaults to the reference's "You are a helpful assistant".
         #[arg(long)]
         system: Option<String>,
         #[arg(long, default_value_t = 128)]
         max_tokens: usize,
-        /// Sampling temperature; GLM defaults to ds4's 1.0, other models to 0.
+        /// Sampling temperature; GLM defaults to the reference's 1.0, other models to 0.
         #[arg(long)]
         temperature: Option<f32>,
         #[arg(long, default_value_t = false)]
         raw: bool,
-        /// Nucleus sampling; GLM defaults to ds4's 0.95, other models to 1.0.
+        /// Nucleus sampling; GLM defaults to the reference's 0.95, other models to 1.0.
         #[arg(long)]
         top_p: Option<f32>,
         #[arg(long, default_value_t = 0)]
@@ -265,7 +303,7 @@ enum Command {
         rep_penalty: f32,
         #[arg(long, default_value_t = 0)]
         seed: u64,
-        /// Use ds4's maximum GLM reasoning effort instead of its default High.
+        /// Use the reference's maximum GLM reasoning effort instead of its default High.
         #[arg(long, conflicts_with = "nothink")]
         think_max: bool,
         /// Close an empty GLM think block and omit the reasoning-effort prefix.
@@ -275,31 +313,18 @@ enum Command {
         #[arg(long, conflicts_with_all = ["think_max", "nothink"])]
         think: bool,
         /// MTP policy (`auto` = Qwen EV controller or GLM target MTP;
-        /// 0 = serial; 2..=7 = fixed Qwen depth or GLM target MTP).
+        /// 0 = serial; 2..=6 = fixed native Qwen depth or GLM target MTP;
+        /// model-specific limits apply).
         #[arg(long, default_value = "auto")]
         depth: DepthArg,
-        /// Use DS4's exact stochastic acceptance and residual sampling for GLM MTP.
+        /// Use the reference's exact stochastic acceptance and residual sampling for GLM MTP.
         #[arg(long, default_value_t = false)]
         mtp_exact_sampling: bool,
-        /// Prompt-lookup (PLD) speculative decode (greedy only).
-        #[arg(long, default_value_t = false)]
-        pld: bool,
-        /// PLD draft depth (used when --pld is set; 0 = default 4).
-        #[arg(long, default_value_t = 0)]
-        pld_depth: usize,
         /// Ignore EOS: generate exactly max_tokens (the clean-throughput
         /// measurement arm).
         #[arg(long, default_value_t = false)]
         ignore_eos: bool,
-        /// Echo router: score the prompt's 4-gram recurrence and route to PLD
-        /// when it clears `--router-threshold` (greedy only).
-        #[arg(long, default_value_t = false)]
-        router: bool,
-        /// Echo score at or above which the router picks PLD (guards the
-        /// long-KV branch; below LONG_KV PLD is the default regardless).
-        #[arg(long, default_value_t = 0.80)]
-        router_threshold: f32,
-        /// Draft-ranking oracle (specs/08): rank the target's true token in
+        /// Draft-ranking oracle: rank the target's true token in
         /// the draft head's own distribution on every round verify rejects,
         /// and print the top-k repair floor at the end. Diagnostics only —
         /// the proposal, verify, and the committed tokens are untouched.
@@ -350,15 +375,10 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         verify: usize,
         /// MTP draft depth for the chat (`auto` = EV controller, the default;
-        /// 0 = serial; 2..=7 = fixed MTP; 1 is rejected; speculative chat requires greedy sampling.
+        /// 0 = serial; 2..=6 = fixed native MTP; model-specific limits apply;
+        /// 1 is rejected; speculative chat requires greedy sampling).
         #[arg(long, default_value = "auto")]
         depth: DepthArg,
-        /// Prompt-lookup (PLD) speculative decode (greedy only).
-        #[arg(long, default_value_t = false)]
-        pld: bool,
-        /// PLD draft depth (used when --pld is set; 0 = default 4).
-        #[arg(long, default_value_t = 0)]
-        pld_depth: usize,
         #[arg(long, default_value_t = 1.0)]
         top_p: f32,
         #[arg(long, default_value_t = 0)]
@@ -396,15 +416,9 @@ enum Command {
         rep_penalty: Option<f32>,
         #[arg(long, default_value = "auto")]
         depth: DepthArg,
-        /// Use DS4's exact stochastic acceptance and residual sampling for GLM MTP.
+        /// Use the reference's exact stochastic acceptance and residual sampling for GLM MTP.
         #[arg(long, default_value_t = false)]
         mtp_exact_sampling: bool,
-        /// Prompt-lookup (PLD) speculative decode (greedy only).
-        #[arg(long, default_value_t = false)]
-        pld: bool,
-        /// PLD draft depth (used when --pld is set; 0 = default 4).
-        #[arg(long, default_value_t = 0)]
-        pld_depth: usize,
         /// Cross-request prompt prefix cache: max entries, LRU (0 = off).
         #[arg(long, default_value_t = 2)]
         prefix_cache: usize,
@@ -425,7 +439,7 @@ fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     // Weight preparation never initializes a Metal device or allocator.
     if let Command::Prepare { model, plan_only } = &cli.command {
-        let summary = lisa_engine::core::prepare::prepare_model(model, *plan_only)?;
+        let summary = lisa_engine::weights::prepare::prepare_model(model, *plan_only)?;
         println!("{}", serde_json::to_string_pretty(&summary)?);
         return Ok(());
     }
@@ -434,7 +448,7 @@ fn run() -> anyhow::Result<()> {
     }
     if let Command::Inspect { model, header_only } = &cli.command {
         if model.is_file() {
-            use lisa_gguf::{Header, Package};
+            use lisa_gguf::Header;
             let header = Header::open(model)?;
             println!("GGUF architecture: {}", header.architecture()?);
             if header.architecture()? == "deepseek41" {
@@ -452,10 +466,10 @@ fn run() -> anyhow::Result<()> {
                     header.tensors.len()
                 );
             } else {
-                let package = Package::open(model)?;
+                let package = lisa_engine::checkpoint::deepseek41::open_package(model)?;
                 println!("{}", package.summary()?);
                 if header.architecture()? == "qwen35" {
-                    let resident = lisa_engine::bindings::qwen35_gguf::inspect(model)?;
+                    let resident = lisa_engine::weights::qwen35::gguf::inspect(model)?;
                     println!(
                         "Qwen 27B GGUF: 64 trunk layers, embedded MTP, text only; {:.2} GiB resident weights. Experimental F32 graph.",
                         resident as f64 / (1u64 << 30) as f64
@@ -475,7 +489,7 @@ fn run() -> anyhow::Result<()> {
                     );
                 }
                 if header.architecture()? == "deepseek41" {
-                    use lisa_engine::bindings::deepseek41_weights::WeightPlan;
+                    use lisa_engine::weights::deepseek41::plan::WeightPlan;
                     let plan = WeightPlan::inspect(
                         &package,
                         &lisa_engine::checkpoint::deepseek41::config(&header)?,
@@ -497,13 +511,19 @@ fn run() -> anyhow::Result<()> {
         }
         anyhow::ensure!(!header_only, "--header-only requires a local GGUF file");
     }
-    // Resolve the device backend: `LISA_DEVICE`, else Metal when present, else
-    // CPU. Announce a non-default (CPU) selection.
-    let explicit_device = match &cli.command {
-        Command::Decide { device, .. } => device.as_deref(),
-        _ => None,
-    };
-    let backend = lisa_serve::application::device::Backend::from_options(explicit_device)?;
+    // Select the device backend (Metal when present unless `--device` says
+    // otherwise) and the RAM cap before anything loads.
+    if let Some(gib) = cli.ram_cap_gb {
+        lisa_engine::memory::set_ram_cap_gib(gib as usize);
+    }
+    lisa_engine::memory::set_kv_format(match cli.kv_format.as_str() {
+        "native" => lisa_engine::memory::KvFormat::Native,
+        "int8" => lisa_engine::memory::KvFormat::Int8,
+        _ => lisa_engine::memory::KvFormat::Auto,
+    });
+    lisa_engine::loading::set_tree_nodes(cli.tree_nodes as usize);
+    let backend = lisa_serve::application::device::Backend::resolve(cli.device.as_deref())?;
+    backend.select()?;
     if backend != lisa_serve::application::device::Backend::Metal {
         eprintln!("device: {}", backend.name());
     }
@@ -511,7 +531,7 @@ fn run() -> anyhow::Result<()> {
     // Cap how far the Metal buffer pool may grow past load-steady-state before
     // a sweep is forced. Without a cap a pipelined prefill or MTP round pins
     // every temporary it ever made (buffers are only released at a flush).
-    let _ = lisa_metal::memory::set_cache_limit(8 << 30);
+    lisa_metal::memory::set_cache_limit(8 << 30);
     match cli.command {
         Command::Prepare { .. } => unreachable!("preparation is handled before runtime setup"),
         Command::Decide {
@@ -524,7 +544,6 @@ fn run() -> anyhow::Result<()> {
             max_len,
             temperature,
             temperature_by_options,
-            device: _,
             top_k,
         } => {
             let model_type = lisa_engine::checkpoint::model_type_of(&model)?;
@@ -533,7 +552,11 @@ fn run() -> anyhow::Result<()> {
                 "{} has model_type {model_type:?}, not a decision model",
                 model.display()
             );
-            let mut laya = Laya::load_on(&model, backend.open()?, backend.laya_arithmetic())?;
+            let mut laya = lisa_engine::weights::laya::load_on(
+                &model,
+                backend.open()?,
+                backend.laya_arithmetic(),
+            )?;
             let by_options = parse_temp_by_options(&temperature_by_options)?;
             laya.apply_overrides(head_max_len, max_len, temperature, &by_options)?;
 
@@ -593,7 +616,7 @@ fn run() -> anyhow::Result<()> {
             require_qwen4_command(&model, "batch")?;
             let config = config::ModelConfig::from_json(&model.join("config.json"))?;
             let mut tower = lisa_serve::application::load_qwen4(&model, config)?;
-            let tok = tokenizer::Tokenizer::load(&model)?;
+            let tok = lisa_engine::checkpoint::tokenizer::load(&model)?;
             generate::set_eos_ids_for_model(tok.im_end_ids.clone(), &tower);
             let texts: Vec<String> = prompts
                 .iter()
@@ -636,8 +659,6 @@ fn run() -> anyhow::Result<()> {
             temperature,
             verify,
             depth,
-            pld,
-            pld_depth,
             top_p,
             top_k,
             min_p,
@@ -645,12 +666,11 @@ fn run() -> anyhow::Result<()> {
             seed,
         } => {
             require_qwen4_command(&model, "chat")?;
-            let pld = lisa_engine::cli::pld_enable(pld, pld_depth);
             let config = config::ModelConfig::from_json(&model.join("config.json"))?;
             let t0 = std::time::Instant::now();
             let mut tower = lisa_serve::application::load_qwen4(&model, config)?;
             eprintln!("loaded in {:.1}s", t0.elapsed().as_secs_f64());
-            let tok = tokenizer::Tokenizer::load(&model)?;
+            let tok = lisa_engine::checkpoint::tokenizer::load(&model)?;
             generate::set_eos_ids_for_model(tok.im_end_ids.clone(), &tower);
 
             // Warm on a short synthetic turn, then start the session fresh.
@@ -689,7 +709,8 @@ fn run() -> anyhow::Result<()> {
                         .copied()
                         .chain(suffix_ids.iter().copied())
                         .collect();
-                    let (eq, dlog, dhid) = lisa_engine::session_check::verify_incremental(&mut tower, &all, verify)?;
+                    let (eq, dlog, dhid) =
+                        lisa_engine::session_check::verify_incremental(&mut tower, &all, verify)?;
                     eprintln!(
                         "[verify] chunk={verify} argmax_equal={eq} logit_diff={dlog:.6} hidden_diff={dhid:.6}"
                     );
@@ -716,7 +737,7 @@ fn run() -> anyhow::Result<()> {
                         max_tokens,
                         md,
                         None,
-                        if sampler.greedy() {
+                        if sampler.can_use_raw_argmax() {
                             None
                         } else {
                             Some(&mut sampler)
@@ -729,7 +750,6 @@ fn run() -> anyhow::Result<()> {
                         &suffix_ids,
                         max_tokens,
                         &mut sampler,
-                        pld,
                         None,
                         &mut emit,
                     )?
@@ -753,8 +773,6 @@ fn run() -> anyhow::Result<()> {
             rep_penalty,
             depth,
             mtp_exact_sampling,
-            pld,
-            pld_depth,
             prefix_cache,
             max_batch,
         } => {
@@ -763,7 +781,6 @@ fn run() -> anyhow::Result<()> {
                 DepthArg::Fixed(d) => d,
             };
             let cfg = serve::ServerConfig {
-                pld: lisa_engine::cli::pld_enable(pld, pld_depth),
                 prefix_cache,
                 addr,
                 max_tokens,
@@ -776,7 +793,7 @@ fn run() -> anyhow::Result<()> {
                 gen_defaults: serve::GenDefaults::from_model_dir(&model),
                 depth: depth_us,
                 max_batch,
-                chat_template: tokenizer::load_chat_template(&model)?,
+                chat_template: lisa_engine::checkpoint::tokenizer::load_chat_template(&model)?,
                 model_id: serve::model_id_of(&model),
                 supports_images: false,
             };
@@ -812,8 +829,12 @@ fn run() -> anyhow::Result<()> {
             let t0 = std::time::Instant::now();
             let mut tower = match lisa_serve::application::loading::load_dir(&model)? {
                 lisa_serve::application::Loaded::Language(m) => m,
-                lisa_serve::application::Loaded::Image(pipeline) => return serve::images::run(pipeline, cfg),
-                lisa_serve::application::Loaded::Decision(_) => unreachable!("model_type was not laya"),
+                lisa_serve::application::Loaded::Image(pipeline) => {
+                    return serve::images::run(pipeline, cfg);
+                }
+                lisa_serve::application::Loaded::Decision(_) => {
+                    unreachable!("model_type was not laya")
+                }
             };
             if let Some(capacity) = ctx_size {
                 tower.set_context_capacity(capacity)?;
@@ -824,7 +845,7 @@ fn run() -> anyhow::Result<()> {
             );
             eprintln!("loaded in {:.1}s", t0.elapsed().as_secs_f64());
             mlx_mem_line("serve-loaded");
-            let tok = tokenizer::Tokenizer::load(&model)?;
+            let tok = lisa_engine::checkpoint::tokenizer::load(&model)?;
             generate::set_eos_ids_for_model(tok.im_end_ids.clone(), tower.as_ref());
             let warm = tok.encode("user\nhi\nassistant\n thinking\n", false)?;
             tower.warmup(&warm)?;
@@ -852,7 +873,10 @@ fn run() -> anyhow::Result<()> {
                 backend == lisa_serve::application::device::Backend::Metal,
                 "image generation requires the Metal backend"
             );
-            let pipeline = lisa_serve::application::ImagePipeline::load(lisa_serve::application::context()?, &model)?;
+            let pipeline = lisa_serve::application::ImagePipeline::load(
+                lisa_serve::application::context()?,
+                &model,
+            )?;
             let options = lisa_engine::image_generation::Options {
                 width,
                 height,
@@ -892,17 +916,12 @@ fn run() -> anyhow::Result<()> {
             think,
             depth,
             mtp_exact_sampling,
-            pld,
-            pld_depth,
             ignore_eos,
-            router,
-            router_threshold,
             oracle,
         } => {
             if oracle {
                 lisa_engine::core::oracle::enable();
             }
-            let pld = lisa_engine::cli::pld_enable(pld, pld_depth);
             let t0 = std::time::Instant::now();
             let mut tower = match lisa_serve::application::loading::load_dir(&model)? {
                 lisa_serve::application::loading::Loaded::Language(m) => m,
@@ -919,7 +938,7 @@ fn run() -> anyhow::Result<()> {
             println!("loaded in {:.1}s", t0.elapsed().as_secs_f64());
             lisa_engine::ttft_mark("model.load done (load_dir returned)");
             let t_tok = std::time::Instant::now();
-            let tok = tokenizer::Tokenizer::load(&model)?;
+            let tok = lisa_engine::checkpoint::tokenizer::load(&model)?;
             lisa_engine::ttft_mark(&format!(
                 "tokenizer load {:.2}s",
                 t_tok.elapsed().as_secs_f64()
@@ -935,28 +954,26 @@ fn run() -> anyhow::Result<()> {
                 .as_str()
                 .starts_with("glm5");
             let is_deepseek = lisa_engine::checkpoint::model_type_of(&model)? == "deepseek41";
-            let is_olala = lisa_engine::checkpoint::model_type_of(&model)? == "olala";
-            anyhow::ensure!(
-                !(is_deepseek || is_olala) || (pld == 0 && !router),
-                "This GGUF model currently supports serial generation; omit --pld and --router"
-            );
+            let is_inkling = lisa_engine::checkpoint::model_type_of(&model)? == "inkling2";
+            let has_control_frames =
+                lisa_engine::checkpoint::model_type_of(&model)? == "olala" || is_inkling;
             anyhow::ensure!(
                 !mtp_exact_sampling || (is_glm && tower.has_target_mtp()),
                 "--mtp-exact-sampling requires a GLM model with target MTP"
             );
             anyhow::ensure!(
-                is_glm || is_deepseek || is_olala || (!think_max && !nothink && !think),
-                "--think, --think-max, and --nothink require GLM, DeepSeek or Olala"
+                is_glm || is_deepseek || has_control_frames || (!think_max && !nothink && !think),
+                "--think, --think-max, and --nothink require a supported reasoning model"
             );
             let temperature = temperature.unwrap_or(if is_glm { 1.0 } else { 0.0 });
             let top_p = top_p.unwrap_or(if is_glm { 0.95 } else { 1.0 });
             let min_p = min_p.unwrap_or(0.0);
             let glm_reasoning = if think_max {
-                tokenizer::GlmReasoning::Max
+                tokenizer::ReasoningEffort::Max
             } else if nothink {
-                tokenizer::GlmReasoning::Disabled
+                tokenizer::ReasoningEffort::Disabled
             } else {
-                tokenizer::GlmReasoning::High
+                tokenizer::ReasoningEffort::High
             };
             let images = image
                 .iter()
@@ -965,8 +982,11 @@ fn run() -> anyhow::Result<()> {
                     lisa_engine::vision::decode_data_url(&url)
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
-            if !images.is_empty() {
-                anyhow::ensure!(!raw, "--image cannot be combined with --raw");
+            anyhow::ensure!(
+                images.is_empty() || !raw,
+                "--image cannot be combined with --raw"
+            );
+            if !images.is_empty() && !is_inkling {
                 let marker = if is_glm {
                     "<|begin_of_image|><|image|><|end_of_image|>"
                 } else {
@@ -976,8 +996,17 @@ fn run() -> anyhow::Result<()> {
             }
             let (text, special) = if raw {
                 (prompt.clone(), false)
-            } else if is_olala {
-                (olala_prompt(&model, &prompt, system.as_deref(), think || think_max)?, false)
+            } else if has_control_frames {
+                (
+                    checkpoint_prompt(
+                        &model,
+                        &prompt,
+                        system.as_deref(),
+                        think || think_max,
+                        if is_inkling { images.len() } else { 0 },
+                    )?,
+                    false,
+                )
             } else if is_glm {
                 (
                     tokenizer::glm_generation_prompt(
@@ -1021,7 +1050,15 @@ fn run() -> anyhow::Result<()> {
             } else if raw {
                 tok.encode_plain(&text)?
             } else if tok.is_lfm3() {
-                tok.encode(&lisa_models::lfm3::prompt::turn(system.as_deref(), &prompt, true, think || think_max), false)?
+                tok.encode(
+                    &lisa_models::lfm3::prompt::turn(
+                        system.as_deref(),
+                        &prompt,
+                        true,
+                        think || think_max,
+                    ),
+                    false,
+                )?
             } else if special {
                 tok.encode_special(&text)?
             } else {
@@ -1042,9 +1079,14 @@ fn run() -> anyhow::Result<()> {
             let mut sampler = build_sampler(temperature, top_k, top_p, min_p, rep_penalty, seed);
             sampler.mtp_exact_sampling = mtp_exact_sampling;
             let mut first_tok: Option<std::time::Instant> = None;
-            let output_template = if is_olala && !raw {
-                Some(lisa_serve::ChatTemplate::new(&tokenizer::load_chat_template(&model)?.ok_or_else(|| anyhow::anyhow!("missing Olala template"))?)?)
-            } else { None };
+            let output_template = if has_control_frames && !raw {
+                Some(lisa_serve::ChatTemplate::new(
+                    &lisa_engine::checkpoint::tokenizer::load_chat_template(&model)?
+                        .ok_or_else(|| anyhow::anyhow!("missing checkpoint template"))?,
+                )?)
+            } else {
+                None
+            };
             let mut decoder = tokenizer::IncrementalDecoder::new(&tok, false);
             let mut displayed = String::new();
             let emit = &mut |t: u32| -> anyhow::Result<()> {
@@ -1054,8 +1096,11 @@ fn run() -> anyhow::Result<()> {
                 }
                 if let Some(template) = &output_template {
                     decoder.push(t)?;
-                    let (_, content) = template.streaming_sections(decoder.stable_text(), think || think_max);
-                    if let Some(delta) = content.strip_prefix(&displayed) { print!("{delta}"); }
+                    let (_, content) =
+                        template.streaming_sections(decoder.stable_text(), think || think_max);
+                    if let Some(delta) = content.strip_prefix(&displayed) {
+                        print!("{delta}");
+                    }
                     displayed = content.to_owned();
                 } else {
                     print!("{}", tok.decode(&[t])?);
@@ -1064,58 +1109,25 @@ fn run() -> anyhow::Result<()> {
                 std::io::stdout().flush().ok();
                 Ok(())
             };
-            // Router (specs/router): score the prompt's 4-gram recurrence and
-            // route. Measured decision table (27B, 2k-KV, 128 tok):
-            //   echo:  serial 22.6 / pld 33.5 / mtp-auto 17.3 tok/s
-            //   prose: serial 22.9 / pld 22.8 / mtp-auto 21.6
-            //   mixed: serial 23.5 / pld 24.8 / mtp-auto 20.8
-            // → at short KV PLD never loses (its copy-miss fallback IS a
-            // serial step, and drafts are always verified), so it is the
-            // default below LONG_KV. At long KV MTP wins on prose
-            // (specs/03: auto 41.6 vs serial ~27.8 at 12.5k) while PLD keeps
-            // winning on echo text (24.9→59.4), so above LONG_KV only a high
-            // echo score overrides the --depth policy. Note the raw token
-            // 4-gram score separates weakly (measured: echo 0.857, prose
-            // 0.707, mixed 0.594) — the threshold guards the long-KV branch
-            // only, where misrouting prose→pld is the costly direction.
-            let mut pld = pld;
             let mut mdepth = lisa_engine::cli::resolve_mtp_depth(
                 depth,
                 tower.has_target_mtp() || sampler.greedy() || sampler.mtp_exact_sampling,
                 tower.has_drafter() || tower.has_target_mtp(),
             )?;
-            if router && sampler.greedy() {
-                let echo = lisa_engine::core::copy_draft::echo_score(&prompt_ids);
-                const LONG_KV: usize = 8192;
-                let short = prompt_ids.len() < LONG_KV;
-                let routed = echo >= router_threshold || short;
-                eprintln!(
-                    "[router] echo_score {:.3} threshold {:.3} prompt_len {} -> {}",
-                    echo,
-                    router_threshold,
-                    prompt_ids.len(),
-                    if routed { "pld" } else { "depth policy" }
-                );
-                if routed {
-                    if pld == 0 {
-                        pld = 4;
-                    }
-                    mdepth = None;
-                }
-            }
             if has_images {
                 mdepth = None;
-                pld = 0;
             }
             let (generated, stats) = if let Some(md) = mdepth {
                 let mut sess = Session::new(&mut *tower);
                 let t = std::time::Instant::now();
-                let mtp_sampler =
-                    if !tower.has_target_mtp() && sampler.greedy() && !sampler.mtp_exact_sampling {
-                        None
-                    } else {
-                        Some(&mut sampler)
-                    };
+                let mtp_sampler = if !tower.has_target_mtp()
+                    && sampler.can_use_raw_argmax()
+                    && !sampler.mtp_exact_sampling
+                {
+                    None
+                } else {
+                    Some(&mut sampler)
+                };
                 let g = sess.generate_mtp_depth(
                     &mut *tower,
                     &prompt_ids,
@@ -1134,14 +1146,8 @@ fn run() -> anyhow::Result<()> {
                 );
                 (g, None)
             } else {
-                let (g, s) = generate::generate(
-                    &mut *tower,
-                    &prompt_ids,
-                    max_tokens,
-                    &mut sampler,
-                    pld,
-                    emit,
-                )?;
+                let (g, s) =
+                    generate::generate(&mut *tower, &prompt_ids, max_tokens, &mut sampler, emit)?;
                 (g, Some(s))
             };
             println!();
