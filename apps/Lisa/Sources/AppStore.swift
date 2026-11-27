@@ -97,6 +97,10 @@ struct ModelChoice: Decodable, Identifiable {
     @Published var imageMode = false
     @Published var serverURL: String?
     @Published var logs: [String] = []
+    /// Transient progress of the reply being produced; never saved in a turn.
+    @Published var replyStatus: String?
+    /// The current phase of a model load, when it has one worth showing.
+    @Published var loadStatus: String?
     @Published var showBrowser = false
     @Published var switching = false
     @AppStorage("lisa.webEnabled") var webEnabled = true
@@ -372,7 +376,14 @@ struct ModelChoice: Decodable, Identifiable {
         switch kind {
         case "log":
             status = value as? String ?? status; logs.append(status); if logs.count > 500 { logs.removeFirst(logs.count - 500) }
+        case "status":
+            replyStatus = value as? String
+            updateCurrent { chat in
+                if let last = chat.turns.indices.last, !chat.turns[last].complete { chat.turns[last].assistant = "" }
+            }
+        case "load_status": loadStatus = value as? String
         case "replace", "delta", "committed":
+            replyStatus = nil
             guard let text = value as? String else { break }
             backgroundGeneration.update(text, delta: kind == "delta")
             updateCurrent { chat in
@@ -384,13 +395,14 @@ struct ModelChoice: Decodable, Identifiable {
         case "image":
             updateCurrent { chat in if !chat.turns.isEmpty { chat.turns[chat.turns.count - 1].generated_image = value as? String } }
         case "done":
+            replyStatus = nil
             generationSucceeded = current?.turns.last?.complete == true
             busy = suspending; status = suspending ? "Releasing model…" : "Ready"; await save()
             if backgrounded && !suspending { await releaseForBackground() }
             if !suspending { backgroundGeneration.finish(success: generationSucceeded) }
             if !backgrounded && speakReplies, let turn = current?.turns.last, turn.complete { speech.speak(turn.assistant) }
         case "loaded":
-            busy = false
+            busy = false; loadStatus = nil
             if value as? Bool == true { loadedModel = loadingModel; status = "Ready" }
             else { loadedModel = nil; error = logs.last ?? "The model could not be loaded. See Activity for details." }
             loadingModel = nil

@@ -245,9 +245,12 @@ pub(super) fn model_ram_budget() -> u64 {
 /// Load a local checkpoint. A curated snapshot installed without its `mtp/`
 /// sidecar completes it first; when that fails (for example offline), the
 /// target still loads, without a drafter.
+/// `warming` runs before the post-load warmup, which compiles the model's
+/// Metal pipelines: about a minute when the system shader cache is cold.
 pub(super) fn load_model(
     path: &std::path::Path,
     progress: impl Fn(Option<(u64, u64)>) + Send + Sync + 'static,
+    warming: impl FnOnce(),
 ) -> anyhow::Result<lisa_serve::application::loading::Loaded> {
     use lisa_engine::checkpoint::hf;
     let missing_sidecar = hf::snapshot_identity(path).is_some_and(|(repo, _)| {
@@ -265,12 +268,17 @@ pub(super) fn load_model(
             eprintln!("[load] MTP sidecar unavailable; loading without a drafter: {error:#}");
         }
     }
-    warm_loaded_model(lisa_serve::application::loading::load_dir(path)?, path)
+    warm_loaded_model(
+        lisa_serve::application::loading::load_dir(path)?,
+        path,
+        warming,
+    )
 }
 
 fn warm_loaded_model(
     mut loaded: lisa_serve::application::loading::Loaded,
     path: &std::path::Path,
+    warming: impl FnOnce(),
 ) -> anyhow::Result<lisa_serve::application::loading::Loaded> {
     if matches!(
         config_model_type(path).as_deref(),
@@ -288,6 +296,7 @@ fn warm_loaded_model(
     {
         // Bounded, model-owned shapes use private caches. Warm once before
         // reporting Ready, without changing the request's prefill law.
+        warming();
         model.warmup(&[])?;
     }
     Ok(loaded)

@@ -356,6 +356,12 @@ struct ContentView: View {
     private var conversation: some View {
         VStack(spacing: 0) {
             transcript
+            if store.loadingModel != nil, let phase = store.loadStatus {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text(phase).font(.callout).foregroundStyle(.secondary)
+                }.padding(.horizontal, 24).padding(.top, 8)
+            }
             composer.padding(.horizontal, 24).padding(.top, 8)
                 #if os(macOS)
                 .padding(.bottom, 16)
@@ -415,7 +421,10 @@ struct ContentView: View {
     private var transcript: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: ChatLayout.turnSpacing) {
-                ForEach(Array((store.current?.turns ?? []).enumerated()), id: \.offset) { _, turn in
+                let turns = store.current?.turns ?? []
+                ForEach(Array(turns.enumerated()), id: \.offset) { index, turn in
+                    // Only the last turn of a busy conversation can still be producing.
+                    let live = store.busy && store.loadingModel == nil && index == turns.count - 1
                     VStack(alignment: .leading, spacing: ChatLayout.replySpacing) {
                         HStack {
                             Spacer(minLength: 40)
@@ -430,7 +439,17 @@ struct ContentView: View {
                         }
                         HStack(alignment: .top, spacing: 12) {
                             VStack(alignment: .leading, spacing: 10) {
-                                if turn.assistant.isEmpty && !turn.complete { ProgressView().controlSize(.small) }
+                                if turn.assistant.isEmpty && !turn.complete {
+                                    if live {
+                                        HStack(spacing: 8) {
+                                            ProgressView().controlSize(.small)
+                                            if let status = store.replyStatus { Text(status).foregroundStyle(.secondary) }
+                                        }
+                                    } else {
+                                        Label("Reply interrupted", systemImage: "exclamationmark.circle")
+                                            .font(.callout).foregroundStyle(.secondary)
+                                    }
+                                }
                                 else { MarkdownMessage(text: turn.assistant) }
                                 if let image = turn.generated_image {
                                     GeneratedImageCard(path: image)

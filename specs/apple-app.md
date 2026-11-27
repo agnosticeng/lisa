@@ -65,7 +65,9 @@ Image turns, image history and the browser agent run serial.
 ## Prompt reuse and warmup
 
 Olala, LFM3, Qwen and Inkling warm their bounded shapes once before
-reporting Ready. The app's prompt cache keeps two snapshots per loaded
+reporting Ready. Warmup compiles their Metal pipelines; with a cold system
+shader cache (the first load after an update) this takes about a minute, and
+the app shows that phase while it runs. The app's prompt cache keeps two snapshots per loaded
 conversation at each model's prefix granularity, leaves the final natural
 chunk intact and checks exact tokens and the law. Images and models without a
 granularity bypass it; load, unload, clear and restore drop it.
@@ -81,6 +83,10 @@ granularity bypass it; load, unload, clear and restore drop it.
   builds lack the entitlement and stay foreground-only. Without authorization,
   entering the background cancels work; returning reloads and replays history.
 - **Cancellation** happens at generation callbacks, not inside a forward.
+- **Reply progress.** Statuses such as "Searching the web…" are transient
+  events shown beside the progress indicator, never reply text, so a saved
+  turn never holds one. A turn left incomplete with no text shows as
+  interrupted.
 - **Storage.** iOS supplies an app-container root, excludes models from backup
   and configures the Hub cache before workers start; attachment and image paths
   relocate when the container changes.

@@ -136,6 +136,8 @@ impl App {
                 UiEvent::ImageMode(steps) => ("image_mode", json!(steps)),
                 UiEvent::AssistantDelta(s) => ("delta", json!(s)),
                 UiEvent::AssistantReset(s) => ("replace", json!(s)),
+                UiEvent::AssistantStatus(s) => ("status", json!(s)),
+                UiEvent::LoadStatus(s) => ("load_status", json!(s)),
                 UiEvent::AssistantDone => {
                     self.busy = self.unloading;
                     ("done", Value::Null)

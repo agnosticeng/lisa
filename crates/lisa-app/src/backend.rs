@@ -56,6 +56,10 @@ pub(crate) enum UiEvent {
     /// reasoning is stripped and the visible reply no longer extends the
     /// previously emitted prefix).
     AssistantReset(String),
+    /// Transient progress shown in place of the reply while it is produced
+    /// ("Searching the web…"). It clears the reply text and is never saved,
+    /// so an interrupted turn cannot keep a stale status as its answer.
+    AssistantStatus(String),
     AssistantDone,
     WebSearchRequested {
         request: BrowserRequest,
@@ -63,6 +67,8 @@ pub(crate) enum UiEvent {
     },
     /// The authoritative successful reply, safe to replay in a later session.
     TurnCommitted(String),
+    /// The current loading phase, shown beside the progress indicator.
+    LoadStatus(String),
     /// A model finished loading (true) or failed (false).
     Loaded(bool),
     Unloaded,
@@ -506,6 +512,11 @@ pub(crate) fn spawn_controlled(
                             } else {
                                 events.push(UiEvent::DrafterDownloadProgress(progress));
                             }
+                        }, || {
+                            push(UiEvent::Log("compiling GPU kernels".into()));
+                            push(UiEvent::LoadStatus(
+                                "Compiling GPU kernels… The first load after an update can take about a minute.".into(),
+                            ));
                         }) {
                             Ok(lisa_serve::application::loading::Loaded::Language(m)) => {
                                 match lisa_engine::checkpoint::tokenizer::load(&path) {
@@ -756,7 +767,7 @@ pub(crate) fn spawn_controlled(
                                 let stamp=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
                                 let options=lisa_engine::image_generation::Options {seed:stamp as u64,..Default::default()};
                                 std::fs::create_dir_all(&image_root)?;
-                                let png=pipeline.generate(&text,&options,&mut |stage,i,n| {check_cancel()?;push(UiEvent::AssistantReset(format!("{stage} {i}/{n}")));Ok(())})?;
+                                let png=pipeline.generate(&text,&options,&mut |stage,i,n| {check_cancel()?;push(UiEvent::AssistantStatus(format!("{stage} {i}/{n}")));Ok(())})?;
                                 let path=image_root.join(format!("image-{stamp}.png"));std::fs::write(&path,png)?;Ok(path)
                             })();
                             match result {
@@ -1176,7 +1187,7 @@ where
             BrowserRequest::Open(_) => "Reading a Google result…".into(),
         };
         push(UiEvent::Log(status.clone()));
-        push(UiEvent::AssistantReset(status));
+        push(UiEvent::AssistantStatus(status));
         let (reply_tx, reply_rx) = mpsc::channel();
         push(UiEvent::WebSearchRequested {
             request,
@@ -1195,7 +1206,7 @@ where
                 Err(error) => return Err(error.into()),
             };
             match event {
-                BrowserEvent::NeedsInput(message) => push(UiEvent::AssistantReset(message)),
+                BrowserEvent::NeedsInput(message) => push(UiEvent::AssistantStatus(message)),
                 BrowserEvent::Finished(result) => {
                     let result = result.unwrap_or_else(|error| format!("Browser error: {error}"));
                     push(UiEvent::Log(format!(
@@ -1246,7 +1257,7 @@ where
     let mut requested_page_read = false;
     for _ in 0..MAX_BROWSER_ACTIONS + 3 {
         let offered_tools: &[Value] = if remaining_actions > 0 { &tools } else { &[] };
-        push(UiEvent::AssistantReset(if remaining_actions == 0 {
+        push(UiEvent::AssistantStatus(if remaining_actions == 0 {
             "Writing an answer from the available sources…".into()
         } else {
             "Thinking…".into()
@@ -1348,7 +1359,7 @@ where
                     // streams only the text the user is meant to read.
                     if display != emitted {
                         if emitted.is_empty() || !display.starts_with(&emitted) {
-                            // Replace the per-pass status before streaming the answer.
+                            // The pass's status cleared the reply; start its text.
                             push(UiEvent::AssistantReset(display.clone()));
                         } else {
                             push(UiEvent::AssistantDelta(
