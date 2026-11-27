@@ -2,8 +2,22 @@ import SwiftUI
 import WebKit
 
 @MainActor final class BrowserController: NSObject, ObservableObject, WKNavigationDelegate {
-    // A nonzero viewport keeps offscreen WebKit result cards laid out.
-    let webView = WKWebView(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+    // A nonzero viewport keeps offscreen WebKit result cards laid out. Without
+    // Safari's product token Google serves a reduced page with weaker results.
+    let webView: WKWebView = {
+        let configuration = WKWebViewConfiguration()
+        configuration.applicationNameForUserAgent = BrowserController.safariProduct
+        return WKWebView(frame: CGRect(x: 0, y: 0, width: 390, height: 844), configuration: configuration)
+    }()
+    /// Safari's version tracks the OS major version from release 26 onward.
+    static var safariProduct: String {
+        let version = "Version/\(max(ProcessInfo.processInfo.operatingSystemVersion.majorVersion, 26)).0"
+        #if os(iOS)
+        return "\(version) Mobile/15E148 Safari/604.1"
+        #else
+        return "\(version) Safari/605.1.15"
+        #endif
+    }
     @Published var address = ""
     @Published var status = ""
     @Published private(set) var needsInput = false
@@ -54,7 +68,9 @@ import WebKit
                         return
                     }
                 }
-                try? await Task.sleep(for: .seconds(1))
+                // Read a finished page promptly; a pending consent or
+                // verification prompt waits on the user, so poll it slowly.
+                try? await Task.sleep(for: .milliseconds(prompted ? 1000 : 200))
             }
         }
     }

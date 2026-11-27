@@ -57,7 +57,7 @@ Use **⌘N** for a new chat, **Return** to send and **Shift-Return** for a new l
 The model can use the browser in any language-model chat when it needs current
 information. It searches Google and opens result links; the
 browser stays hidden unless Google requires consent or verification. Replies
-show excerpts from retrieved sources. Ask naturally; no browser command
+are written from the pages it read and link them as sources. Ask naturally; no browser command
 is needed.
 
 Language-model context capacity defaults to the checkpoint metadata in both

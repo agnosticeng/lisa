@@ -154,14 +154,14 @@ Closing that prompt cancels the pending browser request. Lisa never chooses a
 consent option or completes verification automatically.
 
 The web agent opens only links from the latest Google results. It selects a
-result number; full mobile redirect URLs remain in the navigator. Direct search
-requests search Google and open the first result before inference. Failed
-retrieval cannot fall back to an answer from model memory. Web replies show source links and compact extracts from the pages actually read.
-Release listings render as film titles with source dates/genres; ratings, buttons
-and navigation are omitted. Other pages use short quoted excerpts. Model-written summaries are not used for those replies, because small
-models can invent titles even after reading sources.
-Excerpts preserve the source wording; they do not certify that a page is current
-or that its claims are true.
+result number from each result's title, source domain and description; redirect
+URLs remain in the navigator. Direct search requests search Google before
+inference. The model may refine a search once; a third search waits until it
+has opened a result. It must open at least one result before a web answer, and
+failed retrieval cannot fall back to an answer from model memory. The model
+writes the reply from the pages it read and links them as sources. Its
+instructions restrict it to facts stated in those pages, but a small model can
+still misread them; sources do not certify that a page is current or correct.
 
 Every chat receives the current UTC date in its runtime system prompt. Saved
 instructions and visible user messages are unchanged. Reopening a chat or sending

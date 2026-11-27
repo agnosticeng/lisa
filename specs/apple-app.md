@@ -87,10 +87,14 @@ granularity bypass it; load, unload, clear and restore drop it.
 
 ## Browser retrieval
 
-The browser extracts links and headings, follows exact search-result links and
-lets the model pick numbered results rather than build URLs. Consent and
-verification pages are shown to the user, never automated. Replies quote
-bounded excerpts with links; a failed read returns a retrieval failure.
+The browser presents itself with Safari's product token so Google serves its
+full results page. Search extraction returns one entry per result card: title,
+source domain and description, without Google's labels, breadcrumbs or
+translation controls; redirect URLs stay in the navigator. The model
+picks numbered results rather than build URLs, may refine a search once before
+it must open a result, must read at least one page before a web answer, and writes that answer from the pages it read, with their
+links appended. Consent and verification pages are shown to the user, never
+automated; a failed read returns a retrieval failure.
 
 ## Limits
 

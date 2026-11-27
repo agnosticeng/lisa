@@ -13,10 +13,16 @@ pub(crate) enum BrowserRequest {
 
 /// Navigation is limited to links returned by the latest successful Google
 /// search. Numeric references avoid asking small models to copy opaque URLs.
+/// One refined search is allowed; after that a result must be opened, since
+/// each further search costs a navigation and a model pass without adding a
+/// source.
 #[derive(Default)]
 pub(crate) struct SearchNavigation {
     results: Vec<String>,
+    unread_searches: usize,
 }
+
+const SEARCHES_BEFORE_READING: usize = 2;
 
 impl SearchNavigation {
     pub(crate) fn navigate(
@@ -25,9 +31,13 @@ impl SearchNavigation {
         navigate: impl FnOnce(BrowserRequest) -> String,
     ) -> String {
         match request {
+            BrowserRequest::Search(_) if self.unread_searches >= SEARCHES_BEFORE_READING => {
+                "Browser error: open the most relevant result from the latest search with web_open before searching again.".into()
+            }
             BrowserRequest::Search(query) => {
                 let content = navigate(BrowserRequest::Search(query));
                 if content.starts_with("Search page: ") {
+                    self.unread_searches += 1;
                     self.results = content
                         .lines()
                         .filter_map(|line| line.strip_prefix("URL: ").map(str::to_string))
@@ -53,172 +63,15 @@ impl SearchNavigation {
                     self.results.iter().find(|url| **url == reference)
                 };
                 match url {
-                    Some(url) => navigate(BrowserRequest::Open(url.clone())),
+                    Some(url) => {
+                        self.unread_searches = 0;
+                        navigate(BrowserRequest::Open(url.clone()))
+                    }
                     None => "Browser error: choose a result number from the latest Google search. Only Google result links can be opened; do not invent a URL.".into(),
                 }
             }
         }
     }
-}
-
-/// Web answers contain source text, not unchecked model-written claims. The
-/// browser's formatted page header supplies provenance; body URLs do not.
-#[derive(Default)]
-pub(crate) struct ReadPages {
-    pages: Vec<(String, String, String)>,
-}
-
-impl ReadPages {
-    pub(crate) fn remember(&mut self, content: &str) {
-        let Some((header, body)) = content.split_once("\n\n") else {
-            return;
-        };
-        let mut lines = header.lines();
-        let Some(title) = lines.next().and_then(|line| line.strip_prefix("Page: ")) else {
-            return;
-        };
-        let Some(url) = lines.next().and_then(|line| line.strip_prefix("URL: ")) else {
-            return;
-        };
-        if self.pages.iter().any(|(_, seen, _)| seen == url) {
-            return;
-        }
-        let body = body
-            .split("\n\nLinks on this page:")
-            .next()
-            .unwrap_or(body)
-            .trim();
-        if body.is_empty() || !(url.starts_with("https://") || url.starts_with("http://")) {
-            return;
-        }
-        self.pages.push((title.into(), url.into(), body.into()));
-    }
-
-    pub(crate) fn answer(&self) -> Option<String> {
-        if self.pages.is_empty() {
-            return None;
-        }
-        Some(
-            self.pages
-                .iter()
-                .take(3)
-                .map(|(title, url, body)| {
-                    let title = title.replace('[', "\\[").replace(']', "\\]");
-                    // Release listings expose a title followed by a dated metadata row.
-                    // Render those exact fields, excluding ratings and site controls.
-                    let lines = body
-                        .lines()
-                        .map(str::trim)
-                        .filter(|line| !line.is_empty())
-                        .collect::<Vec<_>>();
-                    let mut entries = lines
-                        .windows(2)
-                        .filter_map(|pair| {
-                            if let Some(date) = pair[1].strip_prefix("Sortie le ")
-                                && pair[0].chars().count() <= 180
-                                && date.len() <= 80
-                            {
-                                return Some(format!(
-                                    "- **{}**  \n  {}",
-                                    escape_markdown(pair[0]),
-                                    escape_markdown(date)
-                                ));
-                            }
-                            let fields = pair[1].split('|').map(str::trim).collect::<Vec<_>>();
-                            if fields.len() < 2 || pair[0].chars().count() > 180 {
-                                return None;
-                            }
-                            let date = fields[0];
-                            let has_year =
-                                date.split(|ch: char| !ch.is_ascii_digit()).any(|part| {
-                                    part.len() == 4
-                                        && part
-                                            .parse::<u32>()
-                                            .is_ok_and(|year| (1900..=2199).contains(&year))
-                                });
-                            if !has_year || date.len() > 64 {
-                                return None;
-                            }
-                            let detail = if fields.len() >= 3 && !fields.last().unwrap().is_empty()
-                            {
-                                format!("{} · {}", date, fields.last().unwrap())
-                            } else {
-                                date.into()
-                            };
-                            Some(format!(
-                                "- **{}**  \n  {}",
-                                escape_markdown(pair[0]),
-                                escape_markdown(&detail)
-                            ))
-                        })
-                        .take(8)
-                        .collect::<Vec<_>>();
-                    if entries.is_empty() {
-                        // Some listings place title and release date on the same row.
-                        entries = lines
-                            .iter()
-                            .filter_map(|line| {
-                                let (name, date) = line.split_once("Sortie le ")?;
-                                let name = name.trim();
-                                if name.is_empty() || name.chars().count() > 180 || date.len() > 80
-                                {
-                                    return None;
-                                }
-                                Some(format!(
-                                    "- **{}**  \n  {}",
-                                    escape_markdown(name),
-                                    escape_markdown(date.trim())
-                                ))
-                            })
-                            .take(8)
-                            .collect();
-                    }
-                    if !entries.is_empty() {
-                        return format!("{}\n\n[{title}](<{url}>)", entries.join("\n\n"));
-                    }
-                    let excerpt = body.chars().take(500).collect::<String>();
-                    let truncated = excerpt.len() < body.len();
-                    let excerpt = if truncated {
-                        // Do not finish a truncated excerpt halfway through a word.
-                        excerpt
-                            .rsplit_once(char::is_whitespace)
-                            .map(|(text, _)| text)
-                            .unwrap_or(&excerpt)
-                            .to_string()
-                    } else {
-                        excerpt
-                    };
-                    // Escape markup from pages so quoted text cannot create invented
-                    // links or alter the source card's Markdown structure.
-                    let mut quote = excerpt
-                        .lines()
-                        .map(|line| {
-                            let escaped = escape_markdown(line);
-                            format!("> {escaped}")
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    if truncated {
-                        quote.push_str("\n> […]");
-                    }
-                    format!("[{title}](<{url}>)\n\n{quote}")
-                })
-                .collect::<Vec<_>>()
-                .join("\n\n"),
-        )
-    }
-}
-
-fn escape_markdown(text: &str) -> String {
-    text.chars()
-        .flat_map(|ch| {
-            if "\\`*_{}[]<>()#+-.!|".contains(ch) {
-                vec!['\\', ch]
-            } else {
-                vec![ch]
-            }
-        })
-        .collect()
 }
 
 use serde::Deserialize;
@@ -249,6 +102,8 @@ struct PageLink {
 struct SearchHit {
     title: String,
     url: String,
+    #[serde(default)]
+    source: String,
     snippet: String,
 }
 
@@ -270,14 +125,26 @@ pub(crate) const GOOGLE_PROMPT_SCRIPT: &str = r#"
 
 pub(crate) const SEARCH_SCRIPT: &str = r#"(() => {
   const clean = value => (value || '').replace(/\s+/g, ' ').trim();
+  // Hidden cards have no innerText; join their text nodes so adjacent
+  // elements do not run together.
+  const words = node => {
+    const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
+    const parts = [];
+    while (walker.nextNode()) parts.push(walker.currentNode.nodeValue);
+    return parts.join(' ');
+  };
+  const text = node => clean(node.innerText) || clean(words(node));
   const hosts = new Set(['google.com', 'www.google.com', 'consent.google.com']);
-  // Mobile results use opaque /goto redirects; WebKit resolves them on open.
+  // Result links may be opaque /url or /goto redirects; WebKit resolves them on open.
   const redirects = new Set(['/url', '/goto']);
+  const headings = 'h3, [role="heading"][aria-level="3"]';
+  const translate = /\s*·?\s*(?:Traduire cette page|Translate this page|Diese Seite übersetzen|Traducir esta página|Traduci questa pagina)\s*/gi;
+  const domain = value => value.replace(/^https?:\/\//i, '').split(/[\s›\/]/)[0].replace(/^www\./, '');
   const results = Array.from(document.querySelectorAll('a'))
     .map(a => {
-      const heading = a.querySelector('h3, [role="heading"][aria-level="3"]');
+      const heading = a.querySelector(headings);
       if (!heading) return null;
-      let url = a.href;
+      let url = a.href, source = '';
       try {
         let parsed = new URL(url);
         if (hosts.has(parsed.hostname)) {
@@ -291,21 +158,36 @@ pub(crate) const SEARCH_SCRIPT: &str = r#"(() => {
         }
         if (!['http:', 'https:'].includes(parsed.protocol)) return null;
         if (hosts.has(parsed.hostname) && !redirects.has(parsed.pathname)) return null;
+        if (!hosts.has(parsed.hostname)) source = domain(parsed.hostname);
       } catch (_) { return null; }
+      // The card is the widest ancestor that still holds only this result.
       let card = a;
-      for (let i = 0; i < 5 && card.parentElement; i++) {
-        card = card.parentElement;
-        const text = clean(card.textContent);
-        if (text.length > clean(heading.innerText || heading.textContent).length + 20 && text.length < 1400) break;
+      while (card.parentElement && card.parentElement !== document.body) {
+        const parent = card.parentElement;
+        if (parent.querySelectorAll(headings).length > 1 || clean(parent.textContent).length > 1400) break;
+        card = parent;
       }
-      const title = clean(heading.innerText || heading.textContent);
+      const title = text(heading);
       if (!title) return null;
-      const text = clean(card.textContent);
-      const snippet = text.startsWith(title) ? text.slice(title.length).trim() : text;
-      return {title, url, snippet: snippet.slice(0, 700)};
+      const body = clean(text(card).split(title).join(' '));
+      const cite = card.querySelector('cite');
+      const shown = cite ? text(cite) : '';
+      const address = body.match(/https?:\/\/[^\s›]+/i);
+      if (!source) {
+        // Opaque redirects hide the destination; cards still print its address.
+        source = domain(shown || (address || body.match(/(?:[a-z0-9-]+\.)+[a-z]{2,}(?= ›)/i) || [''])[0]);
+      }
+      // The section label, site name and address before the description
+      // repeat the source; the translation offer is a Google control.
+      const end = shown && body.includes(shown) ? body.indexOf(shown) + shown.length
+        : address ? address.index + address[0].length : 0;
+      const snippet = clean(body.slice(end).replace(translate, ' ')).replace(/^[·—\s]+/, '');
+      return {title, url, source, snippet: snippet.slice(0, 700)};
     })
     .filter(Boolean)
-    .filter((item, index, all) => all.findIndex(other => other.url === item.url) === index)
+    // Site links repeat one result's title; keep the first card of each.
+    .filter((item, index, all) => all.findIndex(other => other.url === item.url ||
+      (other.title === item.title && other.source === item.source)) === index)
     .slice(0, 8);
   return JSON.stringify({title: clean(document.title), url: location.href,
     results, body: clean(document.body ? document.body.innerText : '').slice(0, 1800)});
@@ -357,13 +239,12 @@ pub(crate) fn parse_search_page(json: &str) -> Result<String, String> {
         if !(url.starts_with("https://") || url.starts_with("http://")) || title.is_empty() {
             continue;
         }
-        out.push_str(&format!(
-            "\n{}. {}\nURL: {}\nSnippet: {}\n",
-            index + 1,
-            title,
-            url,
-            result.snippet.trim()
-        ));
+        out.push_str(&format!("\n{}. {}\nURL: {}\n", index + 1, title, url));
+        let source = result.source.trim();
+        if !source.is_empty() {
+            out.push_str(&format!("Source: {source}\n"));
+        }
+        out.push_str(&format!("Snippet: {}\n", result.snippet.trim()));
     }
     if out.lines().count() < 4 {
         Err(format!(
@@ -451,46 +332,33 @@ mod tests {
     }
 
     #[test]
-    fn web_answers_only_render_read_page_excerpts() {
-        let mut pages = ReadPages::default();
-        pages.remember("Browser error: navigation failed");
-        pages.remember("Search page: https://google.com\nURL: https://example.com");
-        assert!(pages.answer().is_none());
-        pages.remember("Page: New films\nURL: https://example.com/films\n\nA real film opens on Thursday.\n[Invented link](https://invented.test)\n\nLinks on this page:\n- Navigation — https://other.test");
-        let answer = pages.answer().unwrap();
-        assert!(answer.starts_with("[New films](<https://example.com/films>)"));
-        assert!(answer.contains("> A real film opens on Thursday\\."));
-        assert!(answer.contains("\\[Invented link\\]"));
-        assert!(!answer.contains("https://other.test"));
-        assert!(!answer.contains("Browser error"));
-    }
-
-    #[test]
-    fn release_listings_show_source_titles_dates_and_genres_without_site_controls() {
-        let mut pages = ReadPages::default();
-        pages.remember("Page: This week's releases\nURL: https://example.com/releases\n\nHome\nNew films\nFirst Film\n18 novembre 2026 | 2h 38min | Action, Adventure\nRatings\n3,8\nBOOK TICKETS\nSecond Film\n18 novembre 2026 | 1h 31min | Comedy\nLong description.");
-        let answer = pages.answer().unwrap();
-        assert!(answer.contains("- **First Film**  \n  18 novembre 2026 · Action, Adventure"));
-        assert!(answer.contains("- **Second Film**  \n  18 novembre 2026 · Comedy"));
-        assert!(answer.ends_with("[This week's releases](<https://example.com/releases>)"));
-        for noise in [
-            "Ratings",
-            "BOOK TICKETS",
-            "Long description",
-            "Home",
-            "2h 38min",
-        ] {
-            assert!(!answer.contains(noise));
-        }
-        let mut inline = ReadPages::default();
-        inline.remember("Page: Releases\nURL: https://example.com/releases\n\nNavigation\nFirst Film Sortie le Mercredi 18 novembre 2026\nSecond Film Sortie le Mercredi 11 novembre 2026");
-        let answer = inline.answer().unwrap();
-        assert!(answer.contains("- **First Film**  \n  Mercredi 18 novembre 2026"));
-        assert!(answer.contains("- **Second Film**  \n  Mercredi 11 novembre 2026"));
-        assert!(!answer.contains("Navigation"));
-        let mut multiline = ReadPages::default();
-        multiline.remember("Page: Releases\nURL: https://example.com/releases\n\nNavigation\nFirst Film\nSortie le Mercredi 18 novembre 2026\n  \nSecond Film\nSortie le Mercredi 11 novembre 2026");
-        assert_eq!(multiline.answer(), inline.answer());
+    fn a_third_search_waits_until_a_result_is_opened() {
+        let search = |n: &mut SearchNavigation, query: &str| {
+            n.navigate(BrowserRequest::Search(query.into()), |_| {
+                "Search page: https://www.google.com/search?q=x\n1. One\nURL: https://one.test/\nSnippet: One".into()
+            })
+        };
+        let mut navigation = SearchNavigation::default();
+        assert!(search(&mut navigation, "first").starts_with("Search page: "));
+        assert!(search(&mut navigation, "refined").starts_with("Search page: "));
+        assert!(search(&mut navigation, "again").starts_with("Browser error: open"));
+        // An invalid reference does not count as reading a result.
+        navigation.navigate(BrowserRequest::Open("google-result:9".into()), |_| {
+            panic!("unknown result opened")
+        });
+        assert!(search(&mut navigation, "again").starts_with("Browser error: open"));
+        navigation.navigate(BrowserRequest::Open("google-result:1".into()), |_| {
+            "Page: One\nURL: https://one.test/\n\nText".into()
+        });
+        assert!(search(&mut navigation, "after reading").starts_with("Search page: "));
+        assert!(search(&mut navigation, "refined").starts_with("Search page: "));
+        // Failed searches leave nothing to read and never block the next one.
+        let mut navigation = SearchNavigation::default();
+        navigation.navigate(BrowserRequest::Search("down".into()), |_| {
+            "Browser error: navigation failed".into()
+        });
+        assert!(search(&mut navigation, "retry").starts_with("Search page: "));
+        assert!(search(&mut navigation, "refined").starts_with("Search page: "));
     }
 
     #[test]
@@ -519,5 +387,22 @@ mod tests {
         assert!(result.contains("First paragraph\n\nSecond paragraph"));
         assert!(result.contains("https://example.com/next"));
         assert!(!result.contains("javascript:"));
+    }
+
+    #[test]
+    fn search_results_show_sources_but_keep_redirects_out_of_the_prompt() {
+        let page = json!({"title":"Google", "url":"https://www.google.com/search?q=rust", "body":"", "results":[
+            {"title":"Rust 1.99.0", "url":"https://www.google.com/url?q=CAESopaque", "source":"blog.rust-lang.org", "snippet":"1 oct. 2026 — Rust 1.99.0 is out."},
+            {"title":"Legacy card", "url":"https://example.com/legacy", "snippet":"No source field."}
+        ]});
+        let mut navigation = SearchNavigation::default();
+        let prompt = navigation.navigate(BrowserRequest::Search("rust".into()), |_| {
+            parse_search_page(&page.to_string()).unwrap()
+        });
+        assert!(prompt.contains(
+            "1. Rust 1.99.0\nSource: blog.rust-lang.org\nSnippet: 1 oct. 2026 — Rust 1.99.0 is out."
+        ));
+        assert!(prompt.contains("2. Legacy card\nSnippet: No source field."));
+        assert!(!prompt.contains("CAESopaque"));
     }
 }
